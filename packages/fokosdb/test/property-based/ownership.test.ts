@@ -30,6 +30,11 @@ import type { CounterPartitionDO } from "../sharding/counter-host.js";
 import { makeCounterTable, stub } from "../sharding/counter-table.js";
 import { propertyRuns } from "./harness.js";
 
+const PROPERTY_RUNS = propertyRuns(500);
+// A run has no I/O and takes a few milliseconds. The floor keeps the default limit of a test for a
+// low run count.
+const PROPERTY_TIMEOUT_MS = Math.max(45_000, PROPERTY_RUNS * 100);
+
 const NO_SORT_KEY = KeyCodec.asKeyBytes(new Uint8Array());
 
 /** A key must not be empty. */
@@ -70,12 +75,12 @@ function assertOwnershipAgrees<TPolicy, Ops extends FokosOperationSpec>(
 			const accepted = targets.filter((t) => t.belongs(key)).map((t) => t.doName);
 			expect(accepted).toEqual([owner.kind === "remote" ? owner.target.doName : null]);
 		}),
-		{ numRuns: propertyRuns(500) },
+		{ numRuns: PROPERTY_RUNS },
 	);
 }
 
 describe("Property: belongsToTarget and resolveOwner agree", () => {
-	it("routes and filters every hash key to the same child of a hash split", async () => {
+	it("routes and filters every hash key to the same child of a hash split", { timeout: PROPERTY_TIMEOUT_MS }, async () => {
 		const table = makeCounterTable();
 		for (let i = 0; i < 5; i++) {
 			await table.increment(`k-${i}`);
@@ -88,7 +93,7 @@ describe("Property: belongsToTarget and resolveOwner agree", () => {
 		});
 	});
 
-	it("routes and filters every sort key to the same child of a range split", async () => {
+	it("routes and filters every sort key to the same child of a range split", { timeout: PROPERTY_TIMEOUT_MS }, async () => {
 		const { root } = await makeTriggeredRangeRoot(4);
 		await root.awaitSplitCompleted();
 

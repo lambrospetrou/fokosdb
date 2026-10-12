@@ -35,12 +35,15 @@ import {
 	type ItemData,
 } from "./harness.js";
 
-const SUITE_TIMEOUT_MS = 600_000;
+const PROPERTY_RUNS = propertyRuns(40);
+// A run takes 1 to 2 s alone, because a fault that stays costs the request budget and the recovery
+// after it. This allows for the load of the full suite.
+const PROPERTY_TIMEOUT_MS = PROPERTY_RUNS * 8_000;
 // The start state of the pool: an object for every seeded key.
 const JSON_SEED_DATA: readonly ItemData[] = [{ alpha: 1, beta: "two" }, { gamma: null }, {}];
 
 describe("FokosDB transactions with a fault on one participant — model-based property", () => {
-	it("any sequence of writes, faulty transactions and reads agrees with an in-memory map", { timeout: SUITE_TIMEOUT_MS }, async () => {
+	it("any sequence of writes, faulty transactions and reads agrees with an in-memory map", { timeout: PROPERTY_TIMEOUT_MS }, async () => {
 		const db = makeTestDB({ controlled: true });
 		await useShortRecoveryTimes(db);
 		const stats = newTransactionStats();
@@ -52,7 +55,7 @@ describe("FokosDB transactions with a fault on one participant — model-based p
 
 		await fc.assert(
 			fc.asyncProperty(arbCommands, (run) => runCommands(db, run, JSON_SEED_DATA)),
-			{ numRuns: propertyRuns(40) },
+			{ numRuns: PROPERTY_RUNS },
 		);
 
 		// A property where no fault met the transaction it is for agrees with the model and proves

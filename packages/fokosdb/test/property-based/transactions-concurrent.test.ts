@@ -39,7 +39,14 @@ import {
 	seedSplitTable,
 } from "./harness.js";
 
-const SUITE_TIMEOUT_MS = 600_000;
+// The seed of the table does not depend on the run count.
+const SEED_TIMEOUT_MS = 600_000;
+const CONCURRENT_RUNS = propertyRuns(15);
+const CONTENDING_RUNS = propertyRuns(10);
+// A run takes about 0.5 s alone. This allows for the load of the full suite and for a batch that
+// waits for a partition that splits or for a lock to clear.
+const CONCURRENT_TIMEOUT_MS = CONCURRENT_RUNS * 10_000;
+const CONTENDING_TIMEOUT_MS = CONTENDING_RUNS * 10_000;
 // A batch is heavier than a single command, so a run holds fewer of them.
 const MAX_COMMANDS = 12;
 // A contending batch does more per command: it reads the pool back, replays one transaction, and
@@ -61,37 +68,41 @@ describe("FokosDB concurrent transactions over splitting partitions — model-ba
 	beforeAll(async () => {
 		await seedSplitTable(db);
 		expect(await expectSeedIntact(db), "the seed must have split at least one root partition").toBeGreaterThanOrEqual(1);
-	}, SUITE_TIMEOUT_MS);
+	}, SEED_TIMEOUT_MS);
 
-	it("batches of concurrent transactions agree with an in-memory map and leave no lock behind", { timeout: SUITE_TIMEOUT_MS }, async () => {
-		const stats = newTransactionStats();
-		// `size: "max"` keeps a run at its full length. A shorter run reaches fewer of the item states
-		// that a batch must meet, and a lock that one batch leaks shows up in the next one.
-		const arbRunOverTheTable = arbRun(
-			(keys) => [
-				fc.oneof(
-					{ arbitrary: arbConcurrentBatch(keys, arbLargeOrSmallData, stats), weight: BATCH_WEIGHT },
-					// The single-operation commands run between the batches. They move the items to states
-					// a batch alone reaches rarely, such as an absent key, or a text item that no update applies to.
-					...commandArbitraries(fc.constantFrom(...keys), arbLargeOrSmallData).map((arbitrary) => ({ arbitrary, weight: 1 })),
-				),
-			],
-			{ maxCommands: MAX_COMMANDS, size: "max" },
-		);
+	it(
+		"batches of concurrent transactions agree with an in-memory map and leave no lock behind",
+		{ timeout: CONCURRENT_TIMEOUT_MS },
+		async () => {
+			const stats = newTransactionStats();
+			// `size: "max"` keeps a run at its full length. A shorter run reaches fewer of the item states
+			// that a batch must meet, and a lock that one batch leaks shows up in the next one.
+			const arbRunOverTheTable = arbRun(
+				(keys) => [
+					fc.oneof(
+						{ arbitrary: arbConcurrentBatch(keys, arbLargeOrSmallData, stats), weight: BATCH_WEIGHT },
+						// The single-operation commands run between the batches. They move the items to states
+						// a batch alone reaches rarely, such as an absent key, or a text item that no update applies to.
+						...commandArbitraries(fc.constantFrom(...keys), arbLargeOrSmallData).map((arbitrary) => ({ arbitrary, weight: 1 })),
+					),
+				],
+				{ maxCommands: MAX_COMMANDS, size: "max" },
+			);
 
-		await fc.assert(
-			fc.asyncProperty(arbRunOverTheTable, (run) => runCommands(db, run)),
-			{ numRuns: propertyRuns(15) },
-		);
+			await fc.assert(
+				fc.asyncProperty(arbRunOverTheTable, (run) => runCommands(db, run)),
+				{ numRuns: CONCURRENT_RUNS },
+			);
 
-		const summary = describeTransactionStats(stats);
-		expect(stats.peakInFlight, `the transactions never overlapped — ${summary}`).toBeGreaterThanOrEqual(2);
-		expect(stats.committed, `too few transactions committed — ${summary}`).toBeGreaterThanOrEqual(stats.started * MIN_COMMITTED_FRACTION);
-		expect(stats.lockProbes, `no batch probed the locks it released — ${summary}`).toBeGreaterThan(0);
-		expect(await expectSeedIntact(db)).toBeGreaterThanOrEqual(1);
-	});
+			const summary = describeTransactionStats(stats);
+			expect(stats.peakInFlight, `the transactions never overlapped — ${summary}`).toBeGreaterThanOrEqual(2);
+			expect(stats.committed, `too few transactions committed — ${summary}`).toBeGreaterThanOrEqual(stats.started * MIN_COMMITTED_FRACTION);
+			expect(stats.lockProbes, `no batch probed the locks it released — ${summary}`).toBeGreaterThan(0);
+			expect(await expectSeedIntact(db)).toBeGreaterThanOrEqual(1);
+		},
+	);
 
-	it("batches of contending transactions leave a state that some order of them explains", { timeout: SUITE_TIMEOUT_MS }, async () => {
+	it("batches of contending transactions leave a state that some order of them explains", { timeout: CONTENDING_TIMEOUT_MS }, async () => {
 		const stats = newTransactionStats();
 		const arbRunOverTheTable = arbRun(
 			(keys) => [
@@ -105,7 +116,7 @@ describe("FokosDB concurrent transactions over splitting partitions — model-ba
 
 		await fc.assert(
 			fc.asyncProperty(arbRunOverTheTable, (run) => runCommands(db, run)),
-			{ numRuns: propertyRuns(10) },
+			{ numRuns: CONTENDING_RUNS },
 		);
 
 		const summary = describeTransactionStats(stats);

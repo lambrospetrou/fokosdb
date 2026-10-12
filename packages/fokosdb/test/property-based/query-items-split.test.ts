@@ -28,7 +28,14 @@ import {
 	type Query,
 } from "./query-harness.js";
 
-const SUITE_TIMEOUT_MS = 600_000;
+// The seed of the range tree does not depend on the run count.
+const SEED_TIMEOUT_MS = 600_000;
+const DRAIN_RUNS = propertyRuns(40);
+const COUNT_RUNS = propertyRuns(25);
+const CURSOR_RUNS = propertyRuns(25);
+// A run takes about 50 ms alone, because the tree is seeded once and a run only reads. This allows
+// for the load of the full suite.
+const timeoutFor = (runs: number) => runs * 2_000;
 
 /**
  * A cursor must not promise a page that cannot exist. The walk emits one when a later child of the
@@ -65,7 +72,7 @@ describe("FokosDB queryItems over a range tree — model-based properties", () =
 		// already covers, and it reports a silent success.
 		expect(new Set(fixture.leaves).size, "the hot key must be spread over several range leaves").toBeGreaterThanOrEqual(4);
 		expect(fixture.boundaries).toHaveLength(new Set(fixture.leaves).size - 1);
-	}, SUITE_TIMEOUT_MS);
+	}, SEED_TIMEOUT_MS);
 
 	/** Drains one request and checks every page of it against the cursor rule above. */
 	async function expectDrainAndCursors(queries: Query[], budget: number, select?: "count"): Promise<void> {
@@ -78,21 +85,21 @@ describe("FokosDB queryItems over a range tree — model-based properties", () =
 		});
 	}
 
-	it("a drained request returns exactly the model's items, in key order", { timeout: SUITE_TIMEOUT_MS }, async () => {
+	it("a drained request returns exactly the model's items, in key order", { timeout: timeoutFor(DRAIN_RUNS) }, async () => {
 		await fc.assert(
 			fc.asyncProperty(makeArbRequest(fixture), ({ queries, budget }) => expectDrainAndCursors(queries, budget)),
-			{ numRuns: propertyRuns(40) },
+			{ numRuns: DRAIN_RUNS },
 		);
 	});
 
-	it("count mode counts the same items and materializes none", { timeout: SUITE_TIMEOUT_MS }, async () => {
+	it("count mode counts the same items and materializes none", { timeout: timeoutFor(COUNT_RUNS) }, async () => {
 		await fc.assert(
 			fc.asyncProperty(makeArbRequest(fixture), ({ queries, budget }) => expectDrainAndCursors(queries, budget, "count")),
-			{ numRuns: propertyRuns(25) },
+			{ numRuns: COUNT_RUNS },
 		);
 	});
 
-	it("a cursor answers the same page every time it is sent", { timeout: SUITE_TIMEOUT_MS }, async () => {
+	it("a cursor answers the same page every time it is sent", { timeout: timeoutFor(CURSOR_RUNS) }, async () => {
 		await fc.assert(
 			fc.asyncProperty(makeArbRequest(fixture), async ({ queries, budget }) => {
 				const expected = expectedAnswer(fixture.model, queries);
@@ -120,7 +127,7 @@ describe("FokosDB queryItems over a range tree — model-based properties", () =
 				expect(first.items).toEqual(expectedItemsOfPage.slice(0, first.items.length));
 				expect(again.items).toEqual(expectedItemsOfPage.slice(first.items.length, first.items.length + again.items.length));
 			}),
-			{ numRuns: propertyRuns(25) },
+			{ numRuns: CURSOR_RUNS },
 		);
 	});
 });

@@ -29,6 +29,8 @@ import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
 import { propertyRuns } from "./harness.js";
 
 const PROPERTY_RUNS = propertyRuns(100);
+// One second for each run, which is far more than a run on one Durable Object takes.
+const PROPERTY_TIMEOUT_MS = PROPERTY_RUNS * 1_000;
 const BASE_NOW = 1_000_000;
 const T = (BASE_NOW + 100) * TX_ORDER_TS_UNITS_PER_MS;
 const KEYS = ["a", "b", "c"].map((sk) => ({ hashKey: KeyCodec.encode("h"), sortKey: KeyCodec.encode(sk) }));
@@ -144,7 +146,7 @@ function uniqueKeys(items: readonly TransactionItem[]): TransactionItemKey[] {
 describe("ordered per-item execution — the paths agree with the reference run", () => {
 	it(
 		"gives the same items, deletion metadata, and size estimates on both paths and in the reference run",
-		{ timeout: PROPERTY_RUNS * 1_000 },
+		{ timeout: PROPERTY_TIMEOUT_MS },
 		async () => {
 			const stub = testPartitionStub(`ordered-property.${crypto.randomUUID()}`);
 			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {

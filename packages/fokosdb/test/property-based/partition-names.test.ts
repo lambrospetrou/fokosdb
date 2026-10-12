@@ -25,6 +25,9 @@ import { encodeRangeComponent, isHashPartition, isRangePartition, PartitionIdHel
 import { propertyRuns, textEncoder } from "./harness.js";
 
 const PROPERTY_RUNS = propertyRuns(2_000);
+// A run has no I/O and takes less than a millisecond. The floor keeps the default limit of a test
+// for a low run count.
+const PROPERTY_TIMEOUT_MS = Math.max(45_000, PROPERTY_RUNS * 20);
 
 // ─── The oracle ───────────────────────────────────────────────────────────────
 
@@ -217,7 +220,7 @@ function expectedParse(partition: Partition): ParsedName {
 // ─── The properties ───────────────────────────────────────────────────────────
 
 describe("partition IDs and DO names — properties", () => {
-	it("a partition ID decodes back to the identity that built it", () => {
+	it("a partition ID decodes back to the identity that built it", { timeout: PROPERTY_TIMEOUT_MS }, () => {
 		fc.assert(
 			fc.property(arbPartition, (partition) => {
 				const { bytes, opaque } = encodePartition(partition);
@@ -239,7 +242,7 @@ describe("partition IDs and DO names — properties", () => {
 		);
 	});
 
-	it("a DO name parses back to the shard group and the identity that built it", () => {
+	it("a DO name parses back to the shard group and the identity that built it", { timeout: PROPERTY_TIMEOUT_MS }, () => {
 		fc.assert(
 			fc.property(arbPartition, (partition) => {
 				expect(parseDoName(encodePartition(partition).doName)).toEqual(expectedParse(partition));
@@ -248,7 +251,7 @@ describe("partition IDs and DO names — properties", () => {
 		);
 	});
 
-	it("a component parses back to its bytes, and never holds '.' or starts with '~m'", () => {
+	it("a component parses back to its bytes, and never holds '.' or starts with '~m'", { timeout: PROPERTY_TIMEOUT_MS }, () => {
 		fc.assert(
 			fc.property(arbComponent, (bytes) => {
 				const component = encodeRangeComponent(bytes);
@@ -262,7 +265,7 @@ describe("partition IDs and DO names — properties", () => {
 		);
 	});
 
-	it("a component of a string key is text, and an ASCII component keeps its percent-encoding", () => {
+	it("a component of a string key is text, and an ASCII component keeps its percent-encoding", { timeout: PROPERTY_TIMEOUT_MS }, () => {
 		fc.assert(
 			fc.property(
 				fc.oneof(
