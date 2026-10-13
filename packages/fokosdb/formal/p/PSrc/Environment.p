@@ -4,8 +4,9 @@ fun ENVIRONMENT_STEPS(): int { return 20; }
 
 // The default number of ticks after the end of the faults and after the last change of an alarm. A
 // Durable Object that keeps a deadline for good, such as a coordinator whose participant never
-// answers, otherwise keeps the run going for good. Each change of an alarm starts the count again,
-// and the work of a run is finite, so each run ends.
+// answers, otherwise keeps the run going for good. Each change of an alarm and each lost call start
+// the count again, because a loss can occur after the end of the other faults, and the retry of the
+// lost call needs ticks. The work and the losses of a run are finite, so each run ends.
 fun TICKS_AFTER_FAULTS(): int { return 20; }
 
 // `down` holds the Durable Objects that drop every call, also after the end of the faults.
@@ -124,6 +125,7 @@ machine Environment {
         loss = LOSE_REQUEST;
       } else if (config.losses > 0 && $) {
         config.losses = config.losses - 1;
+        ticksAfterFaults = 0;
         if (config.answersOnly || $) {
           loss = LOSE_ANSWER;
         } else {
