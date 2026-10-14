@@ -4,11 +4,17 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
 	define: {
 		// The suites run inside the Workers runtime and cannot read the shell environment. This
-		// substitutes the run count of the property-based suites into the test modules at build time;
-		// `propertyRuns` in test/property-based/harness.ts reads it and falls back to its default.
+		// substitutes the settings of the property-based suites into the test modules at build time.
+		// `propertyRuns` in test/property-based/harness.ts reads the run count and falls back to its
+		// default. test/property-based/README.md says how the other three replay a failure.
 		__FOKOS_PROPERTY_RUNS__: JSON.stringify(process.env.FOKOS_PROPERTY_RUNS ?? ""),
+		__FOKOS_PROPERTY_SEED__: JSON.stringify(process.env.FOKOS_PROPERTY_SEED ?? ""),
+		__FOKOS_PROPERTY_PATH__: JSON.stringify(process.env.FOKOS_PROPERTY_PATH ?? ""),
+		__FOKOS_PROPERTY_REPLAY_PATH__: JSON.stringify(process.env.FOKOS_PROPERTY_REPLAY_PATH ?? ""),
 	},
 	test: {
+		// It applies the replay settings to fast-check and adds the replay commands to a failure.
+		setupFiles: ["./test/property-based/replay-setup.ts"],
 		// Several suites spy on Date.now, console.error and PartitionStore.prototype. Restoring
 		// globally keeps a spy from leaking out of the test that installed it.
 		restoreMocks: true,

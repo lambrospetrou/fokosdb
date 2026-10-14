@@ -23,10 +23,8 @@
 // query-harness.ts holds the second model, for `queryItems`: a key order oracle, the pages of a
 // request, and the range tree the split suites read.
 //
-// A failure prints `seed` and `path`. Put them in the `fc.assert` parameters, for example
-// `{ seed: 42, path: "3:1:0" }`, to replay the shrunk counterexample. A command sequence also
-// prints `replayPath`; pass it to `fc.commands` as `{ replayPath: "..." }` next to the seed.
-// `FOKOS_PROPERTY_RUNS=500 pnpm vitest run test/property-based/` searches deeper than the default.
+// A failure prints the shell commands that replay it. README.md in this directory says how a run is
+// sized and how a failure replays.
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import fc from "fast-check";
@@ -54,8 +52,10 @@ import { controlledCoordinator, partitionRouter } from "../transactions/tx-helpe
 // ─── The size of a run ────────────────────────────────────────────────────────
 
 // A suite runs inside the Workers runtime and cannot read the shell environment, so
-// `vitest.config.ts` substitutes FOKOS_PROPERTY_RUNS into this constant when it builds the module.
+// `vitest.config.ts` substitutes FOKOS_PROPERTY_RUNS and FOKOS_PROPERTY_REPLAY_PATH into these
+// constants when it builds the module.
 declare const __FOKOS_PROPERTY_RUNS__: string;
+declare const __FOKOS_PROPERTY_REPLAY_PATH__: string;
 
 /**
  * The run count of one property: FOKOS_PROPERTY_RUNS when the shell sets it, else `defaultRuns`.
@@ -1040,9 +1040,13 @@ export function arbRun(
 	constraints: fc.CommandsContraints,
 	pool: (prefix: string) => ItemKey[] = poolKeys,
 ): fc.Arbitrary<Run> {
+	// The shrink of a command sequence depends on which commands ran, so a replay of a shrunk sequence
+	// needs the `replayPath` that the failure printed, next to its seed and path. A `replayPath` in
+	// `constraints` wins, as the parameters of an `fc.assert` call win over the global ones.
+	const replay = __FOKOS_PROPERTY_REPLAY_PATH__ === "" ? {} : { replayPath: __FOKOS_PROPERTY_REPLAY_PATH__ };
 	return fc.uuid().chain((prefix) => {
 		const keys = pool(`${prefix}:`);
-		return fc.record({ keys: fc.constant(keys), cmds: fc.commands(makeCommands(keys), constraints) });
+		return fc.record({ keys: fc.constant(keys), cmds: fc.commands(makeCommands(keys), { ...replay, ...constraints }) });
 	});
 }
 

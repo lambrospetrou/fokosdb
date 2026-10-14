@@ -114,7 +114,7 @@ Tests run in the real Workers runtime through `@cloudflare/vitest-plugin`. Each 
 
 - `test/partition-do/` holds one file per `PartitionDO` behaviour, `test/transactions/` the transaction suites, and `test/repartition/` the repartition flows.
 - Use `makeStub` (`test/partition-do/helpers.ts`) for an ordinary test. Use `TestPartition` (`partition-harness.ts`) only when the test drives a split, a migration, or a promotion, with `triggerHashSplit`, `triggerRangeSplit`, `splitHash`, `splitRange`, `makeRangeRoot`, `runAlarm` and `drainUntil`.
-- Property-based suites are in `test/property-based/` and use `fast-check`. Read that directory before you add or change one: each suite says at its top what it covers, and its shared modules say how a run is sized and how a failure replays.
+- Property-based suites use `fast-check`. Read `test/property-based/README.md` before you add, change, or replay one.
 - Global fake timers can run a DO background callback in the wrong I/O context. Lifecycle tests use real timers and the scheduled-alarm test APIs instead.
 
 ## Where the detail lives
