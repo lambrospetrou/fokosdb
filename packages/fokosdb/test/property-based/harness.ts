@@ -43,6 +43,7 @@ import {
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/expression/types.js";
 import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/json-types.js";
+import { SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
@@ -548,10 +549,15 @@ function expectedRejection(m: Model, op: TxOp): string[] | null {
 /**
  * The codes that cancel a transaction whose premises all hold. A transaction in the same
  * millisecond as the last write of an item gets `timestamp_conflict`, and a partition that splits
- * or imports its share answers 503. A batch over the same keys meets more of them, which
+ * or imports its share answers 503. The sharding runtime defines `partition_migrating`, so its
+ * codes are in the set too. A batch over the same keys meets more of them, which
  * `CONTENTION_CANCEL_CODES` lists.
  */
-const ORDERING_CANCEL_CODES: ReadonlySet<string> = new Set(["timestamp_conflict", ...Object.keys(UNAVAILABLE_CODES)]);
+const ORDERING_CANCEL_CODES: ReadonlySet<string> = new Set([
+	"timestamp_conflict",
+	...Object.keys(UNAVAILABLE_CODES),
+	...Object.keys(SHARDING_UNAVAILABLE_CODES),
+]);
 
 // ─── The counters of a run ────────────────────────────────────────────────────
 
