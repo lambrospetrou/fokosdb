@@ -27,6 +27,8 @@
 // `{ seed: 42, path: "3:1:0" }`, to replay the shrunk counterexample. A command sequence also
 // prints `replayPath`; pass it to `fc.commands` as `{ replayPath: "..." }` next to the seed.
 // `FOKOS_PROPERTY_RUNS=500 pnpm vitest run test/property-based/` searches deeper than the default.
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import fc from "fast-check";
 import { expect } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
@@ -277,16 +279,71 @@ const isItemLocked = (e: unknown): boolean => FokosError.isCode(e, CONFLICT_CODE
  * clears. A lock that clears on its own is therefore acceptable, and only a lock that stays is a
  * leak. `waited` reports whether the write met a lock.
  */
-async function untilUnlocked<T>(fn: () => Promise<T>): Promise<{ value: T; waited: boolean }> {
+async function untilUnlocked<T>(db: FokosDB, fn: () => Promise<T>): Promise<{ value: T; waited: boolean }> {
 	let waited = false;
-	const value = await retryWhile(
-		() => untilAvailable(fn),
-		isItemLocked,
-		() => {
-			waited = true;
-		},
-	);
-	return { value, waited };
+	try {
+		const value = await retryWhile(
+			() => untilAvailable(fn),
+			isItemLocked,
+			() => {
+				waited = true;
+			},
+		);
+		return { value, waited };
+	} catch (e) {
+		if (!isItemLocked(e)) {
+			throw e;
+		}
+		const waitedSeconds = (RETRY_LIMIT * RETRY_DELAY_MS) / 1000;
+		throw new Error(`a lock stayed for ${waitedSeconds} s or more\n${await describeLock(db, e)}`, { cause: e });
+	}
+}
+
+/**
+ * What the partition and the coordinator store for the lock that `e` reports, as text for an error
+ * message. The partition gives the row of the transaction with its recovery times, and the
+ * coordinator gives the state of the transaction and the answers of its participants. Each part also
+ * gives the clock and the alarm of its Durable Object.
+ *
+ * A recovery that is slow shows a `next_recovery_at` or an alarm after `now`. A recovery that cannot
+ * finish shows a `guarded_at`, a transaction that is not complete, or no alarm.
+ */
+async function describeLock(db: FokosDB, e: unknown): Promise<string> {
+	try {
+		const { ns, nsTx } = db.options().table;
+		const { attributes, meta } = e as { attributes: { transactionId: string }; meta?: { servedByActorName?: string } };
+		const { transactionId } = attributes;
+		const partitionName = meta?.servedByActorName;
+		if (!partitionName) {
+			return `transaction ${transactionId}: the error does not name its partition`;
+		}
+		const read = (stub: DurableObjectStub, queries: Record<string, string>) =>
+			runInDurableObject(stub, async (_instance, state) => ({
+				now: Date.now(),
+				alarm: await state.storage.getAlarm(),
+				rows: Object.fromEntries(
+					Object.entries(queries).map(([name, sql]) => [name, state.storage.sql.exec(sql, transactionId).toArray()]),
+				),
+			}));
+		const partition = await read(env[ns].getByName(partitionName), {
+			transaction: `SELECT transaction_ts, created_at, guarded_at, next_recovery_at, coordinator_json FROM pending_tx_info WHERE transaction_id = ?`,
+			lockRows: `SELECT COUNT(*) AS n FROM pending_transactions WHERE transaction_id = ?`,
+		});
+		const lines = [`transaction ${transactionId}`, `partition ${partitionName}: ${JSON.stringify(partition)}`];
+		const [info] = partition.rows.transaction as { coordinator_json: string }[];
+		if (info) {
+			const coordinatorName = (JSON.parse(info.coordinator_json) as { doName: string }).doName;
+			const coordinator = await read(env[nsTx].getByName(coordinatorName), {
+				transaction: `SELECT state, created_at, completed_at, next_recovery_at FROM tc_state WHERE transaction_id = ?`,
+				participants: `SELECT partition_do_name, prepare_outcome, commit_outcome, cancel_outcome, error_json FROM tc_participants WHERE transaction_id = ?`,
+			});
+			lines.push(`coordinator ${coordinatorName}: ${JSON.stringify(coordinator)}`);
+		}
+		return lines.join("\n");
+	} catch (reportError) {
+		// The report must not hide the lock error.
+		return `the report of the lock failed: ${String(reportError)}`;
+	}
 }
 
 // ─── The model ────────────────────────────────────────────────────────────────
@@ -627,11 +684,11 @@ const SEED_DATA: readonly ItemData[] = [
 async function seedPool(db: FokosDB, m: Model, keys: readonly ItemKey[], seedData: readonly ItemData[] = SEED_DATA): Promise<void> {
 	for (const [index, key] of keys.slice(0, -1).entries()) {
 		const data = seedData[index % seedData.length];
-		const { value } = await untilUnlocked(() => db.putItem({ ...key, data }));
+		const { value } = await untilUnlocked(db, () => db.putItem({ ...key, data }));
 		m.items.set(keyId(key), { data, kind: expectedDataKind(data), version: value.version });
 	}
 	const last = keys[keys.length - 1];
-	await untilUnlocked(() => db.deleteItem(last));
+	await untilUnlocked(db, () => db.deleteItem(last));
 	applyDelete(m, last);
 }
 
@@ -675,7 +732,7 @@ function poolModel(items: readonly MaybeReadItem[], keys: readonly ItemKey[]): M
  */
 async function expectKeyUnlocked(m: Model, db: FokosDB, key: ItemKey, stats: TransactionStats): Promise<void> {
 	const item = m.items.get(keyId(key));
-	const { value, waited } = await untilUnlocked<PutItemResult | DeleteItemResult>(() =>
+	const { value, waited } = await untilUnlocked<PutItemResult | DeleteItemResult>(db, () =>
 		item === undefined ? db.deleteItem(key) : db.putItem({ ...key, data: item.data }),
 	);
 	if (item === undefined) {
@@ -990,10 +1047,36 @@ export function arbRun(
  */
 export async function runCommands(db: FokosDB, run: Run, seedData?: readonly ItemData[]): Promise<void> {
 	const model = emptyModel();
-	await seedPool(db, model, run.keys, seedData);
-	await fc.asyncModelRun(() => ({ model, real: db }), run.cmds);
-	await expectModelMatches(db, model, run.keys);
+	try {
+		await seedPool(db, model, run.keys, seedData);
+	} catch (e) {
+		const earlier = firstRunFailures.get(db);
+		throw new Error(
+			[
+				"the seed of the pool failed before a command ran, so this counterexample is not a failure of its commands.",
+				"An earlier run on the same keys left the state that stops the seed.",
+				earlier === undefined
+					? "No run of this table failed before."
+					: `The first failure of this table was:\n${earlier instanceof Error ? (earlier.stack ?? earlier.message) : String(earlier)}`,
+			].join("\n"),
+			{ cause: e },
+		);
+	}
+	try {
+		await fc.asyncModelRun(() => ({ model, real: db }), run.cmds);
+		await expectModelMatches(db, model, run.keys);
+	} catch (e) {
+		if (!firstRunFailures.has(db)) {
+			firstRunFailures.set(db, e);
+		}
+		throw e;
+	}
 }
+
+// The first failure of the commands of each table. fast-check runs smaller inputs on the same table
+// after a failure and reports only the last one that fails. When the first failure leaves a lock, each
+// later run fails in the seed, and the report then has no trace of the first failure.
+const firstRunFailures = new WeakMap<FokosDB, unknown>();
 
 // ─── A batch of transactions over disjoint keys ───────────────────────────────
 
