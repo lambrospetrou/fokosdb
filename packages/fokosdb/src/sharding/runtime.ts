@@ -1383,8 +1383,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		});
 	}
 
-	async alarm(info: AlarmInvocationInfo): Promise<void> {
+	async alarm(info?: AlarmInvocationInfo): Promise<void> {
 		console.log({ ...this.#logParams(), message: "fokos/runtime: alarm triggered.", alarmInfo: info });
+		// The handler can start before the scheduled time on the clock of this object. A pass then
+		// finds no work due and arms the alarm at the same time again. The platform does not deliver
+		// an alarm that a handler arms at its own scheduled time, so no pass runs after that. The
+		// wait moves the clock to the scheduled time, and the pass then finds the work due. The wait
+		// is at most the fallback interval, so a wrong scheduled time cannot hold the handler.
+		//
+		// NOTE: This shouldn't happen in production, but it happens in workerd/miniflare/vitest environments
+		// due to clock discrepancies and going back in time occasionally.
+		const earlyMs = Math.min((info?.scheduledTime ?? 0) - Date.now(), this.#config().fallbackAlarmMs);
+		if (earlyMs > 0) {
+			await scheduler.wait(earlyMs);
+		}
 		await this.runDueWork();
 	}
 

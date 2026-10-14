@@ -203,6 +203,23 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 	});
 
+	it("recovers a stale lock when the alarm handler starts before the scheduled time", async () => {
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
+		const recoverTransaction = mockCoordinatorRecovery();
+		const transactionId = crypto.randomUUID();
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: Date.now() });
+			// The lock goes stale at the scheduled time of the alarm, and the handler starts before it.
+			const scheduledTime = Date.now() + 300;
+			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = ? WHERE transaction_id = ?`, scheduledTime, transactionId);
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime });
+			expect(recoverTransaction).toHaveBeenCalledTimes(1);
+			expect(store.listPendingTxKeys(transactionId)).toHaveLength(0);
+		});
+	});
+
 	it("releases a not_found lock at the exact idempotency-window boundary", async () => {
 		const now = Date.now();
 		const { ctx, stub, rpc } = makeStub();

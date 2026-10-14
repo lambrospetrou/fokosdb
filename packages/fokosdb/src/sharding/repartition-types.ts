@@ -149,7 +149,7 @@ export interface FokosShardingRpc {
 	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void>;
 	/** Cancel the schedule, delete all storage, abort. The caller reads the status and every promotions page first. */
 	fokosDestroy(): Promise<void>;
-	alarm(info: AlarmInvocationInfo): Promise<void>;
+	alarm(info?: AlarmInvocationInfo): Promise<void>;
 }
 
 /** Everything one partition calls on another to run a repartition. */
