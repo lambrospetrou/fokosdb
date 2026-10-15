@@ -8,8 +8,8 @@
  * the modules it names. Nothing here imports a Durable Object class as a value, which keeps the
  * server implementation out of this bundle.
  */
-export { FokosDB } from "./db.js";
-export type { FokosDBOptions, FokosDBResolvedOptions, FokosDBRetryOptions } from "./db.js";
+export { FokosDB, isFokosDBError } from "./db.js";
+export type { FokosDBError, FokosDBOptions, FokosDBResolvedOptions, FokosDBRetryOptions } from "./db.js";
 export { FokosStd } from "./fokos-std.js";
 
 // ─── Item data and single-item operations ─────────────────────────────────────

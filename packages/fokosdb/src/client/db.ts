@@ -80,7 +80,9 @@ import {
 	FokosConditionCheckError,
 	FokosTransactionCancelledError,
 	TRANSACTION_CANCELLED_CODES,
+	isFokosAnyError,
 	withExpressionErrors,
+	type FokosAnyError,
 } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
@@ -219,13 +221,37 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 	return reason as RejectionReason;
 }
 
+/**
+ * The error that every FokosDB method raises. `meta` names the partition that answered the request.
+ * It is absent when no partition answered: a validation error before any I/O, or a failure of the
+ * RPC from the Worker to the first partition.
+ */
+export type FokosDBError = FokosAnyError & { readonly meta?: PartitionInfo };
+
+/** True for an error that a FokosDB method raises, after any number of hops. */
+export function isFokosDBError(e: unknown): e is FokosDBError {
+	return isFokosAnyError(e);
+}
+
+/**
+ * Runs `fn`, which reads the answer of a partition. An error from it gets the meta of that partition,
+ * as an error that the partition raised does.
+ */
+function withAnswerMeta<T>(routing: FokosPublicRouting, fn: () => T): T {
+	try {
+		return fn();
+	} catch (e) {
+		throw Object.assign(FokosError.wrap(e), { meta: partitionInfoOf(routing) });
+	}
+}
+
 /** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
 function conditionCheckError(
 	keys: { hashKey: HashKey; sortKey?: SortKey },
 	res: { reason: RejectionReasonEncoded; meta: OperationMetrics },
 	routing: FokosPublicRouting,
 ): FokosConditionCheckError {
-	const reason = decodeRejectionReason(res.reason);
+	const reason = withAnswerMeta(routing, () => decodeRejectionReason(res.reason));
 	invariant(reason.code === "condition_failed", "an item RPC rejects only a failed condition");
 	return new FokosConditionCheckError(CONDITION_CHECK_CODES.condition_failed, {
 		message: "condition failed",
@@ -565,7 +591,10 @@ export class FokosDB {
 		const meta = publicMeta(res.meta, routing);
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
-		if (res.found) {
+		return withAnswerMeta(routing, (): GetItemResult => {
+			if (!res.found) {
+				return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta };
+			}
 			if (res.item.kind === "projected") {
 				invariant(names, "fokos/getItem: projected response without a projection");
 				return {
@@ -586,8 +615,7 @@ export class FokosDB {
 				item: { hashKey: opts.hashKey, sortKey: opts.sortKey, ...res.item, ...decodeItemData(res.item.kind, res.item.data) },
 				meta,
 			};
-		}
-		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta };
+		});
 	}
 
 	async #deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
@@ -1054,23 +1082,25 @@ export class FokosDB {
 			scannedCount += rpcResult.scannedCount;
 			rowsReturned += rpcResult.rowsReturned;
 			if (select === "projection") {
-				if (projectionNames) {
-					for (const item of rpcResult.items) {
-						items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
+				withAnswerMeta(routing, () => {
+					if (projectionNames) {
+						for (const item of rpcResult.items) {
+							items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
+						}
+					} else {
+						for (const item of rpcResult.items) {
+							const stored = item as StoredItem;
+							items.push({
+								hashKey: KeyCodec.decode(stored.hk),
+								sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
+								// json data arrives as JSON text and is parsed once here to the public JsonValue.
+								...decodeItemData(stored.kind, stored.data),
+								...(stored.ttl_epoch_utc_seconds === null ? {} : { ttlAt: stored.ttl_epoch_utc_seconds }),
+								version: stored.v,
+							});
+						}
 					}
-				} else {
-					for (const item of rpcResult.items) {
-						const stored = item as StoredItem;
-						items.push({
-							hashKey: KeyCodec.decode(stored.hk),
-							sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
-							// json data arrives as JSON text and is parsed once here to the public JsonValue.
-							...decodeItemData(stored.kind, stored.data),
-							...(stored.ttl_epoch_utc_seconds === null ? {} : { ttlAt: stored.ttl_epoch_utc_seconds }),
-							version: stored.v,
-						});
-					}
-				}
+				});
 			}
 			for (const leaf of rpcResult.partitionMetas) {
 				rowsRead += leaf.rowsRead;

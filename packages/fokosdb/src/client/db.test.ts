@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { FokosDB } from "./db.js";
+import { FokosDB, isFokosDBError } from "./db.js";
 import { FokosStd } from "./fokos-std.js";
 import invariant from "../shared/invariant.js";
 import { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
@@ -844,11 +844,54 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(raised.attributes.runtimeCode).toBe(SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code);
 				// The mapping builds a new error object, so the routing must move with it. The public
 				// boundary then turns it into the meta a result would carry, and drops the routing itself.
-				expect((raised as { meta?: unknown }).meta).toMatchObject({ servedByActorName: "leaf", forwardCount: 1, hashDepth: 1 });
+				invariant(isFokosDBError(raised), "getItem must raise a FokosDBError");
+				expect(raised.meta).toMatchObject({ servedByActorName: "leaf", forwardCount: 1, hashDepth: 1 });
 				expect(raised).not.toHaveProperty("routing");
 			} finally {
 				spy.mockRestore();
 			}
+		});
+	});
+
+	describe("FokosDB — errors after a partition answered", () => {
+		it("gives an error from the decode of an answer the meta of the partition that answered", async () => {
+			const db = makeDB();
+			const leaf = { ref: { partitionId: "01", doName: "leaf" }, actorId: "actor", hashDepth: 1, rangeDepth: 0, role: "executed" as const };
+			const answer = {
+				value: {
+					found: true,
+					item: { data: "{not json", kind: "json", version: 1 },
+					meta: { rowsRead: 1, rowsWritten: 0, databaseSize: 1 },
+				},
+				routing: { servedBy: [{ ...leaf, _rangeAncestors: [] }], forwardCount: 1, servedByTruncated: false },
+			};
+			const spy = vi.spyOn(PartitionDO.prototype, "apiGetItem").mockResolvedValue(answer as never);
+			try {
+				const raised = await db.getItem({ hashKey: "alice" }).then(
+					() => {
+						throw new Error("getItem resolved; it must raise item_data_parse_failed");
+					},
+					(e: unknown) => e,
+				);
+				invariant(isFokosDBError(raised), "getItem must raise a FokosDBError");
+				expect(raised.code).toBe("item_data_parse_failed");
+				expect(raised.meta).toMatchObject({ servedByActorName: "leaf", servedByPartitionId: "01", forwardCount: 1, hashDepth: 1 });
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		it("raises a validation error before any I/O with no meta", async () => {
+			const raised = await makeDB()
+				.putItem({ hashKey: "alice", data: "v", ttlAt: -1 })
+				.then(
+					() => {
+						throw new Error("putItem resolved; it must raise ttl_at_invalid");
+					},
+					(e: unknown) => e,
+				);
+			invariant(isFokosDBError(raised), "putItem must raise a FokosDBError");
+			expect(raised).not.toHaveProperty("meta");
 		});
 	});
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FokosDB } from "../src/client/db.js";
+import { FokosDB, isFokosDBError } from "../src/client/db.js";
 import { testCoordinatorRef, testPartitionStub } from "./stub-helpers.js";
 import { openedRpc } from "./partition-do/helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
@@ -44,7 +44,7 @@ describe("the errors of a partition, through the public API", () => {
 		const { rowsRead: _r, rowsWritten: _w, databaseSize: _d, ...routingMeta } = (await db.getItem(key)).meta;
 		for (const call of [() => db.putItem({ ...key, data: "blocked" }), () => db.deleteItem(key)]) {
 			const err = await errorOf(call);
-			expect((err as { meta?: unknown }).meta).toEqual(routingMeta);
+			expect(isFokosDBError(err) && err.meta).toEqual(routingMeta);
 			expect(FokosConflictError.is(err)).toBe(true);
 			expect(err).toMatchObject({
 				code: "item_locked_by_transaction",
