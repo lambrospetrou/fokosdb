@@ -1038,7 +1038,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				// json arrives here as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
 				data: result.data,
 				kind: result.kind,
-				ttlAt: result.ttl_epoch_utc_seconds ?? undefined,
+				...(result.ttl_epoch_utc_seconds === null ? {} : { ttlAt: result.ttl_epoch_utc_seconds }),
 				version: result.v,
 			},
 			meta,

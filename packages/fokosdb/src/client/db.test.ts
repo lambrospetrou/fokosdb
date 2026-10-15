@@ -57,6 +57,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					expect(meta.servedByPartitionId).toBeTypeOf("string");
 				}
 				expect(query.partitionMetas).not.toHaveLength(0);
+				// A leaf forwards nothing, so only the page meta counts the forwards.
+				for (const meta of query.partitionMetas) {
+					expect(meta).not.toHaveProperty("forwardCount");
+				}
+				expect(query.meta.forwardCount).toBeTypeOf("number");
 			});
 		});
 
@@ -72,9 +77,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v2" });
 				const cleared = await db.getItem({ hashKey: "ttl", sortKey: "item" });
 				expect(cleared).toMatchObject({ found: true, item: { data: "v2" } });
-				if (cleared.found) {
-					expect(cleared.item.ttlAt).toBeUndefined();
-				}
+				// An item with no TTL has no `ttlAt` key, on every read path.
+				expect(cleared.item).not.toHaveProperty("ttlAt");
+				expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0]).not.toHaveProperty("ttlAt");
+				const projected = await db.getItem({ hashKey: "ttl", sortKey: "item", projection: [{ expr: { ref: "v" } }] });
+				expect(projected.item).not.toHaveProperty("ttlAt");
 			});
 
 			it.each([0, -1, 1.5])("rejects invalid ttlAt %s for direct and transactional puts", async (ttlAt) => {

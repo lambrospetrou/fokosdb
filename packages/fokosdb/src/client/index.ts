@@ -40,6 +40,7 @@ export type {
 	QueryItemsProjectedOptions,
 	QueryItemsProjectedResult,
 	QueryItemsResult,
+	QueryPartitionMeta,
 	QuerySelect,
 	ReadItem,
 	ReadItemValue,

@@ -3,7 +3,7 @@
  * partition-to-partition routing state stops: the envelope lists every partition that served the
  * request with the hints a router caches, and a client needs the partition that ran the work.
  */
-import type { OperationMetrics, PartitionInfo } from "../shared/types.js";
+import type { OperationMetrics, PartitionInfo, QueryPartitionMeta } from "../shared/types.js";
 import type { FokosPublicRoute, FokosPublicRouting } from "../sharding/runtime-types.js";
 
 /**
@@ -17,16 +17,20 @@ export function partitionInfoOf(routing: FokosPublicRouting): PartitionInfo {
 
 /**
  * The info of one leaf that scanned rows, paired by `partitionId` with the list of the envelope. A
- * leaf forwarded nothing, so its count is 0. The list is a bounded hint, so it can miss a leaf; the
- * caller then skips it instead of reporting a partition it cannot name.
+ * leaf forwarded nothing, so its info has no forward count. The list is a bounded hint, so it can
+ * miss a leaf; the caller then skips it instead of reporting a partition it cannot name.
  */
 export function leafPartitionInfo<M extends OperationMetrics & { partitionId: string }>(
 	leaf: M,
 	routing: FokosPublicRouting,
-): (OperationMetrics & PartitionInfo) | undefined {
+): QueryPartitionMeta | undefined {
 	const { partitionId, ...metrics } = leaf;
 	const node = routing.servedBy.find((n) => n.ref.partitionId === partitionId);
-	return node && { ...metrics, ...routeInfo(node, 0) };
+	if (!node) {
+		return undefined;
+	}
+	const { forwardCount: _forwardCount, ...info } = routeInfo(node, 0);
+	return { ...metrics, ...info };
 }
 
 function routeInfo(node: FokosPublicRoute | undefined, forwardCount: number): PartitionInfo {

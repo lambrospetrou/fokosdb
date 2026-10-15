@@ -137,13 +137,13 @@ export type ItemKey = {
 export type PutItemResult = {
 	item: ItemKey;
 	version: number;
-	meta: OperationMetrics & PartitionInfo & {};
+	meta: OperationMetrics & PartitionInfo;
 };
 
 export type DeleteItemResult = {
 	item: ItemKey;
 	deleted: boolean;
-	meta: OperationMetrics & PartitionInfo & {};
+	meta: OperationMetrics & PartitionInfo;
 };
 
 /**
@@ -192,12 +192,12 @@ export type GetItemResult<T = never> =
 	| {
 			found: true;
 			item: ReadItem<T>;
-			meta: OperationMetrics & PartitionInfo & {};
+			meta: OperationMetrics & PartitionInfo;
 	  }
 	| {
 			found: false;
 			item: ItemKey;
-			meta: OperationMetrics & PartitionInfo & {};
+			meta: OperationMetrics & PartitionInfo;
 	  };
 
 export type PartitionInfo = {
@@ -241,7 +241,6 @@ export type OperationMetrics = {
 	rowsRead: number;
 	rowsWritten: number;
 	databaseSize: number;
-	timings?: {};
 };
 
 // ─── queryItems public API ────────────────────────────────────────────────────
@@ -319,8 +318,18 @@ export type QueryItemsPage<Item> = {
 	scannedCount: number;
 	cursor?: string;
 	meta: QueryItemsMeta;
-	partitionMetas: Array<OperationMetrics & PartitionInfo>;
+	/**
+	 * One entry for each leaf partition that scanned rows. A leaf forwards nothing, so an entry has no
+	 * `forwardCount`: `meta.forwardCount` counts the forwards of the page. The client names a leaf from
+	 * a bounded list of the partitions that served the page, so it can leave a leaf out. Thus the sum
+	 * of `rowsRead` here can be less than `meta.rowsRead`, and the length can be less than
+	 * `meta.partitionsVisited`.
+	 */
+	partitionMetas: Array<QueryPartitionMeta>;
 };
+
+/** The metrics and the partition info of one leaf of a `queryItems` page. */
+export type QueryPartitionMeta = OperationMetrics & Omit<PartitionInfo, "forwardCount">;
 
 // Public result surfaced by FokosDB.queryItems. The keys are decoded back to the caller's own form and
 // db.ts has parsed json text into a JsonValue. The DO's counterpart is QueryItemsRpcResponse, which

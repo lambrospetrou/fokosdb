@@ -262,12 +262,12 @@ function decodeOperationResult(res: TransactWriteOperationResultEncoded): Transa
 	};
 }
 
-/** Runs the body of a public method, and raises any error from it as a FokosError. */
 /** `transactGetItems` raises it when a requested item holds a pending write of an in-progress transaction. */
 function pendingWriteError(): FokosConflictError {
 	return new FokosConflictError(CONFLICT_CODES.pending_write, { message: "an item has a pending write of an in-progress transaction" });
 }
 
+/** Runs the body of a public method, and raises any error from it as a FokosError. */
 async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
@@ -1066,7 +1066,7 @@ export class FokosDB {
 							sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
 							// json data arrives as JSON text and is parsed once here to the public JsonValue.
 							...decodeItemData(stored.kind, stored.data),
-							ttlAt: stored.ttl_epoch_utc_seconds ?? undefined,
+							...(stored.ttl_epoch_utc_seconds === null ? {} : { ttlAt: stored.ttl_epoch_utc_seconds }),
 							version: stored.v,
 						});
 					}
