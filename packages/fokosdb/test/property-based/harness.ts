@@ -1067,7 +1067,7 @@ export async function runCommands(db: FokosDB, run: Run, seedData?: readonly Ite
 				"An earlier run on the same keys left the state that stops the seed.",
 				earlier === undefined
 					? "No run of this table failed before."
-					: `The first failure of this table was:\n${earlier instanceof Error ? (earlier.stack ?? earlier.message) : String(earlier)}`,
+					: `The first failure of this table was:\n${earlier instanceof Error ? (earlier.stack ?? earlier.message) : JSON.stringify(earlier)}`,
 			].join("\n"),
 			{ cause: e },
 		);
