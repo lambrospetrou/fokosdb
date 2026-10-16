@@ -364,7 +364,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// partition that raised the error stays at the head of the list.
 			const routed = routedError(e);
 			if (routed) {
-				const stamp = this.#rangeDepthStamp();
+				const stamp = this.#hashDepthStampForRangeNodes();
 				const raiser = routed.routing.servedBy[0];
 				collector.mergeForwarded(routed.routing, stamp);
 				if (raiser) {
@@ -375,7 +375,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			throw e;
 		}
 		this.#learn(result.routing.servedBy, this.#scopeKeys(descriptor, req));
-		collector.mergeForwarded(result.routing, this.#rangeDepthStamp());
+		collector.mergeForwarded(result.routing, this.#hashDepthStampForRangeNodes());
 		return envelope(result.value, collector.build());
 	}
 
@@ -1795,7 +1795,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		// Only the partition that enters the range tree stamps its depth. A hash-to-hash forward must
 		// leave the nodes alone, or a router above would overwrite the depth of the partition that owns
 		// the promoted key with its own shallower one.
-		const stamp = isRangePartition(target) ? this.#rangeDepthStamp() : undefined;
+		const stamp = isRangePartition(target) ? this.#hashDepthStampForRangeNodes() : undefined;
 		try {
 			const result = await call;
 			this.#learn(result.routing.servedBy, hashKeys);
@@ -1827,10 +1827,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * A range partition has no hash depth of its own. The hash partition that enters the range tree
 	 * writes its own depth on every range node it merges, so a hash router above learns where the
 	 * promoted key left the hash tree. A range partition changes nothing.
-	 *
-	 * TODO: Rename this to be clearer that it's about adding the HASH depth.
 	 */
-	#rangeDepthStamp(): ((node: FokosRouteNode) => FokosRouteNode) | undefined {
+	#hashDepthStampForRangeNodes(): ((node: FokosRouteNode) => FokosRouteNode) | undefined {
 		const identity = this.identity();
 		if (identity.kind !== "hash") {
 			return undefined;

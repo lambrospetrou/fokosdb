@@ -87,7 +87,7 @@ The methods return partition information in five different ways:
   `src/shared/expression/projection.ts`). A library field in that record can have the same name as a caller field.
 - **A range partition does not know its own hash depth.** `#selfNode` in `src/sharding/runtime.ts` writes
   `hashDepth: 0` for a range partition. The hash partition that forwards into the range tree stamps the hash depth on
-  the range nodes (`#rangeDepthStamp`).
+  the range nodes (`#hashDepthStampForRangeNodes`).
 - **Route learning reads only the routing envelope.** `#learn` in `src/sharding/runtime.ts` reads
   `routing.servedBy`. The client sharding layer reads only `routing.forwardCount` (`FokosShardingClient` in
   `src/sharding/client.ts`). No code reads the public `servedByPartitionId` or the `partitionId` of `LeafMetrics`
@@ -287,10 +287,10 @@ the `FokosRouteNode` of the same partition:
 - A hash partition writes its own `hashDepth` and no `rangeDepth`. Its route node has `rangeDepth: 0` (`#selfNode`),
   and the entry does not copy that value.
 - A range partition writes its own `rangeDepth` and no `hashDepth`. Its route node gets the `hashDepth` of the hash
-  partition that forwarded into the range tree (`#rangeDepthStamp`), and the entry does not copy that value.
+  partition that forwarded into the range tree (`#hashDepthStampForRangeNodes`), and the entry does not copy that value.
 - Thus an entry does not depend on the route of the request: a request that goes straight to a range partition gives
   the same entry as a request through the hash tree.
-- `#rangeDepthStamp` stays for the route nodes, because `#learn` reads the hash depth of a range node. The public
+- `#hashDepthStampForRangeNodes` stays for the route nodes, because `#learn` reads the hash depth of a range node. The public
   `meta` does not feed back into routing.
 - The single-partition methods build the entry from the route node (`routeNodeMeta`) only for the raiser of an
   error. That entry also keeps only the depth of the tree of the partition.
@@ -538,7 +538,7 @@ The current design. Rejected: the 10 KB cap can drop the node, and the client th
 ### 5.9 Write the hash depth of the forwarding hash partition on each range entry
 
 A hash partition that forwards into a range tree writes its own depth as the `hashDepth` of each range entry in the
-answer, through a hook of the operation descriptor, as `#rangeDepthStamp` does on the route nodes. Rejected: the value
+answer, through a hook of the operation descriptor, as `#hashDepthStampForRangeNodes` does on the route nodes. Rejected: the value
 describes a router that has no entry of its own, and it depends on the route. A request that goes straight to a range
 partition from a cached hint, or a read-through, gives no value. `forwardCount` already counts the hops. The hook also
 adds a field to the runtime operation descriptor for a debugging value only.
