@@ -29,11 +29,11 @@ export function answerMeta<E extends WirePartitionMeta>(
 /**
  * The entry of the partition that ran a request with no answer list: the executor of a result, or
  * the raiser of an error. `RouteCollector.build` always keeps that node, so the entry always has the
- * name. The node carries both depths, and the entry keeps only the depth that the partition has.
+ * name. The node carries both depths, and the entry keeps only the depth of the tree of the partition.
  */
 export function routeNodeMeta(node: FokosPublicRoute): PartitionMeta {
-	const depths = isRangePartition(node.ref) ? { hashDepth: node.hashDepth, rangeDepth: node.rangeDepth } : { hashDepth: node.hashDepth };
-	return { servedByActorId: node.actorId, servedByActorName: node.ref.doName, ...depths };
+	const depth = isRangePartition(node.ref) ? { rangeDepth: node.rangeDepth } : { hashDepth: node.hashDepth };
+	return { servedByActorId: node.actorId, servedByActorName: node.ref.doName, ...depth };
 }
 
 /**

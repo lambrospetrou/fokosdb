@@ -553,7 +553,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				admissionTag: "write",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req, call) => this.putItemLocal(req, call),
-				stampHashDepth,
 			},
 			apiDeleteItem: {
 				shape: "point",
@@ -561,7 +560,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				admissionTag: "delete",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req) => this.deleteItemLocal(req),
-				stampHashDepth,
 			},
 			apiGetItem: {
 				shape: "point",
@@ -570,7 +568,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				admissionTag: "read",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req) => this.readItemLocally(req),
-				stampHashDepth,
 			},
 			apiQueryItems: {
 				shape: "range",
@@ -581,7 +578,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				clip: (req, visit) => clipQueryToVisit(req, visit),
 				local: (req) => this.queryItemsLocal(req),
 				walk: ({ request, visits, local, forward }) => walkRangeVisits(request, visits, local, forward),
-				stampHashDepth,
 			},
 			txPrepare: {
 				shape: "group",
@@ -605,7 +601,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					return this.ownAnswer({ ...response, results });
 				},
 				merge: mergePrepare,
-				stampHashDepth,
 			},
 			// The coordinator has already decided this transaction, and commit cannot grow the partition:
 			// prepare persisted the payload into pending_transactions, so commit moves those bytes into
@@ -623,7 +618,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					return this.ownAnswer(response);
 				},
 				merge: (parts) => ({ outcome: "committed", partitions: parts.flatMap((p) => p.result.partitions) }),
-				stampHashDepth,
 			},
 			// Cancel only DELETEs pending rows, so size backpressure must not wedge it: cancel is the path
 			// that brings an over-size partition back under its cap.
@@ -641,7 +635,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					return this.ownAnswer({ outcome: "cancelled" });
 				},
 				merge: (parts) => ({ outcome: "cancelled", partitions: parts.flatMap((p) => p.result.partitions) }),
-				stampHashDepth,
 			},
 			txReadForTransaction: {
 				shape: "group",
@@ -662,7 +655,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					}
 					return { items, partitions: parts.flatMap((p) => p.result.partitions) };
 				},
-				stampHashDepth,
 			},
 			// A partition DO is single-threaded and reads the whole set with no `await` in between, so the
 			// result already IS a consistent snapshot; the second phase of the coordinator's read exists
@@ -682,7 +674,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					}
 					return this.ownAnswer({ outcome: "committed", items });
 				},
-				stampHashDepth,
 			},
 			txExecuteSingleShot: {
 				shape: "single_owner",
@@ -698,7 +689,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					}
 					return this.ownAnswer(response);
 				},
-				stampHashDepth,
 			},
 			// Re-enters `dispatch`, so the commit or cancel of each key applies on its current owner. A
 			// row of a key that moved is a copy: its key sends the outcome to the new owner, and the
@@ -1499,19 +1489,6 @@ function mergePrepare(parts: Array<FokosGroupPart<PrepareRequest, PrepareRespons
  */
 function withOffset<T extends { partitionIndex?: number }>(entry: T, offset: number): T {
 	return entry.partitionIndex === undefined ? entry : { ...entry, partitionIndex: offset + entry.partitionIndex };
-}
-
-/**
- * Writes `hashDepth` on each range entry of an answer, as the runtime writes it on the range route
- * nodes. A range entry has a `rangeDepth`. An answer with no `partitions`, for example
- * `not_applicable`, stays as it is.
- */
-function stampHashDepth<Res>(res: Res, hashDepth: number): Res {
-	if (typeof res !== "object" || res === null || !("partitions" in res)) {
-		return res;
-	}
-	const partitions = (res as { partitions: WirePartitionMeta[] }).partitions;
-	return { ...res, partitions: partitions.map((p) => (p.rangeDepth === undefined ? p : { ...p, hashDepth })) };
 }
 
 /** The one key of a promotion plan: its single target carries a `promoted_key` slice. */

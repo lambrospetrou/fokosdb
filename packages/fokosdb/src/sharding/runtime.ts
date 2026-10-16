@@ -376,7 +376,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		this.#learn(result.routing.servedBy, this.#scopeKeys(descriptor, req));
 		collector.mergeForwarded(result.routing, this.#rangeDepthStamp());
-		return envelope(this.#stampHashDepth(descriptor, result.value), collector.build());
+		return envelope(result.value, collector.build());
 	}
 
 	async #dispatchPoint(
@@ -1800,7 +1800,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const result = await call;
 			this.#learn(result.routing.servedBy, hashKeys);
 			collector.mergeForwarded(result.routing, stamp);
-			return stamp ? this.#stampHashDepth(descriptor, result.value) : result.value;
+			return result.value;
 		} catch (e) {
 			// The error path learns what the success path learns, and the same error object travels on
 			// with this hop added, so an error and a result that take one route carry one routing.
@@ -1837,18 +1837,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		const hashDepth = identityDepth(identity);
 		return (node) => (isRangePartition(node.ref) ? { ...node, hashDepth } : node);
-	}
-
-	/**
-	 * The same stamp as `#rangeDepthStamp`, on the entries that the host writes in `value`. The host owns
-	 * the shape of `value`, so the runtime gives only the depth. A range partition changes nothing.
-	 */
-	#stampHashDepth(descriptor: Exclude<AnyOperation, { shape: "local" }>, value: unknown): unknown {
-		const identity = this.identity();
-		if (identity.kind !== "hash" || !descriptor.stampHashDepth) {
-			return value;
-		}
-		return descriptor.stampHashDepth(value, identityDepth(identity));
 	}
 
 	/**

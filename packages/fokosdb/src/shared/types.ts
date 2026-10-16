@@ -206,12 +206,7 @@ export type PartitionMeta = {
 	servedByActorId: string;
 	/** The name of the partition. Absent when the client does not know it. */
 	servedByActorName?: string;
-	/**
-	 * FOR DEBUGGING ONLY. For a hash partition, its depth in the hash tree. A range partition has no hash
-	 * depth, so for a range partition it is the depth of the hash partition that forwarded the request into
-	 * the range tree. Absent for a range partition when no hash partition forwarded the request into the
-	 * range tree.
-	 */
+	/** FOR DEBUGGING ONLY. The depth in the hash tree. Absent for a range partition, which has no hash depth. */
 	hashDepth?: number;
 	/** FOR DEBUGGING ONLY. The depth in the range tree. Absent for a hash partition, which has no range depth. */
 	rangeDepth?: number;
@@ -245,7 +240,7 @@ export type SinglePartitionMeta = FokosMeta<AnsweredPartitionMeta> & { partition
  */
 export type WirePartitionMeta = {
 	actorId: string;
-	/** Absent in the entry that a range partition writes. The hash partition that forwards into the range tree sets it. */
+	/** Absent in the entry that a range partition writes. */
 	hashDepth?: number;
 	/** Absent in the entry that a hash partition writes. */
 	rangeDepth?: number;

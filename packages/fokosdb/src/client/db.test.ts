@@ -857,10 +857,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				// The mapping builds a new error object, so the routing must move with it. The public
 				// boundary then turns it into the meta a result would carry, and drops the routing itself.
 				invariant(isFokosDBError(raised), "getItem must raise a FokosDBError");
-				// Partition ID "01" names a range partition, so the entry has both depths.
+				// Partition ID "01" names a range partition, so the entry has only the range depth.
 				expect(raised.meta).toEqual({
 					forwardCount: 1,
-					partitions: [{ servedByActorId: "actor", servedByActorName: "leaf", hashDepth: 1, rangeDepth: 0 }],
+					partitions: [{ servedByActorId: "actor", servedByActorName: "leaf", rangeDepth: 0 }],
 				});
 				expect(raised).not.toHaveProperty("routing");
 			} finally {
@@ -877,7 +877,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				value: {
 					found: true,
 					item: { data: "{not json", kind: "json", version: 1 },
-					partitions: [{ actorId: "actor", hashDepth: 1, rowsRead: 1, rowsWritten: 0, databaseSize: 1 }],
+					partitions: [{ actorId: "actor", rangeDepth: 0, rowsRead: 1, rowsWritten: 0, databaseSize: 1 }],
 				},
 				routing: { servedBy: [{ ...leaf, _rangeAncestors: [] }], forwardCount: 1, servedByTruncated: false },
 			};
@@ -893,7 +893,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(raised.code).toBe("item_data_parse_failed");
 				expect(raised.meta).toEqual({
 					forwardCount: 1,
-					partitions: [{ servedByActorId: "actor", servedByActorName: "leaf", hashDepth: 1, rowsRead: 1, rowsWritten: 0, databaseSize: 1 }],
+					partitions: [
+						{ servedByActorId: "actor", servedByActorName: "leaf", rangeDepth: 0, rowsRead: 1, rowsWritten: 0, databaseSize: 1 },
+					],
 				});
 			} finally {
 				spy.mockRestore();

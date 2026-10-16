@@ -183,11 +183,7 @@ type PartitionMeta = {
 	servedByActorId: string;
 	/** The name of the partition. Absent when the client does not know it. */
 	servedByActorName?: string;
-	/**
-	 * FOR DEBUGGING ONLY. For a hash partition, its depth in the hash tree. A range partition has no hash depth, so
-	 * for a range partition it is the depth of the hash partition that forwarded the request into the range tree.
-	 * Absent for a range partition when no hash partition forwarded the request into the range tree.
-	 */
+	/** FOR DEBUGGING ONLY. The depth in the hash tree. Absent for a range partition, which has no hash depth. */
 	hashDepth?: number;
 	/** FOR DEBUGGING ONLY. The depth in the range tree. Absent for a hash partition, which has no range depth. */
 	rangeDepth?: number;
@@ -275,7 +271,7 @@ A partition writes its entry with the type below. It writes no name and no parti
 ```ts
 type WirePartitionMeta = {
 	actorId: string;
-	/** Absent in the entry that a range partition writes. Section 4.2.4 says who sets it. */
+	/** Absent in the entry that a range partition writes. */
 	hashDepth?: number;
 	/** Absent in the entry that a hash partition writes. */
 	rangeDepth?: number;
@@ -285,47 +281,19 @@ type WirePartitionMeta = {
 };
 ```
 
-Each partition writes only the depth that it has. A depth that an entry has must be equal to the same depth of the
-`FokosRouteNode` of the same partition, after `#rangeDepthStamp`:
+Each partition writes only the depth of its own tree. A depth that an entry has must be equal to the same depth of
+the `FokosRouteNode` of the same partition:
 
-- A hash partition has no range depth. It writes its own `hashDepth` and no `rangeDepth`. Its route node has
-  `rangeDepth: 0` (`#selfNode`), and the entry does not copy that value.
-- A range partition has no hash depth. It writes its own `rangeDepth` and no `hashDepth`.
-- The hash partition that forwards a request into a range tree writes its own depth as the `hashDepth` of each range
-  entry in the answer, as `#rangeDepthStamp` does on the range nodes. Thus the `hashDepth` of a range entry is the
-  depth where its hash key left the hash tree.
-- A request that goes straight to a range partition passes no hash partition, so its range entries have no
-  `hashDepth`. Today each request enters at a hash root (`resolve` in `src/sharding/client.ts` returns
-  `rootContext`), but a client cache of the topology can later send a request straight to a range partition.
-
-`#forwardTo` and the read-through path in `src/sharding/runtime.ts` apply the stamp to the entries in `value` through
-a hook of the operation descriptor:
-
-```ts
-// FokosOperationBase<Req, Res> in src/sharding/runtime-types.ts
-/**
- * Writes `hashDepth` on the range entries of an answer that this hash partition got from a range partition. The
- * runtime calls it under the same condition as the route-node stamp.
- */
-stampHashDepth?(res: Res, hashDepth: number): Res;
-```
-
-```ts
-// #forwardTo in src/sharding/runtime.ts. `hashDepth` is the depth of this hash partition.
-const stamp = isRangePartition(target) ? this.#rangeDepthStamp() : undefined;
-const result = await call;
-collector.mergeForwarded(result.routing, stamp);
-return stamp && descriptor.stampHashDepth ? descriptor.stampHashDepth(result.value, hashDepth) : result.value;
-```
-
-- `#forwardTo` forwards for every shape, so the hook covers point, `group`, `single_owner` and `range` operations.
-- The hook fills `hashDepth` only on an entry that has none. A range entry has none on the wire, so the first hash
-  partition above the range tree fills it, and a partition above that one changes nothing. This is the rule of
-  `#rangeDepthStamp` for route nodes.
-- The runtime does not read `value`. The host owns the shape of `value`, and the runtime gives only the depth.
-- The hook runs only on a result. An error carries no entries, and its raiser node in `routing` is already stamped.
-- The query and transaction descriptors in `src/server/do-partition.ts` use one helper that maps `res.partitions`. An
-  answer with no `partitions`, for example `not_applicable`, stays as it is.
+- A hash partition writes its own `hashDepth` and no `rangeDepth`. Its route node has `rangeDepth: 0` (`#selfNode`),
+  and the entry does not copy that value.
+- A range partition writes its own `rangeDepth` and no `hashDepth`. Its route node gets the `hashDepth` of the hash
+  partition that forwarded into the range tree (`#rangeDepthStamp`), and the entry does not copy that value.
+- Thus an entry does not depend on the route of the request: a request that goes straight to a range partition gives
+  the same entry as a request through the hash tree.
+- `#rangeDepthStamp` stays for the route nodes, because `#learn` reads the hash depth of a range node. The public
+  `meta` does not feed back into routing.
+- The single-partition methods build the entry from the route node (`routeNodeMeta`) only for the raiser of an
+  error. That entry also keeps only the depth of the tree of the partition.
 
 #### 4.2.5 `queryItems`
 
@@ -507,8 +475,8 @@ Example:
 - A `transactWriteItems` test with a participant that fans out to two owners checks two entries and the index of each
   rejected operation.
 - A replay test checks that a replay of a terminal transaction returns `meta.partitions` `[]` and no `partitionIndex`.
-- A test with a promoted key checks that each range entry has the `hashDepth` of the hash partition that forwarded
-  into the range tree, and that it is equal to the `hashDepth` of the route node of the same partition.
+- A `queryItems` test on a split range tree checks that each range entry has `rangeDepth` and no `hashDepth`, through
+  the hash tree and straight to the range root.
 - A `transactGetItems` test that gets `pending_write` or `read_conflict` checks that the error has the entries of the
   partitions that answered.
 - A `queryItems` test with a failed second sub-query checks that the error has the entries of the first sub-query
@@ -545,8 +513,7 @@ caller field. The items of one leaf are contiguous, so `itemCount` on each entry
 
 ### 5.5 The runtime builds the entries in the envelope
 
-The runtime adds a second list to the envelope, with no cap and no names, and the host adds only the counts. It needs
-no `stampHashDepth` hook. Rejected: it changes the routing envelope, and section 2.2 requires that the envelope stays
+The runtime adds a second list to the envelope, with no cap and no names, and the host adds only the counts. Rejected: it changes the routing envelope, and section 2.2 requires that the envelope stays
 the same.
 
 ### 5.6 Store the `meta` of a transaction, so a replay returns the same `meta`
@@ -567,6 +534,14 @@ the list is the only place for its index.
 ### 5.8 Find the partition of each leaf in the routing
 
 The current design. Rejected: the 10 KB cap can drop the node, and the client then cannot name the leaf.
+
+### 5.9 Write the hash depth of the forwarding hash partition on each range entry
+
+A hash partition that forwards into a range tree writes its own depth as the `hashDepth` of each range entry in the
+answer, through a hook of the operation descriptor, as `#rangeDepthStamp` does on the route nodes. Rejected: the value
+describes a router that has no entry of its own, and it depends on the route. A request that goes straight to a range
+partition from a cached hint, or a read-through, gives no value. `forwardCount` already counts the hops. The hook also
+adds a field to the runtime operation descriptor for a debugging value only.
 
 ## 6. Frequently Asked Questions
 

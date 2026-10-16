@@ -547,17 +547,17 @@ describe("PartitionDO — range split", () => {
 			expect(unnamed.length).toBeGreaterThan(0);
 			for (const p of res.meta.partitions) {
 				expect(p.servedByActorId).toMatch(/^[0-9a-f]{64}$/);
-				// The hash partition at depth 0 forwarded the request into the range tree, and the leaves are
-				// at range depth 1.
-				expect(p).toMatchObject({ hashDepth: 0, rangeDepth: 1 });
+				// A range leaf writes only its own depth: the leaves are at range depth 1.
+				expect(p).not.toHaveProperty("hashDepth");
+				expect(p.rangeDepth).toBe(1);
 				const node = nodes.get(p.servedByActorId);
 				expect(p.servedByActorName).toBe(node?.ref.doName);
 				if (node) {
-					expect([p.hashDepth, p.rangeDepth]).toEqual([node.hashDepth, node.rangeDepth]);
+					expect(p.rangeDepth).toBe(node.rangeDepth);
 				}
 			}
 
-			// A request that goes straight to the range tree passes no hash partition, so no entry has a hash depth.
+			// The entries do not depend on the route: a request that goes straight to the range tree gives the same depths.
 			const direct = opened(await root.stub.apiQueryItems(root.ctx, fullRequest()));
 			expect(direct.meta.partitions).toHaveLength(N);
 			for (const p of direct.meta.partitions) {
