@@ -7,6 +7,7 @@ import type { FokosErrorCode } from "./errors-operations.js";
 import type { ConditionExpression, ProjectionExpression, UpdateExpression } from "./expression/types.js";
 import type {
 	ConditionCheckImage,
+	FokosMeta,
 	HashKey,
 	ItemDeleter,
 	ItemGetter,
@@ -98,6 +99,10 @@ export type ConditionFailedReason = Extract<RejectionReason, { code: "condition_
  * entry marked `itemOmitted` can be followed by one that carries an image, and the same operation
  * set can return a different image set when the operations spread differently over partitions. The
  * outcome codes never depend on that spread.
+ *
+ * `partitionIndex` is the index of the partition that rejected the operation in `meta.partitions` of the
+ * error. It is absent when the request that answers did not get that answer: a replay of the token, or
+ * a participant that did not answer.
  */
 export type TransactWriteOperationResult =
 	| { outcome: "passed" }
@@ -105,6 +110,7 @@ export type TransactWriteOperationResult =
 	| {
 			outcome: "rejected";
 			reason: RejectionReason;
+			partitionIndex?: number;
 			itemOmitted?: "response_too_large";
 	  };
 
@@ -183,6 +189,7 @@ export type TransactWriteExecutionMode = "standard" | "ordered_per_item";
 export type TransactWriteItemsResult = {
 	transactionId: TransactionId;
 	idempotencyToken: IdempotencyToken;
+	meta: FokosMeta;
 };
 
 // ─── transactGetItems ─────────────────────────────────────────────────────────
@@ -217,7 +224,9 @@ export type MaybeReadItem<T = never> = ({ found: true } & ReadItem<T>) | ({ foun
 // write result carries none — a read that cannot answer raises a FokosError instead, for example
 // `FokosConflictError` with `read_conflict` or `pending_write`.
 export type TransactGetItemsResult<Ts extends readonly unknown[] = never[]> = {
-	items: { [K in keyof Ts]: MaybeReadItem<Ts[K]> };
+	/** `partitionIndex` is the index of the partition of the item in `meta.partitions`. */
+	items: { [K in keyof Ts]: MaybeReadItem<Ts[K]> & { partitionIndex: number } };
+	meta: FokosMeta;
 };
 
 // ─── The FokosDB contract ─────────────────────────────────────────────────────

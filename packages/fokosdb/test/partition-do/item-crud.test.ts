@@ -11,16 +11,19 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("missing"), sortKey: kb("sk") });
 		expect(result).toEqual({
 			found: false,
+			// A hash partition writes no range depth, and the entry holds no partition ID.
 			meta: {
-				rowsRead: 0,
-				rowsWritten: 0,
-				databaseSize: expect.any(Number),
-				servedByActorId: expect.any(String),
-				servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
-				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
-				hashDepth: 0,
-				rangeDepth: 0,
+				partitions: [
+					{
+						servedByActorId: expect.stringMatching(/^[0-9a-f]{64}$/),
+						servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
+						hashDepth: 0,
+						rowsRead: 0,
+						rowsWritten: 0,
+						databaseSize: expect.any(Number),
+					},
+				],
 			},
 		});
 	});
@@ -123,7 +126,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 
 		const result = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "data", kind: "text" as const });
 
-		expect(result.meta).toMatchObject({
+		expect(result.meta.partitions[0]).toMatchObject({
 			rowsRead: expect.any(Number),
 			rowsWritten: expect.any(Number),
 			databaseSize: expect.any(Number),
@@ -168,11 +171,15 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 		expect(result).toMatchObject({
 			found: true,
 			meta: {
-				rowsRead: expect.any(Number),
-				rowsWritten: expect.any(Number),
-				databaseSize: expect.any(Number),
-				servedByActorId: expect.any(String),
-				servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
+				partitions: [
+					{
+						rowsRead: expect.any(Number),
+						rowsWritten: expect.any(Number),
+						databaseSize: expect.any(Number),
+						servedByActorId: expect.any(String),
+						servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
+					},
+				],
 			},
 		});
 	});
@@ -288,16 +295,19 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 		expect(result).toEqual({
 			outcome: "ok",
 			deleted: false,
+			// A hash partition writes no range depth, and the entry holds no partition ID.
 			meta: {
-				rowsRead: 0,
-				rowsWritten: 0,
-				databaseSize: expect.any(Number),
-				servedByActorId: expect.any(String),
-				servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
-				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
-				hashDepth: 0,
-				rangeDepth: 0,
+				partitions: [
+					{
+						servedByActorId: expect.stringMatching(/^[0-9a-f]{64}$/),
+						servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
+						hashDepth: 0,
+						rowsRead: 0,
+						rowsWritten: 0,
+						databaseSize: expect.any(Number),
+					},
+				],
 			},
 		});
 	});
@@ -381,13 +391,12 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "data", kind: "text" as const });
 		const result = await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
-		expect(result.meta).toMatchObject({
+		expect(result.meta.partitions[0]).toMatchObject({
 			rowsRead: expect.any(Number),
 			rowsWritten: expect.any(Number),
 			databaseSize: expect.any(Number),
 			servedByActorId: expect.any(String),
 			servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
-			servedByPartitionId: expect.any(String),
 		});
 	});
 });

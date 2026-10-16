@@ -145,9 +145,9 @@ describe("PartitionDO — an expression tree that does not compile", () => {
 				items: withOpIndex([{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "check", condition }]),
 			});
 
-		expect(await prepare({ op: "not_exists", args: [{ ref: "hashKey" }] })).toEqual({ outcome: "accepted" });
+		expect(await prepare({ op: "not_exists", args: [{ ref: "hashKey" }] })).toMatchObject({ outcome: "accepted" });
 		// The lock row holds the answer of the first prepare, so the second prepare evaluates nothing.
-		expect(await prepare(ABOVE_SQL_LIMIT)).toEqual({ outcome: "accepted" });
+		expect(await prepare(ABOVE_SQL_LIMIT)).toMatchObject({ outcome: "accepted" });
 		expect(await lockKeys(stub, "repeated-prepare")).toEqual(["hk/sk"]);
 	});
 });

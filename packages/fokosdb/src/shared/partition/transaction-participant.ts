@@ -1,17 +1,17 @@
 import {
 	COORDINATOR_REF_VERSION,
 	type CommitRequest,
-	type CommitResponse,
+	type CommitOutcome,
 	type CoordinatorRef,
 	type ParticipantOperationResultEncoded,
 	type PrepareRequest,
-	type PrepareResponse,
+	type PrepareOutcome,
 	type ReadForTransactionItemResultEncoded,
 	type ReadForTransactionRequest,
-	type ReadForTransactionResponse,
+	type ReadForTransactionOutcome,
 	type RejectionReasonEncoded,
 	type SingleShotRequest,
-	type SingleShotResponse,
+	type SingleShotOutcome,
 	type TransactionItem,
 	type TransactionItemKey,
 	type TransactionOperationType,
@@ -266,8 +266,8 @@ export type TransactionParticipantDeps = {
 export type PromotionCandidate = { hashKey: KeyBytes; keyEstBytes: number };
 
 /** What a local apply returns: the protocol answer, and the keys it grew. */
-export type CommitLocalResult = { response: CommitResponse; promotionCandidates: PromotionCandidate[] };
-export type SingleShotResult = { response: SingleShotResponse; promotionCandidates: PromotionCandidate[] };
+export type CommitLocalResult = { response: CommitOutcome; promotionCandidates: PromotionCandidate[] };
+export type SingleShotResult = { response: SingleShotOutcome; promotionCandidates: PromotionCandidate[] };
 
 /**
  * The 2PC participant: prepare/commit/cancel/read for the items this partition owns locally.
@@ -355,7 +355,7 @@ export class TransactionParticipant {
 		return { reason: null, read: null };
 	}
 
-	prepareLocal(request: PrepareRequest): PrepareResponse {
+	prepareLocal(request: PrepareRequest): PrepareOutcome {
 		// A lock is only ever released by the outcome of its transaction, and the values below are the
 		// whole thread back to that outcome: the recovery job selects locks by transaction_id and calls
 		// the coordinator that the stored name and token address (nothing else in the system can
@@ -848,7 +848,7 @@ export class TransactionParticipant {
 	 * Reads every requested key from local storage. Takes only the keys: it holds no lock and
 	 * writes nothing, so the single-shot read path can call it without inventing a transaction id.
 	 */
-	readForTransactionLocal(request: Pick<ReadForTransactionRequest, "items">): ReadForTransactionResponse {
+	readForTransactionLocal(request: Pick<ReadForTransactionRequest, "items">): ReadForTransactionOutcome {
 		const results: ReadForTransactionItemResultEncoded[] = [];
 
 		// At most one deletion-metadata read per RPC, shared by every absent item of the request. A

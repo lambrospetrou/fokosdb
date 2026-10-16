@@ -137,13 +137,13 @@ export type ItemKey = {
 export type PutItemResult = {
 	item: ItemKey;
 	version: number;
-	meta: OperationMetrics & PartitionInfo;
+	meta: SinglePartitionMeta;
 };
 
 export type DeleteItemResult = {
 	item: ItemKey;
 	deleted: boolean;
-	meta: OperationMetrics & PartitionInfo;
+	meta: SinglePartitionMeta;
 };
 
 /**
@@ -192,49 +192,66 @@ export type GetItemResult<T = never> =
 	| {
 			found: true;
 			item: ReadItem<T>;
-			meta: OperationMetrics & PartitionInfo;
+			meta: SinglePartitionMeta;
 	  }
 	| {
 			found: false;
 			item: ItemKey;
-			meta: OperationMetrics & PartitionInfo;
+			meta: SinglePartitionMeta;
 	  };
 
-export type PartitionInfo = {
-	/**
-	 * The DurableObjectId of the partition that served the request.
-	 * Useful for correlating with partition topology information in logs,
-	 * and to debug the underlying Durable Objects.
-	 */
+/** One partition that ran a request. */
+export type PartitionMeta = {
+	/** The DurableObjectId of the partition, 64 hex characters. */
 	servedByActorId: string;
+	/** The name of the partition. Absent when the client does not know it. */
+	servedByActorName?: string;
 	/**
-	 * The human-readable name of the partition that served the request, if available.
+	 * FOR DEBUGGING ONLY. For a hash partition, its depth in the hash tree. A range partition has no hash
+	 * depth, so for a range partition it is the depth of the hash partition that forwarded the request into
+	 * the range tree. Absent for a range partition when no hash partition forwarded the request into the
+	 * range tree.
 	 */
-	servedByActorName: string;
-	/**
-	 * Opaque identifier for the partition that served the request.
-	 * Useful for correlating with partition topology information in logs, but not meaningful to clients.
-	 */
-	servedByPartitionId: string;
-	/**
-	 * The number of times the request was forwarded between partitions before reaching the final partition that served it.
-	 */
-	forwardCount: number;
+	hashDepth?: number;
+	/** FOR DEBUGGING ONLY. The depth in the range tree. Absent for a hash partition, which has no range depth. */
+	rangeDepth?: number;
+	/** Absent when the partition did not answer, or when its answer carries no counts. */
+	rowsRead?: number;
+	/** Absent when the partition did not answer, or when its answer carries no counts. */
+	rowsWritten?: number;
+	/** Absent when the partition did not answer, or when its answer carries no counts. */
+	databaseSize?: number;
+};
 
-	/**
-	 * The depth of the hash partition in the topology tree. A root partition has depth 0, its children
-	 * have depth 1, and so on. It is 0 for a range partition, which has no depth in the hash tree.
-	 *
-	 * FOR DEBUGGING ONLY: this is not a stable API. A client must not use the value in its logic.
-	 */
-	hashDepth: number;
-	/**
-	 * The depth of the range partition in its own tree. A root has depth 0. It is 0 for a hash
-	 * partition, which mirrors the convention of hashDepth.
-	 *
-	 * FOR DEBUGGING ONLY: this is not a stable API. A client must not use the value in its logic.
-	 */
-	rangeDepth: number;
+/** The `meta` of every result and every error of a FokosDB method. */
+export type FokosMeta<P extends PartitionMeta = PartitionMeta> = {
+	/** The partition-to-partition forwards of the whole request. */
+	forwardCount: number;
+	/** One entry for each partition that ran the request. */
+	partitions: P[];
+	/** The transaction coordinator that answered. Present only on the coordinator path of `transactWriteItems`. */
+	txCoordinator?: PartitionMeta;
+};
+
+/** An entry with every count, for a result where every partition answered. */
+export type AnsweredPartitionMeta = PartitionMeta & OperationMetrics;
+
+/** The `meta` of a method that one partition runs. */
+export type SinglePartitionMeta = FokosMeta<AnsweredPartitionMeta> & { partitions: [AnsweredPartitionMeta] };
+
+/**
+ * The entry that a partition writes about itself into its answer. It holds no name and no partition ID,
+ * because both can hold the keys, so the size of an entry does not depend on the keys.
+ */
+export type WirePartitionMeta = {
+	actorId: string;
+	/** Absent in the entry that a range partition writes. The hash partition that forwards into the range tree sets it. */
+	hashDepth?: number;
+	/** Absent in the entry that a hash partition writes. */
+	rangeDepth?: number;
+	rowsRead?: number;
+	rowsWritten?: number;
+	databaseSize?: number;
 };
 
 export type OperationMetrics = {
@@ -298,15 +315,6 @@ export type QueryItemsProjectedOptions = QueryItemsOptions & {
  */
 export type QueryItemsProjectedResult<T = never> = QueryItemsPage<CallerType<T, ProjectedItem>>;
 
-export type QueryItemsMeta = {
-	/** Physical SQLite rows read by the leaf query statements. */
-	rowsRead: number;
-	/** SQL result rows the leaf collectors consumed in JavaScript. */
-	rowsReturned: number;
-	forwardCount: number;
-	partitionsVisited: number;
-};
-
 // One page of a query, around whichever element the request asks for. Only that element differs
 // between a complete page and a projected one, so the counts, the cursor, and the metas are declared
 // here once and both result types below name this page.
@@ -317,19 +325,15 @@ export type QueryItemsPage<Item> = {
 	/** Evaluated items in this page. Equal to `count` for a request with no filter. With a filter, `count <= scannedCount`. */
 	scannedCount: number;
 	cursor?: string;
-	meta: QueryItemsMeta;
 	/**
-	 * One entry for each leaf partition that scanned rows. A leaf forwards nothing, so an entry has no
-	 * `forwardCount`: `meta.forwardCount` counts the forwards of the page. The client names a leaf from
-	 * a bounded list of the partitions that served the page, so it can leave a leaf out. Thus the sum
-	 * of `rowsRead` here can be less than `meta.rowsRead`, and the length can be less than
-	 * `meta.partitionsVisited`.
+	 * `meta.partitions` has one entry for each leaf partition that the page visited, in visit order. The
+	 * items of entry `i` are the `itemCount` items after the items of entries `0` to `i - 1`.
 	 */
-	partitionMetas: Array<QueryPartitionMeta>;
+	meta: FokosMeta<AnsweredPartitionMeta & { itemCount: number }> & {
+		/** SQL result rows that the leaf scans consumed in JavaScript. */
+		rowsReturned: number;
+	};
 };
-
-/** The metrics and the partition info of one leaf of a `queryItems` page. */
-export type QueryPartitionMeta = OperationMetrics & Omit<PartitionInfo, "forwardCount">;
 
 // Public result surfaced by FokosDB.queryItems. The keys are decoded back to the caller's own form and
 // db.ts has parsed json text into a JsonValue. The DO's counterpart is QueryItemsRpcResponse, which

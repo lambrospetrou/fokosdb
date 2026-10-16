@@ -14,6 +14,7 @@ import {
 	holdPendingLock,
 	keysAcrossPartitions,
 	makeDB,
+	partitionEntryOf,
 	partitionNameOf,
 	txCalls,
 	writeOutcome,
@@ -649,13 +650,19 @@ describe("transactions - end-to-end", () => {
 			const keys = keysAcrossPartitions(db, 2, "read-pending");
 			const release = await holdPendingLock(db, keys[0], { operation: "put", data: "pending", kind: "text" });
 
+			let err: unknown;
 			try {
-				await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("pending_write"));
+				err = await db.transactGetItems({ items: keys }).catch((e: unknown) => e);
 			} finally {
 				await release();
 			}
-			// Phase one ran on both participants, and phase two never started.
+			expect(err).toEqual(fokosErrorWith("pending_write"));
+			// Phase one ran on both participants, and phase two never started. The error names both answers.
 			expect(await txCalls(db, keys, "txReadForTransaction")).toHaveLength(2);
+			expect(err).toMatchObject({
+				meta: { forwardCount: 0, partitions: expect.arrayContaining(keys.map((key) => partitionEntryOf(db, key))) },
+			});
+			expect((err as { meta: { partitions: unknown[] } }).meta.partitions).toHaveLength(2);
 		});
 
 		it("raises read_conflict when committed item state changes between the two phases", async () => {
@@ -678,7 +685,11 @@ describe("transactions - end-to-end", () => {
 				},
 				() => db.transactGetItems({ items: keys }),
 			);
-			await expect(read).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));
+			const err = await read.catch((e: unknown) => e);
+			expect(err).toEqual(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));
+			// The error has the answers of both phases, with one entry for each partition.
+			expect((err as { meta: { partitions: unknown[] } }).meta.partitions).toHaveLength(2);
+			expect(err).toMatchObject({ meta: { partitions: expect.arrayContaining(keys.map((key) => partitionEntryOf(db, key))) } });
 
 			// Both phases ran on both participants, under one transaction id.
 			const calls = await txCalls(db, keys, "txReadForTransaction");

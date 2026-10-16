@@ -40,7 +40,7 @@ A cohesive folder stays whole inside `shared/` even when only one side uses it. 
 - **`TransactionCoordinatorDO`** (`src/server/do-transaction-coordinator.ts`) — the second host of the sharding runtime. It drives 2PC for a write transaction. The idempotency token is its route key, and its shard group is `fokos.tc.<tableName>`: `coordinatorRootsN` roots that split by hash when they grow past `hashSplitConditions.maxSizeMb`. A read transaction runs in the Worker instead.
 - **`FokosDB`** (`src/client/db.ts`) — the client entry point. It sends every partition and coordinator RPC through a `FokosShardingClient` (`src/sharding/client.ts`), sends a multi-partition write to a coordinator, and drives a multi-partition read itself.
 
-Every partition RPC answers a `FokosEnvelope<T>`: `value` is the result and `routing` is the route evidence. The client opens it and drops the internal hints, and `client/partition-info.ts` builds the public `PartitionInfo` from `routing.servedBy` and `routing.forwardCount`. An error a partition raises carries its `routing` as an own property, and `withFokosErrors` in `db.ts` turns it into the same public `meta` and drops the routing.
+Every partition RPC answers a `FokosEnvelope<T>`: `value` is the result and `routing` is the route evidence. Each partition writes its own entry into `value`, and the client builds the public `meta` (`FokosMeta`) from those entries, with the names from `routing` (`shared/partition-meta.ts`). An error a partition raises carries its `routing` as an own property, and `db.ts` turns it into the same public `meta` and drops the routing.
 
 An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Array | string`, a `version` that every write increments, and an optional TTL.
 

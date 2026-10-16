@@ -74,7 +74,7 @@ describe.concurrent("PartitionDO — range split", () => {
 		const ownedSk = [...sks].sort()[0];
 		const read = await root.rpc.apiGetItem(updatedCtx, { hashKey: kb("alice"), sortKey: kb(ownedSk) });
 		expect(read.found, "the read must actually reach the child").toBe(true);
-		expect(read.meta.servedByActorName).toBe(child.doName);
+		expect(read.meta.partitions[0].servedByActorName).toBe(child.doName);
 
 		// Read the child's stored policy WITHOUT a request, so the assertion observes what the router
 		// forwarded rather than writing the threshold itself.
@@ -98,7 +98,7 @@ describe.concurrent("PartitionDO — range split", () => {
 			// Reading through the router resolves to that exact child (servedByActorName = owning child's doName).
 			const g = await root.get({ hashKey: kb("alice"), sortKey: kb(sk) });
 			expect(g.found).toBe(true);
-			expect(g.meta.servedByActorName, `sk ${sk} should be served by its owning child`).toBe(owners[0].doName);
+			expect(g.meta.partitions[0].servedByActorName, `sk ${sk} should be served by its owning child`).toBe(owners[0].doName);
 		}
 	});
 

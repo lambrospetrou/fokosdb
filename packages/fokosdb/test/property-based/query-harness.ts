@@ -11,6 +11,7 @@ import fc from "fast-check";
 import { expect } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import type { QueryItemsOptions, QueryItemsResult, SortKeyCondition } from "../../src/shared/types.js";
+import { MAX_PARTITION_VISITS_PER_PAGE } from "../../src/shared/query/page-budget.js";
 import { expectedDataKind, makeTestDB, sleep, textEncoder, untilAvailable, type DataKind, type ItemData } from "./harness.js";
 
 export type QueryKey = string | Uint8Array;
@@ -149,10 +150,10 @@ export const expectedAnswer = (model: QueryModel, queries: readonly Query[]): Qu
 /** The rules every page obeys, whatever the request asked for. */
 function expectPageInvariants(page: QueryItemsResult, opts: QueryItemsOptions): void {
 	expect(page.count).toBeLessThanOrEqual(page.scannedCount);
-	// The route evidence of an envelope is capped in bytes, so a deep or wide tree can visit a leaf
-	// that the evidence could not name. The client skips such a leaf instead of reporting a
-	// partition it cannot identify, so a page names no more partitions than it visited.
-	expect(page.meta.partitionsVisited).toBeGreaterThanOrEqual(page.partitionMetas.length);
+	// Each leaf writes its own entry, so the cap of the route evidence drops no leaf. The items of the
+	// page are the items of its entries, in entry order.
+	expect(page.meta.partitions.length).toBeLessThanOrEqual(MAX_PARTITION_VISITS_PER_PAGE);
+	expect(page.meta.partitions.reduce((sum, p) => sum + p.itemCount, 0)).toBe(page.items.length);
 	if (opts.limit !== undefined) {
 		expect(page.scannedCount).toBeLessThanOrEqual(opts.limit);
 	}
@@ -302,7 +303,8 @@ const putAndRecord = (db: FokosDB, model: QueryModel, hashKey: QueryKey, sortKey
 /** The leaves one request reads, in the order the walk visits them. */
 export async function leavesOf(db: FokosDB, opts: QueryItemsOptions): Promise<string[]> {
 	const page = await untilAvailable(() => db.queryItems({ ...opts, select: "count", limit: 100_000 }));
-	return page.partitionMetas.map((m) => m.servedByActorName);
+	// The cap of the route evidence can drop the name of a leaf. Such a leaf has no name to compare.
+	return page.meta.partitions.flatMap((m) => m.servedByActorName ?? []);
 }
 
 /** Polls the leaves of the hot key until `accept` holds. It returns them, or undefined after the last try. */

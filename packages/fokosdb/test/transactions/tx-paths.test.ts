@@ -88,7 +88,9 @@ describe("transactions - single-partition fast path", () => {
 		// item by item, in request order.
 		const slow = await slowDb.transactGetItems({ items: keys });
 		expect(await calls()).toMatchObject({ txReadSnapshot: 1, txReadForTransaction: 2 });
-		expect(fast).toEqual(slow);
+		// The two clients use two tables, so only the items can be equal. Each read names its one partition.
+		expect(fast.items).toEqual(slow.items);
+		expect([fast.meta.partitions.length, slow.meta.partitions.length]).toEqual([1, 1]);
 		expect(fast.items.map((i) => i.found)).toEqual([true, true, false]);
 	});
 
@@ -111,7 +113,9 @@ describe("transactions - single-partition fast path", () => {
 
 		const slow = await slowDb.transactGetItems({ items });
 		expect(await calls()).toMatchObject({ txReadSnapshot: 1, txReadForTransaction: 2 });
-		expect(fast).toEqual(slow);
+		// The two clients use two tables, so only the items can be equal. Each read names its one partition.
+		expect(fast.items).toEqual(slow.items);
+		expect([fast.meta.partitions.length, slow.meta.partitions.length]).toEqual([1, 1]);
 		expect(fast.items[0]).toMatchObject({
 			found: true,
 			hashKey: keys[0].hashKey,

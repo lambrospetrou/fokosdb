@@ -1,32 +1,32 @@
 import { env } from "cloudflare:workers";
 import {
+	AnsweredPartitionMeta,
 	DataKind,
 	DecodedItemData,
 	DeleteItemOptions,
 	DeleteItemResult,
 	EncodedItemData,
+	FokosMeta,
 	GetItemOptions,
 	GetItemResult,
 	HashKey,
 	JsonComposite,
 	JsonValue,
-	OperationMetrics,
-	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
 	ProjectedItem,
-	QueryItemsMeta,
 	QueryItemsOptions,
 	QueryItemsProjectedOptions,
 	QueryItemsProjectedResult,
 	QueryItemsResult,
 	QuerySelect,
+	SinglePartitionMeta,
 	SortKey,
 } from "../shared/types.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
-import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
-import type { PartitionOps } from "../server/do-partition.js";
+import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
+import type { ItemRpcPartitions, PartitionOps } from "../server/do-partition.js";
 import type { CoordinatorOps } from "../server/do-transaction-coordinator.js";
 import type {
 	ExecutionFailureCode,
@@ -39,12 +39,14 @@ import type {
 	TransactWriteOperationResult,
 } from "../shared/transaction-api-types.js";
 import type {
+	CoordinatorOperationResultEncoded,
+	IndexedReadItemEncoded,
 	InitiateReadResponseEncoded,
+	ParticipantsMeta,
 	ReadForTransactionItemResultEncoded,
 	RejectionReasonEncoded,
 	SingleShotResponse,
 	TCWriteOperation,
-	TransactWriteOperationResultEncoded,
 	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import {
@@ -90,7 +92,7 @@ import { KeyCodec, KeyPairMap } from "../sharding/key-codec.js";
 import { attachRouting, routedError } from "../sharding/envelope.js";
 import type { FokosPublicRouting } from "../sharding/runtime-types.js";
 import { normalizeSkInterval } from "../sharding/sk-interval.js";
-import { leafPartitionInfo, partitionInfoOf } from "./partition-info.js";
+import { answerMeta, PartitionMetaJoin, routeNodeMeta } from "../shared/partition-meta.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
 import {
@@ -222,11 +224,11 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 }
 
 /**
- * The error that every FokosDB method raises. `meta` names the partition that answered the request.
- * It is absent when no partition answered: a validation error before any I/O, or a failure of the
- * RPC from the Worker to the first partition.
+ * The error that every FokosDB method raises. `meta` names the partitions that answered the request
+ * before the error, and the partition that raised it. It is absent when nothing answered: a validation
+ * error before any I/O, or a failure of the RPC from the Worker to the first partition.
  */
-export type FokosDBError = FokosAnyError & { readonly meta?: PartitionInfo };
+export type FokosDBError = FokosAnyError & { readonly meta?: FokosMeta };
 
 /** True for an error that a FokosDB method raises, after any number of hops. */
 export function isFokosDBError(e: unknown): e is FokosDBError {
@@ -234,30 +236,88 @@ export function isFokosDBError(e: unknown): e is FokosDBError {
 }
 
 /**
- * Runs `fn`, which reads the answer of a partition. An error from it gets the meta of that partition,
- * as an error that the partition raised does.
+ * Runs `fn`, which reads the answer of a partition. An error from it gets the meta of the answers, as
+ * an error that a partition raised does.
  */
-function withAnswerMeta<T>(routing: FokosPublicRouting, fn: () => T): T {
+function withAnswerMeta<T>(meta: FokosMeta, fn: () => T): T {
 	try {
 		return fn();
 	} catch (e) {
-		throw Object.assign(FokosError.wrap(e), { meta: partitionInfoOf(routing) });
+		throw Object.assign(FokosError.wrap(e), { meta });
 	}
+}
+
+/** The `meta` of a method that one partition ran, from the entry of its answer. */
+function singleMeta(partitions: ItemRpcPartitions, routing: FokosPublicRouting): SinglePartitionMeta {
+	const {
+		forwardCount,
+		partitions: [entry],
+	} = answerMeta(partitions, routing);
+	return { forwardCount, partitions: [entry] };
+}
+
+/** The meta of no answer. */
+const NO_META: FokosMeta = { forwardCount: 0, partitions: [] };
+
+/** `soFar` with the entry of the partition that raised an error, which `RouteCollector.build` keeps at the head. */
+function withRaiser(soFar: FokosMeta, routing: FokosPublicRouting): FokosMeta {
+	const raiser = routing.servedBy[0];
+	return {
+		forwardCount: soFar.forwardCount + routing.forwardCount,
+		partitions: raiser ? [...soFar.partitions, routeNodeMeta(raiser)] : soFar.partitions,
+	};
+}
+
+/**
+ * Raises `e` as a public FokosError with the `meta` of the answers that the client has, and the entry
+ * of the partition that raised `e` when it carries routing. The routing state stops here, as it does
+ * on a result. A FokosError that has its `meta` already stays as it is.
+ */
+function withMetaSoFar(e: unknown, soFar: FokosMeta): FokosError {
+	// The cost of the call is not part of the public error.
+	dropCallCost(e);
+	const err = mapInternalErrorToPublic(FokosError.wrap(e));
+	const routed = routedError(err);
+	if (!routed) {
+		return soFar.partitions.length > 0 ? Object.assign(err, { meta: soFar }) : err;
+	}
+	const { routing } = routed;
+	delete (routed as { routing?: unknown }).routing;
+	return Object.assign(err, { meta: withRaiser(soFar, routing) });
+}
+
+/**
+ * Gives an error of the coordinator path its `meta`. The coordinator sends the entries of the
+ * participant answers of the request as the own `meta` of the error, and the routing names the
+ * coordinator that raised it.
+ */
+function coordinatorError(e: unknown): FokosError {
+	dropCallCost(e);
+	const err = mapInternalErrorToPublic(FokosError.wrap(e));
+	const routed = routedError(err);
+	if (!routed) {
+		return err;
+	}
+	const { routing } = routed;
+	delete (routed as { routing?: unknown }).routing;
+	const participants = (err as { meta?: ParticipantsMeta }).meta ?? NO_META;
+	const raiser = routing.servedBy[0];
+	return Object.assign(err, { meta: { ...participants, ...(raiser ? { txCoordinator: routeNodeMeta(raiser) } : {}) } satisfies FokosMeta });
 }
 
 /** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
 function conditionCheckError(
 	keys: { hashKey: HashKey; sortKey?: SortKey },
-	res: { reason: RejectionReasonEncoded; meta: OperationMetrics },
-	routing: FokosPublicRouting,
+	res: { reason: RejectionReasonEncoded },
+	meta: FokosMeta<AnsweredPartitionMeta>,
 ): FokosConditionCheckError {
-	const reason = withAnswerMeta(routing, () => decodeRejectionReason(res.reason));
+	const reason = withAnswerMeta(meta, () => decodeRejectionReason(res.reason));
 	invariant(reason.code === "condition_failed", "an item RPC rejects only a failed condition");
 	return new FokosConditionCheckError(CONDITION_CHECK_CODES.condition_failed, {
 		message: "condition failed",
 		attributes: { hashKey: keys.hashKey, sortKey: keys.sortKey },
 		reason,
-		meta: publicMeta(res.meta, routing),
+		meta,
 	});
 }
 
@@ -265,32 +325,35 @@ function conditionCheckError(
 function transactionCancelledError(fields: {
 	transactionId: string;
 	idempotencyToken: string;
-	results: TransactWriteOperationResultEncoded[];
+	results: CoordinatorOperationResultEncoded[];
+	meta: FokosMeta;
 }): FokosTransactionCancelledError {
 	return new FokosTransactionCancelledError(TRANSACTION_CANCELLED_CODES.transaction_cancelled, {
 		message: "transaction cancelled",
 		attributes: { transactionId: fields.transactionId, idempotencyToken: fields.idempotencyToken },
-		results: fields.results.map(decodeOperationResult),
+		results: withAnswerMeta(fields.meta, () => fields.results.map(decodeOperationResult)),
+		meta: fields.meta,
 	});
 }
 
-function decodeOperationResult(res: TransactWriteOperationResultEncoded): TransactWriteOperationResult {
-	if (res.outcome === "passed") {
-		return { outcome: "passed" };
-	}
-	if (res.outcome === "not_evaluated") {
-		return { outcome: "not_evaluated" };
+function decodeOperationResult(res: CoordinatorOperationResultEncoded): TransactWriteOperationResult {
+	if (res.outcome !== "rejected") {
+		return { outcome: res.outcome };
 	}
 	return {
 		outcome: "rejected",
 		reason: decodeRejectionReason(res.reason),
+		...(res.partitionIndex === undefined ? {} : { partitionIndex: res.partitionIndex }),
 		...(res.itemOmitted ? { itemOmitted: res.itemOmitted } : {}),
 	};
 }
 
 /** `transactGetItems` raises it when a requested item holds a pending write of an in-progress transaction. */
-function pendingWriteError(): FokosConflictError {
-	return new FokosConflictError(CONFLICT_CODES.pending_write, { message: "an item has a pending write of an in-progress transaction" });
+function pendingWriteError(meta: FokosMeta): FokosConflictError {
+	return Object.assign(
+		new FokosConflictError(CONFLICT_CODES.pending_write, { message: "an item has a pending write of an in-progress transaction" }),
+		{ meta },
+	);
 }
 
 /** Runs the body of a public method, and raises any error from it as a FokosError. */
@@ -298,18 +361,9 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} catch (e) {
-		// The cost of the call is not part of the public error.
-		dropCallCost(e);
-		const err = mapInternalErrorToPublic(FokosError.wrap(e));
-		// A partition attaches its routing to its error. The routing state stops here, as it does on a
-		// result: the public error carries the same `meta` a result would, and the internal hints go.
-		const routed = routedError(err);
-		if (routed) {
-			const meta = partitionInfoOf(routed.routing);
-			delete (routed as { routing?: unknown }).routing;
-			Object.assign(routed, { meta });
-		}
-		throw err;
+		// A partition attaches its routing to its error, and the public error names that partition. A
+		// method that has more answers gave the error its `meta` and dropped the routing already.
+		throw withMetaSoFar(e, NO_META);
 	}
 }
 
@@ -414,11 +468,6 @@ function validateRetryOptions(retry: Required<FokosDBRetryOptions>, partitionMig
 			"partitionMigratingRetryDeadlineMs must be an integer of at least 1",
 		);
 	}
-}
-
-/** The public meta of one result: the metrics of the work, and the partition that produced it. */
-function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): OperationMetrics & PartitionInfo {
-	return { ...metrics, ...partitionInfoOf(routing) };
 }
 
 export class FokosDB {
@@ -570,11 +619,12 @@ export class FokosDB {
 				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 			},
 		);
+		const meta = singleMeta(res.partitions, routing);
 		if (res.outcome === "rejected") {
-			throw conditionCheckError(opts, res, routing);
+			throw conditionCheckError(opts, res, meta);
 		}
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta, routing) };
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta };
 	}
 
 	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
@@ -588,10 +638,10 @@ export class FokosDB {
 			{ hashKey, sortKey },
 			{ hashKey, sortKey, ...(projection === undefined ? {} : { projection }) },
 		);
-		const meta = publicMeta(res.meta, routing);
+		const meta = singleMeta(res.partitions, routing);
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
-		return withAnswerMeta(routing, (): GetItemResult => {
+		return withAnswerMeta(meta, (): GetItemResult => {
 			if (!res.found) {
 				return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta };
 			}
@@ -629,11 +679,12 @@ export class FokosDB {
 			{ hashKey, sortKey },
 			{ hashKey, sortKey, condition: opts.condition, returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure },
 		);
+		const meta = singleMeta(res.partitions, routing);
 		if (res.outcome === "rejected") {
-			throw conditionCheckError(opts, res, routing);
+			throw conditionCheckError(opts, res, meta);
 		}
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta, routing) };
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta };
 	}
 
 	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
@@ -689,24 +740,33 @@ export class FokosDB {
 		const { baseDelayMs, maxDelayMs } = this.#options.retry;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
-		const { value: encoded } = await this.#coordinators.point(
-			"initiateWrite",
-			{ hashKey: encodeHashKey(idempotencyToken, this.#limits), sortKey: encodeSortKey(undefined, this.#limits) },
-			{ clientRequestToken: idempotencyToken, table: this.#table, items, executionMode },
-			{
-				retry: {
-					shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
-					baseDelayMs,
-					maxDelayMs,
+		let answer: FokosCallResult<CoordinatorOps["initiateWrite"]["res"]>;
+		try {
+			answer = await this.#coordinators.point(
+				"initiateWrite",
+				{ hashKey: encodeHashKey(idempotencyToken, this.#limits), sortKey: encodeSortKey(undefined, this.#limits) },
+				{ clientRequestToken: idempotencyToken, table: this.#table, items, executionMode },
+				{
+					retry: {
+						shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
+						baseDelayMs,
+						maxDelayMs,
+					},
 				},
-			},
-		);
+			);
+		} catch (e) {
+			throw coordinatorError(e);
+		}
+		const { value: encoded, routing } = answer;
+		// The participant answers of this request, and the coordinator that answered it.
+		const coordinator = routing.servedBy.find((node) => node.role === "executed") ?? routing.servedBy[0];
+		const meta: FokosMeta = { ...encoded.meta, ...(coordinator ? { txCoordinator: routeNodeMeta(coordinator) } : {}) };
 		// The outcome is the driver's, not the caller's: a committed transaction is the only value this
 		// method returns, and a cancelled one raises instead.
 		if (encoded.outcome === "committed") {
-			return { transactionId: encoded.transactionId, idempotencyToken: encoded.idempotencyToken };
+			return { transactionId: encoded.transactionId, idempotencyToken: encoded.idempotencyToken, meta };
 		}
-		throw transactionCancelledError(encoded);
+		throw transactionCancelledError({ ...encoded, meta });
 	}
 
 	/**
@@ -733,36 +793,45 @@ export class FokosDB {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		const request = { items };
 
-		let response: SingleShotResponse;
+		let answer: FokosCallResult<SingleShotResponse>;
 		try {
 			// No retry, matching the coordinator path, which does not retry a write either.
-			response = (await this.#partitions.send("txExecuteSingleShot", groups[0].ctx, request, items)).value;
+			answer = await this.#partitions.send("txExecuteSingleShot", groups[0].ctx, request, items);
 		} catch (err) {
 			// The partition does not throw after its apply commits, so an error that partition code raised
 			// means nothing applied: the transaction cancelled, and that one partition owns every operation,
 			// as the coordinator reports the same refusal of a prepare. A foreign error can be a reply lost
-			// after the apply, so its outcome is unknown.
-			if (FokosError.is(err) && !FokosError.isCode(err, CORE_INTERNAL_CODES.foreign_error)) {
+			// after the apply, so its outcome is unknown. The error has no answer list, so its one entry is
+			// the partition that raised it, and every operation names that entry.
+			const routed = routedError(err);
+			if (routed && !FokosError.isCode(routed, CORE_INTERNAL_CODES.foreign_error)) {
+				dropCallCost(routed);
 				throw transactionCancelledError({
 					transactionId,
 					idempotencyToken: transactionId,
 					results: items.map((item) => ({
 						outcome: "rejected",
-						reason: { code: err.code as ExecutionFailureCode, ...decodeItemKeys(item.hashKey, item.sortKey), error_id: err.error_id },
+						reason: { code: routed.code as ExecutionFailureCode, ...decodeItemKeys(item.hashKey, item.sortKey), error_id: routed.error_id },
+						partitionIndex: 0,
 					})),
+					meta: withRaiser(NO_META, routed.routing),
 				});
 			}
 			throw err;
 		}
 
+		const { value: response } = answer;
 		// No single partition owns every item. Nothing was written, so the coordinator path runs instead.
 		if (response.outcome === "not_applicable") {
 			return null;
 		}
+		const meta = answerMeta(response.partitions, answer.routing);
 		if (response.outcome === "committed") {
-			return { transactionId, idempotencyToken: transactionId };
+			return { transactionId, idempotencyToken: transactionId, meta };
 		}
-		throw transactionCancelledError({ transactionId, idempotencyToken: transactionId, ...response });
+		// The one partition of the answer rejected each rejected operation.
+		const results = response.results.map((r) => (r.outcome === "rejected" ? { ...r, partitionIndex: 0 } : r));
+		throw transactionCancelledError({ transactionId, idempotencyToken: transactionId, results, meta });
 	}
 
 	// The positional types of the public method are erased here: every item takes the same path, and only
@@ -791,15 +860,15 @@ export class FokosDB {
 		// queryItems), parse json text once into a JsonValue, and drop the read-transaction bookkeeping
 		// (maxDeletedV / hasPendingWrite) so callers never depend on it. Those two are meaningless in a
 		// committed read regardless — the driver raises an error when any item has a pending write.
-		return {
+		return withAnswerMeta(response.meta, () => ({
 			items: response.items.map((encoded, index) => {
-				const { hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item } = encoded;
+				const { hasPendingWrite: _hasPendingWrite, partitionIndex, hashKey, sortKey, ...item } = encoded;
 				const keys = {
 					hashKey: KeyCodec.decode(hashKey),
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
 				};
 				if (!item.found) {
-					return { ...keys, found: false as const };
+					return { ...keys, found: false as const, partitionIndex };
 				}
 				if (item.kind === "projected") {
 					// items[i] answers request.items[i], so the names of the record come from the projection of that item.
@@ -812,11 +881,13 @@ export class FokosDB {
 						kind: "projected" as const,
 						version: item.version,
 						...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
+						partitionIndex,
 					};
 				}
-				return { ...keys, ...item, ...decodeItemData(item.kind, item.data) };
+				return { ...keys, ...item, ...decodeItemData(item.kind, item.data), partitionIndex };
 			}),
-		};
+			meta: response.meta,
+		}));
 	}
 
 	/**
@@ -835,17 +906,20 @@ export class FokosDB {
 		}
 
 		// Every error, a transport failure included, is the caller's, exactly as on the two-phase path.
-		const { value: response } = await this.#partitions.send("txReadSnapshot", groups[0].ctx, { items }, items, {
+		const { value: response, routing } = await this.#partitions.send("txReadSnapshot", groups[0].ctx, { items }, items, {
 			retry: this.#options.retry === DEFAULT_RETRY ? SNAPSHOT_READ_RETRY : readRetry(this.#options.retry, isRuntimeRetryableError),
 		});
 		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
 		if (response.outcome === "not_applicable") {
 			return null;
 		}
+		const meta = answerMeta(response.partitions, routing);
 		if (response.outcome === "aborted") {
-			throw pendingWriteError();
+			throw pendingWriteError(meta);
 		}
-		return response;
+		// One partition answers for every key, so its list of one entry needs no join, and the items are
+		// positional to the request.
+		return { outcome: "committed", items: response.items.map((item) => ({ ...item, partitionIndex: 0 })), meta };
 	}
 
 	async #readTransaction(requestedItems: TransactionReadItem[]): Promise<InitiateReadResponseEncoded> {
@@ -861,36 +935,41 @@ export class FokosDB {
 				groups.map(({ ctx, items }) => this.#partitions.send("txReadForTransaction", ctx, { transactionId, items }, items, { retry })),
 			);
 
-		// Phase 1
-		const phase1Settled = await readPhase();
-
-		const phase1Flat: ReadForTransactionItemResultEncoded[] = [];
-		for (const r of phase1Settled) {
-			// A read applies nothing, so the error of a failed phase call is the answer, as the partition raised it.
-			if (r.status === "rejected") {
-				throw r.reason;
+		// The entries of every answer of both phases, one for each partition. Each item changes its index
+		// from the list of its answer to the joined list.
+		const join = new PartitionMetaJoin();
+		let forwardCount = 0;
+		const meta = (): FokosMeta => ({ forwardCount, partitions: join.partitions });
+		// A read applies nothing, so the error of a failed phase call is the answer, as the partition raised
+		// it. The error has the entries of every answer so far.
+		const settlePhase = (settled: Awaited<ReturnType<typeof readPhase>>): IndexedReadItemEncoded[] => {
+			const flat: IndexedReadItemEncoded[] = [];
+			let failed: PromiseRejectedResult | undefined;
+			for (const r of settled) {
+				if (r.status === "rejected") {
+					failed ??= r;
+					continue;
+				}
+				const { value, routing } = r.value;
+				const answer = answerMeta(value.partitions, routing);
+				forwardCount += answer.forwardCount;
+				const indexes = answer.partitions.map((entry) => join.add(entry));
+				flat.push(...value.items.map((item) => ({ ...item, partitionIndex: indexes[item.partitionIndex] })));
 			}
-			phase1Flat.push(...r.value.value.items);
-		}
+			if (failed) {
+				throw withMetaSoFar(failed.reason, meta());
+			}
+			if (flat.some((item) => item.hasPendingWrite)) {
+				throw pendingWriteError(meta());
+			}
+			return flat;
+		};
 
-		if (phase1Flat.some((item) => item.hasPendingWrite)) {
-			throw pendingWriteError();
-		}
+		// Phase 1
+		const phase1Flat = settlePhase(await readPhase());
 
 		// Phase 2 — verify no concurrent mutations
-		const phase2Settled = await readPhase();
-
-		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
-		for (const r of phase2Settled) {
-			if (r.status === "rejected") {
-				throw r.reason;
-			}
-			phase2Flat.push(...r.value.value.items);
-		}
-
-		if (phase2Flat.some((item) => item.hasPendingWrite)) {
-			throw pendingWriteError();
-		}
+		const phase2Flat = settlePhase(await readPhase());
 
 		// Did both phases observe the same committed state? An item found in both phases compares
 		// `version` (the item's `v`). The `v` of a key never repeats in a partition, also after a delete
@@ -919,7 +998,7 @@ export class FokosDB {
 		// flattens the replies, so result order is not request order. KeyPairMap is the ONE identity
 		// primitive for a (hashKey, sortKey) pair — the same one commitLocal's keyset check uses. It
 		// compares the key bytes.
-		const phase1ByKey = new KeyPairMap<ReadForTransactionItemResultEncoded>();
+		const phase1ByKey = new KeyPairMap<IndexedReadItemEncoded>();
 		for (const r of phase1Flat) {
 			phase1ByKey.set(r.hashKey, r.sortKey, r);
 		}
@@ -927,7 +1006,7 @@ export class FokosDB {
 		for (const r of phase2Flat) {
 			phase2ByKey.set(r.hashKey, r.sortKey, r);
 		}
-		const items: ReadForTransactionItemResultEncoded[] = [];
+		const items: IndexedReadItemEncoded[] = [];
 		for (const requested of requestedItems) {
 			const p1 = phase1ByKey.get(requested.hashKey, requested.sortKey);
 			const p2 = phase2ByKey.get(requested.hashKey, requested.sortKey);
@@ -935,15 +1014,17 @@ export class FokosDB {
 			// something to answer with a short array.
 			invariant(p1 && p2, "a participant of a read transaction dropped a requested key");
 			if (!sameCommittedState(p1, p2)) {
-				throw new FokosConflictError(CONFLICT_CODES.read_conflict, {
-					message: "a write changed an item between the two phases of the read",
-					attributes: decodeItemKeys(requested.hashKey, requested.sortKey),
-				});
+				throw Object.assign(
+					new FokosConflictError(CONFLICT_CODES.read_conflict, {
+						message: "a write changed an item between the two phases of the read",
+						attributes: decodeItemKeys(requested.hashKey, requested.sortKey),
+					}),
+					{ meta: meta() },
+				);
 			}
 			items.push(p1);
 		}
-
-		return { outcome: "committed", items };
+		return { outcome: "committed", items, meta: meta() };
 	}
 
 	async #queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult | QueryItemsProjectedResult> {
@@ -1038,15 +1119,13 @@ export class FokosDB {
 		}
 
 		const items: Array<QueryItemsResult["items"][number] | ProjectedItem> = [];
-		const partitionMetas: QueryItemsResult["partitionMetas"] = [];
+		// Each leaf writes its own entry, so the cap of the route list cannot drop a leaf. Only a name can
+		// be absent. The entries of the sub-queries follow in order, so the items stay in entry order.
+		const partitions: QueryItemsResult["meta"]["partitions"] = [];
 		let count = 0;
 		let scannedCount = 0;
 		let rowsReturned = 0;
 		let forwardCount = 0;
-		// The aggregates count every leaf that answered, and never only the leaves that `partitionMetas`
-		// could name: the route list is capped, so naming a leaf is best effort while its counters are not.
-		let rowsRead = 0;
-		let partitionsVisited = 0;
 		let cursor: string | undefined;
 
 		for (let qi = startQueryIdx; qi < normalizedQueries.length; qi++) {
@@ -1060,29 +1139,37 @@ export class FokosDB {
 					? { hk: startInner.hashKey, sk: startInner.sortKey, inclusive: startInner.inclusive }
 					: null;
 
-			const { value: rpcResult, routing } = await this.#partitions.range(
-				"apiQueryItems",
-				{ hashKey: query.hashKey, interval: query.interval, descending: query.direction === "desc" },
-				{
-					hashKey: query.hashKey,
-					interval: query.interval,
-					direction: query.direction,
-					remainingEvaluatedItems: budget.remainingEvaluatedItems,
-					remainingEvaluatedBytes: budget.remainingEvaluatedBytes,
-					remainingResponseBytes: budget.remainingResponseBytes,
-					remainingPartitionVisits: budget.remainingPartitionVisits,
-					allowOversizedFirstItem: budget.allowOversizedFirstItem,
-					cursor: rpcCursor,
-					select,
-					plan: expressions,
-				},
-			);
+			let answer: FokosCallResult<PartitionOps["apiQueryItems"]["res"]>;
+			try {
+				answer = await this.#partitions.range(
+					"apiQueryItems",
+					{ hashKey: query.hashKey, interval: query.interval, descending: query.direction === "desc" },
+					{
+						hashKey: query.hashKey,
+						interval: query.interval,
+						direction: query.direction,
+						remainingEvaluatedItems: budget.remainingEvaluatedItems,
+						remainingEvaluatedBytes: budget.remainingEvaluatedBytes,
+						remainingResponseBytes: budget.remainingResponseBytes,
+						remainingPartitionVisits: budget.remainingPartitionVisits,
+						allowOversizedFirstItem: budget.allowOversizedFirstItem,
+						cursor: rpcCursor,
+						select,
+						plan: expressions,
+					},
+				);
+			} catch (e) {
+				throw withMetaSoFar(e, { forwardCount, partitions });
+			}
+			const { value: rpcResult, routing } = answer;
+			partitions.push(...answerMeta(rpcResult.partitions, routing).partitions);
+			forwardCount += routing.forwardCount;
 
 			count += rpcResult.count;
 			scannedCount += rpcResult.scannedCount;
 			rowsReturned += rpcResult.rowsReturned;
 			if (select === "projection") {
-				withAnswerMeta(routing, () => {
+				withAnswerMeta({ forwardCount, partitions }, () => {
 					if (projectionNames) {
 						for (const item of rpcResult.items) {
 							items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
@@ -1102,15 +1189,6 @@ export class FokosDB {
 					}
 				});
 			}
-			for (const leaf of rpcResult.partitionMetas) {
-				rowsRead += leaf.rowsRead;
-				partitionsVisited += 1;
-				const info = leafPartitionInfo(leaf, routing);
-				if (info) {
-					partitionMetas.push(info);
-				}
-			}
-			forwardCount += routing.forwardCount;
 			budget.consume(rpcResult);
 
 			if (rpcResult.nextCursor !== null) {
@@ -1152,9 +1230,9 @@ export class FokosDB {
 			}
 		}
 
-		const meta: QueryItemsMeta = { rowsRead, rowsReturned, forwardCount, partitionsVisited };
+		const meta: QueryItemsResult["meta"] = { forwardCount, partitions, rowsReturned };
 
-		return { items, count, scannedCount, cursor, meta, partitionMetas } as QueryItemsResult | QueryItemsProjectedResult;
+		return { items, count, scannedCount, cursor, meta } as QueryItemsResult | QueryItemsProjectedResult;
 	}
 
 	async #destroy(): Promise<{ ok: true }> {

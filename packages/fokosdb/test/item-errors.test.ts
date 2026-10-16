@@ -179,7 +179,7 @@ describe("a failed condition of putItem and deleteItem", () => {
 		expect([conditionErr.code, conditionErr.origin, conditionErr.httpStatusHint]).toEqual(["condition_failed", "caller", 409]);
 		expect(conditionErr.attributes).toEqual(key);
 		expect(conditionErr.reason).toEqual({ code: "condition_failed", ...key, item: { ...key, data: "stored", kind: "text", version: 1 } });
-		expect(conditionErr.meta.rowsRead).toBeGreaterThan(0);
+		expect(conditionErr.meta.partitions[0].rowsRead).toBeGreaterThan(0);
 		expect(conditionErr.meta).not.toHaveProperty("_internal");
 		for (const field of ["reason", "meta"]) {
 			expect(Object.hasOwn(conditionErr, field)).toBe(true);

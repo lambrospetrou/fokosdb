@@ -25,8 +25,9 @@ import { hashTransactionOperations } from "../shared/transaction-idempotency.js"
 import type {
 	InitiateWriteRequest,
 	InitiateWriteResponseEncoded,
-	PrepareResponse,
+	PrepareOutcome,
 	TCState,
+	TransactionPartitionsAnswer,
 	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
@@ -37,8 +38,8 @@ import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-con
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
 
-/** A partition answer in its envelope, as a stand-in partition returns it. */
-function enveloped<T>(value: T): FokosEnvelope<T> {
+/** A partition answer in its envelope, as a stand-in partition returns it. It lists the stand-in only. */
+function enveloped<T>(value: T): FokosEnvelope<T & TransactionPartitionsAnswer> {
 	const self = {
 		ref: { partitionId: "00", doName: "stand-in" },
 		actorId: "stand-in",
@@ -46,8 +47,14 @@ function enveloped<T>(value: T): FokosEnvelope<T> {
 		rangeDepth: 0,
 		role: "executed" as const,
 	};
-	return { value, routing: { servedBy: [self], forwardCount: 0, servedByTruncated: false } };
+	return {
+		value: { ...value, partitions: [{ actorId: "stand-in", hashDepth: 0 }] },
+		routing: { servedBy: [self], forwardCount: 0, servedByTruncated: false },
+	};
 }
+
+/** The `meta` of an answer that no participant RPC of the request gave. */
+const NO_PARTITIONS = { forwardCount: 0, partitions: [] };
 
 /**
  * A database size above the admission limit of the coordinator: 110% of the hash split threshold of
@@ -95,7 +102,7 @@ type CoordinatorInternals = {
 	applyMigrationPage(page: unknown[]): void;
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
-	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void;
+	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
 	storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void;
 	markCommitting(transactionId: string, idempotencyToken: string): void;
 	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
@@ -176,7 +183,7 @@ function insertState(
 
 function insertParticipant(
 	state: DurableObjectState,
-	outcome: { prepare?: string; commit?: string; cancel?: string; name?: string; answer?: PrepareResponse; error?: FokosErrorWire },
+	outcome: { prepare?: string; commit?: string; cancel?: string; name?: string; answer?: PrepareOutcome; error?: FokosErrorWire },
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_participants
@@ -205,7 +212,7 @@ function insertImage(state: DurableObjectState, transactionId: string, opIndex: 
 }
 
 /** A prepare answer that rejects one operation on its condition, with the image of the item. */
-function rejection(opIndex: number, hashKey: string, imageBytes: number): PrepareResponse {
+function rejection(opIndex: number, hashKey: string, imageBytes: number): PrepareOutcome {
 	return {
 		outcome: "rejected",
 		results: [
@@ -261,6 +268,7 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
+				meta: NO_PARTITIONS,
 			});
 		});
 	});
@@ -292,7 +300,13 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 				{ outcome: "passed" },
 			];
 			seed(state, tcState, results);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({ outcome: "cancelled", transactionId: TX_ID, idempotencyToken: TOKEN, results });
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+				outcome: "cancelled",
+				transactionId: TX_ID,
+				idempotencyToken: TOKEN,
+				results,
+				meta: NO_PARTITIONS,
+			});
 		});
 	});
 
@@ -342,7 +356,12 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 				kind: "text",
 			}));
 			// Only the rows written before the first prepare are under test.
-			vi.spyOn(tc, "drivePrepare").mockResolvedValue({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
+			vi.spyOn(tc, "drivePrepare").mockResolvedValue({
+				outcome: "committed",
+				transactionId: TX_ID,
+				idempotencyToken: TOKEN,
+				meta: NO_PARTITIONS,
+			});
 
 			await tc.initiateWriteLocal({
 				clientRequestToken: TOKEN,
@@ -372,7 +391,12 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 			const items: InitiateWriteRequest["items"] = [
 				{ opIndex: 0, hashKey: kb("hk"), sortKey: ABSENT_SK, operation: "put", data: "v", kind: "text" },
 			];
-			vi.spyOn(tc, "drivePrepare").mockResolvedValue({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
+			vi.spyOn(tc, "drivePrepare").mockResolvedValue({
+				outcome: "committed",
+				transactionId: TX_ID,
+				idempotencyToken: TOKEN,
+				meta: NO_PARTITIONS,
+			});
 
 			await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: ctx, items });
 
@@ -460,6 +484,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
+				meta: NO_PARTITIONS,
 			});
 		});
 	});
@@ -862,7 +887,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 				insertParticipant(state, { name: "p1" });
 				insertParticipant(state, { name: "p2" });
-				const answers: Record<string, PrepareResponse> = {
+				const answers: Record<string, PrepareOutcome> = {
 					p1: rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX - 5),
 					p2: rejection(1, "hk2", 10),
 				};
@@ -1130,7 +1155,12 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			expect(row).toMatchObject({ state: "COMMITTED", completed_at: expect.any(Number) });
 			expect(countRows(state, "tc_items")).toBe(0);
 			expect(countRows(state, "tc_participants")).toBe(0);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+				outcome: "committed",
+				transactionId: TX_ID,
+				idempotencyToken: TOKEN,
+				meta: NO_PARTITIONS,
+			});
 		});
 	});
 
@@ -1675,6 +1705,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
+				meta: NO_PARTITIONS,
 			});
 		});
 	});

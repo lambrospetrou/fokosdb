@@ -263,14 +263,14 @@ describe("PartitionDO - splitting", () => {
 				condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 			});
 			expect(putResult.meta.forwardCount).toBe(1);
-			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
-			expect(childNames).toContain(putResult.meta.servedByActorName);
+			expect(putResult.meta.partitions[0].servedByActorName).not.toBe(ctx.doName);
+			expect(childNames).toContain(putResult.meta.partitions[0].servedByActorName);
 
 			const getResult = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(getResult.found).toBe(true);
 			expect(getResult.meta.forwardCount).toBe(1);
 			// Same child serves both the write and the subsequent read.
-			expect(getResult.meta.servedByActorName).toBe(putResult.meta.servedByActorName);
+			expect(getResult.meta.partitions[0].servedByActorName).toBe(putResult.meta.partitions[0].servedByActorName);
 		});
 
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
@@ -279,7 +279,7 @@ describe("PartitionDO - splitting", () => {
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
 			expect(result.found).toBe(false);
 			expect(result.meta.forwardCount).toBe(1);
-			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
+			expect(result.meta.partitions[0].servedByActorName).not.toBe(ctx.doName);
 		});
 
 		it("forwards a projected getItem to the owning child after split", async ({ expect }) => {
@@ -297,7 +297,7 @@ describe("PartitionDO - splitting", () => {
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
 			expect(result).toMatchObject({ found: true, item: { projected: [3, 1], kind: "projected" } });
 			expect(result.meta.forwardCount).toBe(1);
-			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
+			expect(result.meta.partitions[0].servedByActorName).not.toBe(ctx.doName);
 		});
 	});
 
@@ -352,14 +352,14 @@ describe("PartitionDO - splitting", () => {
 					item: { data: dummyData },
 				});
 				if (result.found) {
-					servedByActorNames.add(result.meta.servedByActorName);
+					servedByActorNames.add(result.meta.partitions[0].servedByActorName!);
 					// hashDepth is constant (total tree levels) whether the cache skips hops or not.
-					expect(result.meta.hashDepth, "root reads should span at least 2 hash tree levels").toBeGreaterThanOrEqual(2);
+					expect(result.meta.partitions[0].hashDepth, "root reads should span at least 2 hash tree levels").toBeGreaterThanOrEqual(2);
 					// forwardCount starts at hashDepth (cold cache, one RPC per level) and
 					// converges to 1 (warm cache, single RPC directly to the leaf). The invariant
 					// that proves the cache is reducing latency is forwardCount ≤ hashDepth.
 					expect(result.meta.forwardCount, "topology cache should reduce RPC hops to at most one per tree level").toBeLessThanOrEqual(
-						result.meta.hashDepth,
+						result.meta.partitions[0].hashDepth!,
 					);
 					expect(result.meta.forwardCount, "always at least one RPC hop from the root").toBeGreaterThanOrEqual(1);
 				}
@@ -403,7 +403,7 @@ describe("PartitionDO - splitting", () => {
 
 			// root → child (leaf): hashDepth=1, forwardCount=1. Cache stays cold (child returns hashDepth=0).
 			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r1.meta.hashDepth).toBe(1);
+			expect(r1.meta.partitions[0].hashDepth).toBe(1);
 			expect(r1.meta.forwardCount).toBe(1);
 
 			// Split the child that owns hashKey.
@@ -411,7 +411,7 @@ describe("PartitionDO - splitting", () => {
 
 			// root → child → grandchild: hashDepth=2. Cache is cold so forwardCount=2 (two RPC hops).
 			const r2 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r2.meta.hashDepth).toBe(2);
+			expect(r2.meta.partitions[0].hashDepth).toBe(2);
 			expect(r2.meta.forwardCount).toBe(2);
 		});
 
@@ -423,12 +423,12 @@ describe("PartitionDO - splitting", () => {
 
 			// First request: cold cache — root→child→grandchild (two hops). Root learns depth=2.
 			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r1.meta.hashDepth).toBe(2);
+			expect(r1.meta.partitions[0].hashDepth).toBe(2);
 			expect(r1.meta.forwardCount).toBe(2);
 
 			// Second request: warm cache — root skips directly to grandchild (one hop).
 			const r2 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r2.meta.hashDepth).toBe(2);
+			expect(r2.meta.partitions[0].hashDepth).toBe(2);
 			expect(r2.meta.forwardCount).toBe(1);
 		});
 
@@ -443,7 +443,7 @@ describe("PartitionDO - splitting", () => {
 			// own partition id: with the id of the root it would pick itself as the next hop and forward the
 			// read to itself without end (infinite loop).
 			const r = await child.get({ hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r.meta.hashDepth).toBe(2);
+			expect(r.meta.partitions[0].hashDepth).toBe(2);
 			expect(r.meta.forwardCount).toBe(1);
 		});
 
@@ -456,7 +456,7 @@ describe("PartitionDO - splitting", () => {
 
 			// Warm root's cache to depth=2 with one request (root→child→grandchild).
 			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r1.meta.hashDepth).toBe(2);
+			expect(r1.meta.partitions[0].hashDepth).toBe(2);
 
 			// Now split the grandchild, making it a router for great-grandchildren.
 			await (await partition.leafOwning(hashKey)).splitHash();
@@ -465,12 +465,12 @@ describe("PartitionDO - splitting", () => {
 			// Grandchild forwards one more level → root receives hashDepth=1, updates cache to depth=3,
 			// and returns hashDepth=3. forwardCount=2: one RPC root→grandchild + grandchild→great-grandchild.
 			const r2 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r2.meta.hashDepth).toBe(3);
+			expect(r2.meta.partitions[0].hashDepth).toBe(3);
 			expect(r2.meta.forwardCount).toBe(2);
 
 			// Subsequent request: root skips directly to great-grandchild (one RPC hop).
 			const r3 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-			expect(r3.meta.hashDepth).toBe(3);
+			expect(r3.meta.partitions[0].hashDepth).toBe(3);
 			expect(r3.meta.forwardCount).toBe(1);
 		});
 	}, 30_000);
@@ -686,7 +686,7 @@ describe("PartitionDO - splitting", () => {
 					expect(result).toMatchObject({
 						found: true,
 						item: { data: item.data },
-						meta: { servedByActorName: partition.doName, forwardCount: 1 },
+						meta: { forwardCount: 1, partitions: [{ servedByActorName: partition.doName }] },
 					});
 				}
 
@@ -697,7 +697,7 @@ describe("PartitionDO - splitting", () => {
 				expect(projected).toMatchObject({
 					found: true,
 					item: { projected: ["data-alpha-1"], kind: "projected" },
-					meta: { servedByActorName: partition.doName, forwardCount: 1 },
+					meta: { forwardCount: 1, partitions: [{ servedByActorName: partition.doName }] },
 				});
 			});
 			await assertSplitTreeComplete(partition);

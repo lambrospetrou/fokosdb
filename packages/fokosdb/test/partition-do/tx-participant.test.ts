@@ -146,7 +146,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 				transactionTimestamp: Date.now(),
 				items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
 			}),
-		).resolves.toEqual({ outcome: "committed" });
+		).resolves.toMatchObject({ outcome: "committed" });
 	});
 
 	// Reads cannot grow a partition either, so they stay available.
@@ -186,7 +186,7 @@ describe("PartitionDO — single-shot transaction", () => {
 			]),
 		});
 
-		expect(res).toEqual({ outcome: "committed" });
+		expect(res).toMatchObject({ outcome: "committed" });
 		expect(await rpc.apiGetItem(ctx, { hashKey: kb("shot-new"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "written" },
@@ -324,7 +324,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 					coordinator: testCoordinatorRef(),
 					items,
 				}),
-			).toEqual({ outcome: "accepted" });
+			).toMatchObject({ outcome: "accepted" });
 
 			await partition.splitHash();
 			expect(
@@ -335,7 +335,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 					// pending_transactions rows.
 					items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })),
 				}),
-			).toEqual({ outcome: "committed" });
+			).toMatchObject({ outcome: "committed" });
 			expect(await rpc.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
 				found: true,
 				item: { data: "value", ttlAt },
@@ -357,7 +357,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 				{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const },
 			]);
 			const transactionTimestamp = Date.now() + i;
-			expect(await rpc.txPrepare(ctx, { transactionId, transactionTimestamp, coordinator, items })).toEqual({ outcome: "accepted" });
+			expect(await rpc.txPrepare(ctx, { transactionId, transactionTimestamp, coordinator, items })).toMatchObject({ outcome: "accepted" });
 			await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
 			if ((await rpc.status(ctx)).splitStatus) {
 				break;
@@ -412,7 +412,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 				{ hashKey: kb("snap-locked"), sortKey: kb("sk") },
 			],
 		});
-		expect(res).toEqual({ outcome: "aborted", reason: "pending_write" });
+		expect(res).toMatchObject({ outcome: "aborted", reason: "pending_write" });
 	});
 
 	describe("after a hash split", () => {
@@ -427,7 +427,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			for (let i = 0; i < count; i++) {
 				const hashKey = `probe-${i}`;
 				const res = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
-				const child = res.meta.servedByActorName;
+				const child = res.meta.partitions[0].servedByActorName!;
 				expect(child).not.toBe(ctx.doName);
 				byChild.set(child, [...(byChild.get(child) ?? []), hashKey]);
 			}

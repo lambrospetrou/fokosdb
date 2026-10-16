@@ -1495,7 +1495,7 @@ export async function expectSeedIntact(db: FokosDB): Promise<number> {
 		const reads = await Promise.all(batch.map((i) => untilAvailable(() => db.getItem(seedKey(i)))));
 		reads.forEach((res, j) => {
 			expect(res).toMatchObject({ found: true, item: { data: seedItemData(batch[j]), version: 1 } });
-			maxHashDepth = Math.max(maxHashDepth, res.meta.hashDepth);
+			maxHashDepth = Math.max(maxHashDepth, res.meta.partitions[0].hashDepth!);
 		});
 	}
 	return maxHashDepth;

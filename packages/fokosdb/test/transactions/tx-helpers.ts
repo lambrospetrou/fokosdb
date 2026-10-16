@@ -16,6 +16,7 @@ import {
 } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow, type FokosDBLimitOverrides } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
+import type { PartitionMeta } from "../../src/shared/types.js";
 import { recordedTxCalls, type ControlledPartitionDO, type TxOp, type TxRequest } from "../controlled-partition-do.js";
 import type { ControlledTransactionCoordinatorDO } from "../controlled-transaction-coordinator-do.js";
 import { openedRpc } from "../partition-do/helpers.js";
@@ -34,9 +35,12 @@ export type Key = { hashKey: string; sortKey: string };
  * The outcome of a transaction write: the committed result, or the fields of the cancel it raised.
  * The tag is this helper's own. `transactWriteItems` returns the committed result alone and raises on
  * a cancel, so only a value that holds both needs one.
+ *
+ * The outcome has no `meta` and no `partitionIndex`: they name the partitions that answered one
+ * request, so a replay of the token has other values.
  */
 export type WriteOutcome =
-	| ({ outcome: "committed" } & TransactWriteItemsResult)
+	| ({ outcome: "committed" } & Omit<TransactWriteItemsResult, "meta">)
 	| {
 			outcome: "cancelled";
 			transactionId: string;
@@ -50,7 +54,8 @@ export type WriteOutcome =
  */
 export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Promise<WriteOutcome> {
 	try {
-		return { outcome: "committed", ...(await write) };
+		const { meta: _meta, ...result } = await write;
+		return { outcome: "committed", ...result };
 	} catch (e) {
 		if (!FokosTransactionCancelledError.is(e)) {
 			throw e;
@@ -59,9 +64,17 @@ export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Pr
 			outcome: "cancelled",
 			transactionId: e.attributes.transactionId as string,
 			idempotencyToken: e.attributes.idempotencyToken as string,
-			results: e.results,
+			results: e.results.map(withoutPartition),
 		};
 	}
+}
+
+function withoutPartition(result: TransactWriteOperationResult): TransactWriteOperationResult {
+	if (result.outcome !== "rejected") {
+		return result;
+	}
+	const { partitionIndex: _partitionIndex, ...rest } = result;
+	return rest;
 }
 
 /** The total wait of `writeOutcomeWithClockRetry`. It must stay well below the test timeout of 5 s. */
@@ -187,6 +200,12 @@ export function keysInOnePartition(db: FokosDB, count: number, prefix: string): 
 			return bucket;
 		}
 	}
+}
+
+/** The `meta` entry of the root partition of `key`, as a transaction answer names it: with no counts. */
+export function partitionEntryOf(db: FokosDB, key: Key): PartitionMeta {
+	const name = partitionNameOf(db, key);
+	return { servedByActorId: env[db.options().table.ns].idFromName(name).toString(), servedByActorName: name, hashDepth: 0 };
 }
 
 /** The stub and route context of the partition that owns `key`, in the namespace of the table. */

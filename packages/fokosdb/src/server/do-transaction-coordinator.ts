@@ -4,7 +4,14 @@ import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
-import type { FokosEnvelope, FokosLifecycle, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
+import type {
+	FokosEnvelope,
+	FokosLifecycle,
+	FokosOperations,
+	FokosPublicRouting,
+	FokosShardingHooks,
+	RouteKey,
+} from "../sharding/runtime-types.js";
 import type {
 	FokosExecuteLocalRequest,
 	FokosInitRequest,
@@ -22,13 +29,17 @@ import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "./do-partition.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
+import { answerMeta, PartitionMetaJoin } from "../shared/partition-meta.js";
 import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
 import {
 	COORDINATOR_REF_VERSION,
+	type CoordinatorOperationResultEncoded,
 	type CoordinatorRef,
 	type InitiateWriteRequest,
 	type InitiateWriteResponseEncoded,
 	type ParticipantOperationResultEncoded,
+	type ParticipantsMeta,
+	type PrepareOutcome,
 	type PrepareResponse,
 	type RecoverTransactionRequest,
 	type RecoverTransactionResult,
@@ -37,6 +48,7 @@ import {
 	type TransactWriteOperationResultEncoded,
 	type TransactionItem,
 	type TransactionItemKey,
+	type TransactionPartitionsAnswer,
 } from "../shared/transaction-wire-types.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import {
@@ -122,6 +134,53 @@ type PrepareParticipant = {
 	items: TransactionItem[];
 };
 
+/** One answer of a participant, as the partition client returns it. */
+type ParticipantAnswer<T extends TransactionPartitionsAnswer> = { value: T; routing: FokosPublicRouting };
+
+/**
+ * The partitions that answered the participant RPCs of one request to the coordinator, joined into the
+ * `meta` of the answer of that request. The coordinator stores none of it, so a replay that sends no
+ * RPC lists no partition.
+ */
+class RequestPartitions {
+	readonly #join = new PartitionMetaJoin();
+	#forwardCount = 0;
+	/** The index in the join of the partition that rejected each operation, by `opIndex`. */
+	readonly #rejectedBy = new Map<number, number>();
+
+	/** Adds the entries of one answer, and returns the index of each entry in the join. */
+	add(answer: ParticipantAnswer<TransactionPartitionsAnswer>): number[] {
+		const { forwardCount, partitions } = answerMeta(answer.value.partitions, answer.routing);
+		this.#forwardCount += forwardCount;
+		return partitions.map((entry) => this.#join.add(entry));
+	}
+
+	/**
+	 * Adds a prepare answer. The stored prepare answers give the results of a cancel, so only a stored
+	 * answer gives its rejected results an index.
+	 */
+	addPrepare(answer: ParticipantAnswer<PrepareResponse>, stored: boolean): void {
+		const indexes = this.add(answer);
+		if (!stored || answer.value.outcome !== "rejected") {
+			return;
+		}
+		for (const r of answer.value.results) {
+			if (r.partitionIndex !== undefined) {
+				this.#rejectedBy.set(r.opIndex, indexes[r.partitionIndex]);
+			}
+		}
+	}
+
+	/** The index in `meta().partitions` of the partition that rejected an operation, when this request got that answer. */
+	rejectedBy(opIndex: number): number | undefined {
+		return this.#rejectedBy.get(opIndex);
+	}
+
+	meta(): ParticipantsMeta {
+		return { forwardCount: this.#forwardCount, partitions: this.#join.partitions };
+	}
+}
+
 type PrepareFanout = {
 	transactionTs: number;
 	participants: PrepareParticipant[];
@@ -188,7 +247,7 @@ function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEnco
  * and one answer can carry MAX_ITEMS_PER_TX of them. `imageBytes` stays so the coordinator can apply
  * the cap at CANCELLING without reading the images back.
  */
-function stripImagesFromPrepareResponse(r: PrepareResponse): PrepareResponse {
+function stripImagesFromPrepareResponse(r: PrepareOutcome): PrepareOutcome {
 	if (r.outcome === "accepted") {
 		return r;
 	}
@@ -711,7 +770,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow() + this.config().staleTransactionMs);
 		this.fokos.requestSplitEvaluation();
 
-		return await this.drivePrepare(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, {
+		return await this.drivePrepare(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, new RequestPartitions(), {
 			transactionTs,
 			participants,
 		});
@@ -719,26 +778,27 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponseEncoded> {
 		const { transaction_id: transactionId } = existingRow;
+		const seen = new RequestPartitions();
 		switch (existingRow.state) {
 			case "COMMITTED":
-				return this.loadFinalResponse(transactionId, idempotencyToken, existingRow);
+				return this.loadFinalResponse(transactionId, idempotencyToken, seen, existingRow);
 			case "CANCELLED":
-				return this.loadFinalResponse(transactionId, idempotencyToken, existingRow);
+				return this.loadFinalResponse(transactionId, idempotencyToken, seen, existingRow);
 			case "PREPARING": {
-				await this.runPrepareRecovery(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
-				return this.loadFinalResponse(transactionId, idempotencyToken);
+				await this.runPrepareRecovery(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return this.loadFinalResponse(transactionId, idempotencyToken, seen);
 			}
 			case "PREPARED":
 			case "COMMITTING": {
-				await this.runCommit(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
-				return this.loadFinalResponse(transactionId, idempotencyToken);
+				await this.runCommit(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return this.loadFinalResponse(transactionId, idempotencyToken, seen);
 			}
 			case "CANCELLING": {
-				await this.runCancel(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
-				return this.loadFinalResponse(transactionId, idempotencyToken);
+				await this.runCancel(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return this.loadFinalResponse(transactionId, idempotencyToken, seen);
 			}
 			case "CREATED":
-				return await this.drivePrepare(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
+				return await this.drivePrepare(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
 		}
 	}
 
@@ -757,23 +817,34 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 *   cleanup cannot change what the caller observes, and the answer follows the decision. Only
 	 *   the lock release lags, and the `tx_recovery` job drives that too.
 	 * - CREATED / PREPARING: genuinely undecided — those, and only those, ask the caller to retry.
+	 *
+	 * `seen` holds the participant answers of this request, which give the `meta` of the answer and of
+	 * the pending errors.
 	 */
-	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponseEncoded {
+	private loadFinalResponse(
+		transactionId: string,
+		idempotencyToken: string,
+		seen = new RequestPartitions(),
+		existingRow?: TcStateRow,
+	): InitiateWriteResponseEncoded {
 		const row = existingRow ?? this.loadStateRow(transactionId);
 		invariant(row, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
 		switch (row.state) {
 			case "COMMITTED":
 				// The transaction is all-or-nothing, so "committed" already says every operation applied.
 				// Nothing per-item to report, and so no tc_items read on this path.
-				return { outcome: "committed", transactionId, idempotencyToken };
+				return { outcome: "committed", transactionId, idempotencyToken, meta: seen.meta() };
 			case "PREPARED":
 			case "COMMITTING":
 				// The outcome is decided and final, but not every participant has applied it yet, so
 				// this is not a terminal answer for the caller: retry with the same token.
-				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_commit_pending, {
-					message: `transaction commit is pending: the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
-					attributes: { transactionId, state: row.state },
-				});
+				throw Object.assign(
+					new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_commit_pending, {
+						message: `transaction commit is pending: the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
+						attributes: { transactionId, state: row.state },
+					}),
+					{ meta: seen.meta() },
+				);
 			case "CANCELLING":
 			case "CANCELLED": {
 				// CANCELLING writes results_json in the same statement as the state, so a row without it is torn
@@ -799,16 +870,23 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						...(img.image_ttl_epoch_utc_seconds != null ? { ttlAt: img.image_ttl_epoch_utc_seconds } : {}),
 					};
 				}
-				return { outcome: "cancelled", transactionId, idempotencyToken, results };
+				const indexed = results.map((res, i): CoordinatorOperationResultEncoded => {
+					const partitionIndex = res.outcome === "rejected" ? seen.rejectedBy(i) : undefined;
+					return partitionIndex === undefined ? res : { ...res, partitionIndex };
+				});
+				return { outcome: "cancelled", transactionId, idempotencyToken, results: indexed, meta: seen.meta() };
 			}
 			case "CREATED":
 			case "PREPARING":
 				// No decision yet — the `tx_recovery` job drives it. The outcome can still go either way, so
 				// this answer promises nothing and only asks the caller to retry.
-				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
-					message: "transaction outcome is not yet decided, retry later",
-					attributes: { transactionId, state: row.state },
-				});
+				throw Object.assign(
+					new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
+						message: "transaction outcome is not yet decided, retry later",
+						attributes: { transactionId, state: row.state },
+					}),
+					{ meta: seen.meta() },
+				);
 			default: {
 				const _exhaustive: never = row.state;
 				throw new FokosInternalError(INTERNAL_CODES.unexpected_transaction_state, {
@@ -888,11 +966,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * the merge of `cancelTransactionInStore`. This method deletes those images, and does not write them,
 	 * so a transaction never stores more than MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX of images. Without
 	 * this bound, one PREPARING transaction can be larger than the RPC limit of a migration page.
+	 *
+	 * Returns true when it stored the answer.
 	 */
-	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void {
-		this.ctx.storage.transactionSync(() => {
+	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
+		return this.ctx.storage.transactionSync(() => {
 			if (this.loadStateRow(transactionId)?.state !== "PREPARING") {
-				return;
+				return false;
 			}
 			// A stored fatal error decides the transaction: it cancels. An answer of a concurrent drive
 			// must not hide that error, or let markCommitting record a commit decision.
@@ -904,7 +984,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				),
 			);
 			if (isFatalPrepareError(stored?.error_json ?? null)) {
-				return;
+				return false;
 			}
 			const written = this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
@@ -914,12 +994,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 				partitionDoName,
 			);
-			if (written.rowsWritten === 0 || answer.outcome !== "rejected") {
-				return;
+			if (written.rowsWritten === 0) {
+				return false;
 			}
 			// An answer with no image adds no bytes, so the cap drops no new image.
-			if (!answer.results.some((res) => res.outcome === "rejected" && res.imageBytes !== undefined)) {
-				return;
+			if (answer.outcome !== "rejected" || !answer.results.some((res) => res.outcome === "rejected" && res.imageBytes !== undefined)) {
+				return true;
 			}
 			const aboveCap = this.imagesAboveCap(transactionId);
 			for (const opIndex of aboveCap) {
@@ -943,6 +1023,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					img.data,
 				);
 			}
+			return true;
 		});
 	}
 
@@ -953,7 +1034,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			`SELECT answer_json FROM tc_participants WHERE transaction_id = ? AND answer_json IS NOT NULL`,
 			transactionId,
 		)) {
-			const answer = parseTagged<PrepareResponse>(answer_json);
+			const answer = parseTagged<PrepareOutcome>(answer_json);
 			if (answer.outcome === "rejected") {
 				results.push(...answer.results);
 			}
@@ -1017,7 +1098,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
 			for (const p of this.loadParticipants(transactionId)) {
 				const owned = itemsByPartition.get(p.partition_do_name) ?? [];
-				const answer = p.prepare_outcome === "rejected" && p.answer_json ? parseTagged<PrepareResponse>(p.answer_json) : null;
+				const answer = p.prepare_outcome === "rejected" && p.answer_json ? parseTagged<PrepareOutcome>(p.answer_json) : null;
 				let answered: ParticipantOperationResultEncoded[];
 				if (p.prepare_outcome === "accepted") {
 					// An accepted participant sends no array: the lock it holds is the proof that its check
@@ -1164,6 +1245,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
+		seen = new RequestPartitions(),
 		fanout?: PrepareFanout,
 	): Promise<InitiateWriteResponseEncoded> {
 		const row = this.transition(idempotencyToken, () => {
@@ -1175,7 +1257,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// retry with the same token. When that drive has already decided, a prepare from this drive can
 		// lock keys after the cancel released them.
 		if (row.state !== "PREPARING") {
-			return this.loadFinalResponse(transactionId, idempotencyToken, row);
+			return this.loadFinalResponse(transactionId, idempotencyToken, seen, row);
 		}
 
 		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(transactionId);
@@ -1185,7 +1267,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
-				const { value: result } = await this.partitionClient(p.context)
+				const answer = await this.partitionClient(p.context)
 					.send(
 						"txPrepare",
 						p.context,
@@ -1200,8 +1282,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						this.storePrepareError(transactionId, p.doName, err);
 						throw err;
 					});
-				this.storePrepareAnswer(transactionId, p.doName, result);
-				return { partitionDoName: p.doName, result };
+				seen.addPrepare(answer, this.storePrepareAnswer(transactionId, p.doName, answer.value));
+				return { partitionDoName: p.doName, result: answer.value };
 			}),
 		);
 
@@ -1210,7 +1292,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		if (allAccepted) {
 			// All answers in memory are accepted. markCommitting checks the stored answers again.
 			this.markCommitting(transactionId, idempotencyToken);
-			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e: unknown) => {
+			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs, seen).catch((e: unknown) => {
 				// A split moved the token: the client retries, and the new owner commits.
 				if (FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
 					throw e;
@@ -1222,12 +1304,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					error: String(e),
 				});
 			});
-			return this.loadFinalResponse(transactionId, idempotencyToken);
+			return this.loadFinalResponse(transactionId, idempotencyToken, seen);
 		}
 
 		this.cancelTransactionInStore(transactionId, idempotencyToken);
-		await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
-		return this.loadFinalResponse(transactionId, idempotencyToken);
+		await this.runCancel(transactionId, idempotencyToken, requestBudgetMs, seen);
+		return this.loadFinalResponse(transactionId, idempotencyToken, seen);
 	}
 
 	/**
@@ -1235,7 +1317,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * on it, and the rest of `alarmRecoveryBudgetMs` for the `tx_recovery` job. A participant with no answer at the deadline
 	 * stays unconfirmed, and the transaction stays non-terminal for the `tx_recovery` job.
 	 */
-	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
+	private async runCommit(
+		transactionId: string,
+		idempotencyToken: string,
+		requestBudgetMs: number,
+		seen = new RequestPartitions(),
+	): Promise<void> {
 		// More than one drive of a transaction can run at the same time: the request, a retry with the
 		// same token, the `tx_recovery` job, and a participant's recovery call. Each drive sends commits
 		// only when the stored decision is commit. A drive whose own decision lost sends nothing.
@@ -1294,12 +1381,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					return null;
 				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
-				await this.partitionClient(pCtx).send(
-					"txCommit",
-					pCtx,
-					{ transactionId, transactionTimestamp: stateRow.transaction_ts, items: pendingKeys[i] },
-					pendingKeys[i],
-					{ retry: this.fanoutRetry(deadlineMs) },
+				seen.add(
+					await this.partitionClient(pCtx).send(
+						"txCommit",
+						pCtx,
+						{ transactionId, transactionTimestamp: stateRow.transaction_ts, items: pendingKeys[i] },
+						pendingKeys[i],
+						{ retry: this.fanoutRetry(deadlineMs) },
+					),
 				);
 				return p.partition_do_name;
 			}),
@@ -1342,7 +1431,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
-	private async runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
+	private async runCancel(
+		transactionId: string,
+		idempotencyToken: string,
+		requestBudgetMs: number,
+		seen = new RequestPartitions(),
+	): Promise<void> {
 		// Sends cancels only when the stored decision is cancel, to avoid racy runs breaking atomicity.
 		// A cancel after a commit decision makes a participant release a lock that the commit must apply,
 		// and the participant then answers that commit with the idempotent success.
@@ -1385,9 +1479,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
 				const keys = toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []);
-				await this.partitionClient(pCtx).send("txCancel", pCtx, { transactionId, items: keys }, keys, {
-					retry: this.fanoutRetry(deadlineMs),
-				});
+				seen.add(
+					await this.partitionClient(pCtx).send("txCancel", pCtx, { transactionId, items: keys }, keys, {
+						retry: this.fanoutRetry(deadlineMs),
+					}),
+				);
 				this.ctx.storage.sql.exec(
 					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE transaction_id = ? AND partition_do_name = ?`,
 					transactionId,
@@ -1409,7 +1505,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		}
 	}
 
-	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
+	private async runPrepareRecovery(
+		transactionId: string,
+		idempotencyToken: string,
+		requestBudgetMs: number,
+		seen = new RequestPartitions(),
+	): Promise<void> {
 		const stateRow = this.loadStateRow(transactionId);
 		if (stateRow?.state !== "PREPARING") {
 			return;
@@ -1426,7 +1527,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// gets the same error, so the drive cancels at once and sends no prepare.
 		if (nullParticipants.some((p) => isFatalPrepareError(p.error_json))) {
 			this.cancelTransactionInStore(transactionId, idempotencyToken);
-			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
+			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs, seen);
 			return;
 		}
 		const retry = this.config().participantRetry;
@@ -1435,7 +1536,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			nullParticipants.map(async (p) => {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
 				const partitionItems = toTransactionItems(itemsByPartition.get(p.partition_do_name) ?? []);
-				const { value: r } = await this.partitionClient(pCtx)
+				const answer = await this.partitionClient(pCtx)
 					.send(
 						"txPrepare",
 						pCtx,
@@ -1448,7 +1549,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						this.storePrepareError(transactionId, p.partition_do_name, err);
 						throw err;
 					});
-				this.storePrepareAnswer(transactionId, p.partition_do_name, r);
+				seen.addPrepare(answer, this.storePrepareAnswer(transactionId, p.partition_do_name, answer.value));
 			}),
 		);
 
@@ -1466,10 +1567,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		if (allAccepted) {
 			this.markCommitting(transactionId, idempotencyToken);
-			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
+			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs, seen);
 		} else if (anyRejected || heldTooLong) {
 			this.cancelTransactionInStore(transactionId, idempotencyToken);
-			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
+			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs, seen);
 		}
 		// If some participants are still NULL and under the hold deadline, leave in PREPARING; the `tx_recovery` job retries it.
 	}

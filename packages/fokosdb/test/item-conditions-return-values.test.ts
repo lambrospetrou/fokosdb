@@ -61,7 +61,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				},
 			});
 			expect(err.meta).toBeDefined();
-			expect(err.meta.rowsRead).toBeGreaterThanOrEqual(2);
+			expect(err.meta.partitions[0].rowsRead).toBeGreaterThanOrEqual(2);
 		});
 
 		it("returns bytes image on condition failure", async () => {
@@ -169,7 +169,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 
 		expect(FokosConditionCheckError.is(errorNone)).toBe(true);
 		expect(errorNone!.reason.item).toBeUndefined();
-		const rowsReadWithoutImage = errorNone!.meta.rowsRead;
+		const rowsReadWithoutImage = errorNone!.meta.partitions[0].rowsRead;
 
 		let errorAllOld: FokosConditionCheckError | undefined;
 		try {
@@ -185,7 +185,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 
 		expect(FokosConditionCheckError.is(errorAllOld)).toBe(true);
 		expect(errorAllOld!.reason.item).toBeDefined();
-		expect(errorAllOld!.meta.rowsRead).toBe(rowsReadWithoutImage + 1);
+		expect(errorAllOld!.meta.partitions[0].rowsRead).toBe(rowsReadWithoutImage + 1);
 	});
 
 	it("reads the same number of rows on a passing condition whether or not an image was asked for", async () => {
@@ -210,7 +210,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			returnValuesOnConditionCheckFailure: "all_old",
 		});
 
-		expect(resNone.meta.rowsRead).toBe(resAllOld.meta.rowsRead);
+		expect(resNone.meta.partitions[0].rowsRead).toBe(resAllOld.meta.partitions[0].rowsRead);
 	});
 
 	describe("deleteItem answers a failed condition exactly as putItem does", () => {
@@ -324,7 +324,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			}
 			expect(FokosConditionCheckError.is(errorNone)).toBe(true);
 			expect(errorNone!.reason.item).toBeUndefined();
-			const rowsWithoutImage = errorNone!.meta.rowsRead;
+			const rowsWithoutImage = errorNone!.meta.partitions[0].rowsRead;
 
 			let errorAllOld: FokosConditionCheckError | undefined;
 			try {
@@ -338,7 +338,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			}
 			expect(FokosConditionCheckError.is(errorAllOld)).toBe(true);
 			expect(errorAllOld!.reason.item).toBeDefined();
-			expect(errorAllOld!.meta.rowsRead).toBe(rowsWithoutImage + 1);
+			expect(errorAllOld!.meta.partitions[0].rowsRead).toBe(rowsWithoutImage + 1);
 		});
 	});
 });

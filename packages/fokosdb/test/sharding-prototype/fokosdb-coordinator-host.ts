@@ -19,7 +19,7 @@ import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
 import type {
 	InitiateWriteResponseEncoded,
-	PrepareResponse,
+	PrepareOutcome,
 	RecoverTransactionResult,
 	TCState,
 	TCWriteOperation,
@@ -126,7 +126,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					participants.map(async (p) => (await this.partition(p.context).txPrepare(p.context, p.request)).value),
 				);
 				const answers = settled.map((s) => (s.status === "fulfilled" ? s.value : null));
-				const allAccepted = answers.every((a): a is PrepareResponse => a?.outcome === "accepted");
+				const allAccepted = answers.every((a): a is PrepareOutcome => a?.outcome === "accepted");
 				this.transition(token, () => todo(allAccepted ? "state = PREPARED" : "state = CANCELLING, results"));
 				return await this.drive({ ...row, state: allAccepted ? "PREPARED" : "CANCELLING" });
 			}
@@ -137,19 +137,41 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					participants.map(async (p) => (await this.partition(p.context).txCommit(p.context, todo("CommitRequest of p"))).value),
 				);
 				this.transition(token, () => todo("state = COMMITTED, completed_at"));
-				return { outcome: "committed", transactionId: row.transaction_id, idempotencyToken: token };
+				return {
+					outcome: "committed",
+					transactionId: row.transaction_id,
+					idempotencyToken: token,
+					meta: todo("meta of the participant answers"),
+				};
 			}
 			case "CANCELLING": {
 				await Promise.allSettled(
 					participants.map(async (p) => (await this.partition(p.context).txCancel(p.context, todo("CancelRequest of p"))).value),
 				);
 				this.transition(token, () => todo("state = CANCELLED, completed_at"));
-				return { outcome: "cancelled", transactionId: row.transaction_id, idempotencyToken: token, results: todo("results_json") };
+				return {
+					outcome: "cancelled",
+					transactionId: row.transaction_id,
+					idempotencyToken: token,
+					results: todo("results_json"),
+					meta: todo("meta of the participant answers"),
+				};
 			}
 			case "COMMITTED":
-				return { outcome: "committed", transactionId: row.transaction_id, idempotencyToken: token };
+				return {
+					outcome: "committed",
+					transactionId: row.transaction_id,
+					idempotencyToken: token,
+					meta: todo("meta of the participant answers"),
+				};
 			case "CANCELLED":
-				return { outcome: "cancelled", transactionId: row.transaction_id, idempotencyToken: token, results: todo("results_json") };
+				return {
+					outcome: "cancelled",
+					transactionId: row.transaction_id,
+					idempotencyToken: token,
+					results: todo("results_json"),
+					meta: todo("meta of the participant answers"),
+				};
 		}
 	}
 }

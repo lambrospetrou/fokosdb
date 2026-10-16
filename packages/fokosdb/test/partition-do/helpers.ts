@@ -11,52 +11,47 @@ export { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { createTableConfig, type FokosTableIdentity, type FokosTableOptions } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
-import type { PartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
+import type { ItemRpcPartitions, LeafMetrics, PartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
-import type { OperationMetrics, PartitionInfo } from "../../src/shared/types.js";
-import type { FokosEnvelope, FokosPublicRouting } from "../../src/sharding/runtime-types.js";
-import { leafPartitionInfo, partitionInfoOf } from "../../src/client/partition-info.js";
+import type { QueryItemsResult, SinglePartitionMeta } from "../../src/shared/types.js";
+import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
+import { answerMeta } from "../../src/shared/partition-meta.js";
 
 export const kb = (s?: string) => KeyCodec.encodeOptional(s);
 
 // ─── opening the envelope ─────────────────────────────────────────────────────
 
-type PublicMeta = OperationMetrics & PartitionInfo;
-
 /**
- * A partition response as a test reads it: the value with the routing of its envelope folded into
- * `meta`, and each leaf of `partitionMetas` paired with the route list, as `db.ts` builds the public
- * meta. A response with no `meta` is the value itself.
+ * A partition response as a test reads it: the entries of an item or a query response folded into
+ * `meta`, with the names from the routing of the envelope, as `db.ts` builds the public meta. A
+ * transaction response keeps its wire list, and any other response is the value itself.
  */
-export type Opened<R> = R extends { partitionMetas: unknown[] }
-	? Omit<R, "partitionMetas"> & { meta: PublicMeta; partitionMetas: PublicMeta[] }
-	: R extends { meta: OperationMetrics }
-		? Omit<R, "meta"> & { meta: PublicMeta }
+export type Opened<R> = R extends { partitions: LeafMetrics[]; nextCursor: unknown }
+	? Omit<R, "partitions"> & { meta: QueryItemsResult["meta"] }
+	: R extends { partitions: ItemRpcPartitions }
+		? Omit<R, "partitions"> & { meta: SinglePartitionMeta }
 		: R;
 
 export function opened<R>(envelope: FokosEnvelope<R>): Opened<R> {
 	const { value, routing } = envelope;
-	const pub: FokosPublicRouting = { servedBy: routing.servedBy, forwardCount: routing.forwardCount };
-	if (typeof value !== "object" || value === null) {
+	if (typeof value !== "object" || value === null || !("partitions" in value)) {
 		return value as Opened<R>;
 	}
-	if ("partitionMetas" in value && Array.isArray(value.partitionMetas)) {
-		const leaves = value.partitionMetas as Array<OperationMetrics & { partitionId: string }>;
-		const metrics = leaves.reduce(
-			(sum, leaf) => ({ rowsRead: sum.rowsRead + leaf.rowsRead, rowsWritten: sum.rowsWritten + leaf.rowsWritten, databaseSize: 0 }),
-			{ rowsRead: 0, rowsWritten: 0, databaseSize: 0 },
-		);
-		return {
-			...value,
-			meta: { ...metrics, ...partitionInfoOf(pub) },
-			partitionMetas: leaves.flatMap((leaf) => leafPartitionInfo(leaf, pub) ?? []),
-		} as Opened<R>;
+	const { partitions, ...rest } = value as {
+		partitions: Array<LeafMetrics | ItemRpcPartitions[number]>;
+		nextCursor?: unknown;
+		rowsReturned?: number;
+	};
+	// An item or a query entry has counts. A transaction entry has none.
+	if (partitions[0]?.rowsRead === undefined) {
+		return value as Opened<R>;
 	}
-	if ("meta" in value) {
-		return { ...value, meta: { ...(value.meta as OperationMetrics), ...partitionInfoOf(pub) } } as Opened<R>;
+	const meta = answerMeta(partitions, routing);
+	if ("nextCursor" in rest) {
+		return { ...rest, meta: { ...meta, rowsReturned: rest.rowsReturned } } as Opened<R>;
 	}
-	return value as Opened<R>;
+	return { ...rest, meta } as Opened<R>;
 }
 
 /** The node of the partition that executed the request, which an item RPC has exactly one of. */

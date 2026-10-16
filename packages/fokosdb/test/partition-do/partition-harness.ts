@@ -36,7 +36,7 @@ import {
 } from "./helpers.js";
 
 type PartitionWriter = {
-	apiPutItem(ctx: FokosDBRouteContext, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
+	apiPutItem(ctx: FokosDBRouteContext, req: PutItemRpcRequest): Promise<{ meta: { partitions: [{ databaseSize: number }] } }>;
 	status(ctx: FokosDBRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
 };
 
@@ -241,7 +241,7 @@ export class TestPartition {
 				items.push(item);
 				// The split queues inside the write that carries the stored size past the cap, so only
 				// that write needs the status read below.
-				if (res.meta.databaseSize <= capBytes) {
+				if (res.meta.partitions[0].databaseSize <= capBytes) {
 					continue;
 				}
 			} catch (e) {
@@ -358,8 +358,8 @@ export class TestPartition {
 		const keys = this.fillerHashKeys();
 		for (let i = 0; i < MAX_FILLER_WRITES; i++) {
 			const r = await this.put({ hashKey: kb(keys.next().value!), sortKey: kb("sk"), data: chunk, kind: "text" });
-			if (r.meta.databaseSize > target) {
-				return r.meta.databaseSize;
+			if (r.meta.partitions[0].databaseSize > target) {
+				return r.meta.partitions[0].databaseSize;
 			}
 		}
 		throw new Error(`${this.doName}: database never passed ${target} bytes`);

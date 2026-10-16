@@ -89,7 +89,7 @@ describe.concurrent("PartitionDO — routing on errors", () => {
 		const rangeRoot = await hash.awaitPromoted("alice");
 		const children = await rangeRoot.splitRange("sk");
 		const keys = { hashKey: kb("alice"), sortKey: kb("sk0000") };
-		const { servedByActorName } = (await rangeRoot.get(keys)).meta;
+		const { servedByActorName } = (await rangeRoot.get(keys)).meta.partitions[0];
 		const leaf = children.find((c) => c.doName === servedByActorName)!;
 		// A first read settles what the hash partition learns about the range tree, so both calls below take one route.
 		await hash.get(keys);

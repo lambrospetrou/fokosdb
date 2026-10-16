@@ -1,3 +1,4 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB, isFokosDBError } from "./db.js";
 import { FokosStd } from "./fokos-std.js";
@@ -48,20 +49,31 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const get = await db.getItem({ hashKey: "alice", sortKey: "sk1" });
 				const missing = await db.getItem({ hashKey: "alice", sortKey: "nope" });
 				const query = await db.queryItems({ queries: [{ hashKey: "alice" }] });
+				const write = await db.transactWriteItems({ items: [{ operation: "put", hashKey: "alice", sortKey: "sk2", data: "y" }] });
+				const read = await db.transactGetItems({ items: [{ hashKey: "alice", sortKey: "sk1" }] });
 				const del = await db.deleteItem({ hashKey: "alice", sortKey: "sk1" });
 
-				for (const meta of [put.meta, get.meta, missing.meta, del.meta, ...query.partitionMetas]) {
-					expect(meta).not.toHaveProperty("_rangeAncestors");
+				// The table has one root partition, which runs every request.
+				const root = put.meta.partitions[0];
+				invariant(root.servedByActorName, "a single-partition result names its partition");
+				expect(root.servedByActorId).toBe(env[ns].idFromName(root.servedByActorName).toString());
+				for (const meta of [put.meta, get.meta, missing.meta, query.meta, write.meta, read.meta, del.meta]) {
 					expect(meta).not.toHaveProperty("servedBy");
-					expect(meta.servedByActorName).toBeTypeOf("string");
-					expect(meta.servedByPartitionId).toBeTypeOf("string");
+					expect(meta).not.toHaveProperty("coordinator");
+					expect(meta.forwardCount).toBe(0);
+					expect(meta.partitions).toHaveLength(1);
+					for (const entry of meta.partitions) {
+						expect(entry).not.toHaveProperty("_rangeAncestors");
+						expect(entry).not.toHaveProperty("actorId");
+						expect(entry).toMatchObject({ servedByActorId: root.servedByActorId, servedByActorName: root.servedByActorName, hashDepth: 0 });
+						// A hash partition has no range depth.
+						expect(entry).not.toHaveProperty("rangeDepth");
+					}
 				}
-				expect(query.partitionMetas).not.toHaveLength(0);
-				// A leaf forwards nothing, so only the page meta counts the forwards.
-				for (const meta of query.partitionMetas) {
-					expect(meta).not.toHaveProperty("forwardCount");
-				}
-				expect(query.meta.forwardCount).toBeTypeOf("number");
+				expect(read.items[0].partitionIndex).toBe(0);
+				// A transaction entry carries no counts.
+				expect(write.meta.partitions[0]).not.toHaveProperty("rowsRead");
+				expect(query.meta.partitions[0].itemCount).toBe(query.items.length);
 			});
 		});
 
@@ -845,7 +857,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				// The mapping builds a new error object, so the routing must move with it. The public
 				// boundary then turns it into the meta a result would carry, and drops the routing itself.
 				invariant(isFokosDBError(raised), "getItem must raise a FokosDBError");
-				expect(raised.meta).toMatchObject({ servedByActorName: "leaf", forwardCount: 1, hashDepth: 1 });
+				// Partition ID "01" names a range partition, so the entry has both depths.
+				expect(raised.meta).toEqual({
+					forwardCount: 1,
+					partitions: [{ servedByActorId: "actor", servedByActorName: "leaf", hashDepth: 1, rangeDepth: 0 }],
+				});
 				expect(raised).not.toHaveProperty("routing");
 			} finally {
 				spy.mockRestore();
@@ -861,7 +877,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				value: {
 					found: true,
 					item: { data: "{not json", kind: "json", version: 1 },
-					meta: { rowsRead: 1, rowsWritten: 0, databaseSize: 1 },
+					partitions: [{ actorId: "actor", hashDepth: 1, rowsRead: 1, rowsWritten: 0, databaseSize: 1 }],
 				},
 				routing: { servedBy: [{ ...leaf, _rangeAncestors: [] }], forwardCount: 1, servedByTruncated: false },
 			};
@@ -875,7 +891,55 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				);
 				invariant(isFokosDBError(raised), "getItem must raise a FokosDBError");
 				expect(raised.code).toBe("item_data_parse_failed");
-				expect(raised.meta).toMatchObject({ servedByActorName: "leaf", servedByPartitionId: "01", forwardCount: 1, hashDepth: 1 });
+				expect(raised.meta).toEqual({
+					forwardCount: 1,
+					partitions: [{ servedByActorId: "actor", servedByActorName: "leaf", hashDepth: 1, rowsRead: 1, rowsWritten: 0, databaseSize: 1 }],
+				});
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		it("gives an error of a later sub-query the entries of the sub-queries that answered, and the raiser", async () => {
+			const db = makeDB();
+			const put = await db.putItem({ hashKey: "alice", sortKey: "a1", data: "x" });
+			const raiser = {
+				ref: { partitionId: "00000001", doName: "raiser" },
+				actorId: "raiser-actor",
+				hashDepth: 1,
+				rangeDepth: 0,
+				role: "executed" as const,
+			};
+			const failure = attachRouting(new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, { message: "migrating" }), {
+				servedBy: [raiser],
+				forwardCount: 3,
+				servedByTruncated: false,
+			});
+			// The first sub-query runs the real method. The second one fails.
+			const original = Reflect.get(PartitionDO.prototype, "apiQueryItems") as PartitionDO["apiQueryItems"];
+			const spy = vi
+				.spyOn(PartitionDO.prototype, "apiQueryItems")
+				.mockImplementationOnce(function (this: PartitionDO, ...args) {
+					return original.apply(this, args);
+				})
+				.mockRejectedValueOnce(failure);
+			try {
+				const raised = await db.queryItems({ queries: [{ hashKey: "alice" }, { hashKey: "bob" }] }).then(
+					() => {
+						throw new Error("queryItems resolved; the second sub-query must fail");
+					},
+					(e: unknown) => e,
+				);
+				invariant(isFokosDBError(raised), "queryItems must raise a FokosDBError");
+				const { servedByActorId, servedByActorName } = put.meta.partitions[0];
+				expect(raised.meta).toEqual({
+					forwardCount: 3,
+					partitions: [
+						expect.objectContaining({ servedByActorId, servedByActorName, hashDepth: 0, itemCount: 1 }),
+						{ servedByActorId: "raiser-actor", servedByActorName: "raiser", hashDepth: 1 },
+					],
+				});
+				expect(raised).not.toHaveProperty("routing");
 			} finally {
 				spy.mockRestore();
 			}
@@ -950,7 +1014,8 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			expect(res.scannedCount).toBe(5);
 			expect(res.cursor).toBeUndefined();
 			// One leaf scan per sub-query (both route to the same single root DO, listed once per RPC).
-			expect(res.partitionMetas).toHaveLength(2);
+			expect(res.meta.partitions).toHaveLength(2);
+			expect(res.meta.partitions.map((p) => p.itemCount)).toEqual([3, 2]);
 			expect(res.meta.rowsReturned).toBe(5);
 		});
 
@@ -1219,7 +1284,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			expect(res.scannedCount).toBe(10);
 			expect(res.cursor).toBeUndefined();
 			// The empty interval makes no RPC.
-			expect(res.partitionMetas).toHaveLength(4);
+			expect(res.meta.partitions).toHaveLength(4);
 		});
 
 		it("the first-item exception applies once per page across sub-queries", async () => {

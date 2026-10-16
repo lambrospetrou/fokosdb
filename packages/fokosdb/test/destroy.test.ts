@@ -31,7 +31,7 @@ describe("FokosDB.destroy()", () => {
 			for (let attempt = 0; attempt < 20; attempt++) {
 				try {
 					const { meta } = await db.putItem({ hashKey: hk, data: ITEM_DATA });
-					doNamesSet.add(meta.servedByActorName);
+					doNamesSet.add(meta.partitions[0].servedByActorName!);
 					break;
 				} catch (e: unknown) {
 					expect(["partition_migrating", "partition_over_size"]).toContain((e as { code?: string }).code);

@@ -133,7 +133,7 @@ class Churn {
 			}
 			this.#puts++;
 			await this.#trim();
-			if (result.meta.databaseSize > RANGE_CAP_BYTES) {
+			if (result.meta.partitions[0].databaseSize > RANGE_CAP_BYTES) {
 				return "queued";
 			}
 		}
@@ -213,12 +213,12 @@ const readsThroughToSource = (names: readonly string[]) => new Set(names).size <
 
 /**
  * A text that changes with every split of the hot key. A response names only the leaves that fit in
- * its route data, so the names alone can miss a split late in the walk. `partitionsVisited` counts
- * every leaf that answered, so a split changes it immediately.
+ * its route data, so the names alone can miss a split late in the walk. `meta.partitions` has an
+ * entry for every leaf that answered, so a split changes its length immediately.
  */
 async function topologyOf(fixture: Fixture): Promise<string> {
 	const page = await untilAvailable(() => fixture.db.queryItems({ queries: [{ hashKey: HOT_HASH_KEY }], select: "count", limit: 100_000 }));
-	return `${page.meta.partitionsVisited}:${page.partitionMetas.map((meta) => meta.servedByActorName).join()}`;
+	return `${page.meta.partitions.length}:${page.meta.partitions.map((meta) => meta.servedByActorName ?? meta.servedByActorId).join()}`;
 }
 
 /** Polls the topology of the hot key until it is not `before`, or until the last attempt. */
@@ -266,7 +266,7 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 				fixture.db.queryItems({ queries: [{ hashKey: HOT_HASH_KEY }], select: "count", limit: 100_000, cursor }),
 			);
 			count += page.count;
-			readThrough ||= readsThroughToSource(page.partitionMetas.map((meta) => meta.servedByActorName));
+			readThrough ||= readsThroughToSource(page.meta.partitions.flatMap((meta) => meta.servedByActorName ?? []));
 			cursor = page.cursor;
 		} while (cursor !== undefined);
 		return { count, readThrough };

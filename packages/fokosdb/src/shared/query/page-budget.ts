@@ -43,12 +43,12 @@ export class QueryPageBudget implements QueryPageBudgetState {
 		evaluatedBytes: number;
 		responseBytes: number;
 		items: readonly unknown[];
-		partitionMetas: readonly unknown[];
+		partitions: readonly unknown[];
 	}): void {
 		this.remainingEvaluatedItems -= res.scannedCount;
 		this.remainingEvaluatedBytes -= res.evaluatedBytes;
 		this.remainingResponseBytes -= res.responseBytes;
-		this.remainingPartitionVisits -= res.partitionMetas.length;
+		this.remainingPartitionVisits -= res.partitions.length;
 		if (res.items.length > 0) {
 			this.allowOversizedFirstItem = false;
 		}

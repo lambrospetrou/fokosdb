@@ -139,7 +139,7 @@ describe("PartitionDO — the operations of one item reach one owner", () => {
 		expect(await locksOf(partition, request.transactionId)).toEqual([{ key: "carol/x", opList: [[1, "put"]], hasData: true }]);
 
 		const commit = { transactionId: request.transactionId, transactionTimestamp: request.transactionTimestamp, items: keysOf(request) };
-		expect(await partition.rpc.txCommit(partition.ctx, commit)).toEqual({ outcome: "committed" });
+		expect(await partition.rpc.txCommit(partition.ctx, commit)).toMatchObject({ outcome: "committed" });
 		expect(await dataOf(partition, "bob", "x")).toEqual({ n: 2 });
 		expect(await dataOf(partition, "bob", "y")).toBe(2);
 		expect(await dataOf(partition, "carol", "x")).toEqual({ c: 1 });
@@ -171,7 +171,7 @@ describe("PartitionDO — a lock row of an item with more than one operation mov
 		);
 
 		const commit = { transactionId: request.transactionId, transactionTimestamp: request.transactionTimestamp, items: keysOf(request) };
-		expect(await partition.rpc.txCommit(partition.ctx, commit)).toEqual({ outcome: "committed" });
+		expect(await partition.rpc.txCommit(partition.ctx, commit)).toMatchObject({ outcome: "committed" });
 		expect(await dataOf(partition, "alice", "locked")).toEqual({ n: 2 });
 		expect(await dataOf(partition, "bob", "sk1")).toBe("b");
 	}, 30_000);
@@ -214,7 +214,7 @@ describe("PartitionDO — a lock row of an item with more than one operation mov
 		]);
 
 		const commit = { transactionId: request.transactionId, transactionTimestamp: request.transactionTimestamp, items: keysOf(request) };
-		expect(await partition.rpc.txCommit(partition.ctx, commit)).toEqual({ outcome: "committed" });
+		expect(await partition.rpc.txCommit(partition.ctx, commit)).toMatchObject({ outcome: "committed" });
 		expect(await dataOf(partition, left, "s")).toEqual({ n: 2 });
 		expect(await dataOf(partition, right, "s")).toEqual({ r: 1, n: 1 });
 	}, 30_000);

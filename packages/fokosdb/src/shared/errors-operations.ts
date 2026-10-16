@@ -31,7 +31,7 @@ import {
 import { FOKOS_SHARDING_CODE_TABLES, type FokosShardingError } from "../sharding/errors.js";
 import type { ExpressionError } from "./expression/errors.js";
 import type { ConditionFailedReason, TransactWriteOperationResult } from "./transaction-api-types.js";
-import type { OperationMetrics, PartitionInfo } from "./types.js";
+import type { AnsweredPartitionMeta, FokosMeta } from "./types.js";
 
 export const CONDITION_CHECK_CODES = defineCodes("FokosConditionCheckError", "caller", 409, {
 	condition_failed: "usbs9w",
@@ -49,12 +49,12 @@ export class FokosConditionCheckError<C extends string = string> extends FokosEr
 	 * the caller asked for one and the item exists.
 	 */
 	readonly reason: ConditionFailedReason;
-	/** The metrics and the partition info of the request that evaluated the condition. */
-	readonly meta: OperationMetrics & PartitionInfo;
+	/** The partition that evaluated the condition, with its counts. */
+	readonly meta: FokosMeta<AnsweredPartitionMeta>;
 
 	constructor(
 		code: FokosCodeDef<"FokosConditionCheckError", C>,
-		options: FokosErrorOptions & { reason: ConditionFailedReason; meta: OperationMetrics & PartitionInfo },
+		options: FokosErrorOptions & { reason: ConditionFailedReason; meta: FokosMeta<AnsweredPartitionMeta> },
 	) {
 		super(code, options);
 		this.reason = options.reason;
@@ -76,10 +76,12 @@ export class FokosTransactionCancelledError<C extends string = string> extends F
 	 * operation: a premise that did not hold, or the error of the partition that owns it.
 	 */
 	readonly results: TransactWriteOperationResult[];
+	/** The partitions that the operations of `results` name by `partitionIndex`. */
+	readonly meta: FokosMeta;
 
 	constructor(
 		code: FokosCodeDef<"FokosTransactionCancelledError", C>,
-		options: FokosErrorOptions & { results: TransactWriteOperationResult[] },
+		options: FokosErrorOptions & { results: TransactWriteOperationResult[]; meta: FokosMeta },
 	) {
 		// The first rejected entry of each origin, in request order. A caller entry wins, so the loop stops at the first one.
 		let caller: FokosCodeDef | undefined;
@@ -103,6 +105,7 @@ export class FokosTransactionCancelledError<C extends string = string> extends F
 		const decisive = caller ?? internal ?? service;
 		super(code, { origin: decisive?.origin, httpStatusHint: decisive?.httpStatusHint, ...options });
 		this.results = options.results;
+		this.meta = options.meta;
 	}
 }
 

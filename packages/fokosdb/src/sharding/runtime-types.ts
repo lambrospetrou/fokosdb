@@ -181,6 +181,12 @@ export type FokosOperationBase<Req, Res> = {
 	 * derived route context and the request. A host overrides it only when the remote method has another name.
 	 */
 	forward?(stub: DurableObjectStub, target: FokosRouteContext<unknown>, req: Req): Promise<FokosEnvelope<Res>>;
+	/**
+	 * Writes `hashDepth` on the range entries of an answer that this hash partition got from a range
+	 * partition, or from its source on a read-through. The runtime calls it under the same condition as
+	 * the hash-depth stamp of the route nodes, and only on a result. The runtime does not read `res`.
+	 */
+	stampHashDepth?(res: Res, hashDepth: number): Res;
 };
 
 /** One remote or local part of a `group` operation, as `merge` receives it. */

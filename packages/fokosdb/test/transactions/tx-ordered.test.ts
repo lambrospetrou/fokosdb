@@ -18,6 +18,7 @@ import {
 	keysInOnePartition,
 	makeDB,
 	txCalls,
+	writeOutcome,
 } from "./tx-helpers.js";
 
 const TTL_AT = Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
@@ -113,16 +114,18 @@ describe("transactWriteItems - executionMode", () => {
 		const keys = keysInOnePartition(db, 2, `mode-replay-${crypto.randomUUID()}`);
 		const items = [put(keys[0], "a"), put(keys[1], "b")];
 		const token = `mode-replay-${crypto.randomUUID()}`;
-		const first = await db.transactWriteItems({ items, clientRequestToken: token, ...ORDERED });
-		expect(await db.transactWriteItems({ items, clientRequestToken: token, ...ORDERED })).toEqual(first);
+		const first = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token, ...ORDERED }));
+		expect(await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token, ...ORDERED }))).toEqual(first);
 		await expect(db.transactWriteItems({ items, clientRequestToken: token })).rejects.toThrow(
 			fokosErrorWith("idempotent_parameter_mismatch"),
 		);
 
 		// An absent mode is "standard".
 		const standardToken = `mode-standard-${crypto.randomUUID()}`;
-		const standard = await db.transactWriteItems({ items, clientRequestToken: standardToken });
-		expect(await db.transactWriteItems({ items, clientRequestToken: standardToken, executionMode: "standard" })).toEqual(standard);
+		const standard = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: standardToken }));
+		expect(await writeOutcome(db.transactWriteItems({ items, clientRequestToken: standardToken, executionMode: "standard" }))).toEqual(
+			standard,
+		);
 	});
 });
 

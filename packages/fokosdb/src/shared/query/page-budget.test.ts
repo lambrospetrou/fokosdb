@@ -16,14 +16,14 @@ const res = (
 		evaluatedBytes?: number;
 		responseBytes?: number;
 		items?: readonly unknown[];
-		partitionMetas?: readonly unknown[];
+		partitions?: readonly unknown[];
 	} = {},
 ) => ({
 	scannedCount: 0,
 	evaluatedBytes: 0,
 	responseBytes: 0,
 	items: [],
-	partitionMetas: [{}],
+	partitions: [{}],
 	...overrides,
 });
 
@@ -41,7 +41,7 @@ describe("QueryPageBudget", () => {
 			res({ scannedCount: 10 }),
 			res({ evaluatedBytes: 1_000 }),
 			res({ responseBytes: 1_000 }),
-			res({ partitionMetas: [{}, {}, {}, {}, {}] }),
+			res({ partitions: [{}, {}, {}, {}, {}] }),
 		]) {
 			const budget = makeBudget();
 			budget.consume(r);
@@ -52,7 +52,7 @@ describe("QueryPageBudget", () => {
 	// A caller can overshoot a counter when a response lands past the remaining budget. A negative
 	// counter is more exhausted than a zero one, and must never read as "keep going".
 	it("stays exhausted when a counter overshoots past zero", () => {
-		for (const r of [res({ scannedCount: 11 }), res({ evaluatedBytes: 1_001 }), res({ partitionMetas: [{}, {}, {}, {}, {}, {}] })]) {
+		for (const r of [res({ scannedCount: 11 }), res({ evaluatedBytes: 1_001 }), res({ partitions: [{}, {}, {}, {}, {}, {}] })]) {
 			const budget = makeBudget();
 			budget.consume(r);
 			expect(budget.exhausted).toBe(true);

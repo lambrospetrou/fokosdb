@@ -3,7 +3,7 @@
  * `meta`. Only the paths that touch the sharding surface are written.
  */
 import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
-import type { OperationMetrics, PartitionInfo } from "../../src/shared/types.js";
+import type { OperationMetrics } from "../../src/shared/types.js";
 import { FokosRouter, FokosShardingClient, todo } from "./api.js";
 import type { FokosPublicRoute, FokosPublicRouting, FokosRangeConfig, FokosTopology, KeyBytes } from "./api.js";
 import type { CoordinatorRpc, InitiateWriteReq } from "./fokosdb-coordinator-host.js";
@@ -21,7 +21,14 @@ export type FokosDBOptions = {
 };
 
 /** What `meta` becomes: the operation metrics plus the public routing of the envelope. */
-export type PublicMeta = OperationMetrics & PartitionInfo;
+export type PublicMeta = OperationMetrics & {
+	servedByActorId: string;
+	servedByActorName: string;
+	servedByPartitionId: string;
+	hashDepth: number;
+	rangeDepth: number;
+	forwardCount: number;
+};
 
 export class FokosDB {
 	readonly partitions: FokosRouter<FokosDBPolicy>;
@@ -79,7 +86,7 @@ export class FokosDB {
 		const ctx = this.partitions.rootContext(req.hashKey);
 		const { value, routing } = this.partitions.unwrap(await this.partitionStub(ctx).apiQueryItems(ctx, req));
 		const byPartition = new Map(routing.servedBy.map((node) => [node.ref.partitionId, node]));
-		const partitionMetas = value.partitionMetas.flatMap((leaf: LeafMetrics) => {
+		const partitionMetas = value.partitions.flatMap((leaf: LeafMetrics) => {
 			const node = byPartition.get(leaf.partitionId);
 			return node ? [FokosDB.meta(leaf, node, 0)] : [];
 		});

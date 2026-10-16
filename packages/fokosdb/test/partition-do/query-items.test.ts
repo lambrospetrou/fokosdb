@@ -135,7 +135,7 @@ describe("PartitionDO — range split", () => {
 				expect(result.rowsReturned).toBe(11);
 				expect(result.nextCursor?.inclusive).toBe(true);
 				expect(KeyCodec.decode(result.nextCursor!.sk)).toBe("010");
-				expect(result.meta.rowsRead).toBeGreaterThan(0);
+				expect(result.meta.partitions[0].rowsRead).toBeGreaterThan(0);
 			});
 		});
 
@@ -271,8 +271,8 @@ describe("PartitionDO — range split", () => {
 
 				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 10 })));
 
-				expect(result.meta.rowsRead).toBeGreaterThan(0);
-				expect(result.partitionMetas[0].rowsRead).toBe(result.meta.rowsRead);
+				expect(result.meta.partitions).toHaveLength(1);
+				expect(result.meta.partitions[0].rowsRead).toBeGreaterThan(0);
 			});
 		});
 
@@ -491,8 +491,8 @@ describe("PartitionDO — range split", () => {
 				for (const it of res.items) {
 					out.push(KeyCodec.decode((it as StoredItem).sk));
 				}
-				for (const m of res.partitionMetas) {
-					leaves.add(m.servedByActorName);
+				for (const m of res.meta.partitions) {
+					leaves.add(m.servedByActorId);
 				}
 				if (res.nextCursor === null) {
 					break;
@@ -513,11 +513,57 @@ describe("PartitionDO — range split", () => {
 
 			// The fan-out actually touched every leaf — before the fix it routed by the sentinel sort key
 			// to the single leftmost leaf and silently dropped the rest.
-			const leaves = new Set(res.partitionMetas.map((m) => m.servedByActorName));
+			const leaves = new Set(res.meta.partitions.map((m) => m.servedByActorName));
 			expect(leaves.size).toBe(N);
-			// partitionMetas is leaf-only: N leaves, the router contributes no entry but is counted in forwardCount.
-			expect(res.partitionMetas).toHaveLength(N);
+			// meta.partitions is leaf-only: N leaves, the router contributes no entry but is counted in forwardCount.
+			expect(res.meta.partitions).toHaveLength(N);
 			expect(res.meta.forwardCount).toBe(N);
+		});
+
+		// A range name and a range partition ID hold the sort-key bounds, so with long bounds the route list
+		// of the page is over its byte cap and drops nodes. Each leaf writes its own entry into the answer,
+		// so the cap drops no entry: only a name can be absent.
+		it("lists each leaf of the page in meta.partitions when the route list is over its byte cap", async () => {
+			const N = 4;
+			const { root, hashPartition } = await makeRangeRoot(N);
+			const pad = "x".repeat(400);
+			const sks = await root.triggerRangeSplit((i) => `${pad}${String(i).padStart(4, "0")}`);
+			await root.awaitSplitCompleted();
+
+			const envelope = await hashPartition.stub.apiQueryItems(hashPartition.ctx, fullRequest());
+			const res = opened(envelope);
+			expect(res.nextCursor).toBeNull();
+			expect(res.items).toHaveLength(sks.length);
+			expect(envelope.routing.servedByTruncated).toBe(true);
+
+			expect(res.meta.partitions).toHaveLength(N);
+			expect(new Set(res.meta.partitions.map((p) => p.servedByActorId)).size).toBe(N);
+			expect(res.meta.partitions.reduce((sum, p) => sum + p.itemCount, 0)).toBe(res.items.length);
+			// Each leaf holds a part of the rows after the split.
+			expect(res.meta.partitions.every((p) => p.itemCount > 0)).toBe(true);
+
+			const nodes = new Map(envelope.routing.servedBy.map((node) => [node.actorId, node]));
+			const unnamed = res.meta.partitions.filter((p) => p.servedByActorName === undefined);
+			expect(unnamed.length).toBeGreaterThan(0);
+			for (const p of res.meta.partitions) {
+				expect(p.servedByActorId).toMatch(/^[0-9a-f]{64}$/);
+				// The hash partition at depth 0 forwarded the request into the range tree, and the leaves are
+				// at range depth 1.
+				expect(p).toMatchObject({ hashDepth: 0, rangeDepth: 1 });
+				const node = nodes.get(p.servedByActorId);
+				expect(p.servedByActorName).toBe(node?.ref.doName);
+				if (node) {
+					expect([p.hashDepth, p.rangeDepth]).toEqual([node.hashDepth, node.rangeDepth]);
+				}
+			}
+
+			// A request that goes straight to the range tree passes no hash partition, so no entry has a hash depth.
+			const direct = opened(await root.stub.apiQueryItems(root.ctx, fullRequest()));
+			expect(direct.meta.partitions).toHaveLength(N);
+			for (const p of direct.meta.partitions) {
+				expect(p).not.toHaveProperty("hashDepth");
+				expect(p.rangeDepth).toBe(1);
+			}
 		});
 
 		it("paginates across leaves under a tight byte budget without dropping or duplicating items", async () => {
@@ -657,7 +703,7 @@ describe("PartitionDO — range split", () => {
 				interval: { upper: { value: upper, inclusive: false } },
 				remainingPartitionVisits: 2,
 			});
-			expect(res.partitionMetas).toHaveLength(2);
+			expect(res.meta.partitions).toHaveLength(2);
 			const expected = [...sks].sort().filter((sk) => KeyCodec.compare(KeyCodec.encode(sk), upper) < 0);
 			expect(expected.length).toBeGreaterThan(0);
 			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(expected);
@@ -718,7 +764,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(
 				leaf0.items.map((it) => KeyCodec.decode((it as StoredItem).sk)),
 			);
-			expect(res.partitionMetas).toHaveLength(2);
+			expect(res.meta.partitions).toHaveLength(2);
 			expect(res.rowsReturned).toBe(leaf0.rowsReturned + 1);
 			expect(res.nextCursor?.inclusive).toBe(true);
 			expect(KeyCodec.compare(res.nextCursor!.sk, (leaf1.items[0] as StoredItem).sk)).toBe(0);
@@ -780,7 +826,7 @@ describe("PartitionDO — range split", () => {
 			const p = await queryPage(root, { select: "count", remainingPartitionVisits: 1 });
 			expect(p.count).toBe(0);
 			expect(p.items).toHaveLength(0);
-			expect(p.partitionMetas).toHaveLength(1);
+			expect(p.meta.partitions).toHaveLength(1);
 			expect(p.nextCursor).not.toBeNull();
 
 			const { count } = await collect(root, { select: "count", remainingPartitionVisits: 1 });
@@ -810,7 +856,7 @@ describe("PartitionDO — range split", () => {
 			expect(r.nextCursor).toBeNull();
 			expect(r.lastEvaluatedCursor).not.toBeNull();
 			expect(KeyCodec.compare(r.lastEvaluatedCursor!.sk, g1Sks[g1Sks.length - 1])).toBe(0);
-			expect(r.partitionMetas).toHaveLength(2);
+			expect(r.meta.partitions).toHaveLength(2);
 			expect(r.items.length).toBe(g1Sks.length);
 			expect(r.count).toBe(g1Sks.length);
 			expect(r.scannedCount).toBe(g1Sks.length);
@@ -837,8 +883,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.count).toBe(owned.length);
 				// One RPC to the source, which executed the scan; the child is listed as the owner it read through for.
 				expect(res.meta.forwardCount).toBe(1);
-				expect(res.meta.servedByActorName).toBe(root.doName);
-				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
+				expect(res.meta.partitions[0].servedByActorName).toBe(root.doName);
 				expect(envelope.routing.servedBy.map((n) => [n.ref.doName, n.role])).toEqual([
 					[child.doName, "read_through"],
 					[root.doName, "executed"],
@@ -868,7 +913,7 @@ describe("PartitionDO — range split", () => {
 				expect(Object.hasOwn(row, "0")).toBe(true);
 			}
 			// The fan-out touched every leaf.
-			expect(new Set(res.partitionMetas.map((m) => m.servedByActorName)).size).toBe(N);
+			expect(new Set(res.meta.partitions.map((m) => m.servedByActorName)).size).toBe(N);
 		});
 
 		it("a filter marks only matched rows across every leaf", async () => {
@@ -885,7 +930,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.scannedCount).toBe(sks.length);
 			expect(res.nextCursor).toBeNull();
 			// The fan-out still touched every leaf: the filter rejects rows, not partitions.
-			expect(res.partitionMetas).toHaveLength(N);
+			expect(res.meta.partitions).toHaveLength(N);
 		});
 
 		it("a migrating range child answers a projected query from its parent", { concurrent: false }, async () => {
@@ -908,7 +953,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(owned);
 				expect(res.count).toBe(owned.length);
 				expect(res.meta.forwardCount).toBe(1);
-				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
+				expect(res.meta.partitions[0].servedByActorName).toBe(root.doName);
 			});
 
 			// Drain pending child migrations so their background work does not outlive the test.
@@ -941,7 +986,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.count).toBe(expected.length);
 				expect(res.scannedCount).toBe(owned.length);
 				expect(res.meta.forwardCount).toBe(1);
-				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
+				expect(res.meta.partitions[0].servedByActorName).toBe(root.doName);
 			});
 
 			// Drain pending child migrations so their background work does not outlive the test.
@@ -954,9 +999,9 @@ describe("PartitionDO — range split", () => {
 			const res = await queryPage(root);
 			// Every leaf drains its interval, so its one extra read returns no row.
 			expect(res.rowsReturned).toBe(sks.length);
-			expect(res.partitionMetas.reduce((s, m) => s + m.rowsRead, 0)).toBeGreaterThanOrEqual(sks.length);
+			expect(res.meta.partitions.reduce((s, m) => s + m.rowsRead, 0)).toBeGreaterThanOrEqual(sks.length);
 			// The router itself reads no rows, so it is not a leaf of the page.
-			expect(res.partitionMetas.map((m) => m.servedByActorName)).not.toContain(root.doName);
+			expect(res.meta.partitions.map((m) => m.servedByActorName)).not.toContain(root.doName);
 		});
 	});
 
@@ -1038,7 +1083,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.count).toBe(expected);
 			expect(res.items).toHaveLength(0);
 			expect(res.meta.forwardCount).toBe(1);
-			expect(res.partitionMetas).toHaveLength(1);
+			expect(res.meta.partitions).toHaveLength(1);
 		});
 
 		it("a filter that matches nothing still reports the forwarded leaf's evaluated count", async () => {
@@ -1053,7 +1098,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.items).toHaveLength(0);
 			expect(res.scannedCount).toBe(expected);
 			expect(res.meta.forwardCount).toBe(1);
-			expect(res.partitionMetas).toHaveLength(1);
+			expect(res.meta.partitions).toHaveLength(1);
 		});
 
 		it("projection mode returns the forwarded leaf's projected rows", async () => {
@@ -1066,7 +1111,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.count).toBe(expected);
 			expect(res.items).toEqual(Array.from({ length: expected }, () => ["sk", 1]));
 			expect(res.meta.forwardCount).toBe(1);
-			expect(res.partitionMetas).toHaveLength(1);
+			expect(res.meta.partitions).toHaveLength(1);
 		});
 	});
 
@@ -1091,7 +1136,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(expected);
 			expect(res.count).toBe(expected.length);
 			expect(res.scannedCount).toBe(writes.length);
-			expect(res.partitionMetas[0].servedByActorName).toBe(rangeRoot.doName);
+			expect(res.meta.partitions[0].servedByActorName).toBe(rangeRoot.doName);
 		});
 
 		it("serves a projected page from the range root", async () => {
@@ -1103,7 +1148,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(expected);
 			expect(res.count).toBe(writes.length);
 			expect(res.meta.forwardCount).toBeGreaterThanOrEqual(1);
-			expect(res.partitionMetas[0].servedByActorName).toBe(rangeRoot.doName);
+			expect(res.meta.partitions[0].servedByActorName).toBe(rangeRoot.doName);
 		});
 	});
 });

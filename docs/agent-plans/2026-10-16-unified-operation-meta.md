@@ -102,15 +102,13 @@ The methods return partition information in five different ways:
 
 1. Every result and every error of every `FokosDB` method has one field, `meta`, of one base type, `FokosMeta`.
 2. `meta.partitions` lists each partition that ran the request, one entry for each partition.
-3. An item or a result entry that belongs to one partition points into `meta.partitions` by index. It does not
-   repeat the partition information.
+3. A `transactGetItems` item and a rejected `transactWriteItems` operation point into `meta.partitions` by index.
+   They do not repeat the partition information.
 4. `meta.partitions` of `queryItems` has one entry for each leaf that the page visited. No entry is dropped.
 5. `transactWriteItems`, `transactGetItems` and `FokosTransactionCancelledError` return `meta`, on the fast path and
    on the two-phase path.
-6. A replay of a `transactWriteItems` token returns the same `meta.partitions` and `meta.forwardCount` as the first
-   answer.
-7. The `meta` of the coordinator path of `transactWriteItems` names the transaction coordinator that answered, in
-   `meta.coordinator`.
+6. The `meta` of the coordinator path of `transactWriteItems` names the transaction coordinator that answered, in
+   `meta.txCoordinator`.
 
 ### 2.2 Requirements
 
@@ -125,16 +123,17 @@ The methods return partition information in five different ways:
 - `meta` is absent only when nothing answered: a validation error before any I/O, or a failure of the RPC from the
   Worker to the first partition.
 - The routing envelope does not change. Route learning must not change.
-- A coordinator change must not add a SQLite row. A stored value goes into a column of a row that the coordinator
-  already writes. DO storage bills each row written.
+- The coordinator stores no `meta`. It adds no column and no row. DO storage bills each row written.
 
 ### 2.3 Out of scope
 
 - The item shape difference between `getItem` and `transactGetItems`, and the key source difference between the
   methods. They are not about `meta`.
 - The two meanings of `idempotencyToken` when the caller sends no token. It is not about `meta`.
-- A link from each operation of a committed `transactWriteItems` to its partition. No caller needs it now. A
-  cancelled transaction has this link in its results (section 4.2.7).
+- A link from each passed operation of `transactWriteItems` to its partition. No caller needs it now. A rejected
+  operation has this link (section 4.2.7).
+- The same `meta` on a replay of a `transactWriteItems` token. `meta` lists the partitions that ran the request that
+  answers, and a replay that only reads the stored outcome runs none (section 4.2.7).
 - The counts of the transaction operations. A transaction entry has no counts now (section 4.2.6). A follow-up
   decides, for all methods together, which rows each operation counts. For example: does a prepare count the lock
   rows that it writes in `pending_transactions`, or only the rows of `items`?
@@ -155,8 +154,8 @@ Each result and each error has `meta`. `meta` has two parts:
   partition, its counts, and its name when the client knows it.
 
 A method that uses one partition returns a list of one entry. A method that uses many partitions returns one entry
-for each. An item or a result entry that belongs to one partition carries `partitionIndex`, the index of its
-partition in `meta.partitions`. For `queryItems`, each entry carries `itemCount` in place of an index on each item.
+for each. A `transactGetItems` item and a rejected `transactWriteItems` operation carry `partitionIndex`, the index
+of their partition in `meta.partitions`. For `queryItems`, each entry carries `itemCount` in place of an index on each item.
 
 Each partition writes its own entry into the `value` of its answer. A router that merges the answers of other
 partitions joins their lists. The 10 KB cap applies only to `routing`, so it cannot drop an entry. The client gets the
@@ -203,7 +202,7 @@ type FokosMeta<P extends PartitionMeta = PartitionMeta> = {
 	forwardCount: number;
 	partitions: P[];
 	/** The transaction coordinator that answered. Present only on the coordinator path of `transactWriteItems`. */
-	coordinator?: PartitionMeta;
+	txCoordinator?: PartitionMeta;
 };
 
 /** An entry with every count, for a result where every partition answered. */
@@ -351,20 +350,25 @@ Size: an entry is about 150 bytes of JSON. A page has at most 100 entries, so th
 #### 4.2.6 A transaction answer of a partition
 
 Each answer of `txPrepare`, `txCommit`, `txCancel`, `txReadForTransaction`, `txReadSnapshot` and
-`txExecuteSingleShot` carries two more fields:
+`txExecuteSingleShot` carries one more field:
 
 ```ts
-{
-	partitions: WirePartitionMeta[];
-	/** Positional to the items of the sub-request: the index of the owner of each item in `partitions`. */
-	partitionIndexes: number[];
-}
+{ partitions: WirePartitionMeta[] }
 ```
 
-- A local handler returns a list of one entry, itself, and an index of `0` for each item.
-- A `merge` joins the lists of its parts. It adds the length of the list before it to each index of a part.
-- `mergePrepare` keeps the `partitions` and `partitionIndexes` of every part, also when it returns `accepted`.
-- The merges of `txCommit` and `txCancel` return the joined lists with their fixed outcome.
+- A local handler returns a list of one entry, itself.
+- A `merge` appends the lists of its parts, in part order.
+
+An index goes on the object that it names, not in a list that is parallel to the request. A merge does not keep the
+order of the items, but each object keeps its own index, so a merge only adds the length of the lists before the part:
+
+- A rejected result of a `txPrepare` answer has `partitionIndex`, the index of the partition that rejected it in the
+  `partitions` of the answer. A local handler gives `0`. `mergePrepare` adds the offset of the part. A passed or a
+  `not_evaluated` result has no index.
+- An item of a `txReadForTransaction` answer has `partitionIndex`, the index of the partition that read it. A local
+  handler gives `0`. The merge adds the offset of the part.
+- `txReadSnapshot` and `txExecuteSingleShot` are `single_owner` operations, so their answers have one entry, and they
+  carry no index.
 
 A transaction entry has no counts. The participant methods in `TransactionParticipant`
 (`src/shared/partition/transaction-participant.ts`) do not count rows today, and this change does not add a count. A
@@ -384,99 +388,59 @@ The cancelled error:
 ```ts
 FokosTransactionCancelledError {
 	results: Array<
-		| { outcome: "passed"; partitionIndex: number }
-		| { outcome: "not_evaluated"; partitionIndex?: number }
-		| { outcome: "rejected"; reason: RejectionReason; partitionIndex: number; itemOmitted?: "response_too_large" }
+		| { outcome: "passed" }
+		| { outcome: "not_evaluated" }
+		| { outcome: "rejected"; reason: RejectionReason; partitionIndex?: number; itemOmitted?: "response_too_large" }
 	>;
 	meta: FokosMeta;
 }
 ```
 
-`RejectionReason` does not change. It has no partition fields. A `not_evaluated` entry has no `partitionIndex` when
-no partition judged the operation.
+`RejectionReason` does not change. It has no partition fields. A rejected entry has no `partitionIndex` when the
+request that answers did not get the answer that rejected it: a replay, a participant that did not answer, or a
+rejection that another drive of the same transaction stored.
 
-**The fast path.** `#writeSingleShotFastPath` reads `partitions` and `partitionIndexes` from the `txExecuteSingleShot`
-answer. When the partition raises an error, the error has no answer list. The client then builds one entry from the
-raiser node of the error routing, with no counts, and gives each operation `partitionIndex: 0`.
+**The fast path.** `#writeSingleShotFastPath` reads `partitions` from the `txExecuteSingleShot` answer, and gives each
+rejected operation `partitionIndex: 0`. When the partition raises an error, the error has no answer list. The client
+then builds one entry from the raiser node of the error routing, with no counts, and gives each operation
+`partitionIndex: 0`.
 
-**The coordinator path.**
+**The coordinator path.** The coordinator stores no `meta`. It joins the answers that the participant RPCs of the
+current request get, in memory:
 
-1. Each participant answer carries its lists (section 4.2.6). One participant can be many leaf partitions.
-2. The coordinator stores the lists of each participant in a new column of `tc_participants`. It writes the column in
-   the same statement that writes `prepare_outcome`, `commit_outcome` or `cancel_outcome`. Thus it adds no row.
-3. For each participant and phase, the coordinator keeps the first answer that it stores. A later answer of the same
-   phase, from a retry or from the `tx_recovery` job, does not change the stored lists.
-4. The coordinator joins the stored lists of all participants into one list. It sums the counts of the phases of one
-   partition into one entry, by `actorId`.
-5. The coordinator stores the joined `meta` in `tc_state`, in the statement that writes the terminal state.
-   `loadFinalResponse` returns it. A replay and the `tx_recovery` job return the same stored value.
-6. The coordinator split copies the new columns with the rows.
-7. The project is pre-release, so the `CREATE TABLE` statements change in place.
+1. Each prepare, commit and cancel answer adds its entries to the join, with the name from the routing of the answer.
+   The join sums the counts of one partition, by `actorId`. `forwardCount` is the sum of the forward counts of the
+   answers.
+2. A rejected result of a prepare answer gets the index of its entry in the join, by `opIndex`. Only the answer that
+   the coordinator stores gives indexes, because the stored answers give the results of the cancel.
+3. The answer of the request returns the join as `meta`, with the outcome that `loadFinalResponse` reads.
 
-**A participant that did not answer.** It has no answer list, so the coordinator builds its entry from the stored
-participant row:
+A participant that did not answer gets no entry. Its operations have the reason `prepare_unanswered` and no
+`partitionIndex`.
 
-- `servedByActorId`: `idFromName(partition_do_name)` in the partition namespace of the stored route context.
-- `servedByActorName`: `partition_do_name`.
-- `hashDepth`: from the stored route context, and no `rangeDepth`. The coordinator sends each participant to a hash
-  root (`resolve` and `resolveAll` in `src/sharding/client.ts` return `rootContext`), so the depth is known.
-- No counts.
-
-Each operation of that participant gets `outcome: "rejected"`, the reason `prepare_unanswered`, and the index of this
-entry. In the example below, the transaction has two operations. Root `~h.3` did not answer. Root `~h.5` forwarded its
-operation to its child `~h.5.1`, which accepted it:
-
-```ts
-results: [
-	{ outcome: "rejected", reason: { code: "prepare_unanswered", hashKey: "a", error_id: "e_…" }, partitionIndex: 0 },
-	{ outcome: "passed", partitionIndex: 1 },
-],
-meta: {
-	forwardCount: 1,
-	coordinator: { servedByActorId: "<64 hex>", servedByActorName: "fokos.tc.t~h.4", hashDepth: 0 },
-	partitions: [
-		{ servedByActorId: "<64 hex>", servedByActorName: "fokos.p.t~h.3", hashDepth: 0 },
-		{ servedByActorId: "<64 hex>", servedByActorName: "fokos.p.t~h.5.1", hashDepth: 1 },
-	],
-}
-```
-
-The entry names the partition that the coordinator sent the request to. That partition can be a router above the
-owner of the operation. The owner is not known, because no answer came back.
+A replay that finds a terminal transaction sends no participant RPC, so its `meta.partitions` is `[]` and its
+`meta.forwardCount` is `0`. Its rejected results have no `partitionIndex`. A replay that drives a transaction further,
+for example the commits that a `transaction_commit_pending` left, lists the partitions of the RPCs that it sends.
 
 **The coordinator entry.** The transaction coordinator is a sharded Durable Object: its shard group
 `fokos.tc.<tableName>` has `coordinatorRootsN` roots that split by hash. Thus its entry has the shape of a hash
 partition entry, with no counts.
 
-- The client builds `meta.coordinator` from the routing of its own RPC to the coordinator. `build` always keeps the
+- The client builds `meta.txCoordinator` from the routing of its own RPC to the coordinator. `build` always keeps the
   node that ran the request or raised the error, so the entry always has `servedByActorName`.
-- `meta.coordinator` names the coordinator that answered this request. A replay after a coordinator split can reach a
-  child of the first coordinator. Then `meta.coordinator` changes, and `meta.partitions` and `meta.forwardCount` are
-  the stored values.
-- The fast path has no coordinator, so its `meta` has no `coordinator`.
+- The fast path has no coordinator, so its `meta` has no `txCoordinator`.
 
-| Case | `meta.coordinator` | `meta.partitions` |
+| Case | `meta.txCoordinator` | `meta.partitions` |
 | --- | --- | --- |
-| Committed, on the coordinator path | present | the stored participant lists |
-| `FokosTransactionCancelledError`, on the coordinator path | present | the stored participant lists |
-| `transaction_commit_pending` | present | the participant lists that the coordinator stored so far |
-| Another coordinator error, for example `partition_migrating` | present | the stored lists, or `[]` if none |
+| Committed, on the coordinator path | present | the participant answers of this request |
+| `FokosTransactionCancelledError`, on the coordinator path | present | the participant answers of this request |
+| `transaction_commit_pending` | present | the participant answers of this request |
+| Another coordinator error, for example `partition_migrating` | present | `[]` |
 | The fast path, and every other method | absent | section 4.2.2 and section 4.2.3 |
 
-A coordinator error carries the stored lists as its own field over the wire, as `FokosConditionCheckError` carries
-`reason` and `meta`. `FokosTransactionPendingError` (`src/shared/errors.ts`) gets a `meta` field for this. The client
-adds `meta.coordinator` from the routing of the error.
-
-**`forwardCount`.** On the fast path, it is the `forwardCount` of the routing of the answer. On the coordinator path,
-it is the sum of the forward counts of the stored participant answers. The client adds nothing to it, so a replay
-returns the same value. The forwards of the RPC from the client to the coordinator are not part of it.
-
-**The name.** The client fills `servedByActorName` from the routing of the answer, by `actorId`. The coordinator fills
-it from the routing of each participant answer that it receives, and from `partition_do_name` for a participant that
-did not answer. The coordinator stores every name that it knows, with no cap. 100 range names can be about 600 KB.
-This fits in one SQLite value: SQLite in a Durable Object limits a string, a BLOB and a table row to 2 MB
-([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). A later cap changes
-only the coordinator: a name over the cap stays absent, and the type already allows that.
+A coordinator error carries the entries of the participant answers as its own `meta` over the wire, as
+`FokosConditionCheckError` carries `reason` and `meta`. The client adds `meta.txCoordinator` from the routing of the
+error. The forwards of the RPC from the client to the coordinator are not part of `forwardCount`.
 
 #### 4.2.8 `transactGetItems`
 
@@ -486,11 +450,13 @@ only the coordinator: a name over the cap stays absent, and the type already all
 
 A found item uses the `ReadItem` envelope, not a flat record, so a `partitionIndex` field on each item is safe.
 
-**The fast path.** `#readSnapshotFastPath` reads the lists from the `txReadSnapshot` answer.
+**The fast path.** `#readSnapshotFastPath` reads the list of one entry from the `txReadSnapshot` answer, and gives each
+item `partitionIndex: 0`.
 
-**The two-phase path.** `#readTransaction` sends one `txReadForTransaction` for each group in each phase. Each answer
-carries its lists. The client joins the lists of all groups. It sums the counts of the two phases of one partition
-into one entry, by `actorId`. Each item gets the index of its owner in the joined list.
+**The two-phase path.** `#readTransaction` sends one `txReadForTransaction` for each group in each phase. The client
+joins the lists of all answers of both phases. It sums the counts of the two phases of one partition into one entry,
+by `actorId`. Each phase 1 item changes its index from the list of its answer to the joined list. The returned items
+are the phase 1 items, so the index names the partition that gave the phase 1 answer.
 
 #### 4.2.9 Size
 
@@ -539,19 +505,17 @@ Example:
   the leaves visited. It checks that `sum(itemCount)` is equal to `items.length`, and that an entry with no name in
   the routing has no `servedByActorName`.
 - A `transactWriteItems` test with a participant that fans out to two owners checks two entries and the index of each
-  operation.
-- A replay test checks that a replay returns the same `meta` as the first answer.
+  rejected operation.
+- A replay test checks that a replay of a terminal transaction returns `meta.partitions` `[]` and no `partitionIndex`.
 - A test with a promoted key checks that each range entry has the `hashDepth` of the hash partition that forwarded
   into the range tree, and that it is equal to the `hashDepth` of the route node of the same partition.
-- A test sends a commit again after its answer is lost. It checks that a replay returns the `meta` that the
-  coordinator stored.
 - A `transactGetItems` test that gets `pending_write` or `read_conflict` checks that the error has the entries of the
   partitions that answered.
 - A `queryItems` test with a failed second sub-query checks that the error has the entries of the first sub-query
   and the raiser entry.
-- A cancelled-transaction test checks the `partitionIndex` of each entry on both paths.
-- A coordinator-path test checks that `meta.coordinator` names the coordinator, on a commit, on a cancel and on
-  `transaction_commit_pending`. A fast-path test checks that `meta.coordinator` is absent.
+- A cancelled-transaction test checks the `partitionIndex` of each rejected entry on both paths.
+- A coordinator-path test checks that `meta.txCoordinator` names the coordinator, on a commit, on a cancel and on
+  `transaction_commit_pending`. A fast-path test checks that `meta.txCoordinator` is absent.
 - A test checks that no field holds `""` or `0` to mean "unknown".
 
 ## 5. Alternative Options
@@ -585,14 +549,22 @@ The runtime adds a second list to the envelope, with no cap and no names, and th
 no `stampHashDepth` hook. Rejected: it changes the routing envelope, and section 2.2 requires that the envelope stays
 the same.
 
-### 5.6 Keep the counts of every answer of a retried phase
+### 5.6 Store the `meta` of a transaction, so a replay returns the same `meta`
 
-The coordinator sums the counts of each answer of a phase, also from a retry. Rejected: the counts of the stored
-answers are the counts that a replay returns, so one rule gives one value. In both rules, the counts are the work
-that the coordinator saw: when the answer of a commit is lost, the retry gives the idempotent success with
-`rowsWritten: 0`.
+The coordinator stores the lists of each participant answer in new columns of `tc_participants`, and the joined
+`meta` in `tc_state` with the terminal state. Rejected: the first answer of a phase can come from another drive, a
+commit can finish in the `tx_recovery` job, and two drives can send the operations in a different order. Thus each
+stored list needs the `opIndex` of each operation, a fixed join order, and a rule for which answer of a phase stays.
+That is a large part of the coordinator for a value that is for debugging only.
 
-### 5.7 Find the partition of each leaf in the routing
+### 5.7 A `partitionIndex` on each operation of `transactWriteItems`
+
+Each answer carries `partitionIndexes`, a list that is parallel to the items of its request. Rejected: a merge does
+not keep the order of the items, so each merge, the coordinator and the client must find each item by its key to
+build the parent list. A passed operation has no object of its own in the answers of `txCommit` and `txCancel`, so
+the list is the only place for its index.
+
+### 5.8 Find the partition of each leaf in the routing
 
 The current design. Rejected: the 10 KB cap can drop the node, and the client then cannot name the leaf.
 

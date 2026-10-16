@@ -58,7 +58,7 @@ function expectCursorHasSomewhereToGo(
 	}
 	const lastChildOfTheWalk = queries[0].scanIndexForward === false ? fixture.leaves[0] : fixture.leaves[fixture.leaves.length - 1];
 	expect(
-		page.partitionMetas.map((meta) => meta.servedByActorName),
+		page.meta.partitions.flatMap((meta) => meta.servedByActorName ?? []),
 		"a cursor was emitted at the last child of the walk, with the whole answer already returned",
 	).not.toContain(lastChildOfTheWalk);
 }

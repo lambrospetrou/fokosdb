@@ -108,7 +108,7 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 				transactionTimestamp,
 				items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
 			}),
-		).resolves.toEqual({ outcome: "committed" });
+		).resolves.toMatchObject({ outcome: "committed" });
 		expect(await rangeRoot.get({ hashKey: kb("alice"), sortKey: kb("sk1") })).toMatchObject({
 			found: true,
 			item: { data: "from-the-lock" },
@@ -202,7 +202,9 @@ describe.concurrent("PartitionDO — a hash split after a promotion", () => {
 		const aliceRead = await aliceChildren[0].get({ hashKey: kb("alice"), sortKey: kb("sk1") });
 		expect(aliceRead.found, "the hash child must forward a read of alice to the range tree").toBe(true);
 		expect(aliceRead.meta.forwardCount).toBeGreaterThanOrEqual(1);
-		expect(aliceRead.meta.servedByActorName, "the range root must answer the read of alice, not the hash child").toBe(rangeRoot.doName);
+		expect(aliceRead.meta.partitions[0].servedByActorName, "the range root must answer the read of alice, not the hash child").toBe(
+			rangeRoot.doName,
+		);
 
 		// The hash partition forwards a read of a split key to the child that owns it.
 		const trigResult = await partition.get(splitItems[0]);
@@ -292,7 +294,7 @@ describe.concurrent("PartitionDO — a range root before its first page", () => 
 		const bobOwner = await partition.childOwning("bob");
 		await bobOwner.awaitPromoted("bob");
 		const warm = await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") });
-		expect(warm.meta.servedByActorName).toBe(bobOwner.rangeRoot("bob").doName);
+		expect(warm.meta.partitions[0].servedByActorName).toBe(bobOwner.rangeRoot("bob").doName);
 
 		// A hash key that the child of bob owns, and that no promotion moved. The filters of the root and
 		// of the child both report it as promoted. Each sender sends the key to its range root, the range
@@ -321,7 +323,7 @@ describe.concurrent("PartitionDO — a range root before its first page", () => 
 
 			// The source runs the write.
 			const put = await partition.put({ hashKey: kb(key), sortKey: kb("sk2"), data: "v2", kind: "text" });
-			expect(put.meta.servedByActorName).toBe(owner.doName);
+			expect(put.meta.partitions[0].servedByActorName).toBe(owner.doName);
 			expect(await owner.localItemCount(key)).toBe(2);
 		} finally {
 			await keyRangeRoot.testReleaseInit();
@@ -669,11 +671,11 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 		const rangeRoot = partition.rangeRoot(hashKey);
 
 		const put = await partition.put({ hashKey: kb(hashKey), sortKey: kb("sk1"), data: "v", kind: "text" });
-		expect(put.meta.servedByActorName).toBe(partition.doName);
+		expect(put.meta.partitions[0].servedByActorName).toBe(partition.doName);
 		expect(await partition.get({ hashKey: kb(hashKey), sortKey: kb("sk1") })).toMatchObject({
 			found: true,
 			item: { data: "v" },
-			meta: { servedByActorName: partition.doName },
+			meta: { partitions: [{ servedByActorName: partition.doName }] },
 		});
 
 		const key = { hashKey: kb(hashKey), sortKey: kb("sk2") };

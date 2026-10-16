@@ -5,7 +5,7 @@ import { FokosError } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
-import { keysInOnePartition, makeDB, partitionRouter, type Key } from "./tx-helpers.js";
+import { keysInOnePartition, makeDB, partitionEntryOf, partitionRouter, type Key } from "./tx-helpers.js";
 
 /**
  * A transaction raises the same exception, category, and code for one failure on the single-partition
@@ -92,6 +92,8 @@ describe.each(PATHS)("transactGetItems on %s", (_path, pathOptions) => {
 		try {
 			const err = await errorOf(() => db.transactGetItems({ items: keys }));
 			expect([err._tag, err.code, err.origin, err.httpStatusHint]).toEqual(["FokosConflictError", "pending_write", "caller", 409]);
+			// One partition owns both keys, so the error names its one answer.
+			expect(err).toMatchObject({ meta: { forwardCount: 0, partitions: [partitionEntryOf(db, keys[0])] } });
 		} finally {
 			await release();
 		}

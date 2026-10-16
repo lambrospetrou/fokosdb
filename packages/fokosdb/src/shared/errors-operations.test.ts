@@ -16,6 +16,7 @@ function cancelled(results: TransactWriteOperationResult[], options: { origin?: 
 	return new FokosTransactionCancelledError(TRANSACTION_CANCELLED_CODES.transaction_cancelled, {
 		message: "transaction cancelled",
 		results,
+		meta: { forwardCount: 0, partitions: [{ servedByActorId: "actor" }] },
 		...options,
 	});
 }
@@ -47,7 +48,7 @@ describe("the categories of errors-operations", () => {
 	const condition = new FokosConditionCheckError(CONDITION_CHECK_CODES.condition_failed, {
 		message: "condition failed",
 		reason: { code: "condition_failed", hashKey: "hk" },
-		meta: { rowsRead: 1, rowsWritten: 0, servedByActorId: "a", servedByActorName: "n", forwardCount: 0 } as never,
+		meta: { forwardCount: 0, partitions: [{ servedByActorId: "a", servedByActorName: "n", rowsRead: 1, rowsWritten: 0, databaseSize: 1 }] },
 	});
 	const transaction = cancelled([conditionFailed]);
 
@@ -65,7 +66,7 @@ describe("the categories of errors-operations", () => {
 	it("carry their fields as own data properties", () => {
 		for (const [e, fields] of [
 			[condition, ["reason", "meta"]],
-			[transaction, ["results"]],
+			[transaction, ["results", "meta"]],
 		] as const) {
 			for (const field of fields) {
 				expect(Object.hasOwn(e, field), field).toBe(true);
@@ -109,6 +110,6 @@ describe("FokosTransactionCancelledError", () => {
 		if (!FokosTransactionCancelledError.is(back)) {
 			throw new Error("unreachable");
 		}
-		expect([back.error_id, back.results]).toEqual([e.error_id, e.results]);
+		expect([back.error_id, back.results, back.meta]).toEqual([e.error_id, e.results, e.meta]);
 	});
 });

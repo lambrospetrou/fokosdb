@@ -123,7 +123,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 				transactionTimestamp: prepare.transactionTimestamp,
 				items: [{ hashKey: kb("bob"), sortKey: kb("sk") }],
 			}),
-		).resolves.toEqual({ outcome: "committed" });
+		).resolves.toMatchObject({ outcome: "committed" });
 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
 		expect(await rpc.apiGetItem(ctx, { hashKey: kb("bob"), sortKey: kb("sk") })).toMatchObject({
@@ -143,7 +143,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		// The retry of a commit whose owned part is already applied. The copies are not local work.
 		await expect(
 			rpc.txCommit(ctx, { transactionId, transactionTimestamp: Date.now(), items: [{ hashKey: kb("bob"), sortKey: kb("sk") }] }),
-		).resolves.toEqual({ outcome: "committed" });
+		).resolves.toMatchObject({ outcome: "committed" });
 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
 		// The payload of the copy belongs to the target, which applies it. A read of the key goes
@@ -184,7 +184,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 			cutOverPromotion(state, "alice");
 		});
 
-		await expect(rpc.txCancel(ctx, { transactionId, items: [] })).resolves.toEqual({ outcome: "cancelled" });
+		await expect(rpc.txCancel(ctx, { transactionId, items: [] })).resolves.toMatchObject({ outcome: "cancelled" });
 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk", "bob/sk"]);
 	});
@@ -198,7 +198,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 			cutOverPromotion(state, "alice");
 		});
 
-		await expect(rpc.txCancel(ctx, { transactionId, items: [{ hashKey: kb("bob"), sortKey: kb("sk") }] })).resolves.toEqual({
+		await expect(rpc.txCancel(ctx, { transactionId, items: [{ hashKey: kb("bob"), sortKey: kb("sk") }] })).resolves.toMatchObject({
 			outcome: "cancelled",
 		});
 
@@ -223,7 +223,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 				transactionTimestamp: prepare.transactionTimestamp,
 				items: keys.map((key) => ({ hashKey: kb(key.hashKey), sortKey: kb(key.sortKey) })),
 			}),
-		).resolves.toEqual({ outcome: "committed" });
+		).resolves.toMatchObject({ outcome: "committed" });
 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
 	});
@@ -455,14 +455,14 @@ describe("PartitionDO — the locks of a key that a real promotion moves", () =>
 			const rangeRoot = await promoteAndHoldAck(partition);
 
 			// The source commits "bob" and sends "alice" to the range root, which commits its imported row.
-			await expect(partition.rpc.txCommit(partition.ctx, commit)).resolves.toEqual({ outcome: "committed" });
+			await expect(partition.rpc.txCommit(partition.ctx, commit)).resolves.toMatchObject({ outcome: "committed" });
 			expect(await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") })).toMatchObject({ found: true, item: { data: "v-sk1" } });
 			expect(await rangeRoot.get({ hashKey: kb("alice"), sortKey: kb("sk1") })).toMatchObject({ found: true, item: { data: "v-sk1" } });
 			expect(await lockKeys(rangeRoot.stub, transactionId)).toEqual([]);
 			// The source keeps the copy until the acknowledgement, and a retry of the commit applies
 			// nothing a second time.
 			expect(await lockKeys(partition.stub, transactionId)).toEqual(["alice/sk1"]);
-			await expect(partition.rpc.txCommit(partition.ctx, commit)).resolves.toEqual({ outcome: "committed" });
+			await expect(partition.rpc.txCommit(partition.ctx, commit)).resolves.toMatchObject({ outcome: "committed" });
 			expect(await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") })).toMatchObject({ item: { version: 1 } });
 
 			await partition.controlled.testRefuseAcks(false);
@@ -569,7 +569,7 @@ describe("PartitionDO — the locks on a hash split router", () => {
 			await firstChild.awaitMigrationCompleted();
 
 			// A cancel with no key releases nothing on the router.
-			await expect(partition.rpc.txCancel(partition.ctx, { transactionId, items: [] })).resolves.toEqual({ outcome: "cancelled" });
+			await expect(partition.rpc.txCancel(partition.ctx, { transactionId, items: [] })).resolves.toMatchObject({ outcome: "cancelled" });
 			expect((await lockKeys(partition.stub, transactionId)).sort()).toEqual(allKeys);
 
 			// The router sends each row to its child and changes no row of its own. The second child

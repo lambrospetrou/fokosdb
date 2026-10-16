@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DataKind, OperationMetrics, type QuerySelect, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
+import type { DataKind, OperationMetrics, QuerySelect, ReturnValuesOnConditionCheckFailure, WirePartitionMeta } from "../shared/types.js";
 import type { ConditionExpression, ProjectionExpression, QueryExpressions } from "../shared/expression/types.js";
 import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import type {
@@ -9,6 +9,7 @@ import type {
 	CommitResponse,
 	DebugForceResolveTransactionRequest,
 	DebugForceResolveTransactionResponse,
+	IndexedReadItemEncoded,
 	ParticipantOperationResultEncoded,
 	PrepareRequest,
 	PrepareResponse,
@@ -21,6 +22,7 @@ import type {
 	SingleShotResponse,
 	TransactionItem,
 	TransactionItemKey,
+	TransactionPartitionsAnswer,
 	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
@@ -113,9 +115,13 @@ import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES } from "../sharding/err
  * This matches the transaction and query RPCs, so every key crossing into a DO has one form.
  *
  * No response carries a key: `db.ts` answers with the caller's own keys, which are the only ones the
- * caller can recognise. No response carries a routing fact either: the envelope around it does.
+ * caller can recognise. No response carries a routing fact either: the envelope around it does. Each
+ * response carries the entry of the partition that ran it, with its counts.
  */
 export type ItemRpcKeys = { hashKey: KeyBytes; sortKey: KeyBytes };
+
+/** The entry of the one partition that ran an item RPC. */
+export type ItemRpcPartitions = [WirePartitionMeta & OperationMetrics];
 
 export type PutItemRpcRequest = ItemRpcKeys & {
 	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
@@ -127,8 +133,8 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 };
 
 export type PutItemRpcResponse =
-	| { outcome: "ok"; version: number; meta: OperationMetrics }
-	| { outcome: "rejected"; reason: RejectionReasonEncoded; meta: OperationMetrics };
+	| { outcome: "ok"; version: number; partitions: ItemRpcPartitions }
+	| { outcome: "rejected"; reason: RejectionReasonEncoded; partitions: ItemRpcPartitions };
 
 export type DeleteItemRpcRequest = ItemRpcKeys & {
 	condition?: ConditionExpression;
@@ -136,8 +142,8 @@ export type DeleteItemRpcRequest = ItemRpcKeys & {
 };
 
 export type DeleteItemRpcResponse =
-	| { outcome: "ok"; deleted: boolean; meta: OperationMetrics }
-	| { outcome: "rejected"; reason: RejectionReasonEncoded; meta: OperationMetrics };
+	| { outcome: "ok"; deleted: boolean; partitions: ItemRpcPartitions }
+	| { outcome: "rejected"; reason: RejectionReasonEncoded; partitions: ItemRpcPartitions };
 
 export type GetItemRpcRequest = ItemRpcKeys & { projection?: readonly ProjectionExpression[] };
 
@@ -148,9 +154,13 @@ export type GetItemRpcRequest = ItemRpcKeys & { projection?: readonly Projection
 // common to both found variants. `kind` is then `"projected"`, which is a read-result tag and never
 // a stored `data_kind`.
 export type GetItemRpcResponse =
-	| { found: true; item: { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number }; meta: OperationMetrics }
-	| { found: true; item: { projected: ProjectedWireRow; kind: "projected"; ttlAt?: number; version: number }; meta: OperationMetrics }
-	| { found: false; meta: OperationMetrics };
+	| { found: true; item: { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number }; partitions: ItemRpcPartitions }
+	| {
+			found: true;
+			item: { projected: ProjectedWireRow; kind: "projected"; ttlAt?: number; version: number };
+			partitions: ItemRpcPartitions;
+	  }
+	| { found: false; partitions: ItemRpcPartitions };
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
@@ -175,8 +185,8 @@ export type QueryItemsRpcRequest = {
 	plan: QueryExpressions | null;
 };
 
-/** The metrics of one leaf scan, named by the leaf. `db.ts` pairs it with the route list of the envelope. */
-export type LeafMetrics = OperationMetrics & { partitionId: string };
+/** The entry of one leaf scan, with its counts. `itemCount` is the number of items of the response that the leaf gave. */
+export type LeafMetrics = WirePartitionMeta & OperationMetrics & { itemCount: number };
 
 export type QueryItemsRpcResponse = {
 	/** One shape per request: complete items, or positional projected rows. The client narrows by the plan it sent. */
@@ -194,8 +204,11 @@ export type QueryItemsRpcResponse = {
 	/** The last candidate that entered the logical page, or null when none did. */
 	lastEvaluatedCursor: ScanCursor | null;
 	nextCursor: ScanCursor | null;
-	/** Leaf-only: hash leaves and non-split range partitions that scanned rows. Routers appear in the envelope only. */
-	partitionMetas: LeafMetrics[];
+	/**
+	 * Leaf-only: hash leaves and non-split range partitions that scanned rows, in visit order. The items of
+	 * a leaf are one contiguous block of `items`. Routers appear in the envelope only.
+	 */
+	partitions: LeafMetrics[];
 };
 
 export type { FokosPartitionRef } from "../sharding/repartition-types.js";
@@ -540,6 +553,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				admissionTag: "write",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req, call) => this.putItemLocal(req, call),
+				stampHashDepth,
 			},
 			apiDeleteItem: {
 				shape: "point",
@@ -547,6 +561,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				admissionTag: "delete",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req) => this.deleteItemLocal(req),
+				stampHashDepth,
 			},
 			apiGetItem: {
 				shape: "point",
@@ -555,6 +570,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				admissionTag: "read",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req) => this.readItemLocally(req),
+				stampHashDepth,
 			},
 			apiQueryItems: {
 				shape: "range",
@@ -565,6 +581,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				clip: (req, visit) => clipQueryToVisit(req, visit),
 				local: (req) => this.queryItemsLocal(req),
 				walk: ({ request, visits, local, forward }) => walkRangeVisits(request, visits, local, forward),
+				stampHashDepth,
 			},
 			txPrepare: {
 				shape: "group",
@@ -575,16 +592,20 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				subRequest: (req, items) => ({ ...req, items: items as TransactionItem[] }),
 				local: (req, call) => {
 					if (req.items.length === 0) {
-						return { outcome: "accepted" };
+						return this.ownAnswer({ outcome: "accepted" });
 					}
 					const response = this.#participant.prepareLocal(req);
 					// The lock is durable, so its recovery deadline must be too, even when the coordinator never returns.
 					if (response.outcome === "accepted") {
 						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.fokosNow() + this.config().staleTransactionMs }] });
+						return this.ownAnswer(response);
 					}
-					return response;
+					// This partition rejected each rejected operation, and it is the first entry of its own list.
+					const results = response.results.map((r) => (r.outcome === "rejected" ? { ...r, partitionIndex: 0 } : r));
+					return this.ownAnswer({ ...response, results });
 				},
 				merge: mergePrepare,
+				stampHashDepth,
 			},
 			// The coordinator has already decided this transaction, and commit cannot grow the partition:
 			// prepare persisted the payload into pending_transactions, so commit moves those bytes into
@@ -599,9 +620,10 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				local: (req, call) => {
 					const { response, promotionCandidates } = this.#participant.commitLocal(req);
 					this.signalGrowth(call, promotionCandidates);
-					return response;
+					return this.ownAnswer(response);
 				},
-				merge: () => ({ outcome: "committed" }),
+				merge: (parts) => ({ outcome: "committed", partitions: parts.flatMap((p) => p.result.partitions) }),
+				stampHashDepth,
 			},
 			// Cancel only DELETEs pending rows, so size backpressure must not wedge it: cancel is the path
 			// that brings an over-size partition back under its cap.
@@ -616,9 +638,10 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				// a router releases nothing and a source keeps the copies of the keys it forwards.
 				local: (req) => {
 					this.#participant.cancelLocal(req.transactionId, req.items);
-					return { outcome: "cancelled" };
+					return this.ownAnswer({ outcome: "cancelled" });
 				},
-				merge: () => ({ outcome: "cancelled" }),
+				merge: (parts) => ({ outcome: "cancelled", partitions: parts.flatMap((p) => p.result.partitions) }),
+				stampHashDepth,
 			},
 			txReadForTransaction: {
 				shape: "group",
@@ -627,8 +650,19 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				failurePolicy: "fail_fast",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 				subRequest: (req, items) => ({ ...req, items: items as TransactionReadItem[] }),
-				local: (req) => this.#participant.readForTransactionLocal(req),
-				merge: (parts) => ({ items: parts.flatMap((p) => p.result.items) }),
+				// This partition read each item, and it is the first entry of its own list.
+				local: (req) =>
+					this.ownAnswer({ items: this.#participant.readForTransactionLocal(req).items.map((item) => ({ ...item, partitionIndex: 0 })) }),
+				merge: (parts) => {
+					const items: IndexedReadItemEncoded[] = [];
+					let offset = 0;
+					for (const { result } of parts) {
+						items.push(...result.items.map((item) => withOffset(item, offset)));
+						offset += result.partitions.length;
+					}
+					return { items, partitions: parts.flatMap((p) => p.result.partitions) };
+				},
+				stampHashDepth,
 			},
 			// A partition DO is single-threaded and reads the whole set with no `await` in between, so the
 			// result already IS a consistent snapshot; the second phase of the coordinator's read exists
@@ -644,10 +678,11 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					// Parity with the two-phase path: an item locked by an in-progress transaction has a write
 					// that may or may not land, so the read cannot claim a committed snapshot.
 					if (items.some((item) => item.hasPendingWrite)) {
-						return { outcome: "aborted", reason: "pending_write" };
+						return this.ownAnswer({ outcome: "aborted", reason: "pending_write" });
 					}
-					return { outcome: "committed", items };
+					return this.ownAnswer({ outcome: "committed", items });
 				},
+				stampHashDepth,
 			},
 			txExecuteSingleShot: {
 				shape: "single_owner",
@@ -661,8 +696,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					if (response.outcome !== "rejected") {
 						this.signalGrowth(call, promotionCandidates);
 					}
-					return response;
+					return this.ownAnswer(response);
 				},
+				stampHashDepth,
 			},
 			// Re-enters `dispatch`, so the commit or cancel of each key applies on its current owner. A
 			// row of a key that moved is a copy: its key sends the outcome to the new owner, and the
@@ -694,7 +730,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 							outcome: req.outcome,
 							...counts,
 						});
-						return { ...response.value, ...counts };
+						return { outcome: response.value.outcome, ...counts };
 					} catch (e) {
 						// The runtime throws `partition_fanout_failed` only after the local part committed,
 						// so the line keeps the local count. With every other code, no row changed here.
@@ -957,7 +993,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			return {
 				outcome: "rejected",
 				reason: conditionFailedReason(decodeItemKeys(hashKey, sortKey), localRes.image?.row),
-				meta: this.metrics(localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes),
+				partitions: this.answered(localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes),
 			};
 		}
 
@@ -968,7 +1004,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return {
 			outcome: "ok",
 			version: writeRes.version,
-			meta: this.metrics(conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
+			partitions: this.answered(conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
 		};
 	}
 
@@ -997,7 +1033,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			return {
 				outcome: "rejected",
 				reason: conditionFailedReason(decodeItemKeys(hashKey, sortKey), localRes.image?.row),
-				meta: this.metrics(localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes),
+				partitions: this.answered(localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes),
 			};
 		}
 
@@ -1005,7 +1041,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return {
 			outcome: "ok",
 			deleted: writeRes.deleted,
-			meta: this.metrics(conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
+			partitions: this.answered(conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
 		};
 	}
 
@@ -1016,9 +1052,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				: this.#store.getItemProjected(req.projection, req.hashKey, req.sortKey);
 		const { rowsRead, rowsWritten } = res;
 		const result = res.row;
-		const meta = this.metrics({ rowsRead, rowsWritten });
+		const partitions = this.answered({ rowsRead, rowsWritten });
 		if (!result) {
-			return { found: false, meta };
+			return { found: false, partitions };
 		}
 		if ("projected" in result) {
 			return {
@@ -1029,7 +1065,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					...(result.ttlAt === undefined ? {} : { ttlAt: result.ttlAt }),
 					version: result.version,
 				},
-				meta,
+				partitions,
 			};
 		}
 		return {
@@ -1041,7 +1077,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				...(result.ttl_epoch_utc_seconds === null ? {} : { ttlAt: result.ttl_epoch_utc_seconds }),
 				version: result.v,
 			},
-			meta,
+			partitions,
 		};
 	}
 
@@ -1079,7 +1115,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		const page = collector.state;
 
 		// A leaf (hash leaf or non-split range partition) is the only kind of DO that scans rows, so it
-		// is the only kind that contributes a `partitionMetas` entry. Routers appear in the envelope only.
+		// is the only kind that contributes a `partitions` entry. Routers appear in the envelope only.
 		return {
 			items: page.items,
 			count: page.count,
@@ -1089,13 +1125,30 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			rowsReturned: page.rowsReturned,
 			lastEvaluatedCursor: page.lastEvaluatedCursor,
 			nextCursor: page.nextCursor,
-			partitionMetas: [{ ...this.metrics({ rowsRead, rowsWritten }), partitionId: this.fokos.identity().ref.partitionId }],
+			partitions: [{ ...this.answered({ rowsRead, rowsWritten })[0], itemCount: page.items.length }],
 		};
 	}
 
-	/** The metrics of work this node did itself. */
-	private metrics(counts: { rowsRead: number; rowsWritten: number }): OperationMetrics {
-		return { rowsRead: counts.rowsRead, rowsWritten: counts.rowsWritten, databaseSize: this.#store.databaseSize };
+	/** The entry of this partition, with the counts of the work it did itself. */
+	private answered(counts: { rowsRead: number; rowsWritten: number }): ItemRpcPartitions {
+		return [
+			{ ...this.selfPartition(), rowsRead: counts.rowsRead, rowsWritten: counts.rowsWritten, databaseSize: this.#store.databaseSize },
+		];
+	}
+
+	/**
+	 * The entry of this partition in the `partitions` of an answer. Each partition writes only the depth
+	 * that it has: a hash partition its hash depth, and a range partition its range depth.
+	 */
+	private selfPartition(): WirePartitionMeta {
+		const identity = this.fokos.identity();
+		const depth = identityDepth(identity);
+		return { actorId: this.ctx.id.toString(), ...(identity.kind === "hash" ? { hashDepth: depth } : { rangeDepth: depth }) };
+	}
+
+	/** The answer of a local transaction handler, which lists this partition only. */
+	private ownAnswer<T>(outcome: T): T & TransactionPartitionsAnswer {
+		return { ...outcome, partitions: [this.selfPartition()] };
 	}
 
 	// ═══ the test view ═══════════════════════════════════════════════════════
@@ -1345,7 +1398,7 @@ async function walkRangeVisits(
 		rowsReturned: 0,
 		lastEvaluatedCursor: null,
 		nextCursor: null,
-		partitionMetas: [],
+		partitions: [],
 	};
 
 	// The visits that can contribute to this page: they intersect the query interval, and they are not
@@ -1377,7 +1430,7 @@ async function walkRangeVisits(
 		if (req.select === "projection") {
 			out.items.push(...part.items);
 		}
-		out.partitionMetas.push(...part.partitionMetas);
+		out.partitions.push(...part.partitions);
 		out.count += part.count;
 		out.scannedCount += part.scannedCount;
 		out.evaluatedBytes += part.evaluatedBytes;
@@ -1414,26 +1467,51 @@ async function walkRangeVisits(
 /**
  * This node answers for every operation it was given, whichever part evaluated it. An execution
  * failure belongs to no operation and outranks every per-operation rejection, so it travels up as it
- * arrived. An accepted part sends no array, so its operations passed.
+ * arrived. An accepted part sends no array, so its operations passed. The answer lists the partitions
+ * of every part, in part order.
  */
 function mergePrepare(parts: Array<FokosGroupPart<PrepareRequest, PrepareResponse>>): PrepareResponse {
+	const partitions = parts.flatMap((p) => p.result.partitions);
 	const executionFailure = parts.find((p) => p.result.outcome === "rejected" && !p.result.results);
 	if (executionFailure) {
-		return executionFailure.result;
+		return { ...executionFailure.result, partitions };
 	}
 	if (!parts.some((p) => p.result.outcome === "rejected")) {
-		return { outcome: "accepted" };
+		return { outcome: "accepted", partitions };
 	}
 	const merged: ParticipantOperationResultEncoded[] = [];
+	let offset = 0;
 	for (const { request, result } of parts) {
 		if (result.outcome === "accepted") {
 			merged.push(...request.items.map((item) => ({ outcome: "passed" as const, opIndex: item.opIndex })));
 		} else {
-			merged.push(...result.results);
+			merged.push(...result.results.map((r) => withOffset(r, offset)));
 		}
+		offset += result.partitions.length;
 	}
 	applyImageCap(merged);
-	return { outcome: "rejected", results: merged };
+	return { outcome: "rejected", results: merged, partitions };
+}
+
+/**
+ * An entry of one part of a merged answer, with its `partitionIndex` moved by `offset`: the length of
+ * the lists of the parts before it.
+ */
+function withOffset<T extends { partitionIndex?: number }>(entry: T, offset: number): T {
+	return entry.partitionIndex === undefined ? entry : { ...entry, partitionIndex: offset + entry.partitionIndex };
+}
+
+/**
+ * Writes `hashDepth` on each range entry of an answer, as the runtime writes it on the range route
+ * nodes. A range entry has a `rangeDepth`. An answer with no `partitions`, for example
+ * `not_applicable`, stays as it is.
+ */
+function stampHashDepth<Res>(res: Res, hashDepth: number): Res {
+	if (typeof res !== "object" || res === null || !("partitions" in res)) {
+		return res;
+	}
+	const partitions = (res as { partitions: WirePartitionMeta[] }).partitions;
+	return { ...res, partitions: partitions.map((p) => (p.rangeDepth === undefined ? p : { ...p, hashDepth })) };
 }
 
 /** The one key of a promotion plan: its single target carries a `promoted_key` slice. */

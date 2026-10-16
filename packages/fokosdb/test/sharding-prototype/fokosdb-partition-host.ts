@@ -19,19 +19,19 @@ import {
 } from "../../src/sharding/sk-interval.js";
 import type {
 	CancelRequest,
-	CancelResponse,
+	CancelOutcome,
 	CommitRequest,
-	CommitResponse,
+	CommitOutcome,
 	DebugForceResolveTransactionRequest,
 	DebugForceResolveTransactionResponse,
 	ParticipantOperationResultEncoded,
-	PrepareResponse,
+	PrepareOutcome,
 	ReadForTransactionRequest,
-	ReadForTransactionResponse,
+	ReadForTransactionOutcome,
 	ReadSnapshotRequest,
-	ReadSnapshotResponse,
+	ReadSnapshotOutcome,
 	SingleShotRequest,
-	SingleShotResponse,
+	SingleShotOutcome,
 	TransactionItem,
 	TransactionItemKey,
 	TransactionTimestamp,
@@ -76,7 +76,7 @@ export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
 // ─── wire types that change ──────────────────────────────────────────────────
 
 /** `meta` keeps the operation metrics only. Routing facts move to the envelope. */
-type WithMetrics<R> = R extends { meta: unknown } ? Omit<R, "meta"> & { meta: OperationMetrics } : R;
+type WithMetrics<R> = R extends { partitions: unknown } ? Omit<R, "partitions"> & { meta: OperationMetrics } : R;
 
 export type PutRes = WithMetrics<PutItemRpcResponse>;
 export type DeleteRes = WithMetrics<DeleteItemRpcResponse>;
@@ -108,7 +108,7 @@ export type QueryRes = {
 	rowsReturned: number;
 	lastEvaluatedCursor: ScanCursor | null;
 	nextCursor: ScanCursor | null;
-	partitionMetas: LeafMetrics[];
+	partitions: LeafMetrics[];
 };
 
 /**
@@ -132,12 +132,12 @@ export type PartitionOps = {
 	apiGetItem: { req: GetItemRpcRequest; res: GetRes };
 	apiDeleteItem: { req: DeleteItemRpcRequest; res: DeleteRes };
 	apiQueryItems: { req: QueryReq; res: QueryRes };
-	txPrepare: { req: PrepareReq; res: PrepareResponse };
-	txCommit: { req: CommitRequest; res: CommitResponse };
-	txCancel: { req: CancelRequest; res: CancelResponse };
-	txReadForTransaction: { req: ReadForTransactionRequest; res: ReadForTransactionResponse };
-	txReadSnapshot: { req: ReadSnapshotRequest; res: ReadSnapshotResponse };
-	txExecuteSingleShot: { req: SingleShotRequest; res: SingleShotResponse };
+	txPrepare: { req: PrepareReq; res: PrepareOutcome };
+	txCommit: { req: CommitRequest; res: CommitOutcome };
+	txCancel: { req: CancelRequest; res: CancelOutcome };
+	txReadForTransaction: { req: ReadForTransactionRequest; res: ReadForTransactionOutcome };
+	txReadSnapshot: { req: ReadSnapshotRequest; res: ReadSnapshotOutcome | { outcome: "not_applicable" } };
+	txExecuteSingleShot: { req: SingleShotRequest; res: SingleShotOutcome | { outcome: "not_applicable" } };
 	debugForceResolveTransaction: { req: DebugForceResolveTransactionRequest; res: DebugForceResolveTransactionResponse };
 	debugForcePromoteKey: { req: { hashKey: KeyBytes }; res: DebugForcePromoteKeyRes };
 };
@@ -395,7 +395,7 @@ function promotedKeyStatusOf(state: Rpc.RepartitionState): PromotedKeyStatus {
 	return state === "queued" ? "queued" : state === "cleaned" ? "promoted" : "promoting";
 }
 
-function mergePrepare(parts: Array<FokosGroupPart<PrepareReq, PrepareResponse>>): PrepareResponse {
+function mergePrepare(parts: Array<FokosGroupPart<PrepareReq, PrepareOutcome>>): PrepareOutcome {
 	const executionFailure = parts.find((p) => p.result.outcome === "rejected" && !p.result.results);
 	if (executionFailure) {
 		return executionFailure.result;
@@ -440,7 +440,7 @@ async function walkRange(
 		rowsReturned: 0,
 		lastEvaluatedCursor: null,
 		nextCursor: null,
-		partitionMetas: [],
+		partitions: [],
 	};
 
 	// The visits are ordered by `descending` already. Drop those that cannot contribute to this page.
@@ -467,7 +467,7 @@ async function walkRange(
 		if (req.select === "projection") {
 			out.items.push(...part.items);
 		}
-		out.partitionMetas.push(...part.partitionMetas);
+		out.partitions.push(...part.partitions);
 		out.count += part.count;
 		out.scannedCount += part.scannedCount;
 		out.evaluatedBytes += part.evaluatedBytes;

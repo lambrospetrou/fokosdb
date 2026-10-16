@@ -34,10 +34,7 @@ describe("fokosdb", async () => {
 				version: 1,
 			},
 			meta: {
-				rowsRead: 1,
-				rowsWritten: 0,
-				databaseSize: expect.any(Number),
-				servedByActorId: expect.any(String),
+				partitions: [{ rowsRead: 1, rowsWritten: 0, databaseSize: expect.any(Number), servedByActorId: expect.any(String) }],
 			},
 		});
 	});

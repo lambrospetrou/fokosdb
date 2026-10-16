@@ -8,12 +8,21 @@ import type { ProjectedWireRow } from "./expression/projection.js";
 import type { KeyBytes } from "../sharding/key-codec.js";
 import type { FokosDBTableConfig } from "./partition-context.js";
 import type { IdempotencyToken, RejectionReasonOf, TransactionId, TransactWriteExecutionMode } from "./transaction-api-types.js";
-import type { ConditionCheckImageEncoded, DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
+import type { ConditionCheckImageEncoded, DataKind, FokosMeta, ReturnValuesOnConditionCheckFailure, WirePartitionMeta } from "./types.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
 // Transaction order timestamp: Date.now() * TX_ORDER_TS_UNITS_PER_MS (see txOrderTimestampNow in shared/transaction-limits.ts).
 export type TransactionTimestamp = number;
+
+/**
+ * The partitions that ran one transaction request, which every answer of a partition carries. A local
+ * handler lists itself only. A merge appends the lists of its parts.
+ */
+export type TransactionPartitionsAnswer = { partitions: WirePartitionMeta[] };
+
+/** The `meta` of the participant answers that one request to the coordinator got. The client adds `txCoordinator`. */
+export type ParticipantsMeta = Omit<FokosMeta, "txCoordinator">;
 
 // ─── PartitionDO — Prepare ────────────────────────────────────────────────────
 
@@ -93,16 +102,22 @@ export type TransactWriteOperationResultEncoded =
 			itemOmitted?: "response_too_large";
 	  };
 
-/** What a participant answers: the same result, labelled with the index the request gave it. */
-export type ParticipantOperationResultEncoded = TransactWriteOperationResultEncoded & { opIndex: number };
+/**
+ * What a participant answers: the same result, labelled with the index the request gave it. In a
+ * `txPrepare` answer, a rejected result has `partitionIndex`, the index of the partition that rejected
+ * it in the `partitions` of the answer.
+ */
+export type ParticipantOperationResultEncoded = TransactWriteOperationResultEncoded & { opIndex: number; partitionIndex?: number };
 
-export type PrepareResponse =
+export type PrepareOutcome =
 	| { outcome: "accepted" }
 	| {
 			outcome: "rejected";
 			/** One result for each operation that the participant answers for. */
 			results: ParticipantOperationResultEncoded[];
 	  };
+
+export type PrepareResponse = PrepareOutcome & TransactionPartitionsAnswer;
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
 
@@ -118,7 +133,9 @@ export type CommitRequest = {
 	items: TransactionItemKey[];
 };
 
-export type CommitResponse = { outcome: "committed" };
+export type CommitOutcome = { outcome: "committed" };
+
+export type CommitResponse = CommitOutcome & TransactionPartitionsAnswer;
 
 // ─── PartitionDO — Cancel ─────────────────────────────────────────────────────
 
@@ -137,14 +154,16 @@ export type CancelRequest = {
 	items: TransactionItemKey[];
 };
 
-export type CancelResponse = { outcome: "cancelled" };
+export type CancelOutcome = { outcome: "cancelled" };
+
+export type CancelResponse = CancelOutcome & TransactionPartitionsAnswer;
 
 export type DebugForceResolveTransactionRequest = {
 	transactionId: TransactionId;
 	outcome: "commit" | "cancel";
 };
 
-export type DebugForceResolveTransactionResponse = (CommitResponse | CancelResponse) & {
+export type DebugForceResolveTransactionResponse = (CommitOutcome | CancelOutcome) & {
 	/** Pending rows of this transaction that this partition owned and resolved in this call. */
 	resolvedLocally: number;
 	/** Keys of this transaction that this partition sent to their current owners. Not the rows those owners resolved. */
@@ -199,9 +218,14 @@ export type ReadForTransactionItemResultEncoded = {
 	| { found: false; maxDeletedV: number }
 );
 
-export type ReadForTransactionResponse = {
+export type ReadForTransactionOutcome = {
 	items: ReadForTransactionItemResultEncoded[];
 };
+
+/** A read item, with the index of the partition that read it in the `partitions` of its answer or in `meta.partitions`. */
+export type IndexedReadItemEncoded = ReadForTransactionItemResultEncoded & { partitionIndex: number };
+
+export type ReadForTransactionResponse = { items: IndexedReadItemEncoded[] } & TransactionPartitionsAnswer;
 
 // ─── PartitionDO — SingleShot (single-partition fast path) ───────────────────
 
@@ -231,7 +255,7 @@ export type SingleShotRequest = {
  * run the coordinator path. It is a value, not an error: on a split table it is the ordinary answer to
  * a set that straddles two children, and every forwarding hop passes it up unchanged.
  */
-export type SingleShotResponse =
+export type SingleShotOutcome =
 	| { outcome: "committed" }
 	| {
 			outcome: "rejected";
@@ -240,8 +264,9 @@ export type SingleShotResponse =
 			 * rejection comes from its check pass, which answers for every operation it looked at.
 			 */
 			results: ParticipantOperationResultEncoded[];
-	  }
-	| { outcome: "not_applicable" };
+	  };
+
+export type SingleShotResponse = (SingleShotOutcome & TransactionPartitionsAnswer) | { outcome: "not_applicable" };
 
 // ─── PartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
 
@@ -264,10 +289,11 @@ export type ReadSnapshotRequest = {
  * `not_applicable` has the meaning it has on `SingleShotResponse`: no single DO owns every key, nothing
  * was read, and the caller runs the two-phase path.
  */
-export type ReadSnapshotResponse =
+export type ReadSnapshotOutcome =
 	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
-	| { outcome: "aborted"; reason: "pending_write" }
-	| { outcome: "not_applicable" };
+	| { outcome: "aborted"; reason: "pending_write" };
+
+export type ReadSnapshotResponse = (ReadSnapshotOutcome & TransactionPartitionsAnswer) | { outcome: "not_applicable" };
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
@@ -332,22 +358,34 @@ export type InitiateWriteRequest = {
 	executionMode?: TransactWriteExecutionMode;
 };
 
+/**
+ * One result of a cancelled transaction. A rejected result has `partitionIndex`, the index of the
+ * partition that rejected it in `meta.partitions`, when the request that answers got that answer.
+ */
+export type CoordinatorOperationResultEncoded = TransactWriteOperationResultEncoded & { partitionIndex?: number };
+
 export type InitiateWriteResponseEncoded =
 	| {
 			outcome: "committed";
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
+			meta: ParticipantsMeta;
 	  }
 	| {
 			outcome: "cancelled";
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
 			/** One result for each operation, in request order. Each rejected entry carries its own reason. */
-			results: TransactWriteOperationResultEncoded[];
+			results: CoordinatorOperationResultEncoded[];
+			meta: ParticipantsMeta;
 	  };
 
 /**
  * On "committed", `items` is positionally matched to the request: `items[i]` answers
  * `request.items[i]`, one entry per requested key.
  */
-export type InitiateReadResponseEncoded = { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] };
+export type InitiateReadResponseEncoded = {
+	outcome: "committed";
+	items: IndexedReadItemEncoded[];
+	meta: FokosMeta;
+};

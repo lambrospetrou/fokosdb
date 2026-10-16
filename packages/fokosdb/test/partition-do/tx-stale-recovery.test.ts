@@ -104,7 +104,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				coordinator: { v: 1, doName: coordinator.doName, idempotencyToken: `token-${transactionId}` },
 				items,
 			}),
-		).toEqual({ outcome: "accepted" });
+		).toMatchObject({ outcome: "accepted" });
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = 0 WHERE transaction_id = ?`, transactionId);
@@ -295,9 +295,9 @@ describe("PartitionDO — stale transaction recovery", () => {
 			coordinator: testCoordinatorRef(`token-${transactionId}`),
 			items: [{ ...key, opIndex: 0, operation: "check" as const, condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }) }],
 		};
-		expect(await rpc.txPrepare(ctx, prepare)).toEqual({ outcome: "accepted" });
-		expect(await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: [key] })).toEqual({ outcome: "committed" });
-		expect(await rpc.txPrepare(ctx, prepare)).toEqual({ outcome: "accepted" });
+		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
+		expect(await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: [key] })).toMatchObject({ outcome: "committed" });
+		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);

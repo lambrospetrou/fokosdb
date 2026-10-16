@@ -409,8 +409,8 @@
 						splitRecordResponse(
 							performance.now() - t0,
 							workerDurMs,
-							body?.meta?.servedByActorName ?? null,
-							body?.meta?.databaseSize ?? null,
+							body?.meta?.partitions?.[0]?.servedByActorName ?? null,
+							body?.meta?.partitions?.[0]?.databaseSize ?? null,
 							body?.meta?.forwardCount ?? null,
 						);
 					} catch (e) {

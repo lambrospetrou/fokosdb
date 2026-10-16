@@ -141,7 +141,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 
 			const point = await child.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
 			expect(point.found, "a promoted key must stay readable through an importing hash child").toBe(true);
-			expect(point.meta.servedByActorName, "the range tree owns the key, not the hash parent").toBe(rangeRoot.doName);
+			expect(point.meta.partitions[0].servedByActorName, "the range tree owns the key, not the hash parent").toBe(rangeRoot.doName);
 
 			const page = opened(
 				await Promise.resolve(
@@ -154,7 +154,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 				),
 			);
 			expect(page.items.length, "a query of a promoted key must reach the range tree too").toBeGreaterThan(0);
-			expect(page.meta.servedByActorName).toBe(rangeRoot.doName);
+			expect(page.meta.partitions[0].servedByActorName).toBe(rangeRoot.doName);
 
 			const sibling = (await partition.children()).find((c) => c.doName !== child.doName);
 			expect(sibling, "a two-way split should have a sibling").toBeDefined();
