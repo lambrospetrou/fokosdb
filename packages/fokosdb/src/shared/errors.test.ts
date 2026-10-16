@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
 	CONFLICT_CODES,
@@ -16,6 +17,7 @@ import {
 	isRuntimeRetryableError,
 	type FokosCodeDef,
 	type FokosErrorOptions,
+	type FokosErrorWire,
 } from "./errors.js";
 import { FOKOS_LIBRARY_CODE_TABLES, isFokosAnyError, type FokosAnyError } from "./errors-operations.js";
 import { FOKOS_SHARDING_CODE_TABLES, SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
@@ -368,20 +370,36 @@ describe("FokosError.toWire and FokosError.fromWire", () => {
 		}
 	});
 
-	it("store the cause as plain data", () => {
-		const inner = Object.assign(new Error("inner"), { status: 7 });
+	it("give back an Error cause as an Error, with its name, message, own fields and cause", () => {
+		const root = new RangeError("root");
+		const inner = Object.assign(new TypeError("inner", { cause: root }), { status: 7, key: new Uint8Array([9]) });
 		const wire = FokosError.toWire(errorOf(SHARDING_INTERNAL_CODES.partition_fanout_failed, { cause: inner }));
-		expect(wire.cause).toEqual({ error: "Error: inner", errorProps: { status: 7 } });
-		expect(FokosError.fromWire(wire).cause).toEqual(wire.cause);
+		expect(wire.cause).toEqual({
+			error: {
+				name: "TypeError",
+				message: "inner",
+				fields: { status: 7, key: null },
+				cause: { error: { name: "RangeError", message: "root", fields: {} } },
+			},
+		});
+		const back = FokosError.fromWire(JSON.parse(JSON.stringify(wire))).cause;
+		expect(back).toBeInstanceOf(Error);
+		expect(back).toEqual(inner);
+		expect([(back as Error).name, Object.keys(back as Error)]).toEqual(["TypeError", ["status", "key"]]);
+		expect((back as Error).cause).toEqual(root);
 	});
 
-	it("store a primitive cause without its characters", () => {
-		expect(FokosError.toWire(FokosError.wrap("ab")).cause).toEqual({ error: "ab", errorProps: {} });
+	it("give back a cause that is not an Error as the same data", () => {
+		for (const cause of ["ab", 7, null, { error: "x", errorProps: {} }, [new Uint8Array([1])]]) {
+			const wire = FokosError.toWire(errorOf(CONFLICT_CODES.read_conflict, { cause }));
+			expect(FokosError.fromWire(JSON.parse(JSON.stringify(wire))).cause).toEqual(cause);
+		}
 	});
 
 	it("wrap a foreign value before it goes on the wire", () => {
 		const wire = FokosError.toWire(new Error("boom"));
-		expect([wire.name, wire.code, wire.cause?.error]).toEqual(["FokosInternalError", "foreign_error", "Error: boom"]);
+		expect([wire.name, wire.code]).toEqual(["FokosInternalError", "foreign_error"]);
+		expect(wire.cause).toEqual({ error: { name: "Error", message: "boom", fields: {} } });
 	});
 
 	it("rebuild the class from an error that has no prototype", () => {
@@ -390,9 +408,139 @@ describe("FokosError.toWire and FokosError.fromWire", () => {
 		const back = FokosError.fromWire(copy);
 		expect(back).toBeInstanceOf(FOKOS_ERROR_CATEGORIES.get("FokosTransactionPendingError")!);
 		expect(contractOf(back)).toEqual(contractOf(e));
-		expect(back.cause).toBe(e.cause);
+		expect(back.cause).toEqual(e.cause);
+	});
+
+	it("keep the own fields of a category, with their bytes, through JSON", () => {
+		const e = withFields(errorOf(CONFLICT_CODES.read_conflict, { attributes: { hashKey: new Uint8Array([0, 255]) } }), {
+			reason: { code: "condition_failed", item: { sortKey: new Uint8Array([7]), data: "x" } },
+			meta: { forwardCount: 2 },
+		});
+		const wire = FokosError.toWire(e);
+		expect(wire.attributes).toEqual({ hashKey: null });
+		const back = FokosError.fromWire(JSON.parse(JSON.stringify(wire)));
+		expect(contractOf(back)).toEqual(contractOf(e));
+		expect(ownFields(back)).toEqual(ownFields(e));
+	});
+
+	it("keep a key named __proto__ as data", () => {
+		const value = {};
+		Object.defineProperty(value, "__proto__", {
+			value: { bytes: new Uint8Array([1]) },
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
+		const e = withFields(errorOf(CONFLICT_CODES.read_conflict), { value });
+		const back = FokosError.fromWire(JSON.parse(JSON.stringify(FokosError.toWire(e))));
+		const got = (back as unknown as { value: object }).value;
+		expect(Object.getPrototypeOf(got)).toBe(Object.prototype);
+		expect(Object.getOwnPropertyDescriptor(got, "__proto__")?.value).toEqual({ bytes: new Uint8Array([1]) });
+	});
+
+	it("store a FokosError cause as its own record, and a second cycle changes nothing", () => {
+		const inner = withFields(errorOf(CONFLICT_CODES.read_conflict, { attributes: { k: new Uint8Array([3]) } }), { detail: 1 });
+		const wire: FokosErrorWire = JSON.parse(JSON.stringify(FokosError.toWire(errorOf(CONFLICT_CODES.pending_write, { cause: inner }))));
+		const back = FokosError.fromWire(wire);
+		expect(FokosError.isCode(back.cause, CONFLICT_CODES.read_conflict)).toBe(true);
+		expect(contractOf(back.cause as FokosError)).toEqual(contractOf(inner));
+		expect(ownFields(back.cause as FokosError)).toEqual({ detail: 1 });
+		expect(FokosError.toWire(back)).toEqual(wire);
+	});
+
+	it("end a cycle of causes", () => {
+		const e = errorOf(CONFLICT_CODES.read_conflict);
+		Object.defineProperty(e, "cause", { value: e });
+		let depth = 0;
+		let cause = FokosError.toWire(e).cause;
+		while (cause && "fokos" in cause) {
+			depth += 1;
+			cause = cause.fokos.cause;
+		}
+		expect(depth).toBe(8);
+		// The last cause stores as an Error with no cause of its own.
+		expect(cause).toEqual({ error: expect.objectContaining({ name: "FokosConflictError", message: e.message }) });
+		expect(cause && "error" in cause && cause.error.cause).toBeUndefined();
+	});
+
+	it("refuse a bytes path that does not end at a value", () => {
+		const wire = FokosError.toWire(errorOf(CONFLICT_CODES.read_conflict, { attributes: { k: new Uint8Array([1]) } }));
+		wire.bytes![0][0] = ["attributes", "missing"];
+		expect(() => FokosError.fromWire(wire)).toThrow(expect.objectContaining({ code: "invariant_failed" }));
+	});
+
+	it("give every error back from its JSON record, and give every record back from its error", () => {
+		const reserved = new Set([
+			"name",
+			"message",
+			"stack",
+			"cause",
+			"_tag",
+			"type",
+			"code",
+			"error_id",
+			"origin",
+			"httpStatusHint",
+			"attributes",
+		]);
+		const { value } = fc.letrec((tie) => ({
+			value: fc.oneof(
+				{ depthSize: "small" },
+				fc.string(),
+				fc.integer(),
+				fc.boolean(),
+				fc.constant(null),
+				fc.uint8Array({ maxLength: 4 }),
+				fc.array(tie("value"), { maxLength: 3 }),
+				fc.dictionary(fc.string(), tie("value"), { maxKeys: 3, noNullPrototype: true }),
+			),
+		}));
+		const fields = fc.dictionary(
+			fc.string().filter((key) => !reserved.has(key)),
+			value,
+			{ maxKeys: 3, noNullPrototype: true },
+		);
+		const attributes = fc.dictionary(fc.string(), value, { maxKeys: 3, noNullPrototype: true });
+		const error = fc.record({ def: fc.constantFrom(...DEFS), attributes, fields });
+		// A cause of each kind: none, a FokosError, another Error, and plain data.
+		const cause = fc.oneof(
+			fc.constant(undefined),
+			error.map((inner) => withFields(errorOf(inner.def, { attributes: inner.attributes }), inner.fields)),
+			fc.record({ message: fc.string(), fields }).map(({ message, fields }) => withFields(new Error(message), fields)),
+			value,
+		);
+		fc.assert(
+			fc.property(error, cause, (outer, cause) => {
+				const e = withFields(errorOf(outer.def, { attributes: outer.attributes, cause }), outer.fields);
+				const wire: FokosErrorWire = JSON.parse(JSON.stringify(FokosError.toWire(e)));
+				const back = FokosError.fromWire(wire);
+				expect(contractOf(back)).toEqual(contractOf(e));
+				expect(ownFields(back)).toEqual(ownFields(e));
+				if (FokosError.is(cause)) {
+					expect(contractOf(back.cause as FokosError)).toEqual(contractOf(cause));
+					expect(ownFields(back.cause as FokosError)).toEqual(ownFields(cause));
+				} else {
+					expect(back.cause).toEqual(cause);
+				}
+				expect(FokosError.toWire(back)).toEqual(wire);
+			}),
+		);
 	});
 });
+
+/** `e` with `fields` as own data properties, as a category constructor assigns them. */
+function withFields<E extends Error>(e: E, fields: Record<string, unknown>): E {
+	for (const [key, value] of Object.entries(fields)) {
+		Object.defineProperty(e, key, { value, writable: true, enumerable: true, configurable: true });
+	}
+	return e;
+}
+
+/** The own enumerable properties of `e` that are not in its contract. */
+function ownFields(e: FokosError): Record<string, unknown> {
+	const contract = new Set(Object.keys(contractOf(e)));
+	return Object.fromEntries(Object.entries(e).filter(([key]) => !contract.has(key)));
+}
 
 describe("isRuntimeRetryableError", () => {
 	it("reads the runtime markers on a raw error, and in the attributes after wrap", () => {

@@ -159,9 +159,9 @@ type TcResultRow = {
 	image_data: string | ArrayBuffer;
 };
 
-// Every JSON column here — rejection reasons, participant answers, and the results array — can hold
-// binary (Uint8Array) keys, which plain JSON.stringify mangles. These tag and restore them, so a
-// cancelled transaction over binary keys still reports the exact key after reload.
+// The participant answers and the results array can hold binary (Uint8Array) keys, which plain
+// JSON.stringify mangles. These tag and restore them, so a cancelled transaction over binary keys still
+// reports the exact key after reload. A stored error needs no tags: its record holds its own bytes.
 function stringifyTagged(value: unknown): string {
 	return JSON.stringify(value, (_k, v) => (v instanceof Uint8Array ? { $u8: Array.from(v) } : v));
 }
@@ -986,9 +986,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			if (!row || isFatalPrepareError(row.error_json)) {
 				return;
 			}
+			// The route hints of the participant are for its callers, and nothing reads them back here.
+			const wire = FokosError.toWire(err);
+			delete wire.fields?.routing;
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET error_json = ? WHERE transaction_id = ? AND partition_do_name = ?`,
-				stringifyTagged(FokosError.toWire(err)),
+				JSON.stringify(wire),
 				transactionId,
 				partitionDoName,
 			);
@@ -1090,7 +1093,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			return FokosError.toWire(unexpectedTransactionStateError("a rejected prepare answer cannot be read back"));
 		}
 		if (p.error_json) {
-			return parseTagged<FokosErrorWire>(p.error_json);
+			return JSON.parse(p.error_json) as FokosErrorWire;
 		}
 		return FokosError.toWire(
 			new FokosUnavailableError(UNAVAILABLE_CODES.prepare_unanswered, {
@@ -1894,7 +1897,7 @@ function isFatalPrepare(err: unknown): boolean {
 
 /** True when a stored prepare error is fatal (`isFatalPrepare`). */
 function isFatalPrepareError(errorJson: string | null): boolean {
-	return errorJson !== null && isFatalPrepare(FokosError.fromWire(parseTagged<FokosErrorWire>(errorJson)));
+	return errorJson !== null && isFatalPrepare(FokosError.fromWire(JSON.parse(errorJson) as FokosErrorWire));
 }
 
 /** The time at which the `idempotency_sweep` job can delete a transaction that completed at `completedAt`. */

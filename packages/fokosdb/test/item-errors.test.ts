@@ -195,12 +195,14 @@ describe("a failed condition of putItem and deleteItem", () => {
 		const copy = Object.assign(new Error(err.message), err);
 
 		// The category lives outside errors.ts, so fromWire builds the generic class, and the own fields
-		// and the category guard still hold on it.
-		const back = FokosError.fromWire(copy as FokosAnyError);
-		expect(FokosConditionCheckError.is(back)).toBe(true);
-		if (!FokosConditionCheckError.is(back)) {
-			throw new Error("unreachable");
+		// and the category guard still hold on it. A record that went through JSON keeps them too.
+		const stored = JSON.parse(JSON.stringify(FokosError.toWire(err)));
+		for (const back of [FokosError.fromWire(copy as FokosAnyError), FokosError.fromWire(stored)]) {
+			expect(FokosConditionCheckError.is(back)).toBe(true);
+			if (!FokosConditionCheckError.is(back)) {
+				throw new Error("unreachable");
+			}
+			expect([back.error_id, back.reason, back.meta]).toEqual([err.error_id, err.reason, err.meta]);
 		}
-		expect([back.error_id, back.reason, back.meta]).toEqual([err.error_id, err.reason, err.meta]);
 	});
 });

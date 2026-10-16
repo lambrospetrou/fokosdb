@@ -24,6 +24,8 @@
  * types of the library, such as `FokosConditionCheckError`, lives in `errors-operations.ts`.
  */
 
+import invariant from "./invariant.js";
+
 export type FokosErrorOrigin = "caller" | "service" | "internal";
 
 /**
@@ -85,7 +87,10 @@ export type FokosErrorOptions = {
 	error_id?: string;
 };
 
-/** The plain record of an error, for storage. Every field is plain data, so it survives JSON and any RPC hop. */
+/**
+ * The plain record of an error, for storage. It survives `JSON.stringify` and any RPC hop, and
+ * `FokosError.fromWire` builds the error again from it with all its fields.
+ */
 export type FokosErrorWire = {
 	name: string;
 	message: string;
@@ -94,8 +99,29 @@ export type FokosErrorWire = {
 	origin: FokosErrorOrigin;
 	httpStatusHint: number;
 	attributes: Record<string, unknown>;
-	cause?: { error: string; errorProps: Record<string, unknown> };
+	/** The own fields that a category adds to the base fields, for example `reason` and `meta`. */
+	fields?: Record<string, unknown>;
+	cause?: FokosCauseWire;
+	/**
+	 * Each Uint8Array of the record: its path from the root of the record, and its bytes in base64url.
+	 * The value at the path is `null`. Only the root record has this field.
+	 */
+	bytes?: Array<[path: Array<string | number>, data: string]>;
 };
+
+/**
+ * The record of a cause. Its key tells its kind, so `fromWire` gives back a value of the same kind,
+ * and no value of the caller can look like a record of another kind.
+ *
+ * - `fokos`: a FokosError, which comes back as a FokosError.
+ * - `error`: any other Error, which comes back as an Error with the same name, message and own fields.
+ *   An Error stores as `{}` in JSON, so the record holds each part.
+ * - `value`: any other value, as plain data.
+ */
+export type FokosCauseWire =
+	| { fokos: FokosErrorWire }
+	| { error: { name: string; message: string; fields: Record<string, unknown>; cause?: FokosCauseWire } }
+	| { value: unknown };
 
 /** `T` is the category and `C` is the union of the codes the error can carry. */
 export abstract class FokosError<T extends string = string, C extends string = string> extends Error {
@@ -193,25 +219,17 @@ export abstract class FokosError<T extends string = string, C extends string = s
 		});
 	}
 
-	/** The plain record for storage. It accepts a class instance, an error that crossed a hop, or a foreign value, which it wraps first. */
+	/**
+	 * The plain record for storage. It accepts a class instance, an error that crossed a hop, or a
+	 * foreign value, which it wraps first. Each own field of a category goes into `fields`, so the
+	 * record needs no list of the categories. Each Uint8Array goes into `bytes`.
+	 *
+	 * `fromWire(toWire(e))` has every field of `e` except `stack`, and `toWire(fromWire(w))` is equal to `w`.
+	 */
 	static toWire(e: unknown): FokosErrorWire {
-		const err = FokosError.wrap(e);
-		const wire: FokosErrorWire = {
-			name: err.name,
-			message: err.message,
-			code: err.code,
-			error_id: err.error_id,
-			origin: err.origin,
-			httpStatusHint: err.httpStatusHint,
-			attributes: err.attributes,
-		};
-		const cause: unknown = err.cause;
-		if (cause !== undefined) {
-			// An Error object stores as `{}` in JSON, so the cause keeps its text and its own enumerable fields.
-			// oxlint-disable-next-line typescript/no-base-to-string
-			wire.cause = { error: String(cause), errorProps: typeof cause === "object" && cause !== null ? { ...cause } : {} };
-		}
-		return wire;
+		const bytes: NonNullable<FokosErrorWire["bytes"]> = [];
+		const wire = encodeBytes(plainWire(FokosError.wrap(e), 0), [], bytes) as FokosErrorWire;
+		return bytes.length === 0 ? wire : { ...wire, bytes };
 	}
 
 	/**
@@ -219,25 +237,166 @@ export abstract class FokosError<T extends string = string, C extends string = s
 	 * category that this module does not define keeps its tag and its fields.
 	 */
 	static fromWire(w: FokosErrorWire | FokosError): FokosError {
-		const Category = FOKOS_ERROR_CATEGORIES.get(w.name) ?? OtherCategoryError;
-		// The error already has its identity, so the segment is never read.
-		const err = new Category(
-			{ tag: w.name, code: w.code, segment: "", origin: w.origin, httpStatusHint: w.httpStatusHint },
-			{
-				message: "",
-				attributes: w.attributes,
-				cause: w.cause,
-				error_id: w.error_id,
-			},
-		);
-		// The message already carries its `fokos/<code>: ` prefix.
-		err.message = w.message;
-		// A category can hold own fields beyond the base ones, such as `reason` and `meta`. An error that
-		// crossed a hop still has them, so they move to the new instance. A wire record has none.
-		const { name: _name, message: _message, stack: _stack, cause: _cause, ...fields } = w as Record<string, unknown>;
-		Object.assign(err, fields);
-		return err;
+		return buildError(FokosError.is(w) ? plainWire(w, 0) : decodeBytes(w));
 	}
+}
+
+/** The own properties of every FokosError. Every other own enumerable property is a field of its category. */
+const BASE_FIELD_NAMES = [
+	"name",
+	"message",
+	"stack",
+	"cause",
+	"_tag",
+	"type",
+	"code",
+	"error_id",
+	"origin",
+	"httpStatusHint",
+	"attributes",
+] as const satisfies ReadonlyArray<keyof FokosError>;
+const BASE_FIELDS: ReadonlySet<string> = new Set(BASE_FIELD_NAMES);
+
+// The build fails when FokosError gets a field that BASE_FIELD_NAMES does not list.
+const _allBaseFields: [Exclude<keyof FokosError, (typeof BASE_FIELD_NAMES)[number]>] extends [never] ? true : never = true;
+
+/** The deepest cause that keeps its own cause. A cause at this depth stores without its cause, so a cycle of causes ends. */
+const CAUSE_DEPTH_MAX = 8;
+
+/** The record of `err` with its bytes in place. `depth` is the number of causes above `err`. */
+function plainWire(err: FokosError, depth: number): FokosErrorWire {
+	const wire: FokosErrorWire = {
+		name: err.name,
+		message: err.message,
+		code: err.code,
+		error_id: err.error_id,
+		origin: err.origin,
+		httpStatusHint: err.httpStatusHint,
+		attributes: err.attributes,
+	};
+	const fields = Object.entries(err).filter(([key]) => !BASE_FIELDS.has(key));
+	if (fields.length > 0) {
+		wire.fields = Object.fromEntries(fields);
+	}
+	const cause: unknown = err.cause;
+	if (cause !== undefined) {
+		wire.cause = causeWire(cause, depth);
+	}
+	return wire;
+}
+
+function causeWire(cause: unknown, depth: number): FokosCauseWire {
+	const deeper = depth < CAUSE_DEPTH_MAX;
+	if (FokosError.is(cause) && deeper) {
+		return { fokos: plainWire(cause, depth + 1) };
+	}
+	if (!(cause instanceof Error)) {
+		return { value: cause };
+	}
+	const fields = Object.fromEntries(Object.entries(cause).filter(([key]) => !ERROR_FIELDS.has(key)));
+	const record: Extract<FokosCauseWire, { error: unknown }>["error"] = { name: cause.name, message: cause.message, fields };
+	if (cause.cause !== undefined && deeper) {
+		record.cause = causeWire(cause.cause, depth + 1);
+	}
+	return { error: record };
+}
+
+/** The own properties of every Error. Every other own enumerable property is a field of the Error. */
+const ERROR_FIELDS: ReadonlySet<string> = new Set(["name", "message", "stack", "cause"]);
+
+function buildCause(wire: FokosCauseWire): unknown {
+	if ("fokos" in wire) {
+		return buildError(wire.fokos);
+	}
+	if (!("error" in wire)) {
+		return wire.value;
+	}
+	const { name, message, fields, cause } = wire.error;
+	const err = new Error(message, cause === undefined ? undefined : { cause: buildCause(cause) });
+	// `Error.prototype` holds `name`, so the own property stays out of the fields, as it does on an Error.
+	Object.defineProperty(err, "name", { value: name, writable: true, enumerable: false, configurable: true });
+	for (const [key, value] of Object.entries(fields)) {
+		if (!ERROR_FIELDS.has(key)) {
+			setOwn(err, key, value);
+		}
+	}
+	return err;
+}
+
+/** The error of a record whose bytes are in place. */
+function buildError(wire: FokosErrorWire): FokosError {
+	const Category = FOKOS_ERROR_CATEGORIES.get(wire.name) ?? OtherCategoryError;
+	const cause = wire.cause === undefined ? undefined : buildCause(wire.cause);
+	// The error already has its identity, so the segment is never read.
+	const err = new Category(
+		{ tag: wire.name, code: wire.code, segment: "", origin: wire.origin, httpStatusHint: wire.httpStatusHint },
+		{ message: "", attributes: wire.attributes, cause, error_id: wire.error_id },
+	);
+	// The message already carries its `fokos/<code>: ` prefix.
+	err.message = wire.message;
+	for (const [key, value] of Object.entries(wire.fields ?? {})) {
+		if (!BASE_FIELDS.has(key)) {
+			setOwn(err, key, value);
+		}
+	}
+	return err;
+}
+
+/**
+ * A copy of `value` with `null` in place of each Uint8Array, and the path and the bytes of each one
+ * in `out`. `Object.fromEntries` makes own properties, so a key `__proto__` stays data.
+ */
+function encodeBytes(value: unknown, path: Array<string | number>, out: NonNullable<FokosErrorWire["bytes"]>): unknown {
+	if (value instanceof Uint8Array) {
+		out.push([path, value.toBase64({ alphabet: "base64url", omitPadding: true })]);
+		return null;
+	}
+	if (Array.isArray(value)) {
+		return value.map((item, i) => encodeBytes(item, [...path, i], out));
+	}
+	if (typeof value === "object" && value !== null) {
+		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodeBytes(item, [...path, key], out)]));
+	}
+	return value;
+}
+
+/** A copy of `wire` with each Uint8Array of `bytes` back at its path, and no `bytes`. */
+function decodeBytes(wire: FokosErrorWire): FokosErrorWire {
+	if (wire.bytes === undefined) {
+		return wire;
+	}
+	const { bytes, ...rest } = wire;
+	const copy = structuredClone(rest);
+	for (const [path, data] of bytes) {
+		invariant(path.length > 0, "bytes path must not be empty");
+		let parent: unknown;
+		let node: unknown = copy;
+		for (const key of path) {
+			parent = node;
+			node = ownValue(node, key, path);
+		}
+		setOwn(parent as object, path.at(-1)!, Uint8Array.fromBase64(data, { alphabet: "base64url" }));
+	}
+	return copy;
+}
+
+/**
+ * The own property `key` of `node`. A path that does not end at an own property is a record that
+ * `toWire` did not make, and a path through an inherited property would write outside the record.
+ */
+function ownValue(node: unknown, key: string | number, path: Array<string | number>): unknown {
+	if (typeof node !== "object" || node === null || !Object.hasOwn(node, key)) {
+		throw new FokosInternalError(CORE_INTERNAL_CODES.invariant_failed, {
+			message: "an error record has a bytes path with no value",
+			attributes: { path },
+		});
+	}
+	return (node as Record<string | number, unknown>)[key];
+}
+
+/** Writes an own data property, as an assignment does. An assignment to `__proto__` would change the prototype instead. */
+function setOwn(target: object, key: string | number, value: unknown): void {
+	Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
 }
 
 /**
