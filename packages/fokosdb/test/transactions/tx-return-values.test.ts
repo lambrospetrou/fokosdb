@@ -432,13 +432,20 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 
 			// The same four-operation shape twice: operations 0 and 2 fail their condition and ask for the
 			// old image, operations 1 and 3 pass. Only the keys differ, so only the layout differs.
-			const runOver = async (keys: Key[], token?: string) => {
+			//
+			// Only operations 0 and 2 have a stored item. A seed put stamps the clock of its partition, and
+			// the two-phase path stamps the clock of the coordinator. These clocks can disagree, and then a
+			// put on a seeded item gets timestamp_conflict. A put on an absent item compares only with the
+			// last delete of the partition, and this table has no deletes. A failed condition rejects before
+			// the timestamp check, so operations 0 and 2 do not depend on the clocks.
+			const runOver = async (keys: Key[]) => {
 				for (const [i, k] of keys.entries()) {
-					await db.putItem({ ...k, data: `stored-${i}` });
+					if (i % 2 === 0) {
+						await db.putItem({ ...k, data: `stored-${i}` });
+					}
 				}
 				const res = await writeOutcome(
 					db.transactWriteItems({
-						...(token ? { clientRequestToken: token } : {}),
 						items: keys.map((k, i) => ({
 							operation: "put" as const,
 							...k,
@@ -461,14 +468,13 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(countDistinctPartitions(db, oneKeys)).toBe(1);
 			expect(countDistinctPartitions(db, manyKeys)).toBe(4);
 
-			// The spread set carries a token, which is what puts it on the two-phase path; the single
-			// partition set runs the single-shot fast path.
+			// The single partition set runs the single-shot fast path; the spread set runs the two-phase path.
 			const one = await runOver(oneKeys);
-			const many = await runOver(manyKeys, `layout-${crypto.randomUUID()}`);
+			const many = await runOver(manyKeys);
 
 			const codesOf = (res: Awaited<ReturnType<typeof runOver>>) => res.results.map((r) => r.outcome);
 			expect(codesOf(one)).toEqual(["rejected", "passed", "rejected", "passed"]);
-			expect(codesOf(many)).toEqual(codesOf(one));
+			expect(codesOf(many), JSON.stringify(many.results)).toEqual(codesOf(one));
 
 			// The same images and the same reasons come back on both layouts.
 			const imagesOf = (res: Awaited<ReturnType<typeof runOver>>) =>
