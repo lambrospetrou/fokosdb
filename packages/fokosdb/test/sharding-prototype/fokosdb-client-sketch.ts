@@ -3,11 +3,11 @@
  * `meta`. Only the paths that touch the sharding surface are written.
  */
 import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
-import type { OperationMetrics } from "../../src/shared/types.js";
+import { answerMeta } from "../../src/shared/partition-meta.js";
 import { FokosRouter, FokosShardingClient, todo } from "./api.js";
-import type { FokosPublicRoute, FokosPublicRouting, FokosRangeConfig, FokosTopology, KeyBytes } from "./api.js";
+import type { FokosRangeConfig, FokosTopology, KeyBytes } from "./api.js";
 import type { CoordinatorRpc, InitiateWriteReq } from "./fokosdb-coordinator-host.js";
-import type { FokosDBPolicy, FokosDBRouteContext, LeafMetrics, PartitionRpc, QueryReq } from "./fokosdb-partition-host.js";
+import type { FokosDBPolicy, FokosDBRouteContext, PartitionRpc, QueryReq } from "./fokosdb-partition-host.js";
 
 export type FokosDBOptions = {
 	tableName: string;
@@ -18,16 +18,6 @@ export type FokosDBOptions = {
 	policy: FokosDBPolicy;
 	/** Root count of the coordinator pool. It grows by hash splits from there, so retries need no fixed pool size. */
 	coordinatorRootsN?: number;
-};
-
-/** What `meta` becomes: the operation metrics plus the public routing of the envelope. */
-export type PublicMeta = OperationMetrics & {
-	servedByActorId: string;
-	servedByActorName: string;
-	servedByPartitionId: string;
-	hashDepth: number;
-	rangeDepth: number;
-	forwardCount: number;
 };
 
 export class FokosDB {
@@ -58,39 +48,23 @@ export class FokosDB {
 		return todo(`txCoordinatorStubByName(${ctx.policy.nsTx}, ${ctx.doName})`);
 	}
 
-	/** `meta` combines the partition that executed the request with the operation metrics of the value. */
-	static meta(metrics: OperationMetrics, node: FokosPublicRoute, forwardCount: number): PublicMeta {
-		return {
-			...metrics,
-			servedByActorId: node.actorId,
-			servedByActorName: node.ref.doName,
-			servedByPartitionId: node.ref.partitionId,
-			hashDepth: node.hashDepth,
-			rangeDepth: node.rangeDepth,
-			forwardCount,
-		};
-	}
-
-	static executor(routing: FokosPublicRouting): FokosPublicRoute {
-		return routing.servedBy.find((node) => node.role === "executed") ?? todo("an item RPC has one executing partition");
-	}
-
+	/** `meta` is the entry that the partition wrote in `partitions`, with the name from the routing of the envelope. */
 	async getItem(hashKey: KeyBytes, sortKey: KeyBytes) {
 		const ctx = this.partitions.rootContext(hashKey);
 		const { value, routing } = this.partitions.unwrap(await this.partitionStub(ctx).apiGetItem(ctx, { hashKey, sortKey }));
-		return { ...value, meta: FokosDB.meta(value.meta, FokosDB.executor(routing), routing.forwardCount) };
+		const { partitions, ...rest } = value;
+		return { ...rest, meta: answerMeta(partitions, routing) };
 	}
 
-	/** One sub-query page. The leaf metrics pair with the list by partition id; a leaf the cap dropped is skipped. */
+	/**
+	 * One sub-query page. Each leaf wrote its own entry, so the byte cap of the routing cannot drop a leaf. A leaf
+	 * whose node the cap dropped has no name.
+	 */
 	async queryPage(req: QueryReq) {
 		const ctx = this.partitions.rootContext(req.hashKey);
 		const { value, routing } = this.partitions.unwrap(await this.partitionStub(ctx).apiQueryItems(ctx, req));
-		const byPartition = new Map(routing.servedBy.map((node) => [node.ref.partitionId, node]));
-		const partitionMetas = value.partitions.flatMap((leaf: LeafMetrics) => {
-			const node = byPartition.get(leaf.partitionId);
-			return node ? [FokosDB.meta(leaf, node, 0)] : [];
-		});
-		return { ...value, partitionMetas, forwardCount: routing.forwardCount };
+		const { partitions, ...rest } = value;
+		return { ...rest, meta: answerMeta(partitions, routing) };
 	}
 
 	/** The coordinator is chosen by the token, as before, and reached through its root. */

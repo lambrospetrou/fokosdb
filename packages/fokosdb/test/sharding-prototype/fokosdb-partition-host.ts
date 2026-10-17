@@ -36,9 +36,9 @@ import type {
 	TransactionItemKey,
 	TransactionTimestamp,
 } from "../../src/shared/transaction-wire-types.js";
-import type { OperationMetrics, QuerySelect } from "../../src/shared/types.js";
+import type { QuerySelect } from "../../src/shared/types.js";
 import type { PutItemRpcRequest, DeleteItemRpcRequest, GetItemRpcRequest } from "../../src/server/do-partition.js";
-import type { PutItemRpcResponse, DeleteItemRpcResponse, GetItemRpcResponse } from "../../src/server/do-partition.js";
+import type { PutItemRpcResponse, DeleteItemRpcResponse, GetItemRpcResponse, LeafMetrics } from "../../src/server/do-partition.js";
 import { FokosShardingRuntime, todo } from "./api.js";
 import type {
 	FokosEnvelope,
@@ -75,12 +75,10 @@ export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
 
 // ─── wire types that change ──────────────────────────────────────────────────
 
-/** `meta` keeps the operation metrics only. Routing facts move to the envelope. */
-type WithMetrics<R> = R extends { partitions: unknown } ? Omit<R, "partitions"> & { meta: OperationMetrics } : R;
-
-export type PutRes = WithMetrics<PutItemRpcResponse>;
-export type DeleteRes = WithMetrics<DeleteItemRpcResponse>;
-export type GetRes = WithMetrics<GetItemRpcResponse>;
+/** An item answer carries the entry of its partition in `partitions`, with no name. The name comes from the envelope. */
+export type PutRes = PutItemRpcResponse;
+export type DeleteRes = DeleteItemRpcResponse;
+export type GetRes = GetItemRpcResponse;
 
 export type QueryReq = {
 	hashKey: KeyBytes;
@@ -96,8 +94,8 @@ export type QueryReq = {
 	plan: CompiledQueryPlan | null;
 };
 
-/** One leaf's metrics keep the leaf identity, so the client can pair them with the route list. */
-export type LeafMetrics = OperationMetrics & { partitionId: string };
+/** The entry of one leaf: its actor ID, its depth, its counts and its item count. It has no name and no partition ID. */
+export type { LeafMetrics };
 
 export type QueryRes = {
 	items: Array<StoredItem | ProjectedWireRow>;

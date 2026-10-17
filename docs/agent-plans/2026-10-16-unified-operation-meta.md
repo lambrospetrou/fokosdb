@@ -1,9 +1,9 @@
 # RFC — One `meta` shape with a list of partitions for every FokosDB result and error
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-16
 **Author:** Lambros Petrou
-**Status:** Not built.
+**Status:** Milestone 1 is built. Section 1 describes the code before this spec as "today".
 
 ## Table of Contents
 
