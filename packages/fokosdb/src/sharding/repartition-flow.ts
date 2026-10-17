@@ -1002,7 +1002,27 @@ export class RepartitionTarget {
 			});
 			return "stopped";
 		}
+		if (page.nextCursor === null) {
+			this.#optimizeAfterImport(rec);
+		}
 		return "progressed";
+	}
+
+	/**
+	 * The import filled the tables of this partition from empty, so the query planner statistics are
+	 * old. `imported` is already durable, so a failure here only logs: the import does not run again.
+	 */
+	#optimizeAfterImport(rec: FokosImportRecord): void {
+		try {
+			this.store.optimize();
+		} catch (error) {
+			console.warn({
+				...this.deps.logParams(),
+				message: "fokos/repartition: PRAGMA optimize failed after the import.",
+				repartitionId: rec.repartitionId,
+				error: String(error),
+			});
+		}
 	}
 
 	/**

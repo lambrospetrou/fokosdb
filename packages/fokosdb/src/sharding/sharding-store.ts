@@ -438,6 +438,15 @@ export class FokosShardingStore {
 		}
 	}
 
+	/**
+	 * Runs `PRAGMA optimize` on the whole database of this partition. It refreshes the query planner
+	 * statistics of the tables that changed a lot, for example after an import filled them. It covers
+	 * the host tables too, because they are in the same database.
+	 */
+	optimize(): void {
+		this.#storage.sql.exec(`PRAGMA optimize`);
+	}
+
 	// ─── KV: identity and policy ────────────────────────────────────────────
 
 	getIdentity(): FokosPartitionIdentity | undefined {

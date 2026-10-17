@@ -216,6 +216,21 @@ describe("PartitionDO - splitting", () => {
 		expect(splitStatus?.splitType).toBe("hash");
 	});
 
+	it("runs PRAGMA optimize on each child after its import", async ({ expect }) => {
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		await partition.splitHash();
+
+		for (const child of await partition.children()) {
+			const analyzed = await runInDurableObject(child.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+				state.storage.sql
+					.exec<{ tbl: string }>(`SELECT DISTINCT tbl FROM sqlite_stat1`)
+					.toArray()
+					.map((r) => r.tbl),
+			);
+			expect(analyzed).toContain("items");
+		}
+	});
+
 	it("alarm with no split queued and no migration in progress does nothing", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
