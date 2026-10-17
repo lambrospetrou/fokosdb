@@ -11,6 +11,18 @@ Range partitions pros:
 - allow more fine-grained splitting logic to calculate exact boundaries.
 - faster data transferring or deletion of "out of range" rows after a split since ranges are continuous.
 
+## Owned data to child partitions
+
+With the upcoming DO Snapshot API splits are now have two implementation approaches:
+1. Manual data transfer over RPC, as we do now. This ensures only the required data ends up in the child partitions, but requires several RPC round-trips and JS encode/decodes.
+2. Snapshot API to fork the source partitions storage and then the child partitions deleting data they don't need. Due to low memory/cpu resources in a DO we have to do the removal of invalid data in chunks and yield in-between.
+
+With the Snapshot API, hash splits are a bit in a disadvantage because we will be deleting rows randomly leaving holes in SQLite pages and without reducing the database size. On the contrary, range partitions delete continuous data so pages will be emptied and garbage-collected.
+
+This might become a problem, so probably we have to keep both approaches, manual data transferring for hash splits and Snapshot API for range splits.
+
+TODO benchmark the two approaches for both split types.
+
 ## Proposal
 
 - N layers of hash partitions, always at least one layer, the root hash partitions so that we can route without any topology caching in the client. This also provides uniform distribution of the hash keys across partitions.
