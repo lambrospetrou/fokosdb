@@ -13,7 +13,7 @@ Range partitions pros:
 
 ## Proposal
 
-- N layers of hash partitions, always at least one layer, the root hash partitions so that we can route without any topology caching in the client.
+- N layers of hash partitions, always at least one layer, the root hash partitions so that we can route without any topology caching in the client. This also provides uniform distribution of the hash keys across partitions.
 - After N depth the partitions switch to range partitions with mixed hash keys, instead of the key promotion flow we do now.
 - Range partitions split as they do now, based on the hash+sort keys lexicographical order in utf-8 bytes.
 - Patricia keys encode the topology of each range partition tree.
