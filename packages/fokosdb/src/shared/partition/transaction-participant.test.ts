@@ -622,7 +622,8 @@ describe("TransactionParticipant - prepare", () => {
 				store.upsertItem({ hk: X.hashKey, sk: X.sortKey, data: "old", kind: "text", ttlAt: null, txOrderTs: 1 });
 				const request = commitAhead(participant, { ...X, operation: "delete" });
 				putX(participant, store);
-				expect(store.getItem(X.hashKey, X.sortKey).row).toMatchObject({ data: "new", v: 2, last_read_ts: aheadTs });
+				// X had v = 1. Its delete has the revision 2, so the new row starts at v = 3.
+				expect(store.getItem(X.hashKey, X.sortKey).row).toMatchObject({ data: "new", v: 3, last_read_ts: aheadTs });
 
 				expect(participant.prepareLocal(request)).toMatchObject({
 					outcome: "rejected",
@@ -828,10 +829,10 @@ describe("TransactionParticipant - commit", () => {
 			expect(commit.promotionCandidates).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
 
 			// delete: row gone, the deletion watermark advanced to the commit timestamp, and
-			// max_deleted_v recorded the v of the removed row.
+			// max_deleted_v recorded the delete revision (v + 1) of the removed row.
 			expect(store.getItem(kb("to-delete"), KeyCodec.encodeOptional(undefined)).row).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(commitTs);
-			expect(store.getDeletionMetadata().maxDeletedV).toBe(1);
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(2);
 
 			// check: data untouched, only the read watermark advanced.
 			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toMatchObject({
@@ -1179,7 +1180,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 			expect(after[0]).toEqual(before[0]);
 			expect(after[0]).not.toHaveProperty("maxDeletedV");
 			expect(before[1]).toMatchObject({ found: false, maxDeletedV: 0 });
-			expect(after[1]).toMatchObject({ found: false, maxDeletedV: 2 });
+			expect(after[1]).toMatchObject({ found: false, maxDeletedV: 3 });
 		});
 	});
 

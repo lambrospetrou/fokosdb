@@ -267,7 +267,8 @@ describe("transactWriteItems - ordered_per_item recovery", () => {
 		const after = await readAll(db, [a, b]);
 		expect(after).toEqual({
 			[`${a.hashKey}/${a.sortKey}`]: { data: { n: 2 }, version: 2, ttlAt: undefined },
-			[`${b.hashKey}/${b.sortKey}`]: { data: { m: 1, n: 1 }, version: 3, ttlAt: undefined },
+			// b had v = 1. Its delete has the revision 2, the put starts at 3, and the update gives 4.
+			[`${b.hashKey}/${b.sortKey}`]: { data: { m: 1, n: 1 }, version: 4, ttlAt: undefined },
 		});
 		await db.transactWriteItems({ items, clientRequestToken: token, ...ORDERED });
 		expect(await readAll(db, [a, b])).toEqual(after);

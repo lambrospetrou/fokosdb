@@ -960,15 +960,16 @@ machine Partition {
     announce eStamped, (partition = this, key = op.key, operation = op.operation, ts = ts, twoPhase = twoPhase);
   }
 
-  // PartitionStore.deleteItem of a present row: removes the row, raises max_deleted_v to its v, and
-  // raises max_delete_tx_order_ts to the larger of `ts` and its last_read_ts.
+  // PartitionStore.deleteItem of a present row: removes the row, raises max_deleted_v to its delete
+  // revision v + 1, and raises max_delete_tx_order_ts to the larger of `ts` and its last_read_ts. The
+  // delete announces its delete revision as `v`.
   fun DeleteItem(key: tKey, tx: int, ts: int) {
     var removed: tItemRow;
     removed = durable.items[key];
     durable.items -= (key);
-    durable.maxDeletedV = Max(durable.maxDeletedV, removed.v);
+    durable.maxDeletedV = Max(durable.maxDeletedV, removed.v + 1);
     durable.maxDeleteTxOrderTs = Max(durable.maxDeleteTxOrderTs, Max(ts, removed.lastReadTs));
-    announce eItemWritten, (partition = this, key = key, deleted = true, value = 0, v = removed.v, tx = tx);
+    announce eItemWritten, (partition = this, key = key, deleted = true, value = 0, v = removed.v + 1, tx = tx);
   }
 
   // cancelLocal: deletes the lock rows of the transaction under the given keys.

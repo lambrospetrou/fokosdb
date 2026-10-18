@@ -8,15 +8,15 @@ import { makePartition, makeRangeRoot, PROMOTION_TEST_MAX_SIZE_MB, type TestPart
 
 // The seeded state migration has to carry: a marker item whose read watermark is above its write
 // watermark (so the two columns are visibly different), and one real user delete so both deletion
-// metadata fields are non-zero. The victim reaches v = 3 before the delete, so a recreate on a new
-// owner must start at v = 4.
+// metadata fields are non-zero. The victim reaches v = 3 before the delete, and the delete has the
+// revision 4, so a recreate on a new owner must start at v = 5.
 const SEED = { readTs: 999_000_000, writeTs: 500_000, deleteWatermarkTs: 777_000_000 } as const;
 
 /**
  * Seeds the marker and a victim row directly in the store (the item timestamps are far below the
  * wall clock, so they must be written with explicit stamps), bumps the marker's read watermark,
  * then deletes the victim so `getDeletionMetadata()` is
- * `{ maxDeleteTxOrderTs: 777_000_000, maxDeletedV: 3 }`.
+ * `{ maxDeleteTxOrderTs: 777_000_000, maxDeletedV: 4 }`.
  */
 async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk: KeyBytes }, victim: { hk: KeyBytes; sk: KeyBytes }) {
 	return await runInDurableObject(node.stub, (_instance: PartitionDO, state: DurableObjectState) => {
@@ -45,7 +45,8 @@ describe.concurrent("PartitionDO — migration carries item timestamps and delet
 		const marker = { hk: kb("marker"), sk: kb("sk") };
 		const seeded = await seedForMigration(root, marker, { hk: kb("victim"), sk: kb("sk") });
 		expect(seeded.row).toMatchObject({ last_read_ts: SEED.readTs, last_write_ts: SEED.writeTs });
-		expect(seeded.meta).toEqual({ maxDeleteTxOrderTs: SEED.deleteWatermarkTs, maxDeletedV: 3 });
+		// The victim row at v = 3 has the delete revision 4.
+		expect(seeded.meta).toEqual({ maxDeleteTxOrderTs: SEED.deleteWatermarkTs, maxDeletedV: 4 });
 
 		const children = await root.splitHash();
 
@@ -62,10 +63,10 @@ describe.concurrent("PartitionDO — migration carries item timestamps and delet
 			expect((await storeStateOf(child, marker)).meta).toEqual(seeded.meta);
 		}
 
-		// A recreate of the victim on its new owner starts above its last v on the source.
+		// A recreate of the victim on its new owner starts above its delete revision on the source.
 		const victim = { hk: kb("victim"), sk: kb("sk") };
 		await root.put({ hashKey: victim.hk, sortKey: victim.sk, data: "again", kind: "text" });
-		expect((await storeStateOf(await root.childOwning("victim"), victim)).row?.v).toBe(4);
+		expect((await storeStateOf(await root.childOwning("victim"), victim)).row?.v).toBe(5);
 	});
 
 	it("a child keeps the inherited timestamps and metadata after it starts serving traffic", async () => {
@@ -109,10 +110,10 @@ describe.concurrent("PartitionDO — migration carries item timestamps and delet
 		expect(onRoot.row).toMatchObject({ v: 1, last_read_ts: SEED.readTs, last_write_ts: SEED.writeTs });
 		expect(onRoot.meta).toEqual(seeded.meta);
 
-		// A new row on the range root starts above the last v that the source removed.
+		// A new row on the range root starts above the delete revision (v + 1) that the source recorded.
 		const created = { hk: kb("hot"), sk: kb("created") };
 		await rangeRoot.put({ hashKey: created.hk, sortKey: created.sk, data: "new", kind: "text" });
-		expect((await storeStateOf(rangeRoot, created)).row?.v).toBe(4);
+		expect((await storeStateOf(rangeRoot, created)).row?.v).toBe(5);
 	});
 
 	it("a range split copies both item timestamps and both deletion-metadata values", async () => {

@@ -116,10 +116,10 @@ describe("PartitionDO — stale transaction recovery", () => {
 			found: true,
 			item: { data: "a2", version: 2 },
 		});
-		// b had v = 1: the delete raised max_deleted_v to 1, so the new row starts at v = 2.
+		// b had v = 1: the delete raised max_deleted_v to its delete revision 2, so the new row starts at v = 3.
 		expect(await rpc.apiGetItem(ctx, { hashKey: kb("b"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
-			item: { data: "b2", version: 2 },
+			item: { data: "b2", version: 3 },
 		});
 	});
 

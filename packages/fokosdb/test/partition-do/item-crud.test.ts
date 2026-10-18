@@ -377,11 +377,12 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 		const result = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "fresh", kind: "text" as const });
 
-		// The version of a key never repeats: the recreate starts above the last version, 2.
-		expect(result).toMatchObject({ outcome: "ok", version: 3 });
+		// The revisions of a key always increase: the delete of the row at version 2 has the delete
+		// revision 3, so the recreate starts at 4.
+		expect(result).toMatchObject({ outcome: "ok", version: 4 });
 		expect(await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
-			item: { data: "fresh", version: 3 },
+			item: { data: "fresh", version: 4 },
 		});
 	});
 

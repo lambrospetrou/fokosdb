@@ -706,10 +706,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
             --                          transaction timestamp that is not greater than this value. A new item row starts with
             --                          last_read_ts and last_write_ts at least this value. Thus the timestamp watermark of a
             --                          key never goes down, and a late prepare of a committed transaction gets a conflict.
-            -- max_deleted_v          : the highest v of an item row that a delete or a TTL expiry removed. A new item row
-            --                          starts at max_deleted_v + 1, so the v of a key never repeats, also after a delete and a
-            --                          recreate. A read transaction compares this value for an item that is absent in both
-            --                          phases. A read compares v for an item that is found in both phases.
+            -- max_deleted_v          : the highest delete revision of the partition. A delete or a TTL expiry of an item row
+            --                          at v has the delete revision v + 1. A new item row starts at max_deleted_v + 1, so
+            --                          the revisions of a key (each v and each delete revision) always increase, also after
+            --                          a delete and a recreate. A read transaction compares this value for an item that is
+            --                          absent in both phases. A read compares v for an item that is found in both phases.
             CREATE TABLE IF NOT EXISTS deletion_metadata (
                 id                     INTEGER PRIMARY KEY CHECK (id = 1),
                 max_delete_tx_order_ts INTEGER NOT NULL DEFAULT 0,
@@ -1086,9 +1087,15 @@ export class PartitionStore {
 	 * when the statement deleted a row. `max_deleted_v` advances only when a row was removed, because
 	 * an absent row has no `v`; `max_delete_tx_order_ts` also advances for an absent row when
 	 * `bumpTxOrderTsAlways`. The metrics cover the DELETE statement ONLY.
+	 *
+	 * The delete of a row at `v` has the revision `deleteVersion = v + 1`, and `max_deleted_v` goes
+	 * to at least that value. The next row of the key starts at `max_deleted_v + 1`, so each
+	 * revision of a key is above all earlier revisions. `deleteVersion` is absent when no row was
+	 * removed.
 	 */
 	deleteItem(opts: { hk: KeyBytes; sk: KeyBytes; txOrderTs: number; bumpTxOrderTsAlways?: boolean }): {
 		deleted: boolean;
+		deleteVersion?: number;
 		rowsRead: number;
 		rowsWritten: number;
 	} {
@@ -1106,16 +1113,18 @@ export class PartitionStore {
 
 		const writeRes = this.#storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hk, opts.sk);
 		const deleted = writeRes.rowsWritten > 0;
+		let deleteVersion: number | undefined;
 		if (deleted) {
 			invariant(before !== undefined, "fokos/partition-store.deleteItem: the DELETE removed a row that the read before it did not find");
-			this.#raiseDeletionMetadata(Math.max(opts.txOrderTs, before.last_read_ts), before.v);
+			deleteVersion = before.v + 1;
+			this.#raiseDeletionMetadata(Math.max(opts.txOrderTs, before.last_read_ts), deleteVersion);
 		} else if (opts.bumpTxOrderTsAlways) {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
 		}
 		if (deleted || opts.bumpTxOrderTsAlways) {
 			this.#subtractKeySizeEstimate(opts.hk, delEst);
 		}
-		return { deleted, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
+		return { deleted, deleteVersion, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
 
 	/**
@@ -1160,15 +1169,16 @@ export class PartitionStore {
 				}
 				deletedBytes += row.est_row_bytes;
 				maxDeleteTxOrderTs = Math.max(maxDeleteTxOrderTs, row.ttl_epoch_utc_seconds * 1000 * TX_ORDER_TS_UNITS_PER_MS, row.last_read_ts);
-				maxDeletedV = Math.max(maxDeletedV, row.v);
+				// The expiry of a row at v has the delete revision v + 1, the same as a user delete.
+				maxDeletedV = Math.max(maxDeletedV, row.v + 1);
 			}
 
 			for (const { hk, bytes } of bytesByHashKey.values()) {
 				this.#subtractKeySizeEstimate(hk, bytes);
 			}
 			// The logical delete of an expired row happened at its expiry. The sweep records the removed
-			// rows the same as a user delete, so a later create of the key starts above their v and their
-			// stamps.
+			// rows the same as a user delete, so a later create of the key starts above their delete
+			// revisions and their stamps.
 			if (rows.length > 0) {
 				this.#raiseDeletionMetadata(maxDeleteTxOrderTs, maxDeletedV);
 			}
@@ -1931,7 +1941,7 @@ export class PartitionStore {
 	/**
 	 * Raises both deletion-metadata values with MAX in one statement. After a delete, `maxDeleteTxOrderTs`
 	 * is the highest of the delete timestamps and of the `last_read_ts` of the removed rows, and
-	 * `maxDeletedV` is the highest `v` of the removed rows.
+	 * `maxDeletedV` is the highest delete revision (`v + 1`) of the removed rows.
 	 */
 	#raiseDeletionMetadata(maxDeleteTxOrderTs: number, maxDeletedV: number): void {
 		this.#storage.sql.exec(

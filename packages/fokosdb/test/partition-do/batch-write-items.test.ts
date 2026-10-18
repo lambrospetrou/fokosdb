@@ -68,11 +68,11 @@ describe.concurrent("PartitionDO — apiBatchWriteItems", () => {
 			items: [putItem(0, "a", "1", "new"), deleteItem(1, "a", "1"), deleteItem(2, "b", "1"), putItem(3, "b", "2", "two")],
 		});
 
-		// The operations apply in request order. The delete of `a/1` at version 2 raises `max_deleted_v`,
-		// so the new row `b/2` starts at version 3.
+		// The operations apply in request order. The delete of `a/1` at version 2 raises `max_deleted_v`
+		// to its delete revision 3, so the new row `b/2` starts at version 4.
 		expect(value.appliedPuts).toEqual([
 			{ opIndex: 0, version: 2, partitionIndex: 0 },
-			{ opIndex: 3, version: 3, partitionIndex: 0 },
+			{ opIndex: 3, version: 4, partitionIndex: 0 },
 		]);
 		expect(value.appliedDeletes).toEqual([
 			{ opIndex: 1, deleted: true, partitionIndex: 0 },

@@ -311,8 +311,8 @@ describe("ordered per-item execution: evaluate", () => {
 	});
 
 	it.each<[string, Op[], number]>([
-		["a single delete", [del("A")], 51],
-		["a final delete after writes", [put("A", { n: 5 }), update("A"), del("A")], 53],
+		["a single delete", [del("A")], 52],
+		["a final delete after writes", [put("A", { n: 5 }), update("A"), del("A")], 54],
 	])("returns the same failure image on both paths after %s of another item", async (_name, beforeDelete, version) => {
 		await withPartition(({ participant, store, storage }) => {
 			for (let i = 0; i < 50; i++) {
@@ -483,14 +483,15 @@ describe("ordered per-item execution: versions", () => {
 			const request = prepareReq(withOpIndex([put("X", { n: 1 }), update("X"), check("X", true)]));
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
-			// A delete of another item between prepare and commit raises max_deleted_v to 50.
+			// A delete of another item at v = 50 between prepare and commit raises max_deleted_v to its
+			// delete revision 51.
 			storage.sql.exec(`UPDATE items SET v = 50 WHERE hk = ?`, kb("B"));
 			store.deleteItem({ hk: kb("B"), sk: SK, txOrderTs: 10 });
-			expect(store.getMaxDeletedV()).toBe(50);
+			expect(store.getMaxDeletedV()).toBe(51);
 
 			participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: T, items: uniqueKeys(request.items) });
 			const row = store.getItem(kb("X"), SK).row;
-			expect(row?.v).toBe(52);
+			expect(row?.v).toBe(53);
 			expect(JSON.parse(row?.data as string)).toEqual({ n: 2 });
 		});
 	});
