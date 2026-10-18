@@ -16,9 +16,21 @@ export function conditionPlanOf(condition: ConditionExpression): CompiledConditi
 	return compileConditionExpression(condition);
 }
 
+const projectionPlans = new WeakMap<readonly ProjectionExpression[], CompiledProjectionPlan>();
+
+/**
+ * One batch read runs one projection for many items: the projection of the request, or the projection
+ * of an item. Thus the plan is kept for the tree object, as `updatePlanOf` keeps the plan of an update,
+ * and one request compiles each tree one time.
+ */
 export function projectionPlanOf(projection: readonly ProjectionExpression[]): CompiledProjectionPlan {
-	refuseCompiledPlan(projection);
-	return compileProjectionExpression(projection);
+	let plan = projectionPlans.get(projection);
+	if (plan === undefined) {
+		refuseCompiledPlan(projection);
+		plan = compileProjectionExpression(projection);
+		projectionPlans.set(projection, plan);
+	}
+	return plan;
 }
 
 export function queryPlanOf(query: QueryExpressions): CompiledQueryPlan {

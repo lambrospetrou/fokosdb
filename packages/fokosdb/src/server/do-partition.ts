@@ -27,7 +27,7 @@ import type {
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
 import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
-import { identityDepth } from "../sharding/partition-id.js";
+import { identityDepth, isRangePartition } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { SplitType } from "../sharding/types.js";
 import invariant from "../shared/invariant.js";
@@ -53,6 +53,7 @@ import { FokosShardingRuntime } from "../sharding/runtime.js";
 import type { FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
 import type {
 	FokosEnvelope,
+	FokosGroupFailure,
 	FokosGroupPart,
 	FokosLifecycle,
 	FokosLocalCall,
@@ -106,6 +107,10 @@ import {
 	UNAVAILABLE_CODES,
 } from "../shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES } from "../sharding/errors.js";
+import { routedError } from "../sharding/envelope.js";
+import type { BatchUnprocessedCode } from "../shared/batch-api-types.js";
+import { classifyBatchFailure } from "../shared/batch-failure.js";
+import { fitBatchResponse } from "../shared/batch-response.js";
 
 // ─── item RPC types ───────────────────────────────────────────────────────────
 
@@ -153,14 +158,62 @@ export type GetItemRpcRequest = ItemRpcKeys & { projection?: readonly Projection
 // A projected read carries the positional row inside `item`, so `kind`, `version`, and `ttlAt` are
 // common to both found variants. `kind` is then `"projected"`, which is a read-result tag and never
 // a stored `data_kind`.
+export type GetItemRpcItem =
+	| { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number }
+	| { projected: ProjectedWireRow; kind: "projected"; ttlAt?: number; version: number };
+
 export type GetItemRpcResponse =
-	| { found: true; item: { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number }; partitions: ItemRpcPartitions }
-	| {
-			found: true;
-			item: { projected: ProjectedWireRow; kind: "projected"; ttlAt?: number; version: number };
-			partitions: ItemRpcPartitions;
-	  }
+	| { found: true; item: GetItemRpcItem; partitions: ItemRpcPartitions }
 	| { found: false; partitions: ItemRpcPartitions };
+
+// ─── batch item RPC types ─────────────────────────────────────────────────────
+
+/**
+ * Wire types for the batch item RPCs. Each item carries its `opIndex`, the position of the item in the
+ * batch, and every answer names its items by `opIndex` and carries no key: `db.ts` builds the public
+ * results from its own request. An answer lists its partitions as a `group` answer does, and each
+ * `partitionIndex` points into that list.
+ */
+export type BatchGetItemsRpcRequest = {
+	items: Array<{ opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; projection?: readonly ProjectionExpression[] }>;
+	/** The projection of each item that has no projection of its own. */
+	projection?: readonly ProjectionExpression[];
+	/** The `maxResponseBytes` of the batch. Every part gets the same value. */
+	maxResponseBytes: number;
+};
+
+export type BatchGetItemsRpcResponse = {
+	/** `bytes` is the estimate of the size of `item`, which `fitBatchResponse` adds up. */
+	found: Array<{ opIndex: number; item: GetItemRpcItem; bytes: number; partitionIndex: number }>;
+	notFound: Array<{ opIndex: number; partitionIndex: number }>;
+	failed: BatchFailure[];
+	partitions: WirePartitionMeta[];
+};
+
+export type BatchWriteRpcItem = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes } & (
+	| { operation: "put"; data: string | Uint8Array; kind: DataKind; ttlAt?: number }
+	| { operation: "delete" }
+);
+
+export type BatchWriteItemsRpcRequest = { items: BatchWriteRpcItem[] };
+
+export type BatchWriteItemsRpcResponse = {
+	appliedPuts: Array<{ opIndex: number; version: number; partitionIndex: number }>;
+	appliedDeletes: Array<{ opIndex: number; deleted: boolean; partitionIndex: number }>;
+	failed: BatchFailure[];
+	partitions: WirePartitionMeta[];
+};
+
+/** One error that stopped one or more items. */
+export type BatchFailure = {
+	outcome: "rejected" | "unprocessed" | "unknown";
+	code: BatchUnprocessedCode;
+	/** Absent only for `response_too_large`, which is no error. */
+	error_id?: string;
+	/** Absent when no partition answered. */
+	partitionIndex?: number;
+	opIndexes: number[];
+};
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
@@ -253,6 +306,8 @@ export type PartitionOps = {
 	apiGetItem: { req: GetItemRpcRequest; res: GetItemRpcResponse };
 	apiDeleteItem: { req: DeleteItemRpcRequest; res: DeleteItemRpcResponse };
 	apiQueryItems: { req: QueryItemsRpcRequest; res: QueryItemsRpcResponse };
+	apiBatchGetItems: { req: BatchGetItemsRpcRequest; res: BatchGetItemsRpcResponse };
+	apiBatchWriteItems: { req: BatchWriteItemsRpcRequest; res: BatchWriteItemsRpcResponse };
 	txPrepare: { req: PrepareRequest; res: PrepareResponse };
 	txCommit: { req: CommitRequest; res: CommitResponse };
 	txCancel: { req: CancelRequest; res: CancelResponse };
@@ -290,6 +345,10 @@ const STALE_RECOVERY_STEP_BUDGET_MS = 10_000;
 const PROMOTION_CANDIDATES_MAX = 5;
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
+
+/** The committed state of one item, and its response bytes. `found` is absent for an absent item. */
+type ItemRead = { found?: { item: GetItemRpcItem; bytes: number }; rowsRead: number; rowsWritten: number };
+
 const keyOf = (item: TransactionItemKey) => ({ hashKey: item.hashKey, sortKey: item.sortKey });
 const rowKeyOf = (row: { hk: KeyBytes; sk: KeyBytes }) => ({ hashKey: row.hk, sortKey: row.sk });
 
@@ -360,6 +419,12 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 	async apiQueryItems(ctx: FokosDBRouteContext, req: QueryItemsRpcRequest) {
 		return await this.#api("apiQueryItems", ctx, req);
+	}
+	async apiBatchGetItems(ctx: FokosDBRouteContext, req: BatchGetItemsRpcRequest) {
+		return await this.#api("apiBatchGetItems", ctx, req);
+	}
+	async apiBatchWriteItems(ctx: FokosDBRouteContext, req: BatchWriteItemsRpcRequest) {
+		return await this.#api("apiBatchWriteItems", ctx, req);
 	}
 	async txPrepare(ctx: FokosDBRouteContext, req: PrepareRequest) {
 		return await this.#api("txPrepare", ctx, req);
@@ -578,6 +643,48 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				clip: (req, visit) => clipQueryToVisit(req, visit),
 				local: (req) => this.queryItemsLocal(req),
 				walk: ({ request, visits, local, forward }) => walkRangeVisits(request, visits, local, forward),
+			},
+			// A batch is not atomic, so a part that fails does not fail the request: `merge` gives each of
+			// its items an outcome from the error.
+			apiBatchGetItems: {
+				shape: "group",
+				whileMigrating: "read_source",
+				readOnly: true,
+				admissionTag: "read",
+				failurePolicy: "collect",
+				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
+				subRequest: (req, items) => ({ ...req, items: items as BatchGetItemsRpcRequest["items"] }),
+				local: (req) => this.batchGetLocal(req),
+				// Each part fits in the limit, but the parts together can go above it. Every node trims its
+				// answer, so no answer that crosses an RPC goes above it.
+				merge: (parts) => {
+					const merged = this.mergeBatch(parts, false, { found: [], notFound: [], failed: [], partitions: [] }, (out, result, offset) => {
+						out.found.push(...result.found.map((entry) => withOffset(entry, offset)));
+						out.notFound.push(...result.notFound.map((entry) => withOffset(entry, offset)));
+					});
+					const { kept, dropped } = fitBatchResponse(merged.found, Math.min(...parts.map((part) => part.request.maxResponseBytes)));
+					merged.found = kept;
+					for (const { opIndex, partitionIndex } of dropped) {
+						merged.failed.push({ outcome: "unprocessed", code: "response_too_large", opIndexes: [opIndex], partitionIndex });
+					}
+					return merged;
+				},
+			},
+			// The handler checks the size of the partition itself, so a partition above its cap still
+			// applies the deletes of a batch: the admission tag is one that `admit` allows.
+			apiBatchWriteItems: {
+				shape: "group",
+				whileMigrating: "throw",
+				admissionTag: "batch_write",
+				failurePolicy: "collect",
+				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
+				subRequest: (req, items) => ({ items: items as BatchWriteRpcItem[] }),
+				local: (req, call) => this.batchWriteLocal(req, call),
+				merge: (parts) =>
+					this.mergeBatch(parts, true, { appliedPuts: [], appliedDeletes: [], failed: [], partitions: [] }, (out, result, offset) => {
+						out.appliedPuts.push(...result.appliedPuts.map((entry) => withOffset(entry, offset)));
+						out.appliedDeletes.push(...result.appliedDeletes.map((entry) => withOffset(entry, offset)));
+					}),
 			},
 			txPrepare: {
 				shape: "group",
@@ -847,12 +954,8 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				if (admissionTag !== "write" || keys.length === 0) {
 					return "allow";
 				}
-				const identity = this.fokos.identity();
-				const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
-				if (maxSizeMb && this.#store.databaseSize > maxSizeMb * ADMISSION_MARGIN * 1024 * 1024) {
-					return { reject: errExceededDatabaseSize(op) };
-				}
-				return "allow";
+				const refusal = this.sizeRefusal(op, policy);
+				return refusal ? { reject: refusal } : "allow";
 			},
 			jobs: [
 				{
@@ -949,18 +1052,56 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return { answer: large.length > 0 ? { promote: large } : {} };
 	}
 
+	/**
+	 * The size gate of a write: the error that refuses it when this partition is above 1.1 times its
+	 * cap, or undefined. The `admit` hook and the batch write handler share it.
+	 */
+	private sizeRefusal(op: string, policy: FokosDBPolicy): FokosUnavailableError | undefined {
+		const identity = this.fokos.identity();
+		const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
+		if (maxSizeMb && this.#store.databaseSize > maxSizeMb * ADMISSION_MARGIN * 1024 * 1024) {
+			return errExceededDatabaseSize(op);
+		}
+		return undefined;
+	}
+
+	// ═══ the write steps of the non-transactional writes ═════════════════════
+	// `putItem`, `deleteItem`, and the batch write share them. Each runs inside the `transactionSync`
+	// of its caller.
+
+	/** Refuses a non-transactional write to an item that an in-progress transaction holds. It does not wait for the lock. */
+	private assertNotLocked(hashKey: KeyBytes, sortKey: KeyBytes): void {
+		const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
+		if (pendingRow) {
+			// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
+			// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
+			throw itemLockedError(pendingRow.transaction_id, hashKey, sortKey);
+		}
+	}
+
+	private upsertNow(item: { hashKey: KeyBytes; sortKey: KeyBytes; data: string | Uint8Array; kind: DataKind; ttlAt?: number }) {
+		return this.#store.upsertItem({
+			hk: item.hashKey,
+			sk: item.sortKey,
+			data: item.data,
+			kind: item.kind,
+			ttlAt: item.ttlAt ?? null,
+			txOrderTs: txOrderTimestampNow(),
+		});
+	}
+
+	/** The delete stamps the transaction order watermark, as a transactional delete does. */
+	private deleteNow(hashKey: KeyBytes, sortKey: KeyBytes) {
+		return this.#store.deleteItem({ hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
+	}
+
 	// ═══ local handlers ══════════════════════════════════════════════════════
 
 	private putItemLocal(req: PutItemRpcRequest, call: FokosLocalCall): PutItemRpcResponse {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
 		const localRes = this.#store.transactionSync(() => {
-			const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
-			if (pendingRow) {
-				// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
-				// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
-				throw itemLockedError(pendingRow.transaction_id, hashKey, sortKey);
-			}
+			this.assertNotLocked(hashKey, sortKey);
 
 			const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
 			if (conditionRes && !conditionRes.conditionOk) {
@@ -968,14 +1109,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				return { outcome: "rejected" as const, conditionRes, image };
 			}
 
-			const writeRes = this.#store.upsertItem({
-				hk: hashKey,
-				sk: sortKey,
-				data: req.data,
-				kind: req.kind,
-				ttlAt: req.ttlAt ?? null,
-				txOrderTs: txOrderTimestampNow(),
-			});
+			const writeRes = this.upsertNow(req);
 			return { outcome: "ok" as const, writeRes, conditionRes };
 		});
 
@@ -1002,11 +1136,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
 		const localRes = this.#store.transactionSync(() => {
-			const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
-			if (pendingRow) {
-				// FIXME: ATC §4 optimization — see same comment in putItem.
-				throw itemLockedError(pendingRow.transaction_id, hashKey, sortKey);
-			}
+			this.assertNotLocked(hashKey, sortKey);
 
 			const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
 			if (conditionRes && !conditionRes.conditionOk) {
@@ -1014,8 +1144,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				return { outcome: "rejected" as const, conditionRes, image };
 			}
 
-			// Keep the deletion transaction order watermark consistent with transactional deletes.
-			const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
+			const writeRes = this.deleteNow(hashKey, sortKey);
 			return { outcome: "ok" as const, writeRes, conditionRes };
 		});
 
@@ -1036,39 +1165,161 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	private readItemLocally(req: GetItemRpcRequest): GetItemRpcResponse {
-		const res =
-			req.projection === undefined
-				? this.#store.getItem(req.hashKey, req.sortKey)
-				: this.#store.getItemProjected(req.projection, req.hashKey, req.sortKey);
-		const { rowsRead, rowsWritten } = res;
-		const result = res.row;
+		const { found, rowsRead, rowsWritten } = this.readItem(req.hashKey, req.sortKey, req.projection);
 		const partitions = this.answered({ rowsRead, rowsWritten });
-		if (!result) {
-			return { found: false, partitions };
-		}
-		if ("projected" in result) {
-			return {
-				found: true,
-				item: {
-					projected: result.projected,
-					kind: "projected",
-					...(result.ttlAt === undefined ? {} : { ttlAt: result.ttlAt }),
-					version: result.version,
-				},
-				partitions,
+		return found ? { found: true, item: found.item, partitions } : { found: false, partitions };
+	}
+
+	/**
+	 * The committed state of one item, with the response bytes that `estimateItemBytes` or
+	 * `estimateProjectedRowBytes` counts for it. `getItem` and the batch read share it.
+	 */
+	private readItem(hashKey: KeyBytes, sortKey: KeyBytes, projection: readonly ProjectionExpression[] | undefined): ItemRead {
+		if (projection !== undefined) {
+			const { row, rowsRead, rowsWritten } = this.#store.getItemProjected(projection, hashKey, sortKey);
+			if (!row) {
+				return { rowsRead, rowsWritten };
+			}
+			const item: GetItemRpcItem = {
+				projected: row.projected,
+				kind: "projected",
+				...(row.ttlAt === undefined ? {} : { ttlAt: row.ttlAt }),
+				version: row.version,
 			};
+			return { found: { item, bytes: estimateProjectedRowBytes(row.projected) }, rowsRead, rowsWritten };
 		}
-		return {
-			found: true,
-			item: {
-				// json arrives here as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
-				data: result.data,
-				kind: result.kind,
-				...(result.ttl_epoch_utc_seconds === null ? {} : { ttlAt: result.ttl_epoch_utc_seconds }),
-				version: result.v,
-			},
-			partitions,
+		const { row, rowsRead, rowsWritten } = this.#store.getItem(hashKey, sortKey);
+		if (!row) {
+			return { rowsRead, rowsWritten };
+		}
+		const item: GetItemRpcItem = {
+			// json arrives here as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
+			data: row.data,
+			kind: row.kind,
+			...(row.ttl_epoch_utc_seconds === null ? {} : { ttlAt: row.ttl_epoch_utc_seconds }),
+			version: row.v,
 		};
+		return { found: { item, bytes: estimateItemBytes({ hk: hashKey, sk: sortKey, ...row }) }, rowsRead, rowsWritten };
+	}
+
+	/**
+	 * Reads the items of one part of a batch read, in request order, as one snapshot of this partition.
+	 * It does not apply the response limit: `merge` does, after it joins this part with the others.
+	 */
+	private batchGetLocal(req: BatchGetItemsRpcRequest): BatchGetItemsRpcResponse {
+		const out: BatchGetItemsRpcResponse = { found: [], notFound: [], failed: [], partitions: [] };
+		let rowsRead = 0;
+		let rowsWritten = 0;
+		for (const { opIndex, hashKey, sortKey, projection } of req.items) {
+			let read: ItemRead;
+			try {
+				read = this.readItem(hashKey, sortKey, projection ?? req.projection);
+			} catch (e) {
+				out.failed.push({ ...classifyBatchFailure(e, { write: false, local: true }), opIndexes: [opIndex], partitionIndex: 0 });
+				continue;
+			}
+			rowsRead += read.rowsRead;
+			rowsWritten += read.rowsWritten;
+			if (read.found) {
+				out.found.push({ opIndex, ...read.found, partitionIndex: 0 });
+			} else {
+				out.notFound.push({ opIndex, partitionIndex: 0 });
+			}
+		}
+		out.partitions = this.answered({ rowsRead, rowsWritten });
+		return out;
+	}
+
+	/**
+	 * Applies the operations of one part of a batch write, in request order, each in its own
+	 * `transactionSync` block. A block that throws rolls back its own writes, and the next operation
+	 * runs. After a block commits, the handler only appends to its answer, and that code does not throw,
+	 * so the handler never throws after its first write. All blocks run in one synchronous call, so no
+	 * other request runs between two operations.
+	 *
+	 * Above 1.1 times the cap, the puts are refused and the deletes still apply: a delete is how a
+	 * client brings an over-size partition back under its cap.
+	 */
+	private batchWriteLocal(req: BatchWriteItemsRpcRequest, call: FokosLocalCall): BatchWriteItemsRpcResponse {
+		const out: BatchWriteItemsRpcResponse = { appliedPuts: [], appliedDeletes: [], failed: [], partitions: [] };
+		const puts = req.items.filter((item) => item.operation === "put").map((item) => item.opIndex);
+		const overSize = puts.length > 0 ? this.sizeRefusal("apiBatchWriteItems", this.fokos.policy()) : undefined;
+		if (overSize) {
+			call.signal({ evaluateSplit: true });
+			out.failed.push({ ...classifyBatchFailure(overSize, { write: true, local: true }), opIndexes: puts, partitionIndex: 0 });
+		}
+		const candidates: PromotionCandidate[] = [];
+		let rowsRead = 0;
+		let rowsWritten = 0;
+		for (const item of req.items) {
+			if (item.operation === "put" && overSize) {
+				continue;
+			}
+			const { opIndex, hashKey, sortKey } = item;
+			let res: ReturnType<PartitionDO["upsertNow"]> | ReturnType<PartitionDO["deleteNow"]>;
+			try {
+				// TODO: This might be performance slowdown instead of doing a transaction for all the items.
+				//       The only reason we do this is to allow partial application of the batch, but might reconsider.
+				res = this.#store.transactionSync(() => {
+					this.assertNotLocked(hashKey, sortKey);
+					return item.operation === "put" ? this.upsertNow(item) : this.deleteNow(hashKey, sortKey);
+				});
+			} catch (e) {
+				out.failed.push({ ...classifyBatchFailure(e, { write: true, local: true }), opIndexes: [opIndex], partitionIndex: 0 });
+				continue;
+			}
+			rowsRead += res.rowsRead;
+			rowsWritten += res.rowsWritten;
+			if (!("deleted" in res)) {
+				out.appliedPuts.push({ opIndex, version: res.version, partitionIndex: 0 });
+				candidates.push({ hashKey, keyEstBytes: res.keyEstBytes });
+			} else {
+				out.appliedDeletes.push({ opIndex, deleted: res.deleted, partitionIndex: 0 });
+			}
+		}
+		if (candidates.length > 0) {
+			this.signalGrowth(call, candidates);
+		}
+		out.partitions = this.answered({ rowsRead, rowsWritten });
+		return out;
+	}
+
+	/**
+	 * Joins the parts of a batch operation. A part that answered adds its lists, with each
+	 * `partitionIndex` moved by the entries of the parts before it. A failed part gives all its items one
+	 * failure, and adds the entry of the partition that raised the error with no counts: this partition
+	 * for the local part, else the head of the routing of the error. A remote error with no routing adds
+	 * no entry. It never throws.
+	 */
+	private mergeBatch<
+		Req extends { items: Array<{ opIndex: number }> },
+		Res extends { failed: BatchFailure[]; partitions: WirePartitionMeta[] },
+	>(
+		parts: Array<FokosGroupPart<Req, Res> | FokosGroupFailure<Req>>,
+		write: boolean,
+		out: Res,
+		addLists: (out: Res, result: Res, offset: number) => void,
+	): Res {
+		for (const part of parts) {
+			const offset = out.partitions.length;
+			if ("result" in part) {
+				addLists(out, part.result, offset);
+				out.failed.push(...part.result.failed.map((entry) => withOffset(entry, offset)));
+				out.partitions.push(...part.result.partitions);
+				continue;
+			}
+			const local = part.target === "local";
+			const entry = local ? this.selfPartition() : raiserPartition(part.error);
+			if (entry) {
+				out.partitions.push(entry);
+			}
+			out.failed.push({
+				...classifyBatchFailure(part.error, { write, local }),
+				opIndexes: part.request.items.map((item) => item.opIndex),
+				...(entry ? { partitionIndex: offset } : {}),
+			});
+		}
+		return out;
 	}
 
 	private queryItemsLocal(req: QueryItemsRpcRequest): QueryItemsRpcResponse {
@@ -1489,6 +1740,18 @@ function mergePrepare(parts: Array<FokosGroupPart<PrepareRequest, PrepareRespons
  */
 function withOffset<T extends { partitionIndex?: number }>(entry: T, offset: number): T {
 	return entry.partitionIndex === undefined ? entry : { ...entry, partitionIndex: offset + entry.partitionIndex };
+}
+
+/** The entry of the partition that raised a forwarded error, from the head of its routing, with no counts. */
+function raiserPartition(error: unknown): WirePartitionMeta | undefined {
+	const raiser = routedError(error)?.routing.servedBy[0];
+	if (!raiser) {
+		return undefined;
+	}
+	return {
+		actorId: raiser.actorId,
+		...(isRangePartition(raiser.ref) ? { rangeDepth: raiser.rangeDepth } : { hashDepth: raiser.hashDepth }),
+	};
 }
 
 /** The one key of a promotion plan: its single target carries a `promoted_key` slice. */

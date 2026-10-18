@@ -59,8 +59,16 @@ function pageRows(page: unknown): number {
 	return (p.items ?? p.pendingTransactions ?? []).length;
 }
 
-/** The transaction operations that this class logs, and that a test can make answer or fail. */
-export type TxOp = "txReadSnapshot" | "txReadForTransaction" | "txExecuteSingleShot" | "txPrepare" | "txCommit" | "txCancel";
+/** The transaction and batch operations that this class logs, and that a test can make answer or fail. */
+export type TxOp =
+	| "txReadSnapshot"
+	| "txReadForTransaction"
+	| "txExecuteSingleShot"
+	| "txPrepare"
+	| "txCommit"
+	| "txCancel"
+	| "apiBatchGetItems"
+	| "apiBatchWriteItems";
 export type TxRequest<Op extends TxOp> = Parameters<PartitionDO[Op]>[1];
 type TxResponse<Op extends TxOp> = Awaited<ReturnType<PartitionDO[Op]>>;
 
@@ -84,6 +92,8 @@ export class ControlledPartitionDO extends PartitionDO {
 		txPrepare: [],
 		txCommit: [],
 		txCancel: [],
+		apiBatchGetItems: [],
+		apiBatchWriteItems: [],
 	};
 	#txRules: { [Op in TxOp]?: TxResponseRule<Op> } = {};
 	#readGate: (Gate & { parked: boolean }) | null = null;
@@ -148,6 +158,14 @@ export class ControlledPartitionDO extends PartitionDO {
 
 	override txCancel(ctx: FokosDBRouteContext, req: TxRequest<"txCancel">) {
 		return this.#tx("txCancel", req, () => super.txCancel(ctx, req));
+	}
+
+	override apiBatchGetItems(ctx: FokosDBRouteContext, req: TxRequest<"apiBatchGetItems">) {
+		return this.#tx("apiBatchGetItems", req, () => super.apiBatchGetItems(ctx, req));
+	}
+
+	override apiBatchWriteItems(ctx: FokosDBRouteContext, req: TxRequest<"apiBatchWriteItems">) {
+		return this.#tx("apiBatchWriteItems", req, () => super.apiBatchWriteItems(ctx, req));
 	}
 
 	// The constructor of PartitionDO reads both methods below, before the fields of this class exist.

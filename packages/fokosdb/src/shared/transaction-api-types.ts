@@ -3,6 +3,7 @@
  * the 2PC requests, responses and driver items live in `transaction-wire-types.ts`, which imports
  * this module and is never imported back.
  */
+import type { ItemBatcher } from "./batch-api-types.js";
 import type { FokosErrorCode } from "./errors-operations.js";
 import type { ConditionExpression, ProjectionExpression, UpdateExpression } from "./expression/types.js";
 import type {
@@ -238,7 +239,7 @@ export interface ItemTransactor {
 	): Promise<TransactGetItemsResult<Ts>>;
 }
 
-// The whole contract composes the single-item halves in `types.ts` with the transaction half above,
-// so it lives here: `types.ts` holds the item primitives that this module builds on and must not
-// import back from it.
-export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemTransactor {}
+// The whole contract composes the single-item halves in `types.ts`, the transaction half above, and the
+// batch half in `batch-api-types.ts`, so it lives here: `types.ts` holds the item primitives that this
+// module builds on and must not import back from it.
+export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemTransactor, ItemBatcher {}

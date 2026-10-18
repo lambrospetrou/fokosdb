@@ -26,8 +26,29 @@ import {
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
-import type { ItemRpcPartitions, PartitionOps } from "../server/do-partition.js";
+import type {
+	BatchFailure,
+	BatchGetItemsRpcRequest,
+	BatchGetItemsRpcResponse,
+	BatchWriteRpcItem,
+	GetItemRpcItem,
+	ItemRpcPartitions,
+	PartitionOps,
+} from "../server/do-partition.js";
 import type { CoordinatorOps } from "../server/do-transaction-coordinator.js";
+import type {
+	BatchGetItemKey,
+	BatchGetItemResult,
+	BatchGetItemsOptions,
+	BatchGetItemsResult,
+	BatchUnprocessedCode,
+	BatchWriteItemResult,
+	BatchWriteItemsOptions,
+	BatchWriteItemsResult,
+} from "../shared/batch-api-types.js";
+import { classifyBatchFailure, type BatchFailureOutcome } from "../shared/batch-failure.js";
+import { fitBatchResponse } from "../shared/batch-response.js";
+import type { FokosErrorCode } from "../shared/errors-operations.js";
 import type {
 	ExecutionFailureCode,
 	RejectionReason,
@@ -61,6 +82,10 @@ import {
 	validateTransactWriteOperations,
 	validateExecutionMode,
 	validateClientRequestToken,
+	validateTtlAt,
+	validateBatchGetItems,
+	MAX_BATCH_GET_RESPONSE_BYTES,
+	validateBatchWriteItems,
 	decodeItemKeys,
 	resolveLimits,
 	type FokosDBLimits,
@@ -91,6 +116,7 @@ import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec, KeyPairMap } from "../sharding/key-codec.js";
 import { attachRouting, routedError } from "../sharding/envelope.js";
 import type { FokosPublicRouting } from "../sharding/runtime-types.js";
+import type { WirePartitionMeta } from "../shared/types.js";
 import { normalizeSkInterval } from "../sharding/sk-interval.js";
 import { answerMeta, PartitionMetaJoin, routeNodeMeta } from "../shared/partition-meta.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
@@ -106,7 +132,7 @@ import {
 } from "../shared/query/page-budget.js";
 import { canonicalConditionIdentity, canonicalProjectionIdentity } from "../shared/expression/identity.js";
 import { validateConditionExpression, validateProjectionExpression, validateUpdateExpression } from "../shared/expression/semantic.js";
-import type { ConditionExpression } from "../shared/expression/types.js";
+import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
 import {
 	coordinatorShardGroup,
@@ -127,7 +153,8 @@ export type FokosDBRetryOptions = {
 	maxDelayMs?: number;
 	/**
 	 * The attempts of each read of a read transaction, and of the single-partition read of
-	 * `transactGetItems`. A read applies nothing, so an attempt again is safe. Default: 5.
+	 * `transactGetItems`. A read applies nothing, so an attempt again is safe. It is also the maximum
+	 * number of calls of each `FokosStd` batch retry helper. Default: 5.
 	 */
 	maxAttempts?: number;
 };
@@ -356,6 +383,111 @@ function pendingWriteError(meta: FokosMeta): FokosConflictError {
 	);
 }
 
+/** The fields of the result of an item that one failure stopped. */
+type BatchFailureFields = { code: BatchUnprocessedCode; error_id?: string; partitionIndex?: number };
+
+/**
+ * Joins the answers of the calls of a batch, in call order, into one `meta`. `groups[i]` holds the
+ * items of call `i`. A call can go to any partition of the table, and that partition forwards the
+ * items that it does not own. Each answer adds its entries to the joined list, and `answer` gets the
+ * function that moves a `partitionIndex` of that answer to the joined list. `failure` gets each item
+ * that a failure stopped: a failure in an answer, or a call that failed, which stops each item of that
+ * call. A failed call adds the entry of the partition that raised its error, when the error carries
+ * routing.
+ */
+function joinBatchAnswers<R extends { failed: BatchFailure[]; partitions: WirePartitionMeta[] }>(
+	settled: ReadonlyArray<PromiseSettledResult<FokosCallResult<R>>>,
+	groups: ReadonlyArray<{ indexes: number[] }>,
+	write: boolean,
+	on: {
+		answer(value: R, at: (partitionIndex: number) => number): void;
+		failure(opIndex: number, failure: { outcome: BatchFailureOutcome; fields: BatchFailureFields }): void;
+	},
+): FokosMeta {
+	const join = new PartitionMetaJoin();
+	let forwardCount = 0;
+	settled.forEach((r, g) => {
+		if (r.status === "fulfilled") {
+			const { value, routing } = r.value;
+			const answer = answerMeta(value.partitions, routing);
+			forwardCount += answer.forwardCount;
+			const indexes = answer.partitions.map((entry) => join.add(entry));
+			const at = (partitionIndex: number) => indexes[partitionIndex];
+			on.answer(value, at);
+			for (const { outcome, code, error_id, partitionIndex, opIndexes } of value.failed) {
+				const fields: BatchFailureFields = {
+					code: publicBatchCode(code),
+					...(error_id === undefined ? {} : { error_id }),
+					...(partitionIndex === undefined ? {} : { partitionIndex: at(partitionIndex) }),
+				};
+				for (const opIndex of opIndexes) {
+					on.failure(opIndex, { outcome, fields });
+				}
+			}
+			return;
+		}
+		const { outcome, code, error_id } = classifyBatchFailure(r.reason, { write, local: false });
+		const routed = routedError(r.reason);
+		let partitionIndex: number | undefined;
+		if (routed) {
+			forwardCount += routed.routing.forwardCount;
+			const raiser = routed.routing.servedBy[0];
+			partitionIndex = raiser ? join.add(routeNodeMeta(raiser)) : undefined;
+		}
+		const fields: BatchFailureFields = {
+			code: publicBatchCode(code),
+			error_id,
+			...(partitionIndex === undefined ? {} : { partitionIndex }),
+		};
+		for (const opIndex of groups[g].indexes) {
+			on.failure(opIndex, { outcome, fields });
+		}
+	});
+	return { forwardCount, partitions: join.partitions };
+}
+
+/** The public code of a batch result, mapped as `mapInternalErrorToPublic` maps the code of an error. */
+function publicBatchCode(code: BatchUnprocessedCode): BatchUnprocessedCode {
+	return code === SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code ? SHARDING_UNAVAILABLE_CODES.partition_migrating.code : code;
+}
+
+/** The `error_id` of a defect in a batch answer, which is logged here. The method still answers each item. */
+function defectErrorId(message: string, attributes: Record<string, unknown> = {}): string {
+	const err = new FokosInternalError(CORE_INTERNAL_CODES.invariant_failed, { message, attributes });
+	console.error({ message: `fokos/batch: ${message}`, error_id: err.error_id, ...attributes });
+	return err.error_id;
+}
+
+/**
+ * The public result of one found item of a batch read, with the caller's own keys. An error while it
+ * decodes the item makes the item `unprocessed`, because the method never throws after I/O starts.
+ */
+function decodeFoundItem(
+	item: GetItemRpcItem,
+	names: readonly string[] | undefined,
+	keys: { hashKey: HashKey; sortKey?: SortKey },
+	partitionIndex: number,
+): BatchGetItemResult {
+	try {
+		if (item.kind === "projected") {
+			invariant(names, "fokos/batchGetItems: projected result without a projection");
+			return {
+				outcome: "found",
+				partitionIndex,
+				...keys,
+				data: projectedItemFromWireRow(names, item.projected),
+				kind: "projected",
+				...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
+				version: item.version,
+			};
+		}
+		return { outcome: "found", partitionIndex, ...keys, ...item, ...decodeItemData(item.kind, item.data) };
+	} catch (e) {
+		const err = FokosError.wrap(e);
+		return { outcome: "unprocessed", code: err.code as FokosErrorCode, error_id: err.error_id, partitionIndex, ...keys };
+	}
+}
+
 /** Runs the body of a public method, and raises any error from it as a FokosError. */
 async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
@@ -390,18 +522,6 @@ function mapInternalErrorToPublic(err: FokosError): FokosError {
 	// the mapping. This code would otherwise be the only one that reaches a client with no meta.
 	const routed = routedError(err);
 	return routed ? attachRouting(mapped, routed.routing) : mapped;
-}
-
-function validateTtlAt(ttlAt: number | undefined, where: string): void {
-	if (ttlAt === undefined) {
-		return;
-	}
-	if (!Number.isInteger(ttlAt) || ttlAt <= 0) {
-		throw new FokosValidationError(VALIDATION_CODES.ttl_at_invalid, {
-			message: "ttlAt must be an integer greater than zero",
-			attributes: { api: where, ttlAt },
-		});
-	}
 }
 
 /**
@@ -446,27 +566,35 @@ export type FokosDBResolvedOptions = Omit<
 	partitionMigratingRetryDeadlineMs: number;
 };
 
-function validateRetryOptions(retry: Required<FokosDBRetryOptions>, partitionMigratingRetryDeadlineMs: number): void {
-	const invalid = (option: string, value: number, message: string) =>
-		new FokosValidationError(VALIDATION_CODES.fokosdb_options_invalid, { message, attributes: { option, value } });
+/** The retry options with the defaults applied, validated. It throws `fokosdb_options_invalid` on a value that is not valid. */
+export function resolveRetryOptions(retry: FokosDBRetryOptions | undefined): Required<FokosDBRetryOptions> {
+	if (retry === undefined) {
+		return DEFAULT_RETRY;
+	}
+	const resolved = {
+		baseDelayMs: retry.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs,
+		maxDelayMs: retry.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs,
+		maxAttempts: retry.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
+	};
+	validateRetryOptions(resolved);
+	return resolved;
+}
+
+const invalidOption = (option: string, value: number, message: string) =>
+	new FokosValidationError(VALIDATION_CODES.fokosdb_options_invalid, { message, attributes: { option, value } });
+
+function validateRetryOptions(retry: Required<FokosDBRetryOptions>): void {
 	if (!Number.isSafeInteger(retry.baseDelayMs) || retry.baseDelayMs < 1) {
-		throw invalid("retry.baseDelayMs", retry.baseDelayMs, "retry.baseDelayMs must be an integer of at least 1");
+		throw invalidOption("retry.baseDelayMs", retry.baseDelayMs, "retry.baseDelayMs must be an integer of at least 1");
 	}
 	if (!Number.isSafeInteger(retry.maxDelayMs) || retry.maxDelayMs < 1) {
-		throw invalid("retry.maxDelayMs", retry.maxDelayMs, "retry.maxDelayMs must be an integer of at least 1");
+		throw invalidOption("retry.maxDelayMs", retry.maxDelayMs, "retry.maxDelayMs must be an integer of at least 1");
 	}
 	if (retry.baseDelayMs >= retry.maxDelayMs) {
-		throw invalid("retry.baseDelayMs", retry.baseDelayMs, "retry.baseDelayMs must be less than retry.maxDelayMs");
+		throw invalidOption("retry.baseDelayMs", retry.baseDelayMs, "retry.baseDelayMs must be less than retry.maxDelayMs");
 	}
 	if (retry.maxAttempts !== undefined && (!Number.isSafeInteger(retry.maxAttempts) || retry.maxAttempts < 1)) {
-		throw invalid("retry.maxAttempts", retry.maxAttempts, "retry.maxAttempts must be an integer of at least 1");
-	}
-	if (!Number.isSafeInteger(partitionMigratingRetryDeadlineMs) || partitionMigratingRetryDeadlineMs < 1) {
-		throw invalid(
-			"partitionMigratingRetryDeadlineMs",
-			partitionMigratingRetryDeadlineMs,
-			"partitionMigratingRetryDeadlineMs must be an integer of at least 1",
-		);
+		throw invalidOption("retry.maxAttempts", retry.maxAttempts, "retry.maxAttempts must be an integer of at least 1");
 	}
 }
 
@@ -494,18 +622,16 @@ export class FokosDB {
 			},
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 			// A client is made for each request, so the defaults are shared and not checked again.
-			retry:
-				options.retry === undefined
-					? DEFAULT_RETRY
-					: {
-							baseDelayMs: options.retry.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs,
-							maxDelayMs: options.retry.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs,
-							maxAttempts: options.retry.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
-						},
+			retry: resolveRetryOptions(options.retry),
 			partitionMigratingRetryDeadlineMs: options.partitionMigratingRetryDeadlineMs ?? PARTITION_MIGRATING_RETRY_DEADLINE_MS,
 		};
-		if (options.retry !== undefined || options.partitionMigratingRetryDeadlineMs !== undefined) {
-			validateRetryOptions(this.#options.retry, this.#options.partitionMigratingRetryDeadlineMs);
+		const deadlineMs = this.#options.partitionMigratingRetryDeadlineMs;
+		if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1) {
+			throw invalidOption(
+				"partitionMigratingRetryDeadlineMs",
+				deadlineMs,
+				"partitionMigratingRetryDeadlineMs must be an integer of at least 1",
+			);
 		}
 		this.#limits = resolveLimits(policy.limits);
 		const { coordinatorRootsN } = this.#options.table;
@@ -576,6 +702,28 @@ export class FokosDB {
 	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T>>;
 	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T> | QueryItemsProjectedResult<T>> {
 		return (await withFokosErrors(async () => await this.#queryItems(opts))) as QueryItemsResult<T> | QueryItemsProjectedResult<T>;
+	}
+
+	/**
+	 * Reads 0 to 100 items by key, and answers each key in request order. It is not a snapshot across
+	 * partitions, and it does not retry: send `unprocessedKeys` again, with the `projection` and the
+	 * `maxResponseBytes` of the request, or use `FokosStd.batchGetItemsWithRetry`. Only a request that is
+	 * not valid throws.
+	 * `Ts` types each item by position, as `transactGetItems` does. The library cannot check `Ts`: it is the
+	 * caller's own statement about what each item holds.
+	 */
+	async batchGetItems<Ts extends readonly unknown[] = never[]>(opts: NoInfer<BatchGetItemsOptions<Ts>>): Promise<BatchGetItemsResult<Ts>> {
+		return (await withFokosErrors(async () => await this.#batchGetItems(opts))) as BatchGetItemsResult<Ts>;
+	}
+
+	/**
+	 * Puts or deletes 0 to 100 items, and answers each operation in request order. It is not atomic, and
+	 * it does not retry: send `unprocessedItems` again, or use `FokosStd.batchWriteItemsWithRetry`. Only a
+	 * request that is not valid throws, because after the first RPC an error for the whole call could
+	 * not say which items applied.
+	 */
+	async batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult> {
+		return await withFokosErrors(async () => await this.#batchWriteItems(opts));
 	}
 
 	/** Stops at the first failure. A partial destroy stays partial, and a later call continues it. */
@@ -1233,6 +1381,141 @@ export class FokosDB {
 		const meta: QueryItemsResult["meta"] = { forwardCount, partitions, rowsReturned };
 
 		return { items, count, scannedCount, cursor, meta } as QueryItemsResult | QueryItemsProjectedResult;
+	}
+
+	// The positional types of the public method are erased here, as in `#transactGetItems`.
+	async #batchGetItems(opts: {
+		items: readonly BatchGetItemKey[];
+		projection?: readonly ProjectionExpression[];
+		maxResponseBytes?: number;
+	}): Promise<BatchGetItemsResult> {
+		const keys = validateBatchGetItems(opts.items, this.#limits);
+		// `names[i]` holds the output names of the projection of item `i`: its own, or the projection of the request.
+		const namesOf = (projection: readonly ProjectionExpression[] | undefined) =>
+			projection === undefined ? undefined : withExpressionErrors(() => validateProjectionExpression(projection)).names;
+		const requestNames = namesOf(opts.projection);
+		const names = opts.items.map((item) => (item.projection === undefined ? requestNames : namesOf(item.projection)));
+		if (opts.maxResponseBytes !== undefined && (!Number.isSafeInteger(opts.maxResponseBytes) || opts.maxResponseBytes <= 0)) {
+			throw new FokosValidationError(VALIDATION_CODES.batch_max_response_bytes_invalid, {
+				message: "maxResponseBytes must be a positive integer when provided",
+				attributes: { maxResponseBytes: opts.maxResponseBytes },
+			});
+		}
+		// `fitBatchResponse` clamps the value on each node.
+		const maxResponseBytes = opts.maxResponseBytes ?? MAX_BATCH_GET_RESPONSE_BYTES;
+		if (opts.items.length === 0) {
+			return { items: [], unprocessedKeys: [], meta: { forwardCount: 0, partitions: [] } };
+		}
+		const items: BatchGetItemsRpcRequest["items"] = opts.items.map((item, opIndex) => ({
+			opIndex,
+			...keys[opIndex],
+			...(item.projection === undefined ? {} : { projection: item.projection }),
+		}));
+
+		const groups = this.#partitions.resolveAll(items);
+		const settled = await Promise.allSettled(
+			groups.map(({ ctx, indexes }) => {
+				const part = indexes.map((i) => items[i]);
+				const request = { items: part, ...(opts.projection === undefined ? {} : { projection: opts.projection }), maxResponseBytes };
+				return this.#partitions.send("apiBatchGetItems", ctx, request, part);
+			}),
+		);
+
+		const keysOf = (i: number) => ({ hashKey: opts.items[i].hashKey, sortKey: opts.items[i].sortKey });
+		const results: Array<BatchGetItemResult | undefined> = Array.from({ length: items.length });
+		const found: BatchGetItemsRpcResponse["found"] = [];
+		const meta = joinBatchAnswers(settled, groups, false, {
+			answer: (value, at) => {
+				for (const entry of value.found) {
+					found.push({ ...entry, partitionIndex: at(entry.partitionIndex) });
+				}
+				for (const { opIndex, partitionIndex } of value.notFound) {
+					results[opIndex] = { outcome: "not_found", partitionIndex: at(partitionIndex), ...keysOf(opIndex) };
+				}
+			},
+			failure: (opIndex, f) => {
+				results[opIndex] =
+					f.outcome === "rejected"
+						? {
+								outcome: "rejected",
+								...f.fields,
+								code: f.fields.code as FokosErrorCode,
+								error_id: f.fields.error_id ?? defectErrorId("a rejected read has no error_id", { opIndex }),
+								...keysOf(opIndex),
+							}
+						: { outcome: "unprocessed", ...f.fields, ...keysOf(opIndex) };
+			},
+		});
+		// Each answer fits in the limit, but the answers of several calls together can go above it.
+		const { kept, dropped } = fitBatchResponse(found, maxResponseBytes);
+		for (const { opIndex, item, partitionIndex } of kept) {
+			results[opIndex] = decodeFoundItem(item, names[opIndex], keysOf(opIndex), partitionIndex);
+		}
+		for (const { opIndex, partitionIndex } of dropped) {
+			results[opIndex] = { outcome: "unprocessed", code: "response_too_large", partitionIndex, ...keysOf(opIndex) };
+		}
+		const out = results.map(
+			(result, opIndex): BatchGetItemResult =>
+				result ?? {
+					outcome: "unprocessed",
+					code: CORE_INTERNAL_CODES.invariant_failed.code,
+					error_id: defectErrorId("a batch read answer has no outcome for an item", { opIndex }),
+					...keysOf(opIndex),
+				},
+		);
+		return { items: out, unprocessedKeys: opts.items.filter((_, i) => out[i].outcome === "unprocessed"), meta };
+	}
+
+	async #batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult> {
+		// The fields of each operation are checked before its data is encoded, so a put with no data
+		// fails with `batch_operation_fields_invalid`.
+		const keys = validateBatchWriteItems(opts.items, this.#limits);
+		if (opts.items.length === 0) {
+			return { results: [], unprocessedItems: [], meta: { forwardCount: 0, partitions: [] } };
+		}
+		const items: BatchWriteRpcItem[] = opts.items.map((item, opIndex) => {
+			if (item.operation === "delete") {
+				return { opIndex, ...keys[opIndex], operation: "delete" };
+			}
+			const encoded = encodeItemData(item.data);
+			validateItemDataSize(encoded.data, "batchWriteItems");
+			return { opIndex, ...keys[opIndex], operation: "put", ...encoded, ...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }) };
+		});
+
+		// No retry: a write whose answer is lost could then apply twice.
+		const groups = this.#partitions.resolveAll(items);
+		const settled = await Promise.allSettled(
+			groups.map(({ ctx, indexes }) => {
+				const part = indexes.map((i) => items[i]);
+				return this.#partitions.send("apiBatchWriteItems", ctx, { items: part }, part);
+			}),
+		);
+
+		const results: Array<BatchWriteItemResult | undefined> = Array.from({ length: items.length });
+		const meta = joinBatchAnswers(settled, groups, true, {
+			answer: (value, at) => {
+				for (const { opIndex, version, partitionIndex } of value.appliedPuts) {
+					results[opIndex] = { outcome: "ok", operation: "put", version, partitionIndex: at(partitionIndex) };
+				}
+				for (const { opIndex, deleted, partitionIndex } of value.appliedDeletes) {
+					results[opIndex] = { outcome: "ok", operation: "delete", deleted, partitionIndex: at(partitionIndex) };
+				}
+			},
+			failure: (opIndex, f) => {
+				const error_id = f.fields.error_id ?? defectErrorId("a failed write has no error_id", { opIndex });
+				results[opIndex] = { outcome: f.outcome, ...f.fields, code: f.fields.code as FokosErrorCode, error_id };
+			},
+		});
+		const out = results.map(
+			(result, opIndex): BatchWriteItemResult =>
+				result ?? {
+					outcome: "unknown",
+					code: CORE_INTERNAL_CODES.invariant_failed.code,
+					error_id: defectErrorId("a batch write answer has no outcome for an item", { opIndex }),
+				},
+		);
+		const unprocessedItems = opts.items.filter((_, i) => out[i].outcome === "unprocessed" || out[i].outcome === "unknown");
+		return { results: out, unprocessedItems, meta };
 	}
 
 	async #destroy(): Promise<{ ok: true }> {

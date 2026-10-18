@@ -334,6 +334,37 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				}
 			}
 			void _transactGetItemsArity;
+
+			it("types each item of batchGetItems by position", async () => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "alice", sortKey: "p1", data: { name: "alpha", score: 3 } });
+				await db.putItem({ hashKey: "alice", sortKey: "p2", data: { label: "beta" } });
+				const read = await db.batchGetItems<[Player, { label: string }]>({
+					items: [
+						{ hashKey: "alice", sortKey: "p1" },
+						{ hashKey: "alice", sortKey: "p2" },
+					],
+				});
+				const [first, second] = read.items;
+				invariant(first.outcome === "found" && first.kind === "json");
+				expect(first.data.score).toBe(3);
+				invariant(second.outcome === "found" && second.kind === "json");
+				expect(second.data.label).toBe("beta");
+			});
+
+			// Type-level contract, never executed: the same rules as `transactGetItems`.
+			async function _batchGetItemsArity(db: FokosDB) {
+				// @ts-expect-error two types named, one item passed
+				await db.batchGetItems<[Player, Player]>({ items: [{ hashKey: "a" }] });
+				// @ts-expect-error one type named, two items passed
+				await db.batchGetItems<[Player]>({ items: [{ hashKey: "a" }, { hashKey: "b" }] });
+				const wide = await db.batchGetItems({ items: [{ hashKey: "a" }] });
+				if (wide.items[0].outcome === "found" && wide.items[0].kind === "json") {
+					const value: JsonValue = wide.items[0].data;
+					void value;
+				}
+			}
+			void _batchGetItemsArity;
 		});
 
 		describe("FokosDB.queryItems — filters", () => {

@@ -497,6 +497,11 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	item_too_large: "ynzx4p",
 	update_not_applicable: "yysds3",
 	update_value_is_bytes: "z9ar7e",
+	batch_items_too_many: "wy5f9g",
+	batch_duplicate_key: "eqs978",
+	batch_operation_fields_invalid: "bfvz4s",
+	batch_request_too_large: "nhncs4",
+	batch_max_response_bytes_invalid: "7zkqbc",
 });
 
 export const EXPRESSION_CODES = defineCodes("FokosExpressionError", "caller", 400, {

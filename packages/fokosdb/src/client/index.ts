@@ -71,6 +71,21 @@ export type {
 	TransactWriteOperationResult,
 } from "../shared/transaction-api-types.js";
 
+// ─── Batch item operations ────────────────────────────────────────────────────
+
+export type {
+	BatchGetItemKey,
+	BatchGetItemResult,
+	BatchGetItemsOptions,
+	BatchGetItemsResult,
+	BatchUnprocessedCode,
+	BatchWriteItem,
+	BatchWriteItemResult,
+	BatchWriteItemsOptions,
+	BatchWriteItemsResult,
+	ItemBatcher,
+} from "../shared/batch-api-types.js";
+
 // ─── Expressions ──────────────────────────────────────────────────────────────
 
 export type { JsonComposite, JsonPrimitive, JsonValue } from "../shared/json-types.js";

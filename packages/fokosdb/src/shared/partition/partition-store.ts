@@ -331,8 +331,8 @@ function codeFromNullableKind(kind: DataKind | null): number | null {
  * not a measurement: a StoredItem has 8 named fields and a projected row has at most
  * `EXPRESSION_LIMITS.projectionEntries` cells, and 64 bytes is in the range both produce.
  *
- * The estimate only feeds the response-byte budget, which keeps one RPC response under the 32 MiB
- * cap of Workers RPC. `MAX_RESPONSE_BYTES_PER_PAGE` (16 MiB) leaves a 2x margin: even an error of 64
+ * The estimate only feeds the response-byte budget, which keeps one RPC response under
+ * `WORKERS_RPC_MAX_BYTES`. `MAX_RESPONSE_BYTES_PER_PAGE` (half of it) leaves a 2x margin: even an error of 64
  * bytes per item on a page of 100,000 tiny items is about 6 MiB, inside that margin. Change this
  * value only when the per-item wire shape grows well past what it stands for (many more named
  * fields, or a much larger cell limit) or when that margin shrinks. Changing it moves page boundaries

@@ -7,9 +7,16 @@
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import type { GetItemRpcResponse, QueryItemsRpcRequest, QueryItemsRpcResponse } from "../../src/server/do-partition.js";
+import type {
+	BatchGetItemsRpcRequest,
+	BatchGetItemsRpcResponse,
+	GetItemRpcResponse,
+	QueryItemsRpcRequest,
+	QueryItemsRpcResponse,
+} from "../../src/server/do-partition.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";
+import { MAX_BATCH_GET_RESPONSE_BYTES } from "../../src/shared/transaction-limits.js";
 import type { StoredItem } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -23,6 +30,11 @@ import {
 	rangeOf,
 	type TestPartition,
 } from "./partition-harness.js";
+
+const batchRequest = (keys: Array<[string, string]>): BatchGetItemsRpcRequest => ({
+	items: keys.map(([hashKey, sortKey], opIndex) => ({ opIndex, hashKey: kb(hashKey), sortKey: kb(sortKey) })),
+	maxResponseBytes: MAX_BATCH_GET_RESPONSE_BYTES,
+});
 
 const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 	hashKey: kb(hashKey),
@@ -113,6 +125,31 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		});
 	});
 
+	it("serves a batch read of a hash child for the keys that hash to it", async () => {
+		const { partition, repartitionId } = shared;
+		const owner = await partition.childOwning("alpha");
+		const sibling = (await partition.children()).find((c) => c.doName !== owner.doName)!;
+		const request = (caller: TestPartition, keys: Array<[string, string]>) => ({
+			op: "apiBatchGetItems",
+			repartitionId,
+			caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
+			request: batchRequest(keys),
+		});
+
+		const mine = await Promise.resolve(
+			partition.stub.fokosExecuteLocal(request(owner, [["alpha", "s1"]])) as FokosEnvelope<BatchGetItemsRpcResponse>,
+		);
+		expect(mine.value.found).toEqual([
+			{ opIndex: 0, item: expect.objectContaining({ data: "alpha-value" }), bytes: expect.any(Number), partitionIndex: 0 },
+		]);
+		expect(mine.value.partitions[0].actorId).toBe(partition.stub.id.toString());
+
+		// One key outside the caller slice refuses the whole request, before any read.
+		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+			await expect(instance.fokosExecuteLocal(request(sibling, [["alpha", "s1"]]))).rejects.toThrow(fokosErrorWith("partition_misrouted"));
+		});
+	});
+
 	it("follows a completed promotion to the range tree instead of reading its own stale rows", { concurrent: false }, async () => {
 		// The defect: a hash child importing from its parent read a promoted key out of the parent's
 		// local rows. Promotion GC makes those rows stale and then deletes them, so the child served a
@@ -142,6 +179,20 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			const point = await child.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
 			expect(point.found, "a promoted key must stay readable through an importing hash child").toBe(true);
 			expect(point.meta.partitions[0].servedByActorName, "the range tree owns the key, not the hash parent").toBe(rangeRoot.doName);
+
+			// A batch read of the importing child reads through its source, and the source sends the
+			// promoted keys to the range tree in one sub-request.
+			const batch = (await child.stub.apiBatchGetItems(
+				child.ctx,
+				batchRequest([
+					["alice", "sk1"],
+					["alice", "sk2"],
+				]),
+			)) as unknown as FokosEnvelope<BatchGetItemsRpcResponse>;
+			expect(batch.value.failed).toEqual([]);
+			expect(batch.value.found.map((f) => f.opIndex)).toEqual([0, 1]);
+			expect(batch.value.partitions.map((p) => p.actorId)).toEqual([rangeRoot.stub.id.toString()]);
+			expect(batch.routing.servedBy.find((n) => n.ref.doName === child.doName)?.role).toBe("read_through");
 
 			const page = opened(
 				await Promise.resolve(

@@ -186,21 +186,44 @@ export type FokosOperationBase<Req, Res> = {
 /** One remote or local part of a `group` operation, as `merge` receives it. */
 export type FokosGroupPart<Req, Res> = { target: FokosPartitionRef | "local"; request: Req; result: Res };
 
+/**
+ * One part of a `group` operation with the failure policy `collect` that failed: its admission or its
+ * local handler threw, or its forward still failed after the cache-miss fallbacks. `error` takes the
+ * place of the result. A remote error keeps the routing of the partition that raised it, with that
+ * partition at the head of `servedBy`.
+ */
+export type FokosGroupFailure<Req> = { target: FokosPartitionRef | "local"; request: Req; error: unknown };
+
+type FokosGroupBase<Req, Res> = FokosOperationBase<Req, Res> & {
+	/**
+	 * A group can fan out to several owners. One owner can apply before another fails.
+	 * The runtime or caller can then retry a sub-request. Each key's local effect must
+	 * be safe to repeat, even when Bloom routing is off.
+	 */
+	shape: "group";
+	items(req: Req): Array<{ key: RouteKey; item: unknown }>;
+	subRequest(req: Req, items: unknown[]): Req;
+};
+
 export type FokosOperation<Req, Res> =
 	| (FokosOperationBase<Req, Res> & { shape: "point"; key(req: Req): RouteKey })
-	| (FokosOperationBase<Req, Res> & {
-			/**
-			 * A group can fan out to several owners. One owner can apply before another fails.
-			 * The runtime or caller can then retry a sub-request. Each key's local effect must
-			 * be safe to repeat, even when Bloom routing is off.
-			 */
-			shape: "group";
-			items(req: Req): Array<{ key: RouteKey; item: unknown }>;
-			subRequest(req: Req, items: unknown[]): Req;
+	| (FokosGroupBase<Req, Res> & {
 			/** Each part carries the sub-request it was given, so a merge can answer for every item. */
 			merge(parts: Array<FokosGroupPart<Req, Res>>): Res;
 			/** "fail_fast": stop at the first failure. "attempt_all": run every group, then throw if any failed. */
 			failurePolicy: "fail_fast" | "attempt_all";
+	  })
+	| (FokosGroupBase<Req, Res> & {
+			/**
+			 * Gets every part, the failed parts included, and must not throw: `dispatch` returns its
+			 * result. A part that fails does not stop the other parts.
+			 */
+			merge(parts: Array<FokosGroupPart<Req, Res> | FokosGroupFailure<Req>>): Res;
+			/**
+			 * "collect": run every group, and give each failed part to `merge` in place of its result.
+			 * An error that `dispatch` throws then means that no handler ran on this partition or below it.
+			 */
+			failurePolicy: "collect";
 	  })
 	| (FokosOperationBase<Req, Res> & {
 			shape: "single_owner";

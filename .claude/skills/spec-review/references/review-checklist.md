@@ -131,8 +131,8 @@ The failure modes this codebase repeats. Check each spec against all of them.
 1. **Migration guard.** Every operation of `PartitionDO` declares `whileMigrating`
    in its descriptor. A target that imports holds incomplete data and incomplete
    locks, so a write or transaction operation must use `"throw"` and answer
-   `partition_migrating`. Only a read-only `point` or `range` operation that
-   tolerates stale data can use `"read_source"`.
+   `partition_migrating`. Only a read-only `point`, `group` or `range` operation
+   that tolerates stale data can use `"read_source"`.
 2. **Split routing.** A router (a source after the cutover, which `status`
    reports as `split_started` or `split_completed`) owns no keys. Writes, locks,
    and `txCancel` must reach the current owners, or pending rows leak forever.
@@ -140,7 +140,9 @@ The failure modes this codebase repeats. Check each spec against all of them.
 3. **Swallowed fan-out errors.** When the code forwards to several owners, it
    must attempt every owner, collect the failures, and rethrow
    (`failurePolicy: "attempt_all"`, `partition_fanout_failed`). A swallowed error
-   moves the coordinator to a terminal state with work undone.
+   moves the coordinator to a terminal state with work undone. The exception is
+   `failurePolicy: "collect"`, for independent items only: `merge` gets each
+   failed part, must not throw, and must report an outcome for each of its items.
 4. **Recovery through private paths.** Recovery must apply an outcome through
    `this.fokos.dispatch("txCommit" | "txCancel", ...)`, because the guards and
    the routing live there. Never inline SQL, and never release the locks of a

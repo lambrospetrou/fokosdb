@@ -26,6 +26,7 @@ import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
 import { withExpressionErrors } from "./errors-operations.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
+import { WORKERS_RPC_MAX_BYTES } from "../sharding/rpc-limits.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
 // DynamoDB uses 2KB for hashKey and 1KB for sortKey. These defaults are stricter, and a table can raise
@@ -74,6 +75,17 @@ export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
+
+/** The most items of one `batchGetItems` or `batchWriteItems` call, DynamoDB parity. */
+export const MAX_ITEMS_PER_BATCH = 100;
+
+/**
+ * The most response bytes of one batch read answer, as `estimateItemBytes` and
+ * `estimateProjectedRowBytes` count them. It is 75% of `WORKERS_RPC_MAX_BYTES` (24 MiB). Each
+ * partition answer and the result of `batchGetItems` hold to it. One answer can go above it by one
+ * item, the item of `opIndex` 0, and still stays below the RPC limit.
+ */
+export const MAX_BATCH_GET_RESPONSE_BYTES = (WORKERS_RPC_MAX_BYTES * 3) / 4;
 
 /**
  * The full limits of a table: the defaults of this package version, with the overrides applied. It
@@ -201,6 +213,19 @@ export function validateClientRequestToken(token: string): void {
  */
 export function itemDataBytes(data: Uint8Array | string): number {
 	return typeof data === "string" ? data.length : data.byteLength;
+}
+
+/** Throws when `ttlAt` is present and is not an integer greater than zero. `where` names the calling API. */
+export function validateTtlAt(ttlAt: number | undefined, where: string): void {
+	if (ttlAt === undefined) {
+		return;
+	}
+	if (!Number.isInteger(ttlAt) || ttlAt <= 0) {
+		throw new FokosValidationError(VALIDATION_CODES.ttl_at_invalid, {
+			message: "ttlAt must be an integer greater than zero",
+			attributes: { api: where, ttlAt },
+		});
+	}
 }
 
 /** Throws when a single item's data exceeds MAX_ITEM_BYTES. `where` names the calling API. */
@@ -516,6 +541,95 @@ export function validateTransactGetItemKeys(keys: readonly TransactionItemKey[])
 		}
 		seen.set(item.hashKey, item.sortKey, true);
 	}
+}
+
+/** The fields of one `batchWriteItems` operation that validation reads. A caller without TypeScript can send any of them. */
+export type BatchWriteItemLike = {
+	operation: unknown;
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
+	data?: unknown;
+	ttlAt?: number;
+	condition?: unknown;
+	update?: unknown;
+	returnValuesOnConditionCheckFailure?: unknown;
+};
+
+/**
+ * Validates the keys of a `batchGetItems` request: the item count, the key rules, and no two keys of
+ * one item. Encodes each key one time and returns the bytes in request order. The caller validates
+ * the projections.
+ */
+export function validateBatchGetItems(
+	items: readonly { hashKey: string | Uint8Array; sortKey?: string | Uint8Array }[],
+	limits: FokosDBLimits,
+): TransactionItemKey[] {
+	validateBatchItemCount("batchGetItems", items.length);
+	const seen = new KeyPairMap<true>();
+	return items.map((item, opIndex) => encodeBatchKey("batchGetItems", item, opIndex, limits, seen));
+}
+
+/**
+ * Validates a `batchWriteItems` request: the item count, the fields of each operation, the key rules,
+ * `ttlAt`, and no two operations on one item. A put carries data. A delete carries no data and no
+ * `ttlAt`. No operation carries a condition, an update, or `returnValuesOnConditionCheckFailure`.
+ * Encodes each key one time and returns the bytes in request order. The caller encodes the data of
+ * each put and checks its size.
+ */
+export function validateBatchWriteItems(items: readonly BatchWriteItemLike[], limits: FokosDBLimits): TransactionItemKey[] {
+	validateBatchItemCount("batchWriteItems", items.length);
+	const seen = new KeyPairMap<true>();
+	return items.map((item, opIndex) => {
+		const invalidFields = (message: string) =>
+			new FokosValidationError(VALIDATION_CODES.batch_operation_fields_invalid, {
+				message,
+				attributes: { opIndex, operation: item.operation },
+			});
+		if (item.operation !== "put" && item.operation !== "delete") {
+			throw invalidFields(`batchWriteItems operation must be "put" or "delete"`);
+		}
+		if (item.operation === "put" && item.data == null) {
+			throw invalidFields(`batchWriteItems "put" operation requires data`);
+		}
+		if (item.operation === "delete" && (item.data != null || item.ttlAt !== undefined)) {
+			throw invalidFields(`batchWriteItems "delete" operation must not carry data or ttlAt`);
+		}
+		if (item.condition !== undefined || item.update !== undefined || item.returnValuesOnConditionCheckFailure !== undefined) {
+			throw invalidFields("batchWriteItems operation must not carry a condition, an update, or returnValuesOnConditionCheckFailure");
+		}
+		validateTtlAt(item.ttlAt, "batchWriteItems");
+		return encodeBatchKey("batchWriteItems", item, opIndex, limits, seen);
+	});
+}
+
+function validateBatchItemCount(api: string, count: number): void {
+	if (count > MAX_ITEMS_PER_BATCH) {
+		throw new FokosValidationError(VALIDATION_CODES.batch_items_too_many, {
+			message: `${api} supports at most ${MAX_ITEMS_PER_BATCH} items`,
+			attributes: { limit: MAX_ITEMS_PER_BATCH, count },
+		});
+	}
+}
+
+/** Validates and encodes one key of a batch. Identity is `KeyPairMap` over the canonical bytes, as in `validateTransactWriteOperations`. */
+function encodeBatchKey(
+	api: string,
+	item: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
+	opIndex: number,
+	limits: FokosDBLimits,
+	seen: KeyPairMap<true>,
+): TransactionItemKey {
+	validateItemKeys(item.hashKey, item.sortKey);
+	const hashKey = encodeHashKey(item.hashKey, limits);
+	const sortKey = encodeSortKey(item.sortKey, limits);
+	if (seen.has(hashKey, sortKey)) {
+		throw new FokosValidationError(VALIDATION_CODES.batch_duplicate_key, {
+			message: `${api} duplicate key`,
+			attributes: { opIndex, ...decodeItemKeys(hashKey, sortKey) },
+		});
+	}
+	seen.set(hashKey, sortKey, true);
+	return { hashKey, sortKey };
 }
 
 export function validateReturnValuesOnConditionCheckFailure(value?: string): void {

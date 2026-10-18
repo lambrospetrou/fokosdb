@@ -21,6 +21,7 @@ export { isDestroyAbortError } from "../shared/cf-utils.js";
 export type { FokosRuntimeConstructorOptions } from "./runtime.js";
 export type {
 	FokosChild,
+	FokosGroupFailure,
 	FokosGroupPart,
 	FokosJob,
 	FokosLifecycle,

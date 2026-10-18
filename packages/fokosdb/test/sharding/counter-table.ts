@@ -60,6 +60,16 @@ export function makeCounterTable(maxRequests = 5) {
 		return result;
 	}
 
+	/** Sends one `incrementMany` of 1 for each key to the root, and records each counter that the answer applied. */
+	async function incrementMany(keys: string[]) {
+		const items = keys.map((key) => ({ hashKey: KeyCodec.encode(key), amount: 1 }));
+		const result = await client.send("incrementMany", root, { items }, keys.map(counterKey));
+		for (const { key } of result.value.applied) {
+			expected.set(key, (expected.get(key) ?? 0) + 1);
+		}
+		return result;
+	}
+
 	/** Reads every partition of the tree. A parent comes before its children. */
 	async function tree(): Promise<TreeNode[]> {
 		const nodes: TreeNode[] = [];
@@ -99,5 +109,5 @@ export function makeCounterTable(maxRequests = 5) {
 		return nodes;
 	}
 
-	return { client, root, increment, tree, childrenOf, settle };
+	return { client, root, increment, incrementMany, tree, childrenOf, settle };
 }

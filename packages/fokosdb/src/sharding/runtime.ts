@@ -62,6 +62,7 @@ import {
 import type {
 	FokosChild,
 	FokosEnvelope,
+	FokosGroupFailure,
 	FokosGroupPart,
 	FokosJob,
 	FokosLifecycle,
@@ -87,6 +88,7 @@ import type { RangeAncestorInfo } from "./types.js";
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 const NOOP_CALL: FokosLocalCall = { signal: () => {} };
+const LOCAL: OwnedResolution = { kind: "local" };
 /** The in-memory step of an identity check that changed nothing. */
 const NO_COMMIT = (): void => {};
 
@@ -151,7 +153,9 @@ const NOT_ROUTER: RouterView = { router: false, rangeChildren: [] };
 type GroupEntry = { key: RouteKey; item: unknown };
 /** The items of a `group` request that resolved to one remote target. They share one resolution. */
 type RemoteGroup = { resolution: RemoteResolution; entries: GroupEntry[] };
-type GroupParts = Array<FokosGroupPart<unknown, unknown>>;
+type GroupParts = Array<FokosGroupPart<unknown, unknown> | FokosGroupFailure<unknown>>;
+/** The parts of a `group` run, and the failures that the failure policy reports. */
+type GroupRun = { parts: GroupParts; localFailure?: { request: unknown; error: unknown }; remoteFailures: unknown[] };
 /** The entries of a `group` request by target, as `#groupByOwner` builds them. `remote` is keyed by partition ID. */
 type Groups = { local: GroupEntry[]; remote: Map<string, RemoteGroup> };
 /** The entries of one hash key that have a Bloom hit, each with its own resolution. */
@@ -519,11 +523,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 
 		const { local, remote } = this.#groupByOwner(op, items, HINTED);
+		const collect = descriptor.failurePolicy === "collect";
 
 		// Admission, `beforeForward`, the local work, and the start of every remote call run in the same
 		// synchronous block as the resolution above: an outbound RPC yields only at the first await of
 		// `#runGroups`, so a cutover cannot interleave between the ownership decision and the write.
-		if (local.length > 0) {
+		// Under `collect`, the local part admits its own entries, so a refusal fails only that part.
+		if (local.length > 0 && !collect) {
 			this.#admit(
 				op,
 				descriptor,
@@ -531,8 +537,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			);
 		}
 		const signals: FokosSignals[] = this.#beforeForward(descriptor, req);
-		const { parts, localFailure, remoteFailures } = await this.#runGroups(op, descriptor, req, local, remote, collector, 0, signals);
-		// The local part is the more specific answer, and every remote group has been attempted by now.
+		const run = await this.#runGroups(op, descriptor, req, local, remote, collector, 0, signals, collect);
+		return envelope(this.#settleGroup(op, descriptor, run, remote.length), collector.build());
+	}
+
+	/**
+	 * The answer of a `group` operation after each group settled. Under `collect`, `merge` gets every
+	 * part, the failed parts included. Otherwise a failure throws: the local part is the more specific
+	 * answer, and every remote group has been attempted by now.
+	 */
+	#settleGroup(op: string, descriptor: Extract<AnyOperation, { shape: "group" }>, run: GroupRun, groupCount: number): unknown {
+		if (descriptor.failurePolicy === "collect") {
+			return descriptor.merge(run.parts);
+		}
+		const { localFailure, remoteFailures } = run;
 		if (localFailure) {
 			throw localFailure.error;
 		}
@@ -543,14 +561,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				attributes: {
 					operation: op,
 					failureCount: remoteFailures.length,
-					groupCount: remote.length,
+					groupCount,
 					// `cause` is a non-enumerable own property, so it does not cross an RPC hop. The
 					// caller still needs the failure it stands for, and `attributes` does cross.
 					...causeAttributes(remoteFailures[0]),
 				},
 			});
 		}
-		return envelope(descriptor.merge(parts), collector.build());
+		// Only `collect` adds a failed part.
+		return descriptor.merge(run.parts as Array<FokosGroupPart<unknown, unknown>>);
 	}
 
 	/**
@@ -653,9 +672,11 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/**
 	 * Runs the local part of a `group` operation and starts each remote group, in the synchronous
-	 * block of the caller, then settles them by the failure policy. The caller admitted the local
-	 * entries. `signals` holds the signals of the caller, which apply with the local part. A
-	 * `fail_fast` failure throws at once. An `attempt_all` failure comes back after each group settled.
+	 * block of the caller, then settles them by the failure policy. With `admitLocal`, the local part
+	 * admits its entries itself; otherwise the caller admitted them. `signals` holds the signals of
+	 * the caller, which apply with the local part. A `fail_fast` failure throws at once. An
+	 * `attempt_all` failure comes back after each group settled. A `collect` failure comes back as a
+	 * failed part, after each group settled.
 	 */
 	async #runGroups(
 		op: string,
@@ -666,13 +687,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		collector: RouteCollector,
 		retries: number,
 		signals: FokosSignals[],
-	): Promise<{ parts: GroupParts; localFailure?: { error: unknown }; remoteFailures: unknown[] }> {
-		const attemptAll = descriptor.failurePolicy === "attempt_all";
+		admitLocal: boolean,
+	): Promise<GroupRun> {
+		const collect = descriptor.failurePolicy === "collect";
+		const settleAll = descriptor.failurePolicy !== "fail_fast";
 		let localCall: { request: unknown; value: unknown; signals: FokosSignals[] } | undefined;
-		// An `attempt_all` group runs every group before it reports a failure, and that includes the
-		// case where the local handler is the part that failed. The throw waits until the remote groups
-		// have settled, so a decided transaction still reaches every partition that holds a piece of it.
-		let localFailure: { error: unknown } | undefined;
+		// An `attempt_all` or `collect` group runs every group before it reports a failure, and that
+		// includes the case where the local part is the part that failed. The report waits until the
+		// remote groups have settled, so a decided transaction still reaches every partition that holds
+		// a piece of it.
+		let localFailure: { request: unknown; error: unknown } | undefined;
 		if (local.length > 0) {
 			const { call, signals: own } = this.#localCall();
 			const request = descriptor.subRequest(
@@ -681,12 +705,19 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			);
 			collector.add(this.#selfNode("executed"));
 			try {
+				if (admitLocal) {
+					this.#admit(
+						op,
+						descriptor,
+						local.map((entry) => entry.key),
+					);
+				}
 				localCall = { request, value: this.#runLocal(descriptor, request, call), signals: own };
 			} catch (error) {
-				if (!attemptAll) {
+				if (!settleAll) {
 					throw error;
 				}
-				localFailure = { error };
+				localFailure = { request, error };
 			}
 		}
 		const remoteCalls = remote.map((group) => {
@@ -702,10 +733,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				localCall.value = await localCall.value;
 				signals.push(...localCall.signals);
 			} catch (error) {
-				if (!attemptAll) {
+				if (!settleAll) {
 					throw error;
 				}
-				localFailure = { error };
+				localFailure = { request: localCall.request, error };
 				localCall = undefined;
 			}
 		}
@@ -718,10 +749,19 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		const parts: GroupParts = [];
 		const remoteFailures: unknown[] = [];
-		if (attemptAll) {
-			for (const result of await Promise.allSettled(remoteCalls)) {
+		if (settleAll) {
+			for (const [i, result] of (await Promise.allSettled(remoteCalls)).entries()) {
 				if (result.status === "fulfilled") {
 					parts.push(...result.value);
+				} else if (collect) {
+					// The group failed after its fallbacks. It is one failed part, with the sub-request that
+					// its first forward sent.
+					const group = remote[i];
+					const request = descriptor.subRequest(
+						req,
+						group.entries.map((entry) => entry.item),
+					);
+					parts.push({ target: group.resolution.target, request, error: result.reason });
 				} else {
 					remoteFailures.push(result.reason);
 				}
@@ -731,6 +771,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		if (localCall) {
 			parts.push({ target: "local", request: localCall.request, result: localCall.value });
+		} else if (collect && localFailure) {
+			parts.push({ target: "local", request: localFailure.request, error: localFailure.error });
 		}
 		return { parts, localFailure, remoteFailures };
 	}
@@ -774,15 +816,29 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			collector.forget(target.partitionId);
 			// The resolution, the admission, the local run, and the start of each remote group run in one
 			// synchronous block, as in `#dispatchGroup`.
+			const collect = descriptor.failurePolicy === "collect";
 			const { local, remote } = this.#groupByOwner(op, group.entries, opts);
-			if (local.length > 0) {
+			if (local.length > 0 && !collect) {
 				this.#admit(
 					op,
 					descriptor,
 					local.map((entry) => entry.key),
 				);
 			}
-			const { parts, localFailure, remoteFailures } = await this.#runGroups(op, descriptor, req, local, remote, collector, retries + 1, []);
+			const { parts, localFailure, remoteFailures } = await this.#runGroups(
+				op,
+				descriptor,
+				req,
+				local,
+				remote,
+				collector,
+				retries + 1,
+				[],
+				collect,
+			);
+			if (collect) {
+				return parts;
+			}
 			if (localFailure) {
 				throw localFailure.error;
 			}
@@ -1205,7 +1261,25 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return envelope(value, collector.build());
 		}
 
-		invariant(descriptor.shape === "range", "fokos/runtime: read_source is allowed for point and range operations only");
+		if (descriptor.shape === "group") {
+			// The `point` rules, for each key: each key must be inside the caller slice, and a promoted
+			// key goes to its range tree. The keys of one range owner go in one sub-request, and the other
+			// keys run here in one sub-request. A read admits nothing.
+			const groups: Groups = { local: [], remote: new Map() };
+			for (const entry of descriptor.items(req.request)) {
+				const { hashKey, sortKey } = entry.key;
+				if (!sliceIncludesItem(slice, hashKey, sortKey, hashSplitN)) {
+					throw misrouted(req.op, "key outside the caller slice");
+				}
+				const promoted = slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(hashKey);
+				addToGroups(groups, entry, promoted ? this.#rangeOwner(hashKey, sortKey, "override", false, true) : LOCAL);
+			}
+			const remote = [...groups.remote.values()];
+			const run = await this.#runGroups(req.op, descriptor, req.request, groups.local, remote, collector, 0, [], false);
+			return envelope(this.#settleGroup(req.op, descriptor, run, remote.length), collector.build());
+		}
+
+		invariant(descriptor.shape === "range", "fokos/runtime: read_source is allowed for point, group and range operations only");
 		const input = descriptor.range(req.request);
 		if (!sliceIncludesHashKey(slice, input.hashKey, hashSplitN)) {
 			throw misrouted(req.op, "hash key outside the caller slice");
@@ -1814,10 +1888,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					this.#learn(routed.routing.servedBy, hashKeys);
 				} catch {}
 				collector.mergeForwarded(routed.routing, stamp);
-				if (raiser) {
-					collector.addRaiser(stamp ? stamp(raiser) : raiser);
+				// Under `collect`, the error becomes a failed part, and this partition answers with a value.
+				// The envelope of that value is not an error, so it gets no raiser, and the error keeps the
+				// routing of the child: `merge` reads the raiser at the head of that list.
+				if (!(descriptor.shape === "group" && descriptor.failurePolicy === "collect")) {
+					if (raiser) {
+						collector.addRaiser(stamp ? stamp(raiser) : raiser);
+					}
+					routed.routing = collector.build();
 				}
-				routed.routing = collector.build();
 			}
 			throw e;
 		}
@@ -2221,9 +2300,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (descriptor.whileMigrating !== "read_source") {
 				continue;
 			}
-			if (descriptor.readOnly !== true || (descriptor.shape !== "point" && descriptor.shape !== "range")) {
+			const shapeReadsThrough = descriptor.shape === "point" || descriptor.shape === "group" || descriptor.shape === "range";
+			if (descriptor.readOnly !== true || !shapeReadsThrough) {
 				throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
-					message: "a read_source operation must be readOnly and of the point or range shape",
+					message: "a read_source operation must be readOnly and of the point, group or range shape",
 					attributes: { operation: name, shape: descriptor.shape, readOnly: descriptor.readOnly },
 				});
 			}

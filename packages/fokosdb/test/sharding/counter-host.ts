@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
 	FokosShardingRuntime,
 	KeyCodec,
+	routedError,
 	type FokosEnvelope,
 	type FokosExecuteLocalRequest,
 	type FokosInitRequest,
@@ -41,7 +42,19 @@ export type CounterOps = {
 		req: { hashKey: KeyBytes; amount: number };
 		res: { key: string; val: number };
 	};
+	/**
+	 * Increments many counters with the failure policy `collect`. Admission refuses a part with a key
+	 * that starts with `refuse-`, and the local handler throws, before any write, for a part with a key
+	 * that starts with `throw-`.
+	 */
+	incrementMany: {
+		req: { items: Array<{ hashKey: KeyBytes; amount: number }> };
+		res: { applied: CounterRow[]; failed: CounterFailure[] };
+	};
 };
+
+/** One failed part of `incrementMany`: its target, its keys, and the partition that raised the error. */
+export type CounterFailure = { target: string; keys: string[]; message: string; raiser: string | null };
 
 /** What a test reads from one partition. */
 export type CounterStats = {
@@ -82,6 +95,13 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 		req: CounterOps["increment"]["req"],
 	): Promise<FokosEnvelope<CounterOps["increment"]["res"]>> {
 		return await this.fokos.dispatch("increment", ctx, req);
+	}
+
+	async incrementMany(
+		ctx: FokosRouteContext<CounterPolicy>,
+		req: CounterOps["incrementMany"]["req"],
+	): Promise<FokosEnvelope<CounterOps["incrementMany"]["res"]>> {
+		return await this.fokos.dispatch("incrementMany", ctx, req);
 	}
 
 	// ── The runtime RPCs ──────────────────────────────────────────────────────
@@ -183,6 +203,43 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 					return { key, val };
 				},
 			},
+			incrementMany: {
+				shape: "group",
+				whileMigrating: "throw",
+				admissionTag: "increment_many",
+				failurePolicy: "collect",
+				items: (req) => req.items.map((item) => ({ key: { hashKey: item.hashKey, sortKey: NO_SORT_KEY }, item })),
+				subRequest: (req, items) => ({ items: items as CounterOps["incrementMany"]["req"]["items"] }),
+				local: (req) => {
+					const keys = req.items.map((item) => KeyCodec.decode(item.hashKey) as string);
+					if (keys.some((key) => key.startsWith("throw-"))) {
+						throw new Error("counter host: the local handler throws");
+					}
+					const applied = req.items.map((item, i) => {
+						const val = (sql.exec<{ val: number }>("SELECT val FROM counters WHERE key = ?", keys[i]).toArray()[0]?.val ?? 0) + item.amount;
+						sql.exec("INSERT OR REPLACE INTO counters (key, val) VALUES (?, ?)", keys[i], val);
+						return { key: keys[i], val };
+					});
+					return { applied, failed: [] };
+				},
+				merge: (parts) => {
+					const out: CounterOps["incrementMany"]["res"] = { applied: [], failed: [] };
+					for (const part of parts) {
+						if ("result" in part) {
+							out.applied.push(...part.result.applied);
+							out.failed.push(...part.result.failed);
+							continue;
+						}
+						out.failed.push({
+							target: part.target === "local" ? "local" : part.target.doName,
+							keys: part.request.items.map((item) => KeyCodec.decode(item.hashKey) as string),
+							message: String((part.error as Error | undefined)?.message),
+							raiser: routedError(part.error)?.routing.servedBy[0]?.ref.doName ?? null,
+						});
+					}
+					return out;
+				},
+			},
 		};
 	}
 
@@ -217,6 +274,10 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 					}
 				},
 			},
+			admit: ({ admissionTag, keys }) =>
+				admissionTag === "increment_many" && keys.some((key) => (KeyCodec.decode(key.hashKey) as string).startsWith("refuse-"))
+					? { reject: new Error("counter host: admission refuses the part") }
+					: "allow",
 			// Every child has acknowledged its import, so the rows of this router are old copies.
 			cleanupSourceStep: () => {
 				sql.exec("DELETE FROM counters");

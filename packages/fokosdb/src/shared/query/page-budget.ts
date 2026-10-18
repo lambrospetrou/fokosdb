@@ -1,3 +1,5 @@
+import { WORKERS_RPC_MAX_BYTES } from "../../sharding/rpc-limits.js";
+
 /**
  * Mutable budget tracker for a single queryItems page. Shared across sub-queries (FokosDB)
  * and across range-tree children (walkRangeChildren). Four counters bound one page: evaluated
@@ -11,7 +13,8 @@ export const DEFAULT_EVALUATED_ITEMS_PER_PAGE = 1_000;
 export const MAX_EVALUATED_ITEMS_PER_PAGE = 100_000;
 export const MAX_EVALUATED_BYTES_PER_PAGE = 100 * 1024 * 1024;
 export const DEFAULT_RESPONSE_BYTES_PER_PAGE = 3 * 1024 * 1024;
-export const MAX_RESPONSE_BYTES_PER_PAGE = 16 * 1024 * 1024;
+/** 50% of `WORKERS_RPC_MAX_BYTES` (16 MiB). The margin holds the errors of the byte estimate. */
+export const MAX_RESPONSE_BYTES_PER_PAGE = WORKERS_RPC_MAX_BYTES / 2;
 export const MAX_PARTITION_VISITS_PER_PAGE = 100;
 
 export type QueryPageBudgetState = {

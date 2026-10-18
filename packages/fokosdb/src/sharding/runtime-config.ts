@@ -6,13 +6,14 @@
  * other value at each use, so a changed override applies at its next read.
  */
 import invariant from "../shared/invariant.js";
+import { WORKERS_RPC_MAX_BYTES } from "./rpc-limits.js";
 import { bloomInitialLayerBytes } from "./bloom-filter.js";
 
 /**
- * The maximum serialized size of one Workers RPC message. A page must stay below it.
- * The actual RPC limit is 32MB, but we restrict everything to 20MB to stay well below the limit.
- **/
-export const RPC_MESSAGE_MAX_BYTES = 20 * 1024 * 1024;
+ * The maximum serialized size of one migration or promotion page. It is 62.5% of
+ * `WORKERS_RPC_MAX_BYTES` (20 MiB), so a page stays well below the RPC limit.
+ */
+export const RPC_MESSAGE_MAX_BYTES = (WORKERS_RPC_MAX_BYTES * 5) / 8;
 
 /** The serialized promotion Bloom filter is one KV value, which must stay below the 2 MB value limit. */
 export const PROMOTION_BLOOM_MAX_BYTES = 1.5 * 1024 * 1024;

@@ -26,7 +26,7 @@
     - [4.2.5 Runtime: the `collect` failure policy](#425-runtime-the-collect-failure-policy)
     - [4.2.6 Runtime: read-through for a `group` operation](#426-runtime-read-through-for-a-group-operation)
     - [4.2.7 `apiBatchGetItems`](#427-apibatchgetitems)
-    - [4.2.8 The response budget of a batch read](#428-the-response-budget-of-a-batch-read)
+    - [4.2.8 The response limit of a batch read](#428-the-response-limit-of-a-batch-read)
     - [4.2.9 Projections](#429-projections)
     - [4.2.10 `apiBatchWriteItems`](#4210-apibatchwriteitems)
     - [4.2.11 The client](#4211-the-client)
@@ -86,7 +86,9 @@ also needs a batch write: its Milestone 3 writes each GSI table with `batchWrite
 - **Read-through supports only the `point` and `range` shapes.** `#validateOperations` refuses `read_source` for any
   other shape, and `#executeLocal` serves only those two. A `group` read on an importing partition gets
   `partition_migrating`, while `getItem` reads through to the source.
-- **A Workers RPC message can be at most 32 MiB** (the Workers RPC documentation, section "Limitations").
+- **A Workers RPC message can be at most 32 MiB** (the Workers RPC documentation, section "Limitations"). The
+  constant `WORKERS_RPC_MAX_BYTES` in `src/sharding/rpc-limits.ts` holds this value. Each limit on one RPC message
+  is a fraction of it.
 - **An item can be 400 KB** (`MAX_ITEM_BYTES` in `src/shared/transaction-limits.ts`). `estimateItemBytes` in
   `src/shared/partition/partition-store.ts` counts text as 2 bytes per character. Thus 100 items can need more than
   32 MiB in one answer.
@@ -227,10 +229,12 @@ export type BatchGetItemKey = ItemKey & { projection?: readonly ProjectionExpres
 
 /** `Ts` names the type of each item by position, as `TransactGetItemsOptions` does. */
 export type BatchGetItemsOptions<Ts extends readonly unknown[] = never[]> = {
-	/** 1 to 100 keys. Two keys of one item fail the request with `batch_duplicate_key`. */
+	/** 0 to 100 keys. An empty list sends no RPC. Two keys of one item fail the request with `batch_duplicate_key`. */
 	items: { [K in keyof Ts]: BatchGetItemKey };
 	/** The projection of each key that has no projection of its own. */
 	projection?: readonly ProjectionExpression[];
+	/** The most bytes of found items in the result (section 4.2.8). Defaults to 24 MiB, and is clamped to it. */
+	maxResponseBytes?: number;
 };
 
 /** `code` is a FokosDB error code, or `response_too_large` when the response budget ran out. */
@@ -255,7 +259,7 @@ export type BatchWriteItem =
 	| { operation: "delete"; hashKey: HashKey; sortKey?: SortKey };
 
 export type BatchWriteItemsOptions = {
-	/** 1 to 100 operations. Two operations on one item fail the request with `batch_duplicate_key`. */
+	/** 0 to 100 operations. An empty list sends no RPC. Two operations on one item fail the request with `batch_duplicate_key`. */
 	items: BatchWriteItem[];
 };
 
@@ -300,11 +304,11 @@ export interface ItemBatcher {
 
 `src/shared/transaction-limits.ts` gets `MAX_ITEMS_PER_BATCH = 100`, `validateBatchGetItems` and
 `validateBatchWriteItems`. Each function encodes each key one time and returns the key bytes in request order, as
-`validateTransactWriteOperations` does.
+`validateTransactWriteOperations` does. A batch with no item is valid: the client method sends no RPC and answers an
+empty result.
 
 | Rule | Code |
 | --- | --- |
-| The batch has no item. | `batch_items_empty` |
 | The batch has more than 100 items. | `batch_items_too_many` |
 | Two items have the same key bytes (`KeyPairMap`). | `batch_duplicate_key` |
 | A write is not `put` or `delete`. | `batch_operation_fields_invalid` |
@@ -313,13 +317,14 @@ export interface ItemBatcher {
 | A key is not valid. | the codes of `validateItemKeys`, `encodeHashKey`, `encodeSortKey` |
 | The data of a put is not valid or above 400 KB. | the codes of `encodeItemData` and `validateItemDataSize` |
 | `ttlAt` is not valid. | `ttl_at_invalid` |
+| `maxResponseBytes` is not a positive integer. | `batch_max_response_bytes_invalid` |
 | A projection is not valid. | the codes of `validateProjectionExpression` |
 
 The client does not cap the payload of a batch write. A root RPC above the RPC limit gives `rejected` with the new
 code `batch_request_too_large` for each item of that root (section 4.2.4).
 
-Each new code (`batch_items_empty`, `batch_items_too_many`, `batch_duplicate_key`, `batch_operation_fields_invalid`,
-`batch_request_too_large`) gets a new id in `VALIDATION_CODES` (`src/shared/errors.ts`).
+Each new code (`batch_items_too_many`, `batch_duplicate_key`, `batch_operation_fields_invalid`,
+`batch_request_too_large`, `batch_max_response_bytes_invalid`) gets a new id in `VALIDATION_CODES` (`src/shared/errors.ts`).
 
 #### 4.2.3 Wire types
 
@@ -330,12 +335,12 @@ always present. No answer carries a key.
 type BatchGetItemsRpcRequest = {
 	items: Array<{ opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; projection?: readonly ProjectionExpression[] }>;
 	projection?: readonly ProjectionExpression[];
-	/** The response bytes this request can return (section 4.2.8). */
-	responseBytes: number;
+	/** The `maxResponseBytes` of the batch (section 4.2.8). Every part gets the same value. */
+	maxResponseBytes: number;
 };
 
 type BatchGetItemsRpcResponse = {
-	found: Array<{ opIndex: number; item: GetItemRpcItem; partitionIndex: number }>;
+	found: Array<{ opIndex: number; item: GetItemRpcItem; bytes: number; partitionIndex: number }>;
 	notFound: Array<{ opIndex: number; partitionIndex: number }>;
 	failed: BatchFailure[];
 	partitions: WirePartitionMeta[];
@@ -394,7 +399,7 @@ One function in `src/shared/`, `classifyBatchFailure(error, { write, local })`, 
 
 For rule 1, the function makes a `FokosValidationError` with `batch_request_too_large`, with the error of workerd as
 its cause. The result carries its `error_id`. In a batch, the error comes from the arguments of a request: a batch
-write answer is small, and the budget holds a batch read answer under the limit (section 4.2.8). The caller
+write answer is small, and the response limit holds a batch read answer under the RPC limit (section 4.2.8). The caller
 serializes the arguments, so the request does not leave the caller and nothing of it applies. The RPC limit test of
 section 4.2.17 checks this. Sending the same items to the same root fails the same way, so the outcome is `rejected`.
 The caller can send the items again in smaller batches.
@@ -404,7 +409,7 @@ with routing that is not `foreign_error` as "nothing applied". A `FokosInternalE
 come from runtime code after a handler wrote. For a write, such an error is `unknown`, and `foreign_error` is a
 `FokosInternalError` too. The caller can still send an `unknown` item again.
 
-The budget of a batch read gives `unprocessed` with `response_too_large` and no `error_id` (section 4.2.8).
+The response limit of a batch read gives `unprocessed` with `response_too_large` and no `error_id` (section 4.2.8).
 
 #### 4.2.5 Runtime: the `collect` failure policy
 
@@ -467,42 +472,50 @@ This is the `point` branch of `#executeLocal`, applied to each key of the reques
 | `admissionTag` | `read` |
 | `failurePolicy` | `collect` |
 | `items` | each item, with its key |
-| `subRequest` | the items of the part, and the share of the part in `responseBytes` (section 4.2.8) |
+| `subRequest` | the items of the part |
+| `merge` | joins the parts, then applies the response limit (section 4.2.8) |
 
 The local handler is synchronous, so it reads its keys as one snapshot of the partition. For each item, in request
 order:
 
 1. It reads the item with the body of `readItemLocally`, with the projection of section 4.2.9.
 2. An absent item goes into `notFound`. It costs no response bytes.
-3. A present item goes into `found` when its estimated bytes fit in the remaining share. The estimate uses the rules
-   of `estimateItemBytes` or `estimateProjectedRowBytes`, with the keys of the request. The item of `opIndex` 0 always
-   goes into `found`, and its bytes count against the share.
-4. A present item that does not fit goes into `failed` as `unprocessed` with `response_too_large`.
-5. An error of the item goes into `failed`, with the outcome of section 4.2.4.
+3. A present item goes into `found`, with its estimated `bytes`. The estimate uses the rules of `estimateItemBytes` or
+   `estimateProjectedRowBytes`, with the keys of the request. The handler does not apply the response limit: `merge`
+   does (section 4.2.8).
+4. An error of the item goes into `failed`, with the outcome of section 4.2.4.
 
 The handler writes one entry for its partition, with the summed `rowsRead` and `rowsWritten`.
 
-#### 4.2.8 The response budget of a batch read
+#### 4.2.8 The response limit of a batch read
 
-The budget of one call is 16 MiB, in a new constant `MAX_BATCH_GET_RESPONSE_BYTES` in
-`src/shared/transaction-limits.ts`. It has the value of `MAX_RESPONSE_BYTES_PER_PAGE` for the same reason: it leaves a
-margin of 2 times under the 32 MiB RPC limit.
+One batch read answer holds at most `maxResponseBytes` of found items, in the estimate of each item.
+`batchGetItems` takes `maxResponseBytes` as an option, as `queryItems` does. It must be a positive integer, or the call
+throws `batch_max_response_bytes_invalid`. It defaults to `MAX_BATCH_GET_RESPONSE_BYTES`, and `fitBatchResponse` clamps
+it to that constant on each node. The constant is in `src/shared/transaction-limits.ts`, and it is 75% of
+`WORKERS_RPC_MAX_BYTES` (24 MiB). The client sends the same value to every call, with no split.
 
-Each node splits its budget over its parts by key count. A part with `k` of the `n` keys of its request gets
-`floor(responseBytes * k / n)`:
+`fitBatchResponse` in `src/shared/batch-response.ts` applies the limit. It keeps the found items in `opIndex` order
+while the sum of their bytes stays at most the limit. An item that does not fit does not stop a smaller item after
+it. The item of `opIndex` 0 always stays. Each item that it drops becomes `unprocessed` with `response_too_large`,
+with the `partitionIndex` of the partition that read it.
 
-- `db.ts` gives each root its share of 16 MiB.
-- `subRequest` gives each part of a root its share of the root share. The miss ladder calls `subRequest` with the
-  request of the node, so a fallback group never gets more than the group it replaces.
+Two places apply the limit:
 
-The sum of the shares is never above the budget, because a sum of floors is at most the floor of the sum. The item of
-`opIndex` 0 can go over the share of its part by one item. Thus:
+- The `merge` of `apiBatchGetItems`, on each node, after it joins its parts. `merge` runs on every node under
+  `collect`, so no answer that crosses an RPC goes above the limit.
+- `db.ts`, after it joins the answers of its calls. Each answer fits in the limit, but the answers of several calls
+  together can go above it.
 
-- One answer is at most 16 MiB plus one item. One item is at most about 1 MB in the estimate: a stored row of 400 KB
-  that the estimate counts at 2 bytes per character.
-- The budget never stops the key of `opIndex` 0. A caller that sends the `unprocessedKeys` again therefore makes
-  progress on the budget, because the first unprocessed key becomes `opIndex` 0 of the next call. A failure of the
-  part of `opIndex` 0 is not a budget stop, and it gives the outcome of section 4.2.4.
+Thus:
+
+- One answer is at most 24 MiB plus one item. One item is at most about 1 MB in the estimate: a stored row of 400 KB
+  that the estimate counts at 2 bytes per character. That stays below the 32 MiB RPC limit.
+- The limit never stops the key of `opIndex` 0. A caller that sends the `unprocessedKeys` again therefore makes
+  progress, because the first unprocessed key becomes `opIndex` 0 of the next call. A failure of the part of
+  `opIndex` 0 is not a stop of the limit, and it gives the outcome of section 4.2.4.
+- A node can read items that it then drops. That happens only when a batch holds more than 24 MiB of found items. The
+  100 keys of a batch hold at most about 40 MB, so a node never holds more than that in memory.
 
 #### 4.2.9 Projections
 
@@ -557,8 +570,8 @@ back. All blocks run in one synchronous call, so no other request runs between t
 1. Validate the batch (section 4.2.2). Check the operation fields before `encodeItemData`, so a put with no `data`
    throws `batch_operation_fields_invalid`. Encode each put with `encodeItemData`. Give each item `opIndex = i`.
 2. Group the items by root with `resolveAll`.
-3. Send one RPC to each root with `send`, all at the same time, with no retry. A batch read gives each root its share
-   of the budget.
+3. Send one RPC to each root with `send`, all at the same time, with no retry. A batch read then applies the response
+   limit to the joined found items (section 4.2.8).
 4. Join the answers with `PartitionMetaJoin`, and move each `partitionIndex` to the joined list, as
    `#readTransaction` does. Add the `forwardCount` of each answer.
 5. Classify a failed root RPC with section 4.2.4. When the error carries routing, add `routing.forwardCount` to
@@ -625,7 +638,7 @@ before it. The result keeps the positions of the first request, so `Ts` of the f
    the classification treats a `FokosInternalError` of a write as `unknown` (section 4.2.4).
 5. A batch write changes `v`, `max_deleted_v`, `max_delete_tx_order_ts` and the item timestamps with the functions of
    `putItem` and `deleteItem`.
-6. One batch read answer is at most 16 MiB plus one item (section 4.2.8).
+6. One batch read answer is at most 24 MiB plus one item (section 4.2.8).
 7. A partition refuses a batch write to a locked item at once. It does not wait for the lock.
 8. No partition answer carries a key.
 
@@ -651,8 +664,8 @@ before it. The result keeps the positions of the first request, so `Ts` of the f
 - **Storage.** A read runs one statement per key. A write runs one upsert or one delete per key. The rows read and
   written are the rows of the single-item operations.
 - **Compile.** A partition compiles each distinct projection tree one time per request (section 4.2.9).
-- **Memory.** A leaf holds at most its share of found items, plus the item of `opIndex` 0. It reads an item that does
-  not fit, estimates it, and drops it.
+- **Memory.** A node holds the found items of its parts before `merge` trims them, at most about 40 MB for 100 keys
+  of 400 KB. The answer that it sends holds at most 24 MiB plus one item.
 
 #### 4.2.16 Deployment
 
@@ -671,9 +684,10 @@ before it. The result keeps the positions of the first request, so `Ts` of the f
 - **Read-through.** `test/partition-do/read-through.test.ts` covers a batch read on an importing child, and a promoted
   key that the source forwards to its range root. It uses `TestPartition`.
 - **Batch read.** A new `test/partition-do/batch-get-items.test.ts` covers found and absent items, the precedence of
-  the item projection, `response_too_large`, the item of `opIndex` 0 above its share, a hash split, a promotion, and
-  `partitionIndex`. Client tests cover the validation codes, the positional results, `unprocessedKeys`, and a failed
-  root RPC (`test/controlled-partition-do.ts`).
+  the item projection, `response_too_large` above `maxResponseBytes`, the trim at a router after a hash split, a promotion, and
+  `partitionIndex`. `src/shared/batch-response.test.ts` covers the rules of `fitBatchResponse`. Client tests cover the
+  validation codes, the positional results, `unprocessedKeys`, the limit on the joined answers of several calls, and
+  a failed root RPC (`test/controlled-partition-do.ts`).
 - **Batch write.** A new `test/partition-do/batch-write-items.test.ts` covers puts and deletes, `version` and
   `deleted`, a locked item, an over-size partition (puts refused, deletes applied, split evaluation), `item_too_large`,
   an importing child, a transport fault (`unknown`), a `FokosInternalError` from a remote part (`unknown`), and that
@@ -724,11 +738,16 @@ a partition over its cap then refuses the deletes of a batch, while `deleteItem`
 The client reads each `partition_migrating` key again with a point read, which reads through. Rejected: it costs one
 Worker RPC for each key of an importing partition, and it adds a second read path to `db.ts`.
 
-### 5.7 A smaller key limit per batch read
+### 5.7 Other response limits for a batch read
 
-Fewer keys give each key a larger share. At 16 MiB, 40 keys give each key about 410 KiB. That share still does not
-hold a 400 KB text item, because the estimate counts it at up to about 800 KB. Only about 16 keys give every leaf room
-for its first item. Rejected: DynamoDB accepts 100 keys, and the rule for `opIndex` 0 gives progress with 100 keys.
+**A share for each part, by key count.** Each node splits its budget over its parts by key count, and each part reads only up to its share. A node then never
+reads an item that it drops. Rejected: items can have very different sizes. A part with 3 items of 400 KB next to a
+part with 50 small items gets 3/53 of the budget, so it stops 2 of its items while the whole answer is far below the
+limit.
+
+**No limit for a batch of one call.** A batch with one call has no other answer to join. Rejected: 100 items of 400 KB are about 40 MB, which is above the
+32 MiB RPC limit. The call then fails for all of its keys, and the same keys fail the same way again, so the caller
+never makes progress. One call can also go through a router to several partitions.
 
 ### 5.8 A payload cap on a batch write
 

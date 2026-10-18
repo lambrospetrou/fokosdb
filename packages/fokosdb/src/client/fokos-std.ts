@@ -1,13 +1,85 @@
+import { jitterBackoff } from "durable-utils/retries";
 import { KeyCodec } from "../sharding/key-codec.js";
+import type {
+	BatchGetItemKey,
+	BatchGetItemResult,
+	BatchGetItemsOptions,
+	BatchGetItemsResult,
+	BatchWriteItem,
+	BatchWriteItemResult,
+	BatchWriteItemsOptions,
+	BatchWriteItemsResult,
+	ItemBatcher,
+} from "../shared/batch-api-types.js";
+import { PartitionMetaJoin } from "../shared/partition-meta.js";
 import { validateKeyContent } from "../shared/transaction-limits.js";
-import type { HashKey, QueryItemsOptions, SortKey } from "../shared/types.js";
+import type { FokosMeta, HashKey, QueryItemsOptions, SortKey } from "../shared/types.js";
+import { resolveRetryOptions, type FokosDBRetryOptions } from "./db.js";
 
 type QuerySpec = QueryItemsOptions["queries"][number];
 
 /**
- * Pure client-side helpers that build requests for `FokosDB`. They send no RPC of their own.
+ * Client-side helpers for `FokosDB`. The request builders send no RPC. The retry helpers send requests
+ * only through the `ItemBatcher` they get.
  */
 export class FokosStd {
+	/**
+	 * Calls `db.batchGetItems` with every key, then again with `unprocessedKeys` and the `projection` and
+	 * `maxResponseBytes` of the request, until no key stays unprocessed or the calls reach
+	 * `retry.maxAttempts`. Before each retry it waits a random time with exponential backoff
+	 * (`retry.baseDelayMs`, `retry.maxDelayMs`).
+	 *
+	 * The result has the positions of the first request: `items[i]` is the last answer for `opts.items[i]`.
+	 * `meta` joins the `meta` of every call. A key that is still unprocessed after the last call stays in
+	 * `unprocessedKeys`. It takes the limits of `batchGetItems`, 0 to 100 keys, and makes one call at a
+	 * time. It throws only for options that are not valid, before any I/O.
+	 */
+	static async batchGetItemsWithRetry<Ts extends readonly unknown[] = never[]>(
+		db: ItemBatcher,
+		opts: NoInfer<BatchGetItemsOptions<Ts>>,
+		retry?: FokosDBRetryOptions,
+	): Promise<BatchGetItemsResult<Ts>> {
+		const policy = resolveRetryOptions(retry);
+		const { projection, maxResponseBytes } = opts as BatchGetItemsOptions;
+		const { results, unprocessed, meta } = await retryBatch<BatchGetItemKey, BatchGetItemResult>(
+			policy,
+			opts.items as readonly BatchGetItemKey[],
+			async (items) => {
+				const answer = await db.batchGetItems({ items, projection, maxResponseBytes });
+				return { results: answer.items, meta: answer.meta };
+			},
+			(result) => result.outcome === "unprocessed",
+			(_earlier, later) => later,
+		);
+		// Every item takes the same path, so the positional types of `Ts` are erased here, as in `db.ts`.
+		return { items: results, unprocessedKeys: unprocessed, meta } as unknown as BatchGetItemsResult<Ts>;
+	}
+
+	/**
+	 * Calls `db.batchWriteItems` with every operation, then again with `unprocessedItems`, as
+	 * `batchGetItemsWithRetry` does. It never sends a `rejected` operation again. An operation that got
+	 * `unknown` keeps `unknown` when a later call does not apply it, because the earlier call can have
+	 * applied it. `results[i]` answers `opts.items[i]`.
+	 */
+	static async batchWriteItemsWithRetry(
+		db: ItemBatcher,
+		opts: BatchWriteItemsOptions,
+		retry?: FokosDBRetryOptions,
+	): Promise<BatchWriteItemsResult> {
+		const policy = resolveRetryOptions(retry);
+		const { results, unprocessed, meta } = await retryBatch<BatchWriteItem, BatchWriteItemResult>(
+			policy,
+			opts.items,
+			async (items) => {
+				const answer = await db.batchWriteItems({ items });
+				return { results: answer.results, meta: answer.meta };
+			},
+			(result) => result.outcome === "unprocessed" || result.outcome === "unknown",
+			(earlier, later) => (earlier.outcome === "unknown" && later.outcome !== "ok" ? earlier : later),
+		);
+		return { results, unprocessedItems: unprocessed, meta };
+	}
+
 	/**
 	 * The least sort key that sorts after every sort key that begins with `prefix`, in the same key
 	 * type as `prefix`, so the result is always a valid query bound. `KeyCodec.publicSuccessor` holds
@@ -46,4 +118,48 @@ export class FokosStd {
 		const above: QuerySpec = { hashKey, sortKeyCondition: { op: "gte", value: successor }, scanIndexForward };
 		return scanIndexForward ? [below, above] : [above, below];
 	}
+}
+
+/**
+ * The retry loop of the batch helpers. `again` selects the results to send again, and `keep` chooses
+ * between the result that an item has and the result of a later call. Each result keeps the position
+ * of its entry in `entries`, and each `partitionIndex` moves to the joined `meta`.
+ */
+async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
+	retry: Required<FokosDBRetryOptions>,
+	entries: readonly Entry[],
+	call: (entries: Entry[]) => Promise<{ results: Result[]; meta: FokosMeta }>,
+	again: (result: Result) => boolean,
+	keep: (earlier: Result, later: Result) => Result,
+): Promise<{ results: Result[]; unprocessed: Entry[]; meta: FokosMeta }> {
+	const join = new PartitionMetaJoin();
+	let forwardCount = 0;
+	const results: Result[] = [];
+	// `positions[j]` is the position in `entries` of the entry `j` of the next call.
+	let positions = entries.map((_, i) => i);
+	for (let calls = 1; ; calls++) {
+		const answer = await call(positions.map((position) => entries[position]));
+		forwardCount += answer.meta.forwardCount;
+		const indexes = answer.meta.partitions.map((entry) => join.add(entry));
+		const next: number[] = [];
+		answer.results.forEach((result, j) => {
+			const moved = result.partitionIndex === undefined ? result : { ...result, partitionIndex: indexes[result.partitionIndex] };
+			const position = positions[j];
+			results[position] = results[position] === undefined ? moved : keep(results[position], moved);
+			if (again(result)) {
+				next.push(position);
+			}
+		});
+		if (next.length === 0 || calls >= retry.maxAttempts) {
+			break;
+		}
+		// The first retry is retry 0 of the backoff.
+		await new Promise((resolve) => setTimeout(resolve, jitterBackoff(calls - 1, retry.baseDelayMs, retry.maxDelayMs)));
+		positions = next;
+	}
+	return {
+		results,
+		unprocessed: entries.filter((_, i) => again(results[i])),
+		meta: { forwardCount, partitions: join.partitions },
+	};
 }

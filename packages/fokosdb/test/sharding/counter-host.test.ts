@@ -162,3 +162,78 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		await table.settle();
 	});
 });
+
+describe.concurrent("Sharding runtime — the collect failure policy", () => {
+	it("answers every part when no part fails", async () => {
+		const table = makeCounterTable();
+		const result = await table.incrementMany(["a", "b", "c"]);
+
+		expect(result.value.failed).toEqual([]);
+		expect(result.value.applied.map((r) => r.key).sort()).toEqual(["a", "b", "c"]);
+		expect(result.routing.forwardCount).toBe(0);
+		await table.settle();
+	});
+
+	it("answers with a failed local part when admission refuses it", async () => {
+		const table = makeCounterTable();
+		const result = await table.incrementMany(["refuse-1", "ok-1"]);
+
+		// The root owns both keys, so both are in the one local part, and admission refused that part.
+		expect(result.value).toEqual({
+			applied: [],
+			failed: [{ target: "local", keys: ["refuse-1", "ok-1"], message: "counter host: admission refuses the part", raiser: null }],
+		});
+		expect(result.routing.servedBy.map((n) => n.ref.doName)).toEqual([table.root.doName]);
+		await table.settle();
+	});
+
+	it("answers with a failed local part when the local handler throws", async () => {
+		const table = makeCounterTable();
+		const result = await table.incrementMany(["throw-1", "ok-1"]);
+
+		expect(result.value).toEqual({
+			applied: [],
+			failed: [{ target: "local", keys: ["throw-1", "ok-1"], message: "counter host: the local handler throws", raiser: null }],
+		});
+		await table.settle();
+	});
+
+	it("answers with a failed remote part after the cache-miss fallback, and applies the other parts", async () => {
+		const table = makeCounterTable();
+		for (let i = 0; i < 5; i++) {
+			await table.increment(`k-${i}`);
+		}
+		await table.settle((n) => n[0].stats.role === "router");
+		const owner = (await table.increment("k-1")).routing.servedBy[0].ref.doName;
+
+		// The root learns a hint to a grandchild of `k-1` that no split created, so the forward of the
+		// part of `k-1` falls back to the child. The child is behind the destroy fence and refuses it.
+		await runInDurableObject(stub(table.root.doName), (_instance, state) => {
+			const arena = HashTopology.create(4, 0);
+			arena.updateFromHint(KeyCodec.encode("k-1"), 2);
+			new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
+		});
+		await stub(table.root.doName)
+			.debugAbort()
+			.catch(() => {});
+		await stub(owner).fokosPrepareDestroy({});
+
+		const keys = ["k-0", "k-1", "k-2", "k-3", "k-4", "m-0", "m-1", "m-2"];
+		const result = await table.incrementMany(keys);
+
+		// The part of `k-1` went through the hint. Another key of the fenced child can be in a part of
+		// its own, because only `k-1` has the hint.
+		const { failed, applied } = result.value;
+		expect(failed.length).toBeGreaterThan(0);
+		for (const part of failed) {
+			expect(part).toMatchObject({ target: owner, raiser: owner });
+			expect(part.message).toContain("partition_migrating");
+		}
+		const failedKeys = failed.flatMap((part) => part.keys);
+		expect(failedKeys).toContain("k-1");
+		expect(applied.length).toBeGreaterThan(0);
+		expect([...applied.map((r) => r.key), ...failedKeys].sort()).toEqual([...keys].sort());
+		// The answer is a value, so the partition that raised the error is not the head of its routing.
+		expect(result.routing.servedBy[0].ref.doName).toBe(table.root.doName);
+	});
+});
