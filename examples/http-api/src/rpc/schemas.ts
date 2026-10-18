@@ -150,6 +150,32 @@ export const TransactGetItemsBodySchema = v.object({
 	partitionOptions: PartitionOptionsSchema,
 });
 
+export const BatchGetItemsBodySchema = v.object({
+	items: v.array(
+		v.strictObject({ hashKey: v.string(), sortKey: v.optional(v.string()), projection: v.optional(v.array(ProjectionEntrySchema)) }),
+	),
+	projection: v.optional(v.array(ProjectionEntrySchema)),
+	maxResponseBytes: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1))),
+	partitionOptions: PartitionOptionsSchema,
+});
+
+// Mirrors the `BatchWriteItem` union: a batch write has no condition and no update.
+export const BatchWriteItemsBodySchema = v.object({
+	items: v.array(
+		v.variant("operation", [
+			v.strictObject({
+				operation: v.literal("put"),
+				hashKey: v.string(),
+				sortKey: v.optional(v.string()),
+				data: v.string(),
+				ttlAt: v.optional(v.number()),
+			}),
+			v.strictObject({ operation: v.literal("delete"), hashKey: v.string(), sortKey: v.optional(v.string()) }),
+		]),
+	),
+	partitionOptions: PartitionOptionsSchema,
+});
+
 // FIXME: the HTTP API only accepts string keys; support Uint8Array (binary) keys via a
 // keyEncoding discriminator or base64-encoded binary form.
 const SortKeyConditionSchema = v.union([

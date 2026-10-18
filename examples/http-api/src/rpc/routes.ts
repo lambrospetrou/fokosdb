@@ -4,6 +4,8 @@ import * as v from "valibot";
 import type { QueryItemsProjectedOptions } from "fokosdb/client";
 import { makeFokosDB, type AppEnv } from "../shared.js";
 import {
+	BatchGetItemsBodySchema,
+	BatchWriteItemsBodySchema,
 	DeleteItemBodySchema,
 	GetItemBodySchema,
 	PutItemBodySchema,
@@ -12,6 +14,7 @@ import {
 	TransactWriteItemsBodySchema,
 } from "./schemas.js";
 import {
+	serializeBatchGetItemsResult,
 	serializeGetItemResult,
 	serializeProjectedQueryItemsResult,
 	serializeQueryItemsResult,
@@ -69,6 +72,18 @@ rpcRoutes.post("/:tableName/:rpcAction", async (c) => {
 		case "transactGetItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactGetItemsBodySchema);
 			return c.json(serializeTransactGetItemsResult(await makeFokosDB(c.env, tableName, partitionOptions).transactGetItems(opts)));
+		}
+		case "batchGetItems": {
+			const { partitionOptions, ...opts } = parseBody(BatchGetItemsBodySchema);
+			const result = await makeFokosDB(c.env, tableName, partitionOptions).batchGetItems(opts);
+			c.set("dbItemMeta", result.meta);
+			return c.json(serializeBatchGetItemsResult(result));
+		}
+		case "batchWriteItems": {
+			const { partitionOptions, ...opts } = parseBody(BatchWriteItemsBodySchema);
+			const result = await makeFokosDB(c.env, tableName, partitionOptions).batchWriteItems(opts);
+			c.set("dbItemMeta", result.meta);
+			return c.json(result);
 		}
 		case "queryItems": {
 			const { partitionOptions, ...opts } = parseBody(QueryItemsBodySchema);

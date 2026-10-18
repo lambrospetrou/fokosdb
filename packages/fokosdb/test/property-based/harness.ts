@@ -25,11 +25,13 @@
 //
 // A failure prints the shell commands that replay it. README.md in this directory says how a run is
 // sized and how a failure replays.
+import { isDeepStrictEqual } from "node:util";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import fc from "fast-check";
 import { expect } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
+import type { BatchWriteItem } from "../../src/shared/batch-api-types.js";
 import {
 	CONFLICT_CODES,
 	CORE_INTERNAL_CODES,
@@ -905,6 +907,76 @@ export class TransactWrite extends ModelCommand {
 	}
 }
 
+/**
+ * A batch read never throws for a part that fails: that key comes back `unprocessed`. A found or an
+ * absent key must agree with the model, and an unprocessed key tells nothing.
+ */
+export class BatchGet extends ModelCommand {
+	constructor(readonly keys: ItemKey[]) {
+		super();
+	}
+	async run(m: Model, db: FokosDB): Promise<void> {
+		const res = await db.batchGetItems({ items: this.keys });
+		expect(res.items).toHaveLength(this.keys.length);
+		this.keys.forEach((key, i) => {
+			const item = res.items[i];
+			expect(item.outcome, `${keyId(key)}: the model knows no reason to reject a read`).not.toBe("rejected");
+			if (item.outcome !== "unprocessed") {
+				expectRead(m, key, { ...item, found: item.outcome === "found" });
+			}
+		});
+	}
+	toString(): string {
+		return `BatchGet(${this.keys.map(keyId).join(", ")})`;
+	}
+}
+
+/** One operation of a batch write, in the vocabulary of the model. */
+export type BatchOp = { key: ItemKey } & ({ operation: "put"; data: ItemData } | { operation: "delete" });
+
+/**
+ * A batch write is not atomic. The model applies each `ok` result. An `unprocessed` operation applied
+ * nothing, so the model does not change. An `unknown` operation can have applied, so the command reads
+ * the key, and the model takes the state that the read shows.
+ */
+export class BatchWrite extends ModelCommand {
+	constructor(readonly ops: BatchOp[]) {
+		super();
+	}
+	async run(m: Model, db: FokosDB): Promise<void> {
+		// A write orders itself with a millisecond timestamp, as a transaction does.
+		await sleep(2);
+		const items = this.ops.map(
+			(op): BatchWriteItem =>
+				op.operation === "put" ? { operation: "put", ...op.key, data: op.data } : { operation: "delete", ...op.key },
+		);
+		const res = await db.batchWriteItems({ items });
+		expect(res.results).toHaveLength(this.ops.length);
+		for (const [i, op] of this.ops.entries()) {
+			const result = res.results[i];
+			const id = keyId(op.key);
+			expect(result.outcome, `${id}: the model knows no reason to reject a write`).not.toBe("rejected");
+			if (result.outcome === "ok" && result.operation === "put") {
+				applyPut(m, op.key, (op as { data: ItemData }).data);
+				expectVersion(m, op.key, result.version);
+			} else if (result.outcome === "ok" && result.operation === "delete") {
+				expect(result.deleted, `${id}: the deleted flag`).toBe(m.items.has(id));
+				applyDelete(m, op.key);
+			} else if (result.outcome === "unknown") {
+				const read = await untilAvailable(() => db.getItem(op.key));
+				if (op.operation === "put" && read.found && isDeepStrictEqual(read.item.data, op.data)) {
+					m.items.set(id, { data: op.data, kind: expectedDataKind(op.data), version: read.item.version });
+				} else if (op.operation === "delete" && !read.found) {
+					applyDelete(m, op.key);
+				}
+			}
+		}
+	}
+	toString(): string {
+		return `BatchWrite(${this.ops.map((op) => `${op.operation}(${keyId(op.key)})`).join(", ")})`;
+	}
+}
+
 // ─── The arbitraries of the commands ──────────────────────────────────────────
 
 // A random condition holds half of the time, and one failing operation cancels the whole set. The
@@ -959,6 +1031,13 @@ export function commandArbitraries(
 	// A transaction rejects two operations on one key, so the keys of a set are unique.
 	const arbTxOps = fc.uniqueArray(arbTxOp, { minLength: 1, maxLength: 4, selector: (op) => keyId(op.key) });
 	const arbReadKeys = fc.uniqueArray(keys, { minLength: 1, maxLength: 4, selector: keyId });
+	// A batch rejects two operations on one key, so the keys of a batch are unique.
+	const arbBatchOps: fc.Arbitrary<BatchOp[]> = fc.uniqueArray(
+		fc
+			.tuple(keys, fc.option(data, { nil: undefined }))
+			.map(([key, d]): BatchOp => (d === undefined ? { key, operation: "delete" } : { key, operation: "put", data: d })),
+		{ minLength: 1, maxLength: 4, selector: (op) => keyId(op.key) },
+	);
 
 	return [
 		fc.tuple(keys, data).map(([key, d]) => new PutItem(key, d)),
@@ -966,6 +1045,8 @@ export function commandArbitraries(
 		keys.map((key) => new DeleteItem(key)),
 		transactions?.write ?? arbTxOps.map((ops) => new TransactWrite(ops)),
 		(transactions?.readKeys ?? arbReadKeys).map((ks) => new TransactGet(ks)),
+		arbReadKeys.map((ks) => new BatchGet(ks)),
+		arbBatchOps.map((ops) => new BatchWrite(ops)),
 	];
 }
 

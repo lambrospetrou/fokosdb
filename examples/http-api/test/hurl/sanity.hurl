@@ -272,6 +272,46 @@ Content-Type: application/json
 }
 HTTP 200
 
+# ── batchWriteItems / batchGetItems ───────────────────────────────────────────
+
+POST {{base_url}}/api/rpc/{{database_name}}/batchWriteItems
+Content-Type: application/json
+{
+  "items": [
+    { "hashKey": "batch#item1", "operation": "put", "data": "batch-value1" },
+    { "hashKey": "batch#item2", "sortKey": "sk", "operation": "put", "data": "batch-value2" },
+    { "hashKey": "batch#never-written", "operation": "delete" }
+  ]
+}
+HTTP 200
+[Asserts]
+jsonpath "$.results" count == 3
+jsonpath "$.results[0].outcome" == "ok"
+jsonpath "$.results[1].outcome" == "ok"
+jsonpath "$.results[2].outcome" == "ok"
+jsonpath "$.results[2].deleted" == false
+jsonpath "$.unprocessedItems" count == 0
+
+POST {{base_url}}/api/rpc/{{database_name}}/batchGetItems
+Content-Type: application/json
+{
+  "items": [
+    { "hashKey": "batch#item1" },
+    { "hashKey": "batch#item2", "sortKey": "sk" },
+    { "hashKey": "batch#never-written" }
+  ]
+}
+HTTP 200
+[Asserts]
+jsonpath "$.items" count == 3
+jsonpath "$.items[0].outcome" == "found"
+jsonpath "$.items[0].data" == "batch-value1"
+jsonpath "$.items[0].dataEncoding" == "utf8"
+jsonpath "$.items[1].outcome" == "found"
+jsonpath "$.items[1].data" == "batch-value2"
+jsonpath "$.items[2].outcome" == "not_found"
+jsonpath "$.unprocessedKeys" count == 0
+
 # ── putItem: same hashKey, multiple sortKeys ──────────────────────────────────
 
 POST {{base_url}}/api/rpc/{{database_name}}/putItem

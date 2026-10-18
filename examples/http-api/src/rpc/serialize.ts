@@ -1,5 +1,6 @@
 import { HTTPException } from "hono/http-exception";
 import type {
+	BatchGetItemsResult,
 	GetItemResult,
 	JsonValue,
 	ProjectedItem,
@@ -47,7 +48,7 @@ export function serializeQueryItemsResult(result: QueryItemsResult) {
 	};
 }
 
-// One encoder for every read result: `getItem`, `queryItems` and `transactGetItems` return one item
+// One encoder for every read result: `getItem`, `queryItems`, `transactGetItems` and `batchGetItems` return one item
 // envelope, so each of them serializes its value the same way. A projected record gets its own
 // `dataEncoding`, and every stored kind takes encodeData.
 function encodeReadItemData(item: ReadItemValue): {
@@ -77,6 +78,17 @@ export function serializeTransactGetItemsResult(result: TransactGetItemsResult) 
 		...result,
 		items: result.items.map((item) => {
 			if (!item.found) return item;
+			const { data: _data, ...rest } = item;
+			return { ...rest, ...encodeReadItemData(item) };
+		}),
+	};
+}
+
+export function serializeBatchGetItemsResult(result: BatchGetItemsResult) {
+	return {
+		...result,
+		items: result.items.map((item) => {
+			if (item.outcome !== "found") return item;
 			const { data: _data, ...rest } = item;
 			return { ...rest, ...encodeReadItemData(item) };
 		}),

@@ -78,7 +78,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Add global eventual indexes (DynamoDB GSIs).
 - Add operation hooks that will run on the final serving partition (onAfterOperation).
-- Batch item operations (non-transactions).
 - Add automatic hashing of the item and signature comparison, similar to the managed "v".
 - Add custom jobs to run on alarms, with their own best-effort interval.
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.

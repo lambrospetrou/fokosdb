@@ -1,8 +1,9 @@
 # RFC — Batch item operations: `batchGetItems` and `batchWriteItems`
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-17
 **Author:** Lambros
+**Status:** All milestones are built. Section 1 and the word "today" describe the code before this spec.
 
 ## Table of Contents
 
@@ -166,7 +167,7 @@ policy gets its first user without a risk to stored data.
    the counter host of `test/sharding/`. AGENTS.md gets the exception to the rule "Never swallow a group error", and
    hazard 3 of `.claude/skills/spec-review/references/review-checklist.md` gets the same exception.
 2. **`batchGetItems`** (sections 4.2.1 to 4.2.4, 4.2.7 to 4.2.9, 4.2.11). The public types, the validation, the wire
-   types, `apiBatchGetItems` with `whileMigrating: "throw"`, the response budget, the projection memo, the `db.ts`
+   types, `apiBatchGetItems` with `whileMigrating: "throw"`, the response limit, the projection memo, the `db.ts`
    method, and the exports. A key on an importing partition comes back `unprocessed` with `partition_migrating`.
 3. **Read-through for `group`** (section 4.2.6). `apiBatchGetItems` changes to `whileMigrating: "read_source"`, and
    a batch read reads through as `getItem` does. AGENTS.md lists `apiBatchGetItems` with the operations that read
@@ -697,8 +698,12 @@ before it. The result keeps the positions of the first request, so `Ts` of the f
 - **Helpers.** The `FokosStd` tests cover the loop until no entry stays, `maxAttempts`, `fokosdb_options_invalid`
   before any I/O, no resend of a `rejected` item, an `unknown` write that a later retry does not apply, and the
   joined `meta`.
-- **Property-based.** The item model of `test/property-based/harness.ts` gets batch commands. The model applies each
-  `applied` result and leaves each other item unchanged.
+- **Property-based.** The item model of `test/property-based/harness.ts` gets the commands `BatchGet` and
+  `BatchWrite`. The model applies each `ok` result and leaves each `unprocessed` item unchanged. For an `unknown`
+  write, the command reads the key, and the model takes the state that the read shows. A `rejected` result fails the
+  run, because the model knows no reason for it.
+- **HTTP example.** `examples/http-api/src/rpc/` gets the routes `batchGetItems` and `batchWriteItems`, and
+  `examples/http-api/test/index.test.ts` covers both, and a write operation with a condition (400).
 - **RPC limit.** A test sends a batch write above 32 MiB to one root: 100 puts of 400,000 ASCII characters under one
   hash key. Each item of that root must come back `rejected` with `batch_request_too_large`, and a read of each key
   must find nothing of the batch. A second test checks that `FokosStd.batchWriteItemsWithRetry` makes one call only.

@@ -174,6 +174,46 @@ describe("http-api example worker", () => {
 		expect(body.items[1]).toMatchObject({ found: true, hashKey: "tx-p2", data: "v-tx-p2", dataEncoding: "utf8" });
 	});
 
+	it("batchWriteItems and batchGetItems answer each item in request order", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		const write = await rpc(table, "batchWriteItems", {
+			items: [
+				{ operation: "put", hashKey: "b-1", data: "v-b-1" },
+				{ operation: "put", hashKey: "b-2", data: "v-b-2" },
+				{ operation: "delete", hashKey: "b-3" },
+			],
+		});
+		expect(write.status).toBe(200);
+		expect(await write.json()).toMatchObject({
+			results: [
+				{ outcome: "ok", operation: "put", version: 1 },
+				{ outcome: "ok", operation: "put", version: 1 },
+				{ outcome: "ok", operation: "delete", deleted: false },
+			],
+			unprocessedItems: [],
+		});
+
+		const read = await rpc(table, "batchGetItems", {
+			items: [{ hashKey: "b-1", projection: [{ expr: { ref: "data" }, as: "d" }] }, { hashKey: "b-2" }, { hashKey: "b-3" }],
+		});
+		expect(read.status).toBe(200);
+		expect(await read.json()).toMatchObject({
+			items: [
+				{ outcome: "found", hashKey: "b-1", data: { d: "v-b-1" }, kind: "projected", dataEncoding: "projected" },
+				{ outcome: "found", hashKey: "b-2", data: "v-b-2", dataEncoding: "utf8" },
+				{ outcome: "not_found", hashKey: "b-3" },
+			],
+			unprocessedKeys: [],
+		});
+	});
+
+	it("rejects a batchWriteItems operation with a condition as 400", async () => {
+		const res = await rpc(`t-${crypto.randomUUID()}`, "batchWriteItems", {
+			items: [{ operation: "put", hashKey: "b-1", data: "v", condition: { op: "not_exists", args: [{ ref: "hashKey" }] } }],
+		});
+		expect(res.status).toBe(400);
+	});
+
 	it("rejects a projection on a count query as 400", async () => {
 		const res = await rpc(`t-${crypto.randomUUID()}`, "queryItems", {
 			queries: [{ hashKey: "qi" }],
