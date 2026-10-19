@@ -45,6 +45,7 @@ global secondary indexes (GSIs) and push targets.
   - [5.4 One sidecar `MaterializationDO` for each base `PartitionDO`](#54-one-sidecar-materializationdo-for-each-base-partitiondo)
   - [5.5 A hash or a local integer ID in the GSI sort key](#55-a-hash-or-a-local-integer-id-in-the-gsi-sort-key)
   - [5.6 Per-target cursors over a local change sequence in `MaterializationDO`](#56-per-target-cursors-over-a-local-change-sequence-in-materializationdo)
+  - [5.7 Compact `target_item_state` with key-change-only pre-RPC writes](#57-compact-target_item_state-with-key-change-only-pre-rpc-writes)
 - [6. Frequently Asked Questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
 
@@ -1313,6 +1314,145 @@ about 2 rows: the insert of its `target_retry` row and its delete.
 - **Comparison with Section 5.3.** Section 5.3 rejects cursors for external consumers, because each consumer must then
   track the splits of `MaterializationDO`. Here the cursor is internal to `MaterializationDO` and moves with its
   migration. Thus no consumer sees a split.
+- **Hot-item starvation on a lagging target.** Each update moves the item to the tail of `change_seq`. When a target
+  has a backlog and more than `n` other items update in each batch window, a hot item moves past `cursor_seq` before the
+  scan reaches it. Thus the target does not send the hot item until its cursor catches up to the tail.
+
+### 5.7 Compact `target_item_state` with key-change-only pre-RPC writes
+
+**Status:** Not decided. This option keeps `target_item_state` and `idx_target_item_state_due` from Sections 4.2.4 and
+4.2.5, infers seven columns from `latest_items` and `materialization_targets`, and writes before an outbound RPC only
+when a GSI key changes.
+
+#### 5.7.1 Why
+
+Section 5.6 removes `target_item_state`, which introduces hot-item starvation on a lagging cursor and requires a batch
+threshold between per-item failures and target failures. Section 4.2.5 avoids both defects, because each `(item_id,
+target_id)` has its own row in `idx_target_item_state_due` and `next_attempt_at` stays `0` when a `'DIRTY'` item changes
+again.
+
+However, Section 4.2.5 writes `target_item_state` before every outbound RPC (`WRITE_NEW`, `DELETE_OLD`, and
+`PUSH_BATCH`):
+
+1. A pre-RPC write on `target_item_state` is necessary to prevent an orphan GSI entry only when `WRITE_NEW` writes a GSI
+   key that is not yet in `target_item_state`.
+2. When the GSI key of an item does not change (`(target_hk, target_sk) == (applied_index_hk, applied_index_sk)`), the
+   key is already durable in `applied_index_*`. A crash during `put` leaves no unrecorded GSI key.
+3. On `DELETE_OLD`, the old key is already durable in `applied_index_*` or `inflight_index_*`. A crash during `delete`
+   leaves no new GSI key.
+4. On `PUSH_BATCH`, the push target keys records by `(baseHashKey, baseSortKey)` and deduplicates by `revision`. It has
+   no old secondary key to delete.
+
+#### 5.7.2 Design
+
+1. **Compact schema.** `target_item_state` drops `applied_revision`, `desired_revision`, `inflight_revision`,
+   `inflight_phase`, `inflight_attempt`, `inflight_apply_before_ms`, and `violation_revision`. `materialization_targets`
+   adds `inflight_until`:
+
+```sql
+CREATE TABLE IF NOT EXISTS materialization_targets (
+    target_id       TEXT    PRIMARY KEY,
+    kind            TEXT    NOT NULL,
+    inflight_until  INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS target_item_state (
+    state_id          INTEGER PRIMARY KEY,
+    item_id           INTEGER NOT NULL,
+    target_id         TEXT    NOT NULL,
+
+    applied_index_hk  BLOB,    -- NULL when the GSI holds no entry, or for a push_sink
+    applied_index_sk  BLOB,    -- x'' when the GSI has no sort key
+
+    inflight_index_hk BLOB,    -- set only before WRITE_NEW when target_key != applied_index_key
+    inflight_index_sk BLOB,
+
+    status            TEXT    NOT NULL, -- 'IDLE' | 'DIRTY' | 'VIOLATION'
+    next_attempt_at   INTEGER NOT NULL DEFAULT 0,
+    last_error_code   TEXT,
+
+    UNIQUE (item_id, target_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_target_item_state_due
+    ON target_item_state (target_id, next_attempt_at, item_id)
+    WHERE status = 'DIRTY';
+```
+
+2. **Inferred state:**
+   - **Desired revision.** Always `latest_items.revision` from the join `USING (item_id)`. The worker records the
+     `stepRevision` of each item in memory when it claims the batch.
+   - **In-flight guard.** Each `target_id` has at most 1 batch in flight in memory. No row moves to `'IN_FLIGHT'`. A row
+     stays `'DIRTY'` until `COMMIT_APPLIED` sets `status = 'IDLE'` (when `latest_items.revision == stepRevision`) or
+     deletes the row (when `latest_items.deleted == 1` and `latest_items.revision == stepRevision`). When a newer write
+     arrives during the RPC (`latest_items.revision > stepRevision`), `status` stays `'DIRTY'` with
+     `next_attempt_at = 0`.
+   - **Violation recovery.** `applyLatestImages` accepts a write only when `incoming.revision > latest_items.revision`.
+     Thus every accepted write is newer than any parked violation, and `applyLatestImages` unconditionally sets
+     `status = 'DIRTY'` and `next_attempt_at = 0`.
+
+3. **Target-level fence for crashes and splits.** Before a worker sends a GSI batch with `applyBeforeMs = now +
+   callDeadlineMs`, its claim `transactionSync` writes `inflight_until = applyBeforeMs + maxClockSkewMs` on the one row
+   of `target_id` in `materialization_targets`.
+   - When the batch returns a definite outcome (`applied`, `unprocessed`, or `rejected`) for every item, the completion
+     `transactionSync` sets `inflight_until = 0`.
+   - When an item returns `unknown`, the completion `transactionSync` sets `next_attempt_at = applyBeforeMs +
+     maxClockSkewMs` on that item row and sets `inflight_until = 0`.
+   - After a crash, an eviction, or a cold start, the worker waits until `now >= inflight_until` before it claims a
+     batch for `target_id`.
+   - On a split or a promotion, `FokosMigrationHost` copies `materialization_targets` with `MAX(inflight_until)` to each
+     child before cutover. Thus a child also waits for any in-flight call from the parent to expire.
+
+4. **GSI execution steps for each due `'DIRTY'` row:**
+   - **Stale `inflight_index_*` cleanup.** When `inflight_index_hk IS NOT NULL` and `(inflight_index_hk,
+     inflight_index_sk)` differs from both `(applied_index_hk, applied_index_sk)` and the desired `(target_hk,
+     target_sk)`, first send `delete(inflight_index_hk, inflight_index_sk)` with zero pre-RPC item writes. On `applied`,
+     clear `inflight_index_* = NULL` in SQLite.
+   - **Same GSI key (`(target_hk, target_sk) == (applied_index_hk, applied_index_sk)`):**
+     - Write nothing to `target_item_state` before the RPC.
+     - Send `put(target_hk, target_sk)` in `batchWriteItems`.
+     - On `applied`, run `COMMIT_APPLIED` (`status = 'IDLE'` when `latest_items.revision == stepRevision`).
+   - **New or changed GSI key (`(target_hk, target_sk) != (applied_index_hk, applied_index_sk)`):**
+     - When `(inflight_index_hk, inflight_index_sk) != (target_hk, target_sk)`, write `inflight_index_hk = target_hk`
+       and `inflight_index_sk = target_sk` in the claim `transactionSync` before `put(target_hk, target_sk)`.
+     - Send `put(target_hk, target_sk)`.
+     - When `put` returns `applied` and `applied_index_hk IS NOT NULL`, send `delete(applied_index_hk,
+       applied_index_sk)` in the same worker step with no intermediate SQLite write to `target_item_state` (only the
+       1-row update to `materialization_targets.inflight_until`).
+     - When `delete` (or `put` when `applied_index_hk IS NULL`) returns `applied`, run `COMMIT_APPLIED`: set
+       `applied_index_hk = target_hk`, `applied_index_sk = target_sk`, `inflight_index_* = NULL`, and update `status`.
+   - **Absent desired key (`DELETE_OLD` for a delete or a sparse omission):**
+     - Write nothing to `target_item_state` before the RPC.
+     - Send `delete(applied_index_hk, applied_index_sk)` (and `delete(inflight_index_*)` when present).
+     - On `applied`, run `COMMIT_APPLIED`.
+
+5. **Push target execution steps (`push_sink`):**
+   - Write nothing to `target_item_state` or `materialization_targets` before the RPC.
+   - Send `method(batch)`.
+   - On `applied`, run `COMMIT_APPLIED` (`status = 'IDLE'` or delete the row when `latest_items.deleted == 1`).
+
+#### 5.7.3 Cost
+
+SQLite table rows written for each base write, with no coalescing, for a table with `T` GSIs (leaving out the 2 writes
+to `materialization_targets.inflight_until` per batch of up to 100 items, which cost 0.02 rows per item):
+
+| Base write | `MaterializationDO` (Section 4.2.9) | `MaterializationDO` (Section 5.7) | Total (Section 5.7) | `T = 10` (Section 4.2.9 / Section 5.7) |
+| --- | --- | --- | --- | --- |
+| Put, every GSI key stays | 2 + 3T | 2 + 2T | 7 + 4T | 57 / 47 |
+| Put, every GSI key moves | 2 + 4T | 2 + 3T | 7 + 8T | 97 / 87 |
+| Delete | 4 + 3T | 4 + 2T | 10 + 5T | 70 / 60 |
+
+A push target costs 2 rows in `MaterializationDO` instead of 3 (ingest and `COMMIT_APPLIED`).
+
+#### 5.7.4 Trade-offs
+
+- **No hot-item starvation.** A `'DIRTY'` row keeps `next_attempt_at = 0` and stays at its `item_id` position in
+  `idx_target_item_state_due` when new updates arrive.
+- **Per-item failure isolation.** A retry or a violation updates `next_attempt_at` or `status` on that item's own
+  `target_item_state` row, with no extra retry table and no batch failure threshold.
+- **Cold-start fence across the target.** When `MaterializationDO` restarts during an in-flight GSI batch, the target
+  waits for `materialization_targets.inflight_until` before it claims its next batch. Normal in-memory batches and
+  item-level `unknown` outcomes do not wait on `materialization_targets.inflight_until`.
 
 ## 6. Frequently Asked Questions
 
