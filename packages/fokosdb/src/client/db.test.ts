@@ -25,6 +25,8 @@ import { fokosErrorWith } from "../../test/errors-matchers.js";
 import { attachRouting } from "../sharding/envelope.js";
 import { FokosUnavailableError, type FokosError } from "../shared/errors.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
+import { TestPartition } from "../../test/partition-do/partition-harness.js";
+import { owningPartition } from "../../test/transactions/tx-helpers.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
@@ -859,6 +861,164 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(got.item.sortKey).toEqual(sortKey);
 			});
 		});
+
+		describe("FokosDB — batchGetItems and batchWriteItems", () => {
+			it("returns a public meta and no routing evidence from both batch methods", async () => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "b", sortKey: "old", data: "v" });
+
+				const write = await db.batchWriteItems({
+					items: [
+						{ operation: "put", hashKey: "b", sortKey: "new", data: "v" },
+						{ operation: "delete", hashKey: "b", sortKey: "old" },
+					],
+				});
+				const read = await db.batchGetItems({
+					items: [
+						{ hashKey: "b", sortKey: "new" },
+						{ hashKey: "b", sortKey: "old" },
+					],
+				});
+
+				expect(write.results).toEqual([
+					{ outcome: "ok", operation: "put", version: 1, partitionIndex: 0 },
+					{ outcome: "ok", operation: "delete", deleted: true, partitionIndex: 0 },
+				]);
+				expect(read.items.map((item) => [item.outcome, item.partitionIndex])).toEqual([
+					["found", 0],
+					["not_found", 0],
+				]);
+				for (const meta of [write.meta, read.meta]) {
+					expect(meta).not.toHaveProperty("servedBy");
+					expect(meta.forwardCount).toBe(0);
+					expect(meta.partitions).toHaveLength(1);
+					const [entry] = meta.partitions;
+					invariant(entry.servedByActorName, "a batch result names its partition");
+					expect(entry.servedByActorId).toBe(env[ns].idFromName(entry.servedByActorName).toString());
+					expect(entry).toMatchObject({ hashDepth: 0 });
+					expect(entry).not.toHaveProperty("_rangeAncestors");
+					expect(entry).not.toHaveProperty("actorId");
+				}
+				expect(write.meta.partitions[0].rowsWritten).toBeGreaterThan(0);
+				expect(read.meta.partitions[0].rowsRead).toBeGreaterThan(0);
+			});
+
+			it("round-trips each data kind, the TTL, and the caller's own keys", async () => {
+				const db = makeDB();
+				const bytes = new Uint8Array([0, 1, 2, 255]);
+				const obj = { a: 1, nested: { b: [true, "x", null] } };
+				const jsonText = '{"a":1}';
+				const binaryKey = { hashKey: new Uint8Array([1, 2, 3]), sortKey: new Uint8Array([9]) };
+				const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+
+				const write = await db.batchWriteItems({
+					items: [
+						{ operation: "put", hashKey: "kinds", sortKey: "bytes", data: bytes },
+						{ operation: "put", hashKey: "kinds", sortKey: "text", data: jsonText, ttlAt },
+						{ operation: "put", hashKey: "kinds", sortKey: "json", data: obj },
+						{ operation: "put", hashKey: "no-sk", data: "v" },
+						{ operation: "put", ...binaryKey, data: "bin" },
+					],
+				});
+				expect(write.results.map((r) => r.outcome)).toEqual(["ok", "ok", "ok", "ok", "ok"]);
+
+				const read = await db.batchGetItems({
+					items: [
+						{ hashKey: "kinds", sortKey: "bytes" },
+						{ hashKey: "kinds", sortKey: "text" },
+						{ hashKey: "kinds", sortKey: "json" },
+						{ hashKey: "no-sk" },
+						binaryKey,
+					],
+				});
+
+				expect(read.items).toEqual([
+					expect.objectContaining({ outcome: "found", hashKey: "kinds", sortKey: "bytes", kind: "bytes", data: bytes }),
+					// The database stores a string as text. It does not parse the string as JSON, also when the string contains JSON.
+					expect.objectContaining({ outcome: "found", hashKey: "kinds", sortKey: "text", kind: "text", data: jsonText, ttlAt }),
+					expect.objectContaining({ outcome: "found", hashKey: "kinds", sortKey: "json", kind: "json", data: obj }),
+					expect.objectContaining({ outcome: "found", hashKey: "no-sk", sortKey: undefined, data: "v" }),
+					// KeyCodec adds a tag to a binary key before it stores the key. The result must show the bytes that the caller sent.
+					expect.objectContaining({ outcome: "found", ...binaryKey, data: "bin" }),
+				]);
+				for (const item of [read.items[0], read.items[2], read.items[3], read.items[4]]) {
+					expect(item).not.toHaveProperty("ttlAt");
+				}
+				expect(read.unprocessedKeys).toEqual([]);
+			});
+
+			it("shares the versions of an item with the single-item methods", async () => {
+				const db = makeDB();
+				const key = { hashKey: "versions", sortKey: "1" };
+				expect((await db.putItem({ ...key, data: "v1" })).version).toBe(1);
+
+				const put = await db.batchWriteItems({ items: [{ operation: "put", ...key, data: "v2" }] });
+				expect(put.results).toMatchObject([{ outcome: "ok", operation: "put", version: 2 }]);
+				expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
+
+				const del = await db.batchWriteItems({
+					items: [
+						{ operation: "delete", ...key },
+						{ operation: "delete", hashKey: "versions", sortKey: "absent" },
+					],
+				});
+				expect(del.results).toMatchObject([
+					{ outcome: "ok", operation: "delete", deleted: true },
+					{ outcome: "ok", operation: "delete", deleted: false },
+				]);
+				expect((await db.batchGetItems({ items: [key] })).items).toMatchObject([{ outcome: "not_found", ...key }]);
+
+				// The delete removes the row at version 2 and records the delete revision 3. Thus, the new row starts at version 4.
+				expect((await db.putItem({ ...key, data: "v4" })).version).toBe(4);
+				expect((await db.batchGetItems({ items: [key] })).items).toMatchObject([{ outcome: "found", data: "v4", version: 4 }]);
+			});
+
+			it("joins the answers of a split root and an unsplit root, and each item names its owner", async () => {
+				const db = makeDBFor(ns, { rootTreesN: 2, maxSizeMb: 1 });
+				const { pCtx, stub } = owningPartition(db, { hashKey: "any", sortKey: "sk" });
+				const root = TestPartition.at(pCtx, stub);
+				await root.splitHash();
+				// There are three owners: the two children of the split root, and the root that did not split.
+				// Find two keys for each owner. The request uses the owners in turn: owner 1, owner 2, owner 3,
+				// and then owner 1 again.
+				const buckets = new Map<string, { depth: number; keys: Array<{ hashKey: string; sortKey: string }> }>();
+				for (let i = 0; buckets.size < 3 || [...buckets.values()].some((b) => b.keys.length < 2); i++) {
+					const key = { hashKey: `batch-split-${i}`, sortKey: "sk" };
+					const rootName = owningPartition(db, key).pCtx.doName;
+					const split = rootName === root.doName;
+					const owner = split ? (await root.childOwning(key.hashKey)).doName : rootName;
+					const bucket = buckets.get(owner) ?? { depth: split ? 1 : 0, keys: [] };
+					if (bucket.keys.length < 2) {
+						bucket.keys.push(key);
+					}
+					buckets.set(owner, bucket);
+				}
+				const order = [0, 1].flatMap((n) => [...buckets].map(([owner, { depth, keys }]) => ({ owner, depth, key: keys[n] })));
+				const keys = order.map(({ key }) => key);
+				const entryOf = (i: number) => expect.objectContaining({ servedByActorName: order[i].owner, hashDepth: order[i].depth });
+
+				// This client has no data about the split. Thus, it sends the keys to the split root, and the
+				// split root forwards them to its children.
+				const write = await db.batchWriteItems({ items: keys.map((key, i) => ({ operation: "put" as const, ...key, data: `v-${i}` })) });
+
+				expect(write.unprocessedItems).toEqual([]);
+				expect(write.meta.forwardCount).toBeGreaterThanOrEqual(1);
+				expect(write.meta.partitions).toHaveLength(3);
+				expect(write.results.map((r) => (r.outcome === "ok" ? write.meta.partitions[r.partitionIndex] : r))).toEqual(
+					keys.map((_, i) => entryOf(i)),
+				);
+
+				const read = await db.batchGetItems({ items: keys });
+
+				expect(read.unprocessedKeys).toEqual([]);
+				expect(read.meta.partitions).toHaveLength(3);
+				read.items.forEach((item, i) => {
+					expect(item).toMatchObject({ outcome: "found", ...keys[i], data: `v-${i}` });
+					invariant(item.partitionIndex !== undefined, "a found item names its partition");
+					expect(read.meta.partitions[item.partitionIndex]).toEqual(entryOf(i));
+				});
+			});
+		});
 	});
 
 	describe("FokosDB — internal codes at the public root", () => {
@@ -1453,7 +1613,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 // Builds a FokosDB over a fresh, isolated table for the given partition DO namespace. Generous split
 // thresholds keep every key on a single root partition so these tests exercise FokosDB.queryItems'
 // cross-sub-query fan-out and pagination, not the DO-level range-tree walk (covered in test/partition-do/query-items.test.ts).
-function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; coordinatorRootsN?: number }) {
+function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; coordinatorRootsN?: number; maxSizeMb?: number }) {
 	const tableName = `test.${crypto.randomUUID()}`;
 	return new FokosDB({
 		table: {
@@ -1465,7 +1625,7 @@ function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; c
 			coordinatorRootsN: options?.coordinatorRootsN,
 		},
 		rangeSplitN: 2,
-		hashSplitConditions: { maxSizeMb: 500 },
+		hashSplitConditions: { maxSizeMb: options?.maxSizeMb ?? 500 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 }
