@@ -1797,6 +1797,63 @@ the table holds at most 244,000 rows. TODO: measure the size of a `change_positi
 - **Tombstones during an outage.** A target that is down keeps the tombstones of all deleted items until it recovers
   or leaves `targets()`. A tombstone is a key-only row.
 
+#### 5.6.14 Variant: versioned GSI tombstones with a TTL
+
+**Status:** Not decided. This variant changes only the GSI hop of Section 5.6. It uses the versioned writes of
+`docs/ideas/2026-10-21-idempotent-sink-writes.md`.
+
+Each GSI entry stores the base `revision`. A `put` applies only when its revision is at or above the stored revision.
+A `delete` writes a key-only tombstone with the revision and a TTL, instead of removing the row. The item TTL sweep
+removes the tombstone. The TTL must be longer than the life of any call, for example 1 hour.
+
+Changes to Section 5.6:
+
+- **Removed from the GSI hop:**
+  - the producer ID, the epoch, and the ancestor fences in `batchWriteItems`,
+  - `producer_fences` in GSI partitions,
+  - the epoch raise after an `unknown` outcome, and the `open_batch` marker.
+
+  A late call has a revision at or below the stored revision or tombstone, so the GSI partition rejects it. This is
+  also true for a late call of a parent `MaterializationDO`.
+- **Unchanged:** the change positions, the cursors, the applied map, `target_retry`, the GSI key sets, and the two
+  calls in sequence for a key move. A tombstone still needs its GSI key, so the key set must still store the key
+  before the `put`.
+- **The base hop is a separate choice.** When the `latest_items` tombstones also expire after a time horizon, the
+  base hop can drop its epochs, its fences, `open_calls`, and the same-epoch rule. When they do not, the base hop
+  keeps the rules of Section 5.6.6.
+- **Added:**
+  - a revision condition in the GSI path of `batchWriteItems`,
+  - tombstone rows in GSI partitions,
+  - a tombstone filter in each GSI query.
+
+Pros:
+
+1. Fewer rules on the GSI hop: no epochs, no fences, and no response rule for old epochs. The checks before each
+   write stay.
+2. GSI writes do not depend on order. Copies of a write in any order give the same final state while the tombstone
+   exists. A retry needs no coordination.
+3. Each GSI entry holds the base revision, which answers Open Question 4.3.3.
+4. The receiver state expires. `producer_fences` rows stay forever, but a tombstone goes after its TTL.
+
+Cons:
+
+1. **A time bound in correctness.** When a late call arrives after its tombstone expired, the call creates an orphan
+   entry. A TTL of 1 hour makes this case unlikely. Only a receiver deadline check (`applyBeforeMs`) gives a hard
+   bound, and that check depends on `maxClockSkewMs`.
+2. **More rows written.** A GSI delete writes the tombstone row and `key_size_estimates` (2), and the sweep later
+   deletes them (2 to 3). A plain delete writes 3 rows. This is about 1 to 2 more rows for each GSI delete or key
+   move. With `T = 10`, a key move costs about 89 to 99 rows instead of 79, and a delete about 62 to 72 instead of
+   52 (Section 5.6.12). TODO: measure.
+3. **Storage for the TTL.** A tombstone holds the GSI hash key and `physicalSk`, which holds the base keys. For
+   example, 100 deletes or key moves each second with a 1-hour TTL keep 360,000 tombstones in each GSI. TODO: measure
+   the size of a tombstone.
+4. **Permanent splits.** Tombstones count in the partition size, and partitions never merge (`RepartitionKind`). A
+   burst of deletes can split GSI partitions, and the partitions stay split after the tombstones expire.
+5. **Query cost.** Each GSI query reads the tombstones in its range and skips them. A page with a `limit` can hold
+   fewer items.
+6. **Revision ties.** When a `targets()` change alters the sparse rules of a GSI, one revision can be present at a key
+   and absent at the same key. The `put` and tombstone rules then need a rule for equal revisions.
+
 ### 5.7 Compact `target_item_state` with key-change-only pre-RPC writes
 
 **Status:** Not decided. This option keeps `target_item_state` and `idx_target_item_state_due` from Sections 4.2.4 and
@@ -1805,10 +1862,10 @@ when a GSI key changes.
 
 #### 5.7.1 Why
 
-Section 5.6 removes `target_item_state`, which introduces hot-item starvation on a lagging cursor and requires a batch
-threshold between per-item failures and target failures. Section 4.2.5 avoids both defects, because each `(item_id,
-target_id)` has its own row in `idx_target_item_state_due` and `next_attempt_at` stays `0` when a `'DIRTY'` item changes
-again.
+Section 4.2.5 keeps one `target_item_state` row for each `(item_id, target_id)`. Each item has its own place in
+`idx_target_item_state_due`, and `next_attempt_at` stays `0` when a `'DIRTY'` item changes again. A retry or a
+violation updates the row of that item. This option keeps that model. It does not need the change positions, the
+producer epochs, or the split fences of Section 5.6.
 
 However, Section 4.2.5 writes `target_item_state` before every outbound RPC (`WRITE_NEW`, `DELETE_OLD`, and
 `PUSH_BATCH`):
