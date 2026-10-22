@@ -554,9 +554,17 @@ function expectedRejection(m: Model, op: TxOp): string[] | null {
  * or imports its share answers 503. The sharding runtime defines `partition_migrating`, so its
  * codes are in the set too. A batch over the same keys meets more of them, which
  * `CONTENTION_CANCEL_CODES` lists.
+ *
+ * `clock_skew` is in the set because of the local test runtime, not because of a defect. A partition
+ * rejects a prepare whose transaction timestamp is more than `maxClockSkewMs` (2 s) ahead of its own
+ * clock. In workerd the clock of a Durable Object moves only at its I/O, so under a heavy load (for
+ * example the full suite on a slow machine) the clock of a partition can stay more than 2 s behind the
+ * clock of its coordinator, and a valid transaction gets `clock_skew`. The cancel is correct: the
+ * transaction applies nothing, and the model applies nothing for it.
  */
 const ORDERING_CANCEL_CODES: ReadonlySet<string> = new Set([
 	"timestamp_conflict",
+	"clock_skew",
 	...Object.keys(UNAVAILABLE_CODES),
 	...Object.keys(SHARDING_UNAVAILABLE_CODES),
 ]);
@@ -1281,7 +1289,6 @@ const CONTENTION_CANCEL_CODES: ReadonlySet<string> = new Set([
 	"condition_failed",
 	"update_not_applicable",
 	"pending_conflict",
-	"clock_skew",
 ]);
 
 // A json document comes back from SQLite with its fields in an order of its own, and that order
