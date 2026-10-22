@@ -229,6 +229,15 @@ export type StalePendingTx = Pick<PendingTxInfo, "transaction_id" | "coordinator
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
+/** The last row that a TTL sweep chunk read, in the order of `idx_items_ttl`. */
+export type TtlScanPosition = { ttlAt: number; hk: KeyBytes; sk: KeyBytes };
+
+/**
+ * One sweep chunk reads at most this many candidates for each row that it can delete. The bound keeps a
+ * chunk short when the copies of a moved key come first in the order.
+ */
+const TTL_SCAN_ROWS_PER_DELETED_ROW = 10;
+
 /** One key of a lock row, as the transaction paths hold it. */
 export type PendingTxKey = { hashKey: KeyBytes; sortKey: KeyBytes };
 
@@ -1129,34 +1138,50 @@ export class PartitionStore {
 	 * Deletes one bounded chunk of expired, unlocked items and updates all deletion bookkeeping in the
 	 * same storage transaction. The victim scan uses only metadata columns and never reads item data.
 	 *
-	 * The chunk holds up to `limit` candidates, and the sweep deletes only the candidates that `owns`
-	 * accepts. A copy of a moved key stays until the cleanup of the source deletes it, because the new
-	 * owner must pull the row and write its delete itself. A lock row, owned or a copy, keeps its item.
-	 * `deletedRows` counts only the deleted rows, so a chunk with a copy reports fewer rows than `limit`.
+	 * The scan reads the candidates in `(ttl_epoch_utc_seconds, hk, sk)` order after `after`, and deletes
+	 * only the candidates that `owns` accepts. It stops at `limit` owned rows or at
+	 * `limit * TTL_SCAN_ROWS_PER_DELETED_ROW` candidates. A copy of a moved key stays until the cleanup of
+	 * the source deletes it, because the new owner must pull the row and write its delete itself. The
+	 * caller gives `resumeAfter`, the last row that the chunk read, as `after` of the next chunk. Thus the
+	 * scan reads each copy one time and reaches the owned rows after the copies. `resumeAfter` is null when
+	 * the scan read all expired rows. A lock row, owned or a copy, keeps its item.
 	 */
 	deleteExpiredItems(
 		nowSeconds: number,
 		limit: number,
 		owns: (row: { hk: KeyBytes; sk: KeyBytes }) => boolean,
-	): { deletedRows: number; deletedBytes: number } {
+		after: TtlScanPosition | null = null,
+	): { deletedRows: number; deletedBytes: number; resumeAfter: TtlScanPosition | null } {
 		return this.transactionSync(() => {
+			const scanLimit = limit * TTL_SCAN_ROWS_PER_DELETED_ROW;
 			const ownedIds: number[] = [];
-			for (const candidate of this.#storage.sql.exec<{ item_id: number; hk: ArrayBuffer; sk: ArrayBuffer }>(
-				`SELECT i.item_id, i.hk, i.sk FROM items i INDEXED BY idx_items_ttl
+			let scanned = 0;
+			let last: TtlScanPosition | null = null;
+			for (const candidate of this.#storage.sql.exec<{ item_id: number; ttl: number; hk: ArrayBuffer; sk: ArrayBuffer }>(
+				`SELECT i.item_id, i.ttl_epoch_utc_seconds AS ttl, i.hk, i.sk FROM items i INDEXED BY idx_items_ttl
 				  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 				    AND i.ttl_epoch_utc_seconds <= ?1
+				    ${after ? "AND (i.ttl_epoch_utc_seconds, i.hk, i.sk) > (?3, ?4, ?5)" : ""}
 				    AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
 				  ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
 				  LIMIT ?2`,
 				nowSeconds,
-				limit,
+				scanLimit,
+				...(after ? [after.ttlAt, after.hk, after.sk] : []),
 			)) {
-				if (owns({ hk: fromSqlKey(candidate.hk), sk: fromSqlKey(candidate.sk) })) {
+				scanned++;
+				last = { ttlAt: candidate.ttl, hk: fromSqlKey(candidate.hk), sk: fromSqlKey(candidate.sk) };
+				if (owns(last)) {
 					ownedIds.push(candidate.item_id);
+					if (ownedIds.length === limit) {
+						break;
+					}
 				}
 			}
+			// A scan that stopped before its limit with fewer than `limit` owned rows read all expired rows.
+			const resumeAfter = ownedIds.length === limit || scanned === scanLimit ? last : null;
 			if (ownedIds.length === 0) {
-				return { deletedRows: 0, deletedBytes: 0 };
+				return { deletedRows: 0, deletedBytes: 0, resumeAfter };
 			}
 			const rows = this.#storage.sql
 				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
@@ -1196,7 +1221,7 @@ export class PartitionStore {
 				this.#raiseDeletionMetadata(maxDeleteTxOrderTs, maxDeletedV);
 			}
 
-			return { deletedRows: rows.length, deletedBytes };
+			return { deletedRows: rows.length, deletedBytes, resumeAfter };
 		});
 	}
 

@@ -1030,23 +1030,34 @@ describe("PartitionStore - TTL deletion", () => {
 					.toArray()
 					.map((row) => row.detail)
 					.join(" | ");
-			const candidates = (indexHint: string) =>
+			const candidates = (indexHint: string, position: string, ...positionBindings: unknown[]) =>
 				explain(
-					`SELECT i.item_id, i.hk, i.sk FROM items i${indexHint}
+					`SELECT i.item_id, i.ttl_epoch_utc_seconds AS ttl, i.hk, i.sk FROM items i${indexHint}
 					  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 					    AND i.ttl_epoch_utc_seconds <= ?1
+					    ${position}
 					    AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
 					  ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
 					  LIMIT ?2`,
 					100,
 					10,
+					...positionBindings,
 				);
+			const afterPosition = "AND (i.ttl_epoch_utc_seconds, i.hk, i.sk) > (?3, ?4, ?5)";
 
-			for (const details of [candidates(" INDEXED BY idx_items_ttl"), candidates("")]) {
+			for (const details of [
+				candidates(" INDEXED BY idx_items_ttl", ""),
+				candidates("", ""),
+				candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, kb("a"), kb("s")),
+			]) {
 				expect(details).toContain("SEARCH i USING COVERING INDEX idx_items_ttl");
 				expect(details).toMatch(/SEARCH p USING COVERING INDEX sqlite_autoindex_pending_transactions_1/);
 				expect(details).not.toMatch(/SCAN p|USE TEMP B-TREE FOR ORDER BY/);
 			}
+			// The scan seeks to the position, and does not read the rows before it.
+			expect(candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, kb("a"), kb("s"))).toContain(
+				"idx_items_ttl ((ttl_epoch_utc_seconds,hk,sk)>(?,?,?) AND ttl_epoch_utc_seconds<?)",
+			);
 			expect(
 				explain(
 					`DELETE FROM items WHERE item_id IN (SELECT value FROM json_each(?1))
@@ -1084,7 +1095,7 @@ describe("PartitionStore - TTL deletion", () => {
 			});
 
 			const first = store.deleteExpiredItems(100, 2, ownsAll);
-			expect(first).toEqual({ deletedRows: 2, deletedBytes: oldBytes + secondBytes });
+			expect(first).toMatchObject({ deletedRows: 2, deletedBytes: oldBytes + secondBytes });
 			expect(store.getItem(kb("a"), kb("old")).row).toBeUndefined();
 			expect(store.getItem(kb("b"), kb("s")).row).toBeUndefined();
 			expect(store.getItem(kb("a"), kb("next")).row).toBeDefined();
@@ -1098,7 +1109,7 @@ describe("PartitionStore - TTL deletion", () => {
 
 			store.bumpMaxDeleteTxOrderTs(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 			const second = store.deleteExpiredItems(100, 2, ownsAll);
-			expect(second).toEqual({ deletedRows: 2, deletedBytes: nextBytes + exactBytes });
+			expect(second).toMatchObject({ deletedRows: 2, deletedBytes: nextBytes + exactBytes });
 			expect(store.getItem(kb("a"), kb("next")).row).toBeUndefined();
 			expect(store.getItem(kb("c"), kb("exact")).row).toBeUndefined();
 			expect(kseBytes(state, "a")).toBe(nullBytes + futureBytes);
@@ -1109,7 +1120,7 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(kseBytes(state, "locked")).toBe(lockedBytes);
 			expect(store.getItem(kb("a"), kb("null")).row).toBeDefined();
 			expect(store.getItem(kb("a"), kb("future")).row).toBeDefined();
-			expect(store.deleteExpiredItems(100, 2, ownsAll)).toEqual({ deletedRows: 0, deletedBytes: 0 });
+			expect(store.deleteExpiredItems(100, 2, ownsAll)).toEqual({ deletedRows: 0, deletedBytes: 0, resumeAfter: null });
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(2);
 		});
 	});
@@ -1288,8 +1299,33 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(ownedVersion + 1);
 
 			// A chunk of copies only deletes nothing and writes no deletion metadata.
-			expect(store.deleteExpiredItems(100, 3, ownsByKey)).toEqual({ deletedRows: 0, deletedBytes: 0 });
+			expect(store.deleteExpiredItems(100, 3, ownsByKey)).toEqual({ deletedRows: 0, deletedBytes: 0, resumeAfter: null });
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(ownedVersion + 1);
+		});
+	});
+
+	it("continues after the returned position, so a long run of copies does not stop the owned rows after it", async () => {
+		await withStore((store) => {
+			// 12 copies expire first, and the owned row expires last. One chunk of limit 1 reads at most 10 candidates.
+			for (let n = 0; n < 12; n++) {
+				store.upsertItem({ hk: kb("copy"), sk: kb(`s${String(n).padStart(2, "0")}`), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
+			}
+			store.upsertItem({ hk: kb("owned"), sk: kb("s"), data: "d", kind: "text", ttlAt: 20, txOrderTs: 1 });
+			const ownsByKey = (row: { hk: KeyBytes }) => keyLabel(row.hk) !== "copy";
+
+			const first = store.deleteExpiredItems(100, 1, ownsByKey);
+			expect(first).toMatchObject({ deletedRows: 0, resumeAfter: { ttlAt: 10, hk: kb("copy"), sk: kb("s09") } });
+			// The same chunk from the start reads the same copies again.
+			expect(store.deleteExpiredItems(100, 1, ownsByKey)).toEqual(first);
+
+			const second = store.deleteExpiredItems(100, 1, ownsByKey, first.resumeAfter);
+			expect(second).toMatchObject({ deletedRows: 1, resumeAfter: { ttlAt: 20, hk: kb("owned"), sk: kb("s") } });
+			expect(store.getItem(kb("owned"), kb("s")).row).toBeUndefined();
+			expect(store.deleteExpiredItems(100, 1, ownsByKey, second.resumeAfter)).toEqual({
+				deletedRows: 0,
+				deletedBytes: 0,
+				resumeAfter: null,
+			});
 		});
 	});
 

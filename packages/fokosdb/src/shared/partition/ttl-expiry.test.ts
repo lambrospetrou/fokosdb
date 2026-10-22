@@ -85,11 +85,12 @@ describe("TtlExpiry", () => {
 		});
 	});
 
-	it("stops the cycle at a chunk that holds a copy, and keeps the copy", async () => {
+	it("keeps a copy and continues the cycle to the owned rows after it", async () => {
 		await withStore(async (store, state) => {
 			putExpired(store, "k0", 1);
 			putExpired(store, "copy", 2);
 			putExpired(store, "k2", 3);
+			putExpired(store, "k3", 4);
 			const copy = KeyCodec.encode("copy");
 			let checks = 0;
 			const expiry = makeExpiry(store, {
@@ -97,10 +98,10 @@ describe("TtlExpiry", () => {
 				ownerCheck: () => (++checks, (row) => KeyCodec.compare(row.hk, copy) !== 0),
 			});
 
-			// The first chunk holds k0 and the copy. It deletes k0 only, so the cycle stops before k2.
-			expect(await expiry.runCycle()).toMatchObject({ deletedRows: 1, more: false });
-			expect(checks).toBe(1);
-			expect(itemCount(state)).toBe(2);
+			// Chunk 1 deletes k0 and k2. Chunk 2 deletes k3 and reads to the end of the expired rows.
+			expect(await expiry.runCycle()).toMatchObject({ deletedRows: 3, more: false });
+			expect(checks).toBe(2);
+			expect(itemCount(state)).toBe(1);
 			expect(store.getItem(copy, kb("s")).row).toBeDefined();
 		});
 	});

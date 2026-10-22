@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-17
 **Author:** Lambros Petrou
-**Status:** The delete revision `v + 1` (Section 4.2.2) is built. Nothing else is built. This document specifies
+**Status:** The delete revision `v + 1` (Section 4.2.2) and Milestone 1 are built. Nothing else is built. This document specifies
 global secondary indexes (GSIs) and push targets.
 
 ## Table of Contents
@@ -209,7 +209,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 
 ## 3. Milestones
 
-### Milestone 1: The TTL sweep deletes only owned rows
+### Milestone 1 — DONE — The TTL sweep deletes only owned rows
 - Change `PartitionStore.deleteExpiredItems` to filter its expired, unlocked candidates with
   `this.fokos.ownerCheck()` and to delete only the owned rows. Unowned copies stay until `cleanupSourceStep` deletes
   them (Section 4.2.3, the TTL sweep item).
@@ -515,8 +515,10 @@ Splits, promotions, and TTL sweeps handle outbox rows and ownership as follows:
    deletes only the owned rows.
    - Unowned copies stay on the promotion source until `cleanupSourceStep` removes them. Thus the range root always
      pulls an expired row during the migration, and its own sweep writes the tombstone after the import.
-   - When a chunk holds unowned copies, the sweep cycle stops early. The owned expired rows that sort after those
-     copies wait until `cleanupSourceStep` finishes. TODO: measure this delay for a promoted key.
+   - Each chunk returns `resumeAfter`, the last row that it read, and the next chunk of the same cycle starts after it.
+     A chunk stops at `limit` owned rows or at `10 * limit` candidates. Thus the sweep reads each copy one time in a
+     cycle, and it deletes the owned expired rows that sort after the copies. The next cycle starts again at the first
+     expired row.
 
 #### 4.2.4 `MaterializationDO` storage and ingest
 

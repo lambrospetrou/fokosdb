@@ -1,4 +1,4 @@
-import type { PartitionStore } from "./partition-store.js";
+import type { PartitionStore, TtlScanPosition } from "./partition-store.js";
 import type { KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
 
@@ -109,6 +109,9 @@ export class TtlExpiry {
 			let deletedBytes = 0;
 			let rowsSinceSleep = 0;
 			let bytesSinceSleep = 0;
+			// The position stays for one cycle only. The next cycle starts again at the first expired row,
+			// because the cleanup of a moved key can delete its copies in the meantime.
+			let after: TtlScanPosition | null = null;
 
 			for (;;) {
 				if (!this.#canSweep()) {
@@ -119,11 +122,7 @@ export class TtlExpiry {
 				}
 
 				const limit = Math.min(config.chunkSize, config.maxRowsPerCycle - deletedRows);
-				const result = this.#store.deleteExpiredItems(this.#nowSec(), limit, this.#ownerCheck());
-				if (result.deletedRows === 0) {
-					return { deletedRows, deletedBytes, more: false };
-				}
-
+				const result = this.#store.deleteExpiredItems(this.#nowSec(), limit, this.#ownerCheck(), after);
 				deletedRows += result.deletedRows;
 				deletedBytes += result.deletedBytes;
 				rowsSinceSleep += result.deletedRows;
@@ -132,11 +131,10 @@ export class TtlExpiry {
 				if (deletedRows >= config.maxRowsPerCycle) {
 					return { deletedRows, deletedBytes, more: true };
 				}
-				// A short chunk has no more expired rows, or it holds copies of a moved key. The copies stay
-				// at the front of the order until the cleanup of the source deletes them, so the cycle stops.
-				if (result.deletedRows < limit) {
+				if (result.resumeAfter === null) {
 					return { deletedRows, deletedBytes, more: false };
 				}
+				after = result.resumeAfter;
 
 				if (rowsSinceSleep >= config.maxRowsBeforeSleep || bytesSinceSleep >= config.maxBytesBeforeSleep) {
 					await this.#wait(config.sleepMs);
