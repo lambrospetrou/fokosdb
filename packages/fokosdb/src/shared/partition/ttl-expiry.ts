@@ -1,4 +1,5 @@
 import type { PartitionStore } from "./partition-store.js";
+import type { KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
 
 export type TtlSweepConfig = {
@@ -20,6 +21,8 @@ export type TtlExpiryOptions = {
 	store: PartitionStore;
 	/** False before context load, during migration, and in split_started or split_completed. */
 	canSweep: () => boolean;
+	/** Returns a check of the rows that this partition owns now. The sweep gets a new check for each chunk. */
+	ownerCheck: () => (row: { hk: KeyBytes; sk: KeyBytes }) => boolean;
 	logParams: () => Record<string, unknown>;
 	/** Read when work starts so subclasses can override the values. */
 	config: () => TtlSweepConfig;
@@ -35,6 +38,7 @@ export class TtlExpiry {
 	#running = false;
 	readonly #store: PartitionStore;
 	readonly #canSweep: () => boolean;
+	readonly #ownerCheck: () => (row: { hk: KeyBytes; sk: KeyBytes }) => boolean;
 	readonly #logParams: () => Record<string, unknown>;
 	readonly #config: () => TtlSweepConfig;
 	readonly #nowSec: () => number;
@@ -43,6 +47,7 @@ export class TtlExpiry {
 	constructor(deps: TtlExpiryOptions) {
 		this.#store = deps.store;
 		this.#canSweep = deps.canSweep;
+		this.#ownerCheck = deps.ownerCheck;
 		this.#logParams = deps.logParams;
 		this.#config = deps.config;
 		this.#nowSec = deps.nowSec ?? (() => Math.floor(Date.now() / 1000));
@@ -114,7 +119,7 @@ export class TtlExpiry {
 				}
 
 				const limit = Math.min(config.chunkSize, config.maxRowsPerCycle - deletedRows);
-				const result = this.#store.deleteExpiredItems(this.#nowSec(), limit);
+				const result = this.#store.deleteExpiredItems(this.#nowSec(), limit, this.#ownerCheck());
 				if (result.deletedRows === 0) {
 					return { deletedRows, deletedBytes, more: false };
 				}
@@ -127,6 +132,8 @@ export class TtlExpiry {
 				if (deletedRows >= config.maxRowsPerCycle) {
 					return { deletedRows, deletedBytes, more: true };
 				}
+				// A short chunk has no more expired rows, or it holds copies of a moved key. The copies stay
+				// at the front of the order until the cleanup of the source deletes them, so the cycle stops.
 				if (result.deletedRows < limit) {
 					return { deletedRows, deletedBytes, more: false };
 				}

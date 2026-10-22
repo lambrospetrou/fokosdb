@@ -398,6 +398,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
 			canSweep: () => this.canSweepLocally(this.fokos.lifecycle()),
+			ownerCheck: () => ownsByHashKey(this.fokos.ownerCheck()),
 			logParams: () => this.logParams(),
 			config: () => this.config().ttlSweep,
 		});

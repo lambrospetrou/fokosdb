@@ -1129,26 +1129,41 @@ export class PartitionStore {
 	 * Deletes one bounded chunk of expired, unlocked items and updates all deletion bookkeeping in the
 	 * same storage transaction. The victim scan uses only metadata columns and never reads item data.
 	 *
-	 * The sweep does not test the owner of each row. An expired row of a key that a promotion moves is
-	 * an owned row or a copy. The promotion cleanup deletes a copy in all cases, so an early delete
-	 * changes no result. A lock row, owned or a copy, keeps its item.
+	 * The chunk holds up to `limit` candidates, and the sweep deletes only the candidates that `owns`
+	 * accepts. A copy of a moved key stays until the cleanup of the source deletes it, because the new
+	 * owner must pull the row and write its delete itself. A lock row, owned or a copy, keeps its item.
+	 * `deletedRows` counts only the deleted rows, so a chunk with a copy reports fewer rows than `limit`.
 	 */
-	deleteExpiredItems(nowSeconds: number, limit: number): { deletedRows: number; deletedBytes: number } {
+	deleteExpiredItems(
+		nowSeconds: number,
+		limit: number,
+		owns: (row: { hk: KeyBytes; sk: KeyBytes }) => boolean,
+	): { deletedRows: number; deletedBytes: number } {
 		return this.transactionSync(() => {
+			const ownedIds: number[] = [];
+			for (const candidate of this.#storage.sql.exec<{ item_id: number; hk: ArrayBuffer; sk: ArrayBuffer }>(
+				`SELECT i.item_id, i.hk, i.sk FROM items i INDEXED BY idx_items_ttl
+				  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
+				    AND i.ttl_epoch_utc_seconds <= ?1
+				    AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
+				  ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
+				  LIMIT ?2`,
+				nowSeconds,
+				limit,
+			)) {
+				if (owns({ hk: fromSqlKey(candidate.hk), sk: fromSqlKey(candidate.sk) })) {
+					ownedIds.push(candidate.item_id);
+				}
+			}
+			if (ownedIds.length === 0) {
+				return { deletedRows: 0, deletedBytes: 0 };
+			}
 			const rows = this.#storage.sql
 				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
 					`DELETE FROM items
-					 WHERE item_id IN (
-					     SELECT i.item_id FROM items i INDEXED BY idx_items_ttl
-					      WHERE i.ttl_epoch_utc_seconds IS NOT NULL
-					        AND i.ttl_epoch_utc_seconds <= ?1
-					        AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
-					      ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
-					      LIMIT ?2
-					 )
+					 WHERE item_id IN (SELECT value FROM json_each(?1))
 					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
-					nowSeconds,
-					limit,
+					JSON.stringify(ownedIds),
 				)
 				.toArray();
 

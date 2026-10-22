@@ -69,6 +69,58 @@ describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 	});
 });
 
+describe("PartitionDO — TTL sweep during a promotion", () => {
+	async function expiredRows(partition: TestPartition, hashKey: string): Promise<number> {
+		return await runInDurableObject(
+			partition.stub,
+			(_instance: PartitionDO, state: DurableObjectState) =>
+				state.storage.sql
+					.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND ttl_epoch_utc_seconds IS NOT NULL`, kb(hashKey))
+					.one().n,
+		);
+	}
+
+	it("keeps the expired copy of the promoted key on the source, and the range root deletes it after its import", async () => {
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const farTtl = Math.floor(Date.now() / 1000) + 3600;
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("expiring"), data: "a", kind: "text", ttlAt: farTtl });
+		await partition.put({ hashKey: kb("bob"), sortKey: kb("expiring"), data: "b", kind: "text", ttlAt: farTtl });
+		const rangeRoot = partition.rangeRoot("alice");
+		await partition.controlled.testHoldPulls({ stream: "items", target: rangeRoot.doName });
+		try {
+			await partition.triggerPromotion("alice");
+			await partition.awaitPromotedKeyStatus("alice", ["promoting"]);
+			// Both rows expire after the cutover. The range root has not pulled the items of alice yet.
+			await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+				state.storage.sql.exec(`UPDATE items SET ttl_epoch_utc_seconds = 1 WHERE ttl_epoch_utc_seconds IS NOT NULL`);
+			});
+
+			// Each status request arms the sweep. The source owns bob and deletes it, and it keeps the copy of alice.
+			await drainUntil(
+				[partition],
+				async () => {
+					await partition.status();
+					return (await expiredRows(partition, "bob")) === 0;
+				},
+				"source sweep of bob",
+			);
+			expect(await expiredRows(partition, "alice")).toBe(1);
+		} finally {
+			await partition.controlled.testReleasePulls();
+		}
+
+		const root = await partition.awaitPromoted("alice");
+		await drainUntil(
+			[root],
+			async () => {
+				await root.status();
+				return (await expiredRows(root, "alice")) === 0;
+			},
+			"range root sweep of alice",
+		);
+	});
+});
+
 describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 	/** Prepares a put of alice/sk1 on `partition`, and returns the transaction id and timestamp. */
 	async function prepareAlice(partition: TestPartition): Promise<{ transactionId: string; transactionTimestamp: number }> {

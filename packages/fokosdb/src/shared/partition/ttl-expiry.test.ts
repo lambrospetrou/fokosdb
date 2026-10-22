@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
-import { KeyCodec } from "../../sharding/key-codec.js";
+import { type KeyBytes, KeyCodec } from "../../sharding/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";
@@ -44,12 +44,14 @@ function makeExpiry(
 	opts: {
 		config?: TtlSweepConfig;
 		canSweep?: () => boolean;
+		ownerCheck?: () => (row: { hk: KeyBytes; sk: KeyBytes }) => boolean;
 		wait?: (ms: number) => Promise<void>;
 	} = {},
 ): TtlExpiry {
 	return new TtlExpiry({
 		store,
 		canSweep: opts.canSweep ?? (() => true),
+		ownerCheck: opts.ownerCheck ?? (() => () => true),
 		logParams: () => ({ partition: "test" }),
 		config: () => opts.config ?? config(),
 		nowSec: () => NOW_SECONDS,
@@ -80,6 +82,26 @@ describe("TtlExpiry", () => {
 			expect(await expiry.runCycle()).toEqual({ deletedRows: 1, deletedBytes: sizes[4], more: false });
 			expect(await expiry.runCycle()).toEqual({ deletedRows: 0, deletedBytes: 0, more: false });
 			expect(itemCount(state)).toBe(0);
+		});
+	});
+
+	it("stops the cycle at a chunk that holds a copy, and keeps the copy", async () => {
+		await withStore(async (store, state) => {
+			putExpired(store, "k0", 1);
+			putExpired(store, "copy", 2);
+			putExpired(store, "k2", 3);
+			const copy = KeyCodec.encode("copy");
+			let checks = 0;
+			const expiry = makeExpiry(store, {
+				config: config({ chunkSize: 2 }),
+				ownerCheck: () => (++checks, (row) => KeyCodec.compare(row.hk, copy) !== 0),
+			});
+
+			// The first chunk holds k0 and the copy. It deletes k0 only, so the cycle stops before k2.
+			expect(await expiry.runCycle()).toMatchObject({ deletedRows: 1, more: false });
+			expect(checks).toBe(1);
+			expect(itemCount(state)).toBe(2);
+			expect(store.getItem(copy, kb("s")).row).toBeDefined();
 		});
 	});
 
@@ -199,6 +221,7 @@ describe("TtlExpiry", () => {
 			const expiry = new TtlExpiry({
 				store,
 				canSweep: () => (++checks, true),
+				ownerCheck: () => () => true,
 				logParams: () => ({ partition: "test" }),
 				config: () => config({ ttlSweepDelayMs: delayMs }),
 				nowSec: () => NOW_SECONDS,
@@ -255,6 +278,7 @@ describe("TtlExpiry", () => {
 				const expiry = new TtlExpiry({
 					store,
 					canSweep: () => true,
+					ownerCheck: () => () => true,
 					logParams: () => ({ partition: "test" }),
 					config: () => {
 						throw error;

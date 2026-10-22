@@ -149,7 +149,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			db,
 			key,
 			async (_instance, state) => {
-				expect(new PartitionStore(state.storage).deleteExpiredItems(ttlAt + 1, 100)).toMatchObject({ deletedRows: 1 });
+				expect(new PartitionStore(state.storage).deleteExpiredItems(ttlAt + 1, 100, () => true)).toMatchObject({ deletedRows: 1 });
 			},
 			() => db.transactGetItems({ items: [key] }),
 		);

@@ -39,6 +39,7 @@ const keyLabel = (key: KeyBytes): string => {
 
 // Only the store creates link ids; a test stands in for the parent partition that read one.
 const linkId = (n: number) => n as ItemLinkId;
+const ownsAll = () => true;
 
 // Mirrors items.est_row_bytes: octet_length(data)+octet_length(hk)+octet_length(sk)+K. octet_length is
 // UTF-8 bytes for text and byteLength for blobs; keys are already canonical bytes. est_row_bytes is a
@@ -1021,34 +1022,38 @@ describe("PartitionStore - TTL deletion", () => {
 		return expectedRowBytes(data, kb(hk), kb(sk));
 	}
 
-	it("uses the bounded covering-index deletion plan", async () => {
+	it("uses the bounded covering-index candidate plan and deletes the owned rows by item_id", async () => {
 		await withStore((_store, state) => {
-			const plan = (indexHint: string) =>
+			const explain = (sql: string, ...bindings: unknown[]) =>
 				state.storage.sql
-					.exec<{ detail: string }>(
-						`EXPLAIN QUERY PLAN DELETE FROM items
-						 WHERE item_id IN (
-						     SELECT i.item_id FROM items i${indexHint}
-						      WHERE i.ttl_epoch_utc_seconds IS NOT NULL
-						        AND i.ttl_epoch_utc_seconds <= ?1
-						        AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
-						      ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
-						      LIMIT ?2
-						 )
-						 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
-						100,
-						10,
-					)
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...bindings)
 					.toArray()
 					.map((row) => row.detail)
 					.join(" | ");
+			const candidates = (indexHint: string) =>
+				explain(
+					`SELECT i.item_id, i.hk, i.sk FROM items i${indexHint}
+					  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
+					    AND i.ttl_epoch_utc_seconds <= ?1
+					    AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
+					  ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
+					  LIMIT ?2`,
+					100,
+					10,
+				);
 
-			for (const details of [plan(" INDEXED BY idx_items_ttl"), plan("")]) {
-				expect(details).toContain("LIST SUBQUERY");
+			for (const details of [candidates(" INDEXED BY idx_items_ttl"), candidates("")]) {
 				expect(details).toContain("SEARCH i USING COVERING INDEX idx_items_ttl");
 				expect(details).toMatch(/SEARCH p USING COVERING INDEX sqlite_autoindex_pending_transactions_1/);
 				expect(details).not.toMatch(/SCAN p|USE TEMP B-TREE FOR ORDER BY/);
 			}
+			expect(
+				explain(
+					`DELETE FROM items WHERE item_id IN (SELECT value FROM json_each(?1))
+					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
+					"[1,2]",
+				),
+			).toMatch(/SEARCH items USING INTEGER PRIMARY KEY/);
 		});
 	});
 
@@ -1078,7 +1083,7 @@ describe("PartitionStore - TTL deletion", () => {
 				next_recovery_at: 1,
 			});
 
-			const first = store.deleteExpiredItems(100, 2);
+			const first = store.deleteExpiredItems(100, 2, ownsAll);
 			expect(first).toEqual({ deletedRows: 2, deletedBytes: oldBytes + secondBytes });
 			expect(store.getItem(kb("a"), kb("old")).row).toBeUndefined();
 			expect(store.getItem(kb("b"), kb("s")).row).toBeUndefined();
@@ -1092,7 +1097,7 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 20 * 1000 * TX_ORDER_TS_UNITS_PER_MS, maxDeletedV: 2 });
 
 			store.bumpMaxDeleteTxOrderTs(200_000 * TX_ORDER_TS_UNITS_PER_MS);
-			const second = store.deleteExpiredItems(100, 2);
+			const second = store.deleteExpiredItems(100, 2, ownsAll);
 			expect(second).toEqual({ deletedRows: 2, deletedBytes: nextBytes + exactBytes });
 			expect(store.getItem(kb("a"), kb("next")).row).toBeUndefined();
 			expect(store.getItem(kb("c"), kb("exact")).row).toBeUndefined();
@@ -1104,7 +1109,7 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(kseBytes(state, "locked")).toBe(lockedBytes);
 			expect(store.getItem(kb("a"), kb("null")).row).toBeDefined();
 			expect(store.getItem(kb("a"), kb("future")).row).toBeDefined();
-			expect(store.deleteExpiredItems(100, 2)).toEqual({ deletedRows: 0, deletedBytes: 0 });
+			expect(store.deleteExpiredItems(100, 2, ownsAll)).toEqual({ deletedRows: 0, deletedBytes: 0 });
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(2);
 		});
 	});
@@ -1264,6 +1269,30 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 		});
 	});
 
+	it("deletes only the expired rows that the owner check accepts, and keeps the copies", async () => {
+		await withStore((store, state) => {
+			const expiring = (hk: string, sk: string) =>
+				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 }).version;
+			expiring("copy", "s1");
+			expiring("copy", "s2");
+			const ownedVersion = expiring("owned", "s");
+			const copyBytes = kseBytes(state, "copy");
+			const ownsByKey = (row: { hk: KeyBytes }) => keyLabel(row.hk) !== "copy";
+
+			// The chunk holds the 2 copies and the owned row. Only the owned row is deleted and counted.
+			expect(store.deleteExpiredItems(100, 3, ownsByKey)).toMatchObject({ deletedRows: 1 });
+			expect(store.getItem(kb("owned"), kb("s")).row).toBeUndefined();
+			expect(store.getItem(kb("copy"), kb("s1")).row).toBeDefined();
+			expect(store.getItem(kb("copy"), kb("s2")).row).toBeDefined();
+			expect(kseBytes(state, "copy")).toBe(copyBytes);
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(ownedVersion + 1);
+
+			// A chunk of copies only deletes nothing and writes no deletion metadata.
+			expect(store.deleteExpiredItems(100, 3, ownsByKey)).toEqual({ deletedRows: 0, deletedBytes: 0 });
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(ownedVersion + 1);
+		});
+	});
+
 	it("raises max_deleted_v to the highest delete revision (v + 1) of a sweep chunk, and a recreate starts above it", async () => {
 		await withStore((store) => {
 			const expiring = (hk: string) => store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
@@ -1271,7 +1300,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			expiring("b");
 			expiring("b");
 			expect(expiring("b").version).toBe(3);
-			expect(store.deleteExpiredItems(100, 10).deletedRows).toBe(2);
+			expect(store.deleteExpiredItems(100, 10, ownsAll).deletedRows).toBe(2);
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(4);
 			expect(text(store, "b", 1)).toBe(5);
 		});
@@ -1291,7 +1320,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			const expiryTs = 10 * 1000 * TX_ORDER_TS_UNITS_PER_MS;
 			store.upsertItem({ hk: kb("x"), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
 			store.bumpItemReadTs(kb("x"), kb("s"), expiryTs + 5);
-			expect(store.deleteExpiredItems(100, 10).deletedRows).toBe(1);
+			expect(store.deleteExpiredItems(100, 10, ownsAll).deletedRows).toBe(1);
 			expect(store.getMaxDeleteTxOrderTs()).toBe(expiryTs + 5);
 		});
 	});
