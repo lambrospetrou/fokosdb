@@ -17,6 +17,7 @@
 			"new_sqlite_classes": [
 				"PartitionDO",
 				"TransactionCoordinatorDO",
+				"MaterializationDO",
 				"CustomPartitionDO",
 				"ControlledPartitionDO",
 				"ControlledTransactionCoordinatorDO",
@@ -35,6 +36,10 @@
 			{
 				"class_name": "TransactionCoordinatorDO",
 				"name": "TRANSACTION_COORDINATOR_DO",
+			},
+			{
+				"class_name": "MaterializationDO",
+				"name": "MATERIALIZATION_DO",
 			},
 			{
 				"class_name": "CustomPartitionDO",

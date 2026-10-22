@@ -201,7 +201,22 @@ type FokosGroupBase<Req, Res> = FokosOperationBase<Req, Res> & {
 	 * be safe to repeat, even when Bloom routing is off.
 	 */
 	shape: "group";
+	/**
+	 * Splits the request into its items. Each `key` selects the owner of its `item`. The runtime
+	 * groups the items by owner and gives each group, in input order, to `subRequest`.
+	 */
 	items(req: Req): Array<{ key: RouteKey; item: unknown }>;
+	/**
+	 * Builds the request for one owner: `req` with only `items`, the `item` values that `items(req)`
+	 * returned for the keys of that owner. Keep the fields of `req` that are the same for each item, for
+	 * example a transaction id or a producer epoch. The runtime calls it for the local part, for each
+	 * forward to a remote owner, and for the request that a failed part gives to `merge`. Each call
+	 * must give a new object, and must not change `req`.
+	 *
+	 * For example, `{ txId: "t1", items: [a, b, c] }` with `a` and `c` on owner X and `b` on owner Y
+	 * gives `subRequest(req, [a, c])` for X and `subRequest(req, [b])` for Y, and each returns
+	 * `{ txId: "t1", items: [...] }`.
+	 */
 	subRequest(req: Req, items: unknown[]): Req;
 };
 

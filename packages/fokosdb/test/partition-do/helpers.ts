@@ -105,7 +105,7 @@ export type PartitionOptions = Partial<
 >;
 
 export function makeStub(opts?: PartitionOptions) {
-	const { tableName, ns, nsTx, rootTreesN, hashSplitN, jurisdiction, ...rest } = opts ?? {};
+	const { tableName, ns, nsTx, nsMat, rootTreesN, hashSplitN, jurisdiction, ...rest } = opts ?? {};
 	const base = createTableConfig({
 		table: {
 			name: tableName ?? `test.${crypto.randomUUID()}`,
@@ -114,6 +114,7 @@ export function makeStub(opts?: PartitionOptions) {
 			rootTreesN: rootTreesN ?? 1,
 			hashSplitN: hashSplitN ?? 2,
 			jurisdiction,
+			nsMat: nsMat ?? (rest.captureChanges ? "MATERIALIZATION_DO" : undefined),
 		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 100 },

@@ -11,6 +11,7 @@
 // do-partition.ts itself.
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import type { MaterializationDO } from "../server/materialization/do-materialization.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
@@ -31,6 +32,10 @@ export type TransactionCoordinatorNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<TransactionCoordinatorDO> ? K : never;
 }[keyof Env];
 
+export type MaterializationNamespaceKey = {
+	[K in keyof Env]: Env[K] extends DurableObjectNamespace<MaterializationDO> ? K : never;
+}[keyof Env];
+
 /**
  * What FokosDB needs on every partition and coordinator, beside the topology. A request with a
  * higher `policyVersion` replaces it, and with an equal version the last writer wins. The exception is
@@ -40,6 +45,8 @@ export type TransactionCoordinatorNamespaceKey = {
 export type FokosDBPolicy = {
 	ns: PartitionNamespaceKey;
 	nsTx: TransactionCoordinatorNamespaceKey;
+	/** The binding of the `MaterializationDO` namespace. Present when the table has one. */
+	nsMat?: MaterializationNamespaceKey;
 	/**
 	 * The location hint for the Durable Objects of this table. It is best-effort placement advice for
 	 * the first time each object spawns. It is not part of the identity of an object.
@@ -71,11 +78,28 @@ const PARTITION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}p.`;
 
 /** The coordinator group of a table, `fokos.tc.<tableName>`, from the partition group of the table. */
 export function coordinatorShardGroup(topology: FokosTopology): string {
+	return `${RESERVED_SHARD_GROUP_PREFIX}tc.${tableNameOf(topology)}`;
+}
+
+/** The materialization group of a table, `fokos.m.<tableName>`, from the partition group of the table. */
+export function materializationShardGroup(topology: FokosTopology): string {
+	return `${RESERVED_SHARD_GROUP_PREFIX}m.${tableNameOf(topology)}`;
+}
+
+/**
+ * The configuration of the materialization group of a table. It has the topology, the range
+ * configuration, and the policy of the partition group, with its own shard group name.
+ */
+export function materializationTableConfig(table: FokosDBTableConfig): FokosDBTableConfig {
+	return { ...table, topology: { ...table.topology, shardGroup: materializationShardGroup(table.topology) } };
+}
+
+function tableNameOf(topology: FokosTopology): string {
 	invariant(
 		topology.shardGroup.startsWith(PARTITION_SHARD_GROUP_PREFIX),
 		`fokos/partition-context: the partition shard group must start with "${PARTITION_SHARD_GROUP_PREFIX}"`,
 	);
-	return `${RESERVED_SHARD_GROUP_PREFIX}tc.${topology.shardGroup.slice(PARTITION_SHARD_GROUP_PREFIX.length)}`;
+	return topology.shardGroup.slice(PARTITION_SHARD_GROUP_PREFIX.length);
 }
 
 /** The part of a route context that selects a namespace and a stub: enough for a Worker with no partition in mind. */
@@ -105,6 +129,8 @@ export type FokosTableIdentity = {
 	readonly ns: PartitionNamespaceKey;
 	/** The binding of the `TransactionCoordinatorDO` namespace. */
 	readonly nsTx: TransactionCoordinatorNamespaceKey;
+	/** The binding of the `MaterializationDO` namespace. Required when `captureChanges` is true. */
+	readonly nsMat?: MaterializationNamespaceKey;
 	/** The number of root partitions, from 1 to 65,000. A hash of the hash key selects one. */
 	readonly rootTreesN: number;
 	/** The number of children of each hash split, from 2 to 255. */
@@ -197,6 +223,9 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 	if (opts.captureChanges !== undefined && typeof opts.captureChanges !== "boolean") {
 		throw invalid("captureChanges", opts.captureChanges, "captureChanges must be a boolean");
 	}
+	if (opts.captureChanges === true && !table.nsMat) {
+		throw invalid("table.nsMat", table.nsMat, "table.nsMat must be provided when captureChanges is true");
+	}
 	const topology: FokosTopology = {
 		shardGroup: `${PARTITION_SHARD_GROUP_PREFIX}${table.name}`,
 		rootTreesN: table.rootTreesN,
@@ -231,6 +260,7 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 	const policy: FokosDBPolicy = {
 		ns: table.ns,
 		nsTx: table.nsTx,
+		...(table.nsMat === undefined ? {} : { nsMat: table.nsMat }),
 		hashSplitConditions,
 		rangeSplitConditions,
 		...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),

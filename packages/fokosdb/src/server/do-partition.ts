@@ -27,7 +27,7 @@ import type {
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
 import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
-import { identityDepth, isRangePartition } from "../sharding/partition-id.js";
+import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { SplitType } from "../sharding/types.js";
 import invariant from "../shared/invariant.js";
@@ -112,9 +112,8 @@ import {
 import { CONDITION_CHECK_CODES } from "../shared/errors-operations.js";
 import type { ConditionEvaluationResult } from "../shared/expression/runtime.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES } from "../sharding/errors.js";
-import { routedError } from "../sharding/envelope.js";
-import type { BatchUnprocessedCode } from "../shared/batch-api-types.js";
 import { classifyBatchFailure } from "../shared/batch-failure.js";
+import { mergeBatchParts, withOffset, type BatchFailure } from "../shared/batch-merge.js";
 import { fitBatchResponse } from "../shared/batch-response.js";
 
 // ─── item RPC types ───────────────────────────────────────────────────────────
@@ -217,21 +216,7 @@ type ConditionalWriteResult<W> =
 	| { outcome: "rejected"; conditionRes: ConditionEvaluationResult; image?: ItemImageRead }
 	| { outcome: "ok"; writeRes: W; conditionRes: ConditionEvaluationResult | null };
 
-/** One error that stopped one or more items. */
-export type BatchFailure = {
-	outcome: "rejected" | "unprocessed" | "unknown";
-	code: BatchUnprocessedCode;
-	/** Absent only for `response_too_large`, which is no error. */
-	error_id?: string;
-	/** Absent when no partition answered. */
-	partitionIndex?: number;
-	opIndexes: number[];
-	/** Only for `condition_failed`, which stops one operation. `reason.item` is the old image. */
-	reason?: RejectionReasonEncoded;
-	/** The byte length of the image in `reason.item`, which `applyBatchImageCap` adds up. */
-	imageBytes?: number;
-	itemOmitted?: "response_too_large";
-};
+export type { BatchFailure } from "../shared/batch-merge.js";
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
@@ -1346,13 +1331,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return out;
 	}
 
-	/**
-	 * Joins the parts of a batch operation. A part that answered adds its lists, with each
-	 * `partitionIndex` moved by the entries of the parts before it. A failed part gives all its items one
-	 * failure, and adds the entry of the partition that raised the error with no counts: this partition
-	 * for the local part, else the head of the routing of the error. A remote error with no routing adds
-	 * no entry. It never throws.
-	 */
+	/** Joins the parts of a batch operation of this class: `mergeBatchParts` with this partition as `self`. */
 	private mergeBatch<
 		Req extends { items: Array<{ opIndex: number }> },
 		Res extends { failed: BatchFailure[]; partitions: WirePartitionMeta[] },
@@ -1362,26 +1341,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		out: Res,
 		addLists: (out: Res, result: Res, offset: number) => void,
 	): Res {
-		for (const part of parts) {
-			const offset = out.partitions.length;
-			if ("result" in part) {
-				addLists(out, part.result, offset);
-				out.failed.push(...part.result.failed.map((entry) => withOffset(entry, offset)));
-				out.partitions.push(...part.result.partitions);
-				continue;
-			}
-			const local = part.target === "local";
-			const entry = local ? this.selfPartition() : raiserPartition(part.error);
-			if (entry) {
-				out.partitions.push(entry);
-			}
-			out.failed.push({
-				...classifyBatchFailure(part.error, { write, local }),
-				opIndexes: part.request.items.map((item) => item.opIndex),
-				...(entry ? { partitionIndex: offset } : {}),
-			});
-		}
-		return out;
+		return mergeBatchParts(parts, { write, self: () => this.selfPartition() }, out, addLists);
 	}
 
 	private queryItemsLocal(req: QueryItemsRpcRequest): QueryItemsRpcResponse {
@@ -1794,26 +1754,6 @@ function mergePrepare(parts: Array<FokosGroupPart<PrepareRequest, PrepareRespons
 	}
 	applyImageCap(merged);
 	return { outcome: "rejected", results: merged, partitions };
-}
-
-/**
- * An entry of one part of a merged answer, with its `partitionIndex` moved by `offset`: the length of
- * the lists of the parts before it.
- */
-function withOffset<T extends { partitionIndex?: number }>(entry: T, offset: number): T {
-	return entry.partitionIndex === undefined ? entry : { ...entry, partitionIndex: offset + entry.partitionIndex };
-}
-
-/** The entry of the partition that raised a forwarded error, from the head of its routing, with no counts. */
-function raiserPartition(error: unknown): WirePartitionMeta | undefined {
-	const raiser = routedError(error)?.routing.servedBy[0];
-	if (!raiser) {
-		return undefined;
-	}
-	return {
-		actorId: raiser.actorId,
-		...(isRangePartition(raiser.ref) ? { rangeDepth: raiser.rangeDepth } : { hashDepth: raiser.hashDepth }),
-	};
 }
 
 /** The one key of a promotion plan: its single target carries a `promoted_key` slice. */

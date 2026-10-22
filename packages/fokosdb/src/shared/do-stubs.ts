@@ -12,7 +12,9 @@
  */
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import type { MaterializationDO } from "../server/materialization/do-materialization.js";
 import type { FokosDBStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
+import invariant from "./invariant.js";
 
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.
@@ -30,6 +32,16 @@ export function txCoordinatorNamespace(env: Env, ctx: FokosDBStubContext): Durab
 	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
 }
 
+/**
+ * The materialization namespace the context names, with its jurisdiction applied. Only a table with
+ * `nsMat` has one.
+ */
+export function materializationNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<MaterializationDO> {
+	invariant(ctx.policy.nsMat !== undefined, "fokos/do-stubs: the table has no materialization namespace (nsMat)");
+	const ns: DurableObjectNamespace<MaterializationDO> = env[ctx.policy.nsMat];
+	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
+}
+
 function stubOptions(ctx: FokosDBStubContext): DurableObjectNamespaceGetDurableObjectOptions | undefined {
 	return ctx.policy.locationHint === undefined ? undefined : { locationHint: ctx.policy.locationHint };
 }
@@ -40,6 +52,10 @@ export function partitionStub(env: Env, ctx: FokosDBStubContext, id: DurableObje
 
 export function partitionStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<PartitionDO> {
 	return partitionNamespace(env, ctx).getByName(doName, stubOptions(ctx));
+}
+
+export function materializationStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<MaterializationDO> {
+	return materializationNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 
 export function txCoordinatorStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {

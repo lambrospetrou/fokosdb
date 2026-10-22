@@ -830,7 +830,7 @@ export type PushTargetItem = {
 };
 
 export type PushTargetBatch = {
-	/** The 32-byte `DurableObjectId` of the sending `MaterializationDO`, in hex. */
+	/** The `DurableObjectId` of the sending `MaterializationDO`, as `DurableObjectId.toString()` gives it (hex). */
 	producerId: string;
 	epoch: number;
 	ancestorFences: readonly { ancestorId: string; minEpoch: number }[];
@@ -866,13 +866,14 @@ The push target contract:
 
 | Hop | Producer ID | Epoch storage at the producer | Receiver checks |
 | --- | --- | --- | --- |
-| Base `PartitionDO` -> `MaterializationDO` (`applyLatestImages`) | 32-byte `DurableObjectId` of the base partition | `materialization_export_state` | The producer epoch, then the revision (Section 4.2.4) |
-| `MaterializationDO` -> GSI `PartitionDO` (`batchWriteItems`) | 32-byte `DurableObjectId` of the `MaterializationDO` | `materialization_targets.epoch` of the GSI target | The producer epoch |
-| `MaterializationDO` -> push target | 32-byte `DurableObjectId` of the `MaterializationDO` | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 4.2.8). |
+| Base `PartitionDO` -> `MaterializationDO` (`applyLatestImages`) | `DurableObjectId` of the base partition, in hex | `materialization_export_state` | The producer epoch, then the revision (Section 4.2.4) |
+| `MaterializationDO` -> GSI `PartitionDO` (`batchWriteItems`) | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the GSI target | The producer epoch |
+| `MaterializationDO` -> push target | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 4.2.8). |
 
 Each GSI shard group gets calls from one target only. Thus a GSI partition stores one epoch for each
-`MaterializationDO`, and the producer ID needs no `targetId`. The `DurableObjectId` has a fixed size of 32 bytes. A
-partition ID or a DO name can hold user keys, which can be multiple kilobytes.
+`MaterializationDO`, and the producer ID needs no `targetId`. The producer ID is the `DurableObjectId` as
+`DurableObjectId.toString()` gives it: 64 hex characters, the form that `idFromString` takes. A partition ID or a DO
+name can hold user keys, which can be multiple kilobytes.
 
 The base partition stores its export state in one row:
 
@@ -889,7 +890,7 @@ producer:
 
 ```sql
 CREATE TABLE IF NOT EXISTS producer_fences (
-    producer_id BLOB    PRIMARY KEY,  -- 32-byte DurableObjectId
+    producer_id TEXT    PRIMARY KEY,  -- DurableObjectId in hex
     epoch       INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
 ```
@@ -910,7 +911,7 @@ and the check adds no row write. The receiver keeps the row of each producer in 
 
 The receiver must not delete a `producer_fences` row. A deleted row has the epoch `0`, and a late call of that
 producer then applies. The number of rows is the number of producers that ever sent to the receiver. A row is about
-50 bytes, so 10,000 producers use about 500 KB in each receiver. TODO: measure the row size.
+80 bytes, so 10,000 producers use about 800 KB in each receiver. TODO: measure the row size.
 
 A receiver split copies the whole table to each child with `MAX(epoch)` (Section 4.2.12). The partition that applies
 a forwarded call checks it.
@@ -1021,7 +1022,7 @@ target hop). The parent is the source of the split, and the child is each target
 ```sql
 CREATE TABLE IF NOT EXISTS ancestor_fences (
     hop         TEXT    NOT NULL,  -- 'export', or a target_id
-    ancestor_id BLOB    NOT NULL,  -- 32-byte DurableObjectId
+    ancestor_id TEXT    NOT NULL,  -- DurableObjectId in hex
     min_epoch   INTEGER NOT NULL,
     until_id    INTEGER NOT NULL,  -- the highest copied seq (target hop) or outbox_id (export hop)
     PRIMARY KEY (hop, ancestor_id)

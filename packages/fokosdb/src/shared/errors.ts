@@ -525,6 +525,7 @@ export const CONFLICT_CODES = {
 	// The partition clock and the transaction clock disagree. A later attempt clears it, so it is a service condition.
 	...defineCodes("FokosConflictError", "service", 503, {
 		clock_skew: "xy3rrw",
+		producer_epoch_fenced: "cq7a8q",
 	}),
 };
 

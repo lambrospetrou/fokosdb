@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { coordinatorShardGroup, createTableConfig, type FokosTableIdentity, type FokosTableOptions } from "./partition-context.js";
+import {
+	coordinatorShardGroup,
+	createTableConfig,
+	materializationShardGroup,
+	materializationTableConfig,
+	type FokosTableIdentity,
+	type FokosTableOptions,
+} from "./partition-context.js";
 import { structurallyEqual } from "../sharding/route-context.js";
 import { FokosRouter } from "../sharding/router.js";
 import { KeyCodec } from "../sharding/key-codec.js";
@@ -7,7 +14,7 @@ import { KeyCodec } from "../sharding/key-codec.js";
 type FlatOptions = Partial<Omit<FokosTableIdentity, "name"> & Omit<FokosTableOptions, "table"> & { tableName: string }>;
 
 function makeOpts(overrides?: FlatOptions): FokosTableOptions {
-	const { tableName, ns, nsTx, rootTreesN, hashSplitN, jurisdiction, ...rest } = overrides ?? {};
+	const { tableName, ns, nsTx, nsMat, rootTreesN, hashSplitN, jurisdiction, ...rest } = overrides ?? {};
 	return {
 		table: {
 			name: tableName ?? "testdb",
@@ -16,6 +23,7 @@ function makeOpts(overrides?: FlatOptions): FokosTableOptions {
 			rootTreesN: rootTreesN ?? 1,
 			hashSplitN: hashSplitN ?? 4,
 			...(jurisdiction === undefined ? {} : { jurisdiction }),
+			...(nsMat === undefined ? {} : { nsMat }),
 		},
 		hashSplitConditions: { maxSizeMb: 100 },
 		...rest,
@@ -82,6 +90,25 @@ describe("createTableConfig — the shard groups of a table", () => {
 		expect(partitions.rootContext(hk).doName).toMatch(/^fokos\.p\.orders~h\.\d+$/);
 		const coordinators = new FokosRouter({ ...cfg.topology, shardGroup: coordinatorShardGroup(cfg.topology) }, cfg.rangeConfig, cfg.policy);
 		expect(coordinators.rootContext(hk).doName).toMatch(/^fokos\.tc\.orders~h\.\d+$/);
+	});
+
+	it("names the materialization partitions fokos.m.<tableName>, with the topology and the policy of the table", () => {
+		const cfg = createTableConfig(makeOpts({ tableName: "orders", nsMat: "MATERIALIZATION_DO", captureChanges: true, rootTreesN: 3 }));
+		expect(materializationShardGroup(cfg.topology)).toBe("fokos.m.orders");
+		const mat = materializationTableConfig(cfg);
+		expect(mat).toEqual({ ...cfg, topology: { ...cfg.topology, shardGroup: "fokos.m.orders" } });
+		expect(mat.policy).toMatchObject({ nsMat: "MATERIALIZATION_DO", captureChanges: true });
+		expect(new FokosRouter(mat.topology, mat.rangeConfig, mat.policy).rootContext(KeyCodec.encode("hk")).doName).toMatch(
+			/^fokos\.m\.orders~h\.\d+$/,
+		);
+	});
+
+	it("needs nsMat when captureChanges is true, and sends no capture field when it is false", () => {
+		expect(() => createTableConfig(makeOpts({ captureChanges: true }))).toThrow(/table.nsMat must be provided/);
+		expect(() => createTableConfig(makeOpts({ captureChanges: "yes" as never, nsMat: "MATERIALIZATION_DO" }))).toThrow(
+			/captureChanges must be a boolean/,
+		);
+		expect(createTableConfig(makeOpts({ captureChanges: false })).policy).not.toHaveProperty("captureChanges");
 	});
 });
 
