@@ -23,30 +23,37 @@ global secondary indexes (GSIs) and push targets.
   - [4.2 Technical details](#42-technical-details)
     - [4.2.1 Shard groups, bindings, and routing](#421-shard-groups-bindings-and-routing)
     - [4.2.2 Monotonic base revisions](#422-monotonic-base-revisions)
-    - [4.2.3 Base mutation capture and outbox](#423-base-mutation-capture-and-outbox)
-    - [4.2.4 `MaterializationDO` storage and deletion lifecycle](#424-materializationdo-storage-and-deletion-lifecycle)
-    - [4.2.5 Target push state machine and background runner](#425-target-push-state-machine-and-background-runner)
-    - [4.2.6 Permanent violations](#426-permanent-violations)
-    - [4.2.7 Target definitions and table destroy](#427-target-definitions-and-table-destroy)
-    - [4.2.8 GSI tables, composite sort key, and queries](#428-gsi-tables-composite-sort-key-and-queries)
-    - [4.2.9 Backpressure, circuit breaking, and cost](#429-backpressure-circuit-breaking-and-cost)
-  - [4.3 Open Questions](#43-open-questions)
-  - [4.4 Future Follow-ups](#44-future-follow-ups)
-    - [4.4.1 Online target backfill](#441-online-target-backfill)
-    - [4.4.2 `FokosDBAutoAdminDO` catalog and activation status](#442-fokosdbautoadmindo-catalog-and-activation-status)
-    - [4.4.3 Per-GSI topology and key-limit overrides](#443-per-gsi-topology-and-key-limit-overrides)
-    - [4.4.4 Capture on a table that has data](#444-capture-on-a-table-that-has-data)
-    - [4.4.5 Base version on GSI queries](#445-base-version-on-gsi-queries)
-    - [4.4.6 Target changes and target versions](#446-target-changes-and-target-versions)
+    - [4.2.3 Base mutation capture and export](#423-base-mutation-capture-and-export)
+    - [4.2.4 `MaterializationDO` storage and ingest](#424-materializationdo-storage-and-ingest)
+    - [4.2.5 Change positions](#425-change-positions)
+    - [4.2.6 Target runner and target step](#426-target-runner-and-target-step)
+    - [4.2.7 GSI targets and key sets](#427-gsi-targets-and-key-sets)
+    - [4.2.8 Push targets](#428-push-targets)
+    - [4.2.9 Producer epochs and fences](#429-producer-epochs-and-fences)
+    - [4.2.10 Failed items and permanent violations](#4210-failed-items-and-permanent-violations)
+    - [4.2.11 Tombstones and garbage collection](#4211-tombstones-and-garbage-collection)
+    - [4.2.12 Splits and promotions](#4212-splits-and-promotions)
+    - [4.2.13 Target definitions and table destroy](#4213-target-definitions-and-table-destroy)
+    - [4.2.14 GSI tables, composite sort key, and queries](#4214-gsi-tables-composite-sort-key-and-queries)
+    - [4.2.15 Backpressure, circuit breaking, and cost](#4215-backpressure-circuit-breaking-and-cost)
+    - [4.2.16 Item lifecycle](#4216-item-lifecycle)
+  - [4.3 Future Follow-ups](#43-future-follow-ups)
+    - [4.3.1 Online target backfill](#431-online-target-backfill)
+    - [4.3.2 `FokosDBAutoAdminDO` catalog and activation status](#432-fokosdbautoadmindo-catalog-and-activation-status)
+    - [4.3.3 Per-GSI topology and key-limit overrides](#433-per-gsi-topology-and-key-limit-overrides)
+    - [4.3.4 Capture on a table that has data](#434-capture-on-a-table-that-has-data)
+    - [4.3.5 Base version on GSI queries](#435-base-version-on-gsi-queries)
+    - [4.3.6 Target changes and target versions](#436-target-changes-and-target-versions)
 - [5. Alternative Options](#5-alternative-options)
   - [5.1 Base outbox, base shadow, and stateless Queue fan-out](#51-base-outbox-base-shadow-and-stateless-queue-fan-out)
   - [5.2 Separate `GsiMaintainerDO` worker tier](#52-separate-gsimaintainerdo-worker-tier)
   - [5.3 Pull cursors (`change_seq`) for push targets](#53-pull-cursors-change_seq-for-push-targets)
   - [5.4 One sidecar `MaterializationDO` for each base `PartitionDO`](#54-one-sidecar-materializationdo-for-each-base-partitiondo)
   - [5.5 A hash or a local integer ID in the GSI sort key](#55-a-hash-or-a-local-integer-id-in-the-gsi-sort-key)
-  - [5.6 Per-target cursors over change positions in `MaterializationDO`](#56-per-target-cursors-over-change-positions-in-materializationdo)
-  - [5.7 Compact `target_item_state` with key-change-only pre-RPC writes](#57-compact-target_item_state-with-key-change-only-pre-rpc-writes)
+  - [5.6 Per-item target state with a write deadline fence](#56-per-item-target-state-with-a-write-deadline-fence)
+  - [5.7 Compact per-item target state with writes only on a GSI key change](#57-compact-per-item-target-state-with-writes-only-on-a-gsi-key-change)
   - [5.8 Versioned GSI tombstones with a TTL instead of GSI-hop epochs](#58-versioned-gsi-tombstones-with-a-ttl-instead-of-gsi-hop-epochs)
+  - [5.9 A time limit for the split fences of a target](#59-a-time-limit-for-the-split-fences-of-a-target)
 - [6. Frequently Asked Questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
 
@@ -111,6 +118,8 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   durable storage and is billed as one row written. A drain at a high throughput needs an in-memory background loop
   that runs while due work exists. The Durable Object alarm is armed only as the fallback after a crash or an
   eviction.
+- **Rows written cost 1,000 times more than rows read.** On the Durable Objects SQLite storage backend, a row written
+  costs $1.00 per million rows, and a row read costs $0.001 per million rows.
 
 ### 1.4 Glossary
 
@@ -119,16 +128,23 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 | Base item | One item in the user table, identified by `(baseHashKey, baseSortKey)`. |
 | Base revision | The strictly increasing integer revision of one base item across writes, deletes, and splits. |
 | Delete revision | The base revision of a delete or a TTL expiry of a row at `v`: `v + 1`. |
-| Export outbox | The coalesced `materialization_outbox` row in a base `PartitionDO` for one dirty base item. |
+| Outbox row | The coalesced `materialization_outbox` row in a base `PartitionDO` for one changed base item. |
 | Capture | The write of `materialization_outbox` rows and their export, enabled by `captureChanges`. |
 | Materialization partition | One `MaterializationDO` in the shard group `fokos.m.<tableName>`. |
 | Latest image | The newest live image or tombstone that `MaterializationDO` accepted for a base item. |
-| Tombstone | An image with `deleted = 1` and no payload: an outbox row, an export entry, or a `latest_items` row. |
+| Tombstone | A delete record with no payload: an outbox row, a `latest_items` row, or an export entry. |
 | Target | A registered downstream destination in `MaterializationDO`: a GSI or a push target. |
 | Push target | A target of kind `push_sink`: a `WorkerEntrypoint` or a `DurableObject` that gets batches over Workers RPC. |
-| Applied state | The revision (and for a GSI, the GSI key `(applied_index_hk, applied_index_sk)`) last completed. |
-| In-flight transition | The revision (and for a GSI, the GSI key) that `MaterializationDO` froze in SQLite before a call. |
-| Desired state | The newest revision that a target must converge to for one base item. |
+| Change position | A row of `change_positions` that points to one changed item. All targets share the positions. |
+| Cursor (`C_t`) | `materialization_targets.cursor_seq` of target `t`. Each position at or below `C_t` is done for `t`. |
+| Read position (`R_t`) | In memory: the highest position that the batch in flight of target `t` read, or `C_t`. |
+| Applied map | An in-memory map `item_id -> revision` of the revisions that a target applied in its current epoch. |
+| Key set | The `target_index_keys` row of one item and one GSI: each GSI key that can have an entry of the item. |
+| Producer | The sender on a hop: a base `PartitionDO` for the export, or a `MaterializationDO` for a target. |
+| Receiver | The partition that applies a call: a `MaterializationDO`, a GSI `PartitionDO`, or a push target. |
+| Producer epoch | An integer that a producer stores for each hop and sends with each call. It only goes up. |
+| Ancestor fence | `(ancestorId, minEpoch)`: a child sends it so that each receiver rejects the late calls of a parent. |
+| Inherited work | The work that a parent can have in flight at a split cutover, copied to the child with the slice. |
 | Violation | A base item revision whose target write fails permanently, for example a GSI key of a type that is not valid. |
 | Unowned copy | A row that a split or a promotion moved to another partition. The source keeps it until `cleanupSourceStep`. |
 | `gsiSK` | The encoded GSI sort key of an item, or `x''` when the GSI has no sort key. |
@@ -140,8 +156,8 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 
 - Support up to 10 GSIs per table. Each GSI defines its own partition key, optional sort key, and attribute
   projection.
-- Support push targets (a `WorkerEntrypoint` or a `DurableObject` called over Workers RPC) from the same
-  `MaterializationDO` state machine.
+- Support push targets (a `WorkerEntrypoint` or a `DurableObject` called over Workers RPC) from the same target
+  runner in `MaterializationDO`.
 - Define GSIs and push targets in a subclass of `MaterializationDO` that overrides `targets()`.
 - When `captureChanges = true`, capture one coalesced outbox marker in the base `PartitionDO`, in the same SQLite
   transaction as each item mutation.
@@ -151,22 +167,23 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   `MaterializationDO` round-robins the targets with 2 parallel workers. The Durable Object alarm is only for recovery
   after a crash or an eviction.
 - Keep a full mirror of live items in `MaterializationDO` (`latest_items.data`). The mirror supports target
-  projections, retries, and future online target backfills (Section 4.4.1).
+  projections, retries, and future online target backfills (Section 4.3.1).
 - Isolate failures between targets. One unavailable GSI or push target must not stop healthy targets or base writes.
+- Write a `MaterializationDO` row for each item and each target only when a GSI key changes or when an item fails.
 
 ### 2.2 Out of scope
 
 - A full change data capture (CDC) history of each intermediate version. Intermediate writes before consumption
   coalesce into the latest image.
-- Pull-based stream cursors. All targets use push delivery from `MaterializationDO`.
+- Pull-based stream cursors for external consumers. All targets use push delivery from `MaterializationDO`.
 - Strongly consistent GSI reads, or atomic visibility of multiple items across a GSI.
-- Prevention of temporary duplicate entries during a GSI key move across partitions. `WRITE_NEW` runs before
-  `DELETE_OLD`, as in the eventually consistent GSIs of DynamoDB.
+- Prevention of temporary duplicate entries during a GSI key move across partitions. The GSI step writes the new entry
+  before it deletes the old entry, as in the eventually consistent GSIs of DynamoDB.
 - Uniqueness constraints on a GSI key. A caller that needs a unique secondary key must use `transactWriteItems` on the
   base table.
 - Online backfill of targets that are added after data exists, cluster-wide activation tracking through
   `FokosDBAutoAdminDO`, per-GSI topology overrides, capture on a table that has data, a base version on GSI
-  queries, and changes to the target list. Section 4.4 tracks them.
+  queries, and changes to the target list. Section 4.3 tracks them.
 
 ### 2.3 Requirements
 
@@ -187,6 +204,8 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 7. Each background scan, export batch, and target push step must enforce bounds on the item count, the byte count, and
    the duration.
 8. `FokosDB.destroy()` must destroy each shard group of the table in dependency order.
+9. The correctness of the delivery to `MaterializationDO` and to each target must not depend on a clock, a timeout,
+   or a time horizon.
 
 ## 3. Milestones
 
@@ -197,35 +216,43 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 - Update the comment of `deleteExpiredItems`, which says that the sweep does not test the owner of each row. Update the
   unit tests and the promotion tests. This milestone ships on its own before any materialization code.
 
-### Milestone 2: Base `materialization_outbox` and `MaterializationDO` mirror
-- Add `captureChanges` and `nsMat` to `FokosTableIdentity`, `FokosTableOptions`, and `FokosDBPolicy`. Add
-  `materialization_outbox` to `PartitionStore` (Sections 4.2.1 and 4.2.3).
-- Add the outbox writes to `upsertItem`, `updateItemSingleShot`, `deleteItem`, `TransactionParticipant.commitLocal`,
-  `TransactionParticipant.executeSingleShot`, and the owned rows of `deleteExpiredItems`.
-- Migrate `materialization_outbox` rows in `FokosMigrationHost`. Delete unowned outbox copies in `cleanupSourceStep`.
+### Milestone 2: Base `materialization_outbox`, export epochs, and `MaterializationDO` mirror
+- Add `captureChanges` and `nsMat` to `FokosTableIdentity`, `FokosTableOptions`, and `FokosDBPolicy`. Store
+  `captureChanges` with the first identity of each partition (Sections 4.2.1 and 4.2.3).
+- Add `materialization_outbox` and `materialization_export_state` to `PartitionStore`. Add the outbox writes to
+  `upsertItem`, `updateItemSingleShot`, `deleteItem`, `TransactionParticipant.commitLocal`,
+  `TransactionParticipant.executeSingleShot`, and the owned rows of `deleteExpiredItems` (Section 4.2.3).
+- Build the in-memory export loop with its alarm fallback, the in-flight key set of the same-epoch rule, `is_call_open`,
+  and the epoch raise after an `unknown` outcome (Sections 4.2.3, 4.2.6, and 4.2.9).
 - Create `MaterializationDO` in the shard group `fokos.m.<tableName>` with `latest_items`, `key_size_estimates`,
-  `applyLatestImages` (`group` dispatch with `failurePolicy: "collect"`), and the in-memory base export loop with its
-  alarm fallback (Sections 4.2.3 to 4.2.5).
+  `producer_fences`, `ancestor_fences`, and `applyLatestImages` (`group` dispatch with `failurePolicy: "collect"`)
+  with the receiver rules (Sections 4.2.4 and 4.2.9).
+- Migrate `materialization_outbox` rows and the export fences with the `until_id` mark in `FokosMigrationHost`. Add the
+  fence removal check to each delete of an outbox row. Delete unowned outbox copies in `cleanupSourceStep` (Sections
+  4.2.3, 4.2.9, and 4.2.12).
 
-### Milestone 3: Push targets (`PUSH_BATCH -> COMMIT_APPLIED`)
-- Add `target_item_state` and the `MaterializationDO.targets()` method override (Sections 4.2.4 and 4.2.7).
-- Build these parts (Sections 4.2.4 to 4.2.6):
-  - the in-memory round-robin target runner with 2 parallel workers,
-  - the write deadline fence,
-  - the single-phase `PUSH_BATCH -> COMMIT_APPLIED` state machine for `push_sink` targets,
-  - violation handling and tombstone GC,
-  - the `MaterializationDO` split and promotion migration.
+### Milestone 3: Target runner and push targets
+- Add the `MaterializationDO.targets()` method override and the stored target list `__fokosdb/mat/targets`
+  (Section 4.2.13).
+- Build these parts (Sections 4.2.5 to 4.2.12):
+  - `change_positions`, the ingest steps, and the position cleanup,
+  - `materialization_targets` with the cursor, the epoch, and `is_batch_open`,
+  - the in-memory round-robin target runner with 2 parallel workers, the target step, and the applied map,
+  - `push_sink` targets with `PushTargetBatch`,
+  - `target_retry` with `idx_target_retry_inherited`, violation handling, and the circuit breaker of each target,
+  - the tombstone GC,
+  - the `MaterializationDO` split and promotion migration with the split fences.
 
-### Milestone 4: Static GSIs (`WRITE_NEW -> DELETE_OLD -> COMMIT_APPLIED`) and `db.gsi(indexName)`
-- Add `applyBeforeMs` and `write_deadline_passed` to `batchWriteItems` from
-  `docs/agent-plans/2026-10-17-batch-get-and-write-items.md` (Section 4.2.8).
-- Build the `WRITE_NEW -> DELETE_OLD -> COMMIT_APPLIED` state machine for `gsi` targets with `FokosDB.batchWriteItems`
-  (Section 4.2.5).
+### Milestone 4: Static GSIs and `db.gsi(indexName)`
+- Add `producerId`, `epoch`, `ancestorFences`, and `producer_epoch_fenced` to `batchWriteItems`. Add
+  `producer_fences` to the GSI `PartitionDO` and to its split migration (Sections 4.2.9 and 4.2.14).
+- Build the GSI target step with `target_index_keys` and two calls in sequence (`put` and then `delete`) with
+  `FokosDB.batchWriteItems` (Section 4.2.7).
 - Add the composite sort key codec (`<L><flag><D>`), the `{ ref: "sortKey" }` compiler rules, the derived GSI key
-  limits, `db.gsi(indexName).queryItems`, and `FokosDB.destroy()` across all shard groups of the table (Sections 4.2.7
-  and 4.2.8).
+  limits, `db.gsi(indexName).queryItems`, and `FokosDB.destroy()` across all shard groups of the table (Sections
+  4.2.13 and 4.2.14).
 
-### Milestone 5: Circuit breaker tuning and admission thresholds
+### Milestone 5: Circuit breaker tuning
 - Tune the circuit breaker values (the failure count that opens a breaker, and `probeIntervalMs`) with measurements.
 
 ## 4. Proposed Solution
@@ -239,37 +266,46 @@ them:
 Base Shard Group: fokos.p.<tableName> (PartitionDO)
   - Stores committed items + coalesced materialization_outbox markers (no payload copy)
   - In-memory export loop sends dirty items by (baseHK, baseSK); alarm is fallback only
+  - Producer: base DO ID + export epoch
           |
-          | applyLatestImages (batched group RPC, failurePolicy: "collect")
+          | applyLatestImages(producerId, epoch, ancestorFences): batched group RPC, failurePolicy: "collect"
           v
 Materialization Shard Group: fokos.m.<tableName> (MaterializationDO)
-  - Routed by (baseHK, baseSK); subclass override targets() defines GSIs and push sinks
+  - Routed by (baseHK, baseSK); the first targets() result is stored and fixed
   - Full mirror of live items in latest_items (1 payload copy per live item)
-  - 1 compact target_item_state row per (item_id, target_id)
-  - Single in-memory loop round-robins targets (2 batches in parallel); alarm is fallback
+  - change_positions shared by all targets; 1 cursor and 1 epoch per target
+  - target_index_keys (GSI keys that can hold an entry), target_retry (failed items)
+  - Receiver: producer_fences; in-memory runner round-robins targets (2 workers); alarm is fallback
           |
-          +----------------------------------------+
-          |                                        |
-          v                                        v
-GSI Shard Groups (up to 10):             Remote Push Targets:
-  fokos.gsiv1.<n>.<tableName>.<indexName>  Workers RPC to a WorkerEntrypoint
-  - Standard FokosDB table (PartitionDO)   or DurableObject
-  - Written via FokosDB.batchWriteItems    - Batched push of coalesced latest items
+          +-----------------------------------------------+
+          | batchWriteItems(producerId, epoch,            | PushTargetBatch(producerId, epoch,
+          |   ancestorFences)                             |   ancestorFences, items)
+          v                                               v
+GSI Shard Groups (up to 10):                       Remote Push Targets:
+  fokos.gsiv1.<n>.<tableName>.<indexName>            Workers RPC to a WorkerEntrypoint or DurableObject
+  - Standard FokosDB table (PartitionDO)             - Drops each revision <= its applied revision
+  - Receiver: producer_fences
 ```
 
 1. **Base write (`PartitionDO`).** When `captureChanges = true`, each committed write, delete, or owned TTL expiry
    updates `items` and upserts a compact marker into `materialization_outbox` in one `transactionSync`. Then it wakes
    the in-memory export loop.
 2. **Export (`PartitionDO -> MaterializationDO`).** The export loop claims the owned, due outbox rows and reads the
-   live payloads from `items`. It sends batched `applyLatestImages` RPCs to `fokos.m.<tableName>`.
-   `MaterializationDO` updates `latest_items`, raises `desired_revision` on each registered target, and wakes its
-   in-memory target push loop. It acknowledges each item in the same call.
+   live payloads from `items`. It sends batched `applyLatestImages` RPCs to `fokos.m.<tableName>`. `MaterializationDO`
+   checks the epoch of the sender and then the revision. It updates `latest_items`, gives the item a change position,
+   and wakes its in-memory target runner. It acknowledges each item in the same call.
 3. **Target push (`MaterializationDO -> GSI or push target`).** One in-memory background loop in `MaterializationDO`
-   round-robins across the registered targets with 2 parallel workers. Each target has at most 1 batch in flight.
-   - For a GSI, the loop freezes the transition in `target_item_state` and writes entries with
-     `FokosDB.batchWriteItems`. When a key moves, it deletes the old GSI key. Then it records the applied GSI key.
-   - For a push target, the loop pushes a batch of `PushTargetItem` records over Workers RPC and records the applied
-     revision.
+   round-robins across the targets with 2 parallel workers. Each target has at most 1 batch in flight. A target reads
+   the change positions above its cursor, sends the latest image of each item, and moves its cursor one time for each
+   batch.
+   - For a GSI, the step records each new GSI key in the key set before the call. It writes the new entry with
+     `FokosDB.batchWriteItems`, and then deletes the old entry when the key moved.
+   - For a push target, the step pushes a batch of `PushTargetItem` records over Workers RPC.
+   - A failed item gets a `target_retry` row, and the cursor continues past it.
+4. **Late calls.** Each call carries the ID and the epoch of its sender. A sender raises its epoch after an `unknown`
+   outcome, at a cold start when a call can still be in flight, and at a split. A receiver rejects a call whose epoch
+   is below the epoch that it stored for that sender. Thus a late call cannot overwrite newer state, and no
+   correctness rule depends on a clock.
 
 ### 4.2 Technical details
 
@@ -286,7 +322,7 @@ A table `orders` with 3 GSIs runs these Durable Object shard groups:
 | --- | --- | --- | --- | --- |
 | `fokos.p.orders` | `PartitionDO` | `policy.ns` | `(baseHK, baseSK)` | `items` + `pending_transactions` bytes |
 | `fokos.tc.orders` | `TransactionCoordinatorDO` | `policy.nsTx` | `(clientRequestToken, "")` | Ledger bytes |
-| `fokos.m.orders` | `MaterializationDO` | `policy.nsMat` | `(baseHK, baseSK)` | `latest_items` + `target_item_state` |
+| `fokos.m.orders` | `MaterializationDO` | `policy.nsMat` | `(baseHK, baseSK)` | `latest_items` + target state bytes |
 | `fokos.gsiv1.6.orders.g1` | `PartitionDO` | `policy.ns` | `(g1HK, physicalSk)` | GSI-1 entry bytes and key skew |
 | `fokos.gsiv1.6.orders.g2` | `PartitionDO` | `policy.ns` | `(g2HK, physicalSk)` | GSI-2 entry bytes and key skew |
 | `fokos.gsiv1.6.orders.g3` | `PartitionDO` | `policy.ns` | `(g3HK, physicalSk)` | GSI-3 entry bytes and key skew |
@@ -305,13 +341,13 @@ Base Table (fokos.p.orders)                          Materialization (fokos.m.or
 ---------------------------                          --------------------------------
 fokos.p.orders~h.0 (old source, rev=5) ------------> fokos.m.orders~h.0
 fokos.p.orders~r.dTE.. (promoted root, rev=6) ----->   owns (hk="u1", sk="o9")
-                                                       accepts rev=6, acks late rev=5 as stale
+                                                       accepts rev=6; fences a late rev=5 or acks it as stale
 ```
 
 2. **`MaterializationDO` split or promotion (`fokos.m`).** Each base `PartitionDO` sends exports through a
    `FokosShardingClient` for `fokos.m.<tableName>`. When a `MaterializationDO` splits or promotes a hot base hash key,
-   its migration host moves the `latest_items` row and all `target_item_state` rows of each item in the same slice.
-   Each child continues to push the items of its slice. No external cursor handoff is necessary.
+   its migration host moves the rows of each item in the slice and the cursor of each target (Section 4.2.12). Each
+   child continues from the copied cursors. No external cursor handoff is necessary.
 3. **GSI split or promotion (`fokos.gsiv1`).** Each `MaterializationDO` holds one `FokosShardingClient` for each GSI
    shard group. A low-cardinality GSI hash key (such as `status = "OPEN"`) promotes to a range tree in that GSI shard
    group. The range tree splits by `physicalSk`, and `fokos.p` and `fokos.m` do not split.
@@ -341,13 +377,9 @@ Delete X   -> max_deleted_v = 3 (revision 3, deleted = 1)
 Recreate X -> v = 4 (revision 4, deleted = 0)
 ```
 
-All existing transaction invariants stay true:
+The existing transaction invariants stay true (Section 6.4).
 
-- `transactGetItems` still detects a create and a delete between phase 1 and phase 2. `max_deleted_v` increases by 2
-  instead of 1.
-- A new row still starts strictly above each earlier `v` and each earlier delete revision.
-
-#### 4.2.3 Base mutation capture and outbox
+#### 4.2.3 Base mutation capture and export
 
 `FokosDBPolicy` and `FokosTableOptions` add `captureChanges` (default `false`), which travels in `PartitionContext`.
 When `captureChanges` is `false`, a partition writes no outbox row and runs no export loop. This includes each GSI
@@ -355,21 +387,19 @@ shard group.
 
 `captureChanges` is fixed when the table is created. Each partition stores it with its first identity (a root from its
 first request, any other partition from `fokosInit`). A request whose policy has a different `captureChanges` value
-fails. Section 4.4.4 tracks capture on a table that has data.
+fails. Section 4.3.4 tracks capture on a table that has data.
 
 `PartitionStore` adds the rowid table `materialization_outbox`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS materialization_outbox (
-    outbox_id          INTEGER PRIMARY KEY,
-    hk                 BLOB    NOT NULL,
-    sk                 BLOB    NOT NULL DEFAULT x'',
-    revision           INTEGER NOT NULL,
-    deleted            INTEGER NOT NULL,
-    unexported_create  INTEGER NOT NULL DEFAULT 0,
-    attempted          INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at    INTEGER NOT NULL DEFAULT 0,
-    apply_before_ms    INTEGER,
+    outbox_id            INTEGER PRIMARY KEY,
+    hk                   BLOB    NOT NULL,
+    sk                   BLOB    NOT NULL DEFAULT x'',
+    revision             INTEGER NOT NULL,
+    is_deleted           INTEGER NOT NULL,
+    is_local_only        INTEGER NOT NULL DEFAULT 0,  -- 1 while no receiver can have a revision of the key
+    next_attempt_at      INTEGER NOT NULL DEFAULT 0,
     UNIQUE (hk, sk)
 ) STRICT;
 
@@ -377,44 +407,77 @@ CREATE INDEX IF NOT EXISTS idx_materialization_outbox_due
     ON materialization_outbox (next_attempt_at, outbox_id);
 ```
 
+##### Capture
+
 When `captureChanges = true`, each committed content mutation updates `materialization_outbox` in the same
 `transactionSync` as `items`:
 
 1. **Insert of a new item (no existing row in `items`):**
    - When no row exists in `materialization_outbox`, insert
-     `(hk, sk, revision = newV, deleted = 0, unexported_create = 1, attempted = 0, next_attempt_at = 0)`.
+     `(hk, sk, revision = newV, is_deleted = 0, is_local_only = 1, next_attempt_at = 0)`.
    - When a row already exists in `materialization_outbox` (an unacknowledged delete), update it to
-     `revision = newV, deleted = 0, unexported_create = 0, next_attempt_at = 0`.
+     `revision = newV, is_deleted = 0, next_attempt_at = 0`. The row keeps `is_local_only = 0` (step 3).
 2. **Update of an existing item:**
-   - Upsert `(hk, sk, revision = newV, deleted = 0, next_attempt_at = 0)`. When the row exists, keep
-     `unexported_create` and `attempted`. Otherwise, set both to `0`.
-3. **Exporter claim:**
-   - Before the exporter sends an `applyLatestImages` RPC for a batch of keys, it sets `attempted = 1`,
-     `apply_before_ms = now + callDeadlineMs`, and `next_attempt_at = apply_before_ms + maxClockSkewMs` on those rows
-     in SQLite.
-   - When the circuit breaker to `MaterializationDO` is open, the exporter claims no rows, and `attempted` stays `0`.
-4. **Delete of an existing item, or owned TTL expiry:**
-   - When the `materialization_outbox` row has `unexported_create = 1 AND attempted = 0`, no byte of this item has left
-     the base partition. `PartitionStore` must delete the `materialization_outbox` row in place and must send no RPC
-     to `MaterializationDO`.
+   - Upsert `(hk, sk, revision = newV, is_deleted = 0, next_attempt_at = 0)`. When the row exists, keep
+     `outbox_id` and `is_local_only`. Otherwise, set `is_local_only = 0`, because `MaterializationDO` can have an
+     older revision of the item.
+   - The upsert must be `INSERT ... ON CONFLICT (hk, sk) DO UPDATE`. It must not be `INSERT OR REPLACE`, because a
+     replace gives the row a new `outbox_id`, and the split fences use `outbox_id` (Section 4.2.9).
+3. **Delete of an existing item, or owned TTL expiry:**
+   - When the `materialization_outbox` row has `is_local_only = 1`, no byte of this item has left the base
+     partition. `PartitionStore` must delete the `materialization_outbox` row in place and must send no RPC to
+     `MaterializationDO`.
    - Otherwise, `PartitionStore` upserts
-     `(hk, sk, revision = deleteVersion, deleted = 1, unexported_create = 0, next_attempt_at = 0)`.
-   - The `attempted` guard prevents a lost delete when an earlier create RPC timed out after `MaterializationDO`
-     committed it.
+     `(hk, sk, revision = deleteVersion, is_deleted = 1, is_local_only = 0, next_attempt_at = 0)`. It keeps
+     `outbox_id` (step 2).
 
-For each claimed row in `materialization_outbox`, the base exporter does these steps:
+`is_local_only = 1` means that no receiver can have a revision of the key. It changes only from 1 to 0. Two cases
+set it to 0:
 
-1. In the claim `transactionSync`, it selects up to `maxItemsPerStep` (100) rows with `next_attempt_at <= now` from
-   `idx_materialization_outbox_due`, bounded by `maxBytesPerStep` (1 MiB).
-   - For an unowned copy of a promoted key (`!this.fokos.owns(key)`), it sets
-     `next_attempt_at = now + exportRetryMs` (default 30 s) and skips the row.
-   - Thus unowned copies never block the owned keys behind them, and they do not spin the alarm.
-2. For each owned row with `deleted = 0`, it reads the item from `items` in the same synchronous snapshot and checks
-   `items.v == outbox.revision`. When the row is absent or `items.v != outbox.revision` (an invariant defect), it logs
-   one error with the keys, deletes the outbox row, and continues.
-3. For `deleted = 1`, it builds a tombstone entry with no item payload.
-4. When the `applyLatestImages` response arrives, it runs this statement for each item that `MaterializationDO`
-   acknowledged at `ackedRevision` and that this partition still owns (`this.fokos.owns(key)`):
+- **An update of an exported item.** For example, the create of X at revision 1 is exported and acknowledged, so the
+  outbox row is deleted. The update to revision 2 inserts a new outbox row. If that row had `is_local_only = 1`, a
+  delete before the next export would remove it in place, and `MaterializationDO` would keep X at revision 1.
+- **The export claim** (step 1 of "Export step" below). This prevents a lost delete when an earlier create RPC timed
+  out after `MaterializationDO` committed it.
+
+##### Export loop
+
+`PartitionDO` drives the export of `materialization_outbox` with one in-memory background promise
+(`#exportPromise`):
+
+- Each committed base write wakes `#exportPromise`.
+- In one `transactionSync`, the loop claims up to `maxExportCalls` (default 2) batches of owned, due rows from
+  `idx_materialization_outbox_due`. It `await`s the `applyLatestImages` RPCs in parallel. Then it applies the
+  responses in one `transactionSync`.
+- It repeats until no due outbox rows remain or `canSweepLocally` becomes `false`.
+- When the circuit breaker to `MaterializationDO` is open, the exporter claims no rows, and `is_local_only` does not
+  change.
+  TODO: define the trigger and the probe of this circuit breaker.
+- Section 4.2.6 ("Lifecycle guard and alarm fallback") gives the alarm fallback.
+
+##### Export step
+
+Each export call has these steps:
+
+1. **Claim.** In the claim `transactionSync`, the exporter:
+   - selects up to `maxExportItems` (100) rows with `next_attempt_at <= now` from `idx_materialization_outbox_due`,
+     bounded by `maxExportBytes` (1 MiB),
+   - skips each row whose key is in a call in flight (the same-epoch rule, Section 4.2.9),
+   - skips each unowned copy of a promoted key (`!this.fokos.owns(key)`) and sets its
+     `next_attempt_at = now + exportRetryMs` (default 30 s). Thus unowned copies never block the owned keys behind
+     them, and they do not spin the alarm.
+   - sets `is_local_only = 0` on the claimed rows that have `is_local_only = 1`. A claimed row with
+     `is_local_only = 0` gets no write,
+   - sets `is_call_open = 1` when no export call is in flight (Section 4.2.9).
+2. **Build.** For each claimed row with `is_deleted = 0`, the exporter reads the item from `items` in the same
+   synchronous snapshot and checks `items.v == outbox.revision`. When the row is absent or `items.v != outbox.revision`
+   (an invariant defect), it logs one error with the keys, deletes the outbox row, and continues. For
+   `is_deleted = 1`, it builds a tombstone entry with no item payload.
+3. **Send.** The exporter sends the call with its `producerId` and its export epoch. While export fence rows exist in
+   `ancestor_fences`, the call also carries all of them (Section 4.2.9).
+4. **Complete.** The exporter applies the response rules of Section 4.2.9. For each item that `MaterializationDO`
+   acknowledged at `ackedRevision` and that this partition still owns (`this.fokos.owns(key)`), it runs this
+   statement:
 
 ```sql
 DELETE FROM materialization_outbox
@@ -426,13 +489,16 @@ The base partition must delete a `materialization_outbox` row on acknowledgement
 
 For example, a newer write (`revision = 12`) arrives while `revision = 11` is in flight. The `DELETE` for `11` then
 matches zero rows and leaves `12` in the outbox with `next_attempt_at = 0`. For an item that returned `unprocessed`,
-the exporter sets `next_attempt_at` to a backoff timestamp.
+the exporter sets `next_attempt_at` to a backoff timestamp. TODO: give the backoff values of the export.
+
+##### Splits, promotions, and TTL sweeps
 
 Splits, promotions, and TTL sweeps handle outbox rows and ownership as follows:
 
 1. **Migration (`FokosMigrationHost`).** The host adds a third migration stream, `materialization_outbox`, after
-   `items` and `pending_tx`. It copies the outbox rows of the slice to the child with `attempted = 1` and
-   `next_attempt_at = 0`, because an export call from the source can be in flight at the cutover.
+   `items` and `pending_tx`. It copies the outbox rows of the slice to the child with `is_local_only = 0` and
+   `next_attempt_at = 0`, because an export call from the source can be in flight at the cutover. When the stream
+   ends, the child stores the export fences with the mark `until_id = MAX(outbox_id)` (Sections 4.2.9 and 4.2.12).
 2. **Cutover ownership.** After the cutover, `this.fokos.owns(key)` is `false` on the source.
    - The source exporter skips unowned outbox rows (it advances their `next_attempt_at`), and it drops the
      acknowledgements of unowned keys.
@@ -452,206 +518,300 @@ Splits, promotions, and TTL sweeps handle outbox rows and ownership as follows:
    - When a chunk holds unowned copies, the sweep cycle stops early. The owned expired rows that sort after those
      copies wait until `cleanupSourceStep` finishes. TODO: measure this delay for a promoted key.
 
-#### 4.2.4 `MaterializationDO` storage and deletion lifecycle
+#### 4.2.4 `MaterializationDO` storage and ingest
 
 `MaterializationDO` keeps the latest payload of each live base item in `latest_items.data` (full-mirror mode):
 
-- Both item tables are rowid tables.
-- `target_item_state` links to `latest_items.item_id` (an 8-byte integer). Thus `(base_hk, base_sk)` is stored one
+- Each table that holds an item payload or multi-kilobyte keys is a rowid table (Section 1.3).
+- Each per-item table links to `latest_items.item_id` (an 8-byte integer). Thus `(base_hk, base_sk)` is stored one
   time for each item, not one time for each target.
 - `key_size_estimates` tracks the byte totals of each `base_hk` for `promotionCandidates` and `planRangeSplit`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS latest_items (
-    item_id         INTEGER PRIMARY KEY,
-    base_hk         BLOB    NOT NULL,
-    base_sk         BLOB    NOT NULL DEFAULT x'',
-    revision        INTEGER NOT NULL,
-    deleted         INTEGER NOT NULL,
-    deleted_at_ms   INTEGER,
-    data_kind       INTEGER,
-    ttl_at          INTEGER,
-    est_row_bytes   INTEGER NOT NULL DEFAULT 0,
-    data            ANY,
+    item_id       INTEGER PRIMARY KEY,
+    base_hk       BLOB    NOT NULL,
+    base_sk       BLOB    NOT NULL DEFAULT x'',
+    revision      INTEGER NOT NULL,
+    deleted_at_ms INTEGER,          -- NULL for a live item; the ingest time of the delete for a tombstone
+    newest_seq    INTEGER,          -- the newest change position of the item (Section 4.2.5)
+    data_kind     INTEGER,
+    ttl_at        INTEGER,
+    est_row_bytes INTEGER NOT NULL DEFAULT 0,
+    data          ANY,
     UNIQUE (base_hk, base_sk)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc
     ON latest_items (deleted_at_ms)
-    WHERE deleted = 1 AND deleted_at_ms IS NOT NULL;
+    WHERE deleted_at_ms IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS key_size_estimates (
     hk        BLOB    PRIMARY KEY,
     est_bytes INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
-
-CREATE TABLE IF NOT EXISTS target_item_state (
-    state_id                 INTEGER PRIMARY KEY,
-    item_id                  INTEGER NOT NULL,
-    target_id                TEXT    NOT NULL,
-
-    applied_revision         INTEGER,
-    applied_index_hk         BLOB,    -- encoded GSI hash key; NULL when the GSI holds no entry
-    applied_index_sk         BLOB,    -- encoded GSI sort key; x'' when the GSI has no sort key
-
-    desired_revision         INTEGER NOT NULL,
-
-    inflight_revision        INTEGER,
-    inflight_index_hk        BLOB,
-    inflight_index_sk        BLOB,
-    inflight_phase           TEXT,
-    inflight_attempt         INTEGER NOT NULL DEFAULT 0,
-    inflight_apply_before_ms INTEGER,
-
-    status                   TEXT    NOT NULL, -- 'IDLE' | 'DIRTY' | 'IN_FLIGHT' | 'VIOLATION'
-    next_attempt_at          INTEGER NOT NULL DEFAULT 0,
-    last_error_code          TEXT,
-    violation_revision       INTEGER,
-
-    UNIQUE (item_id, target_id)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS idx_target_item_state_due
-    ON target_item_state (target_id, next_attempt_at, item_id)
-    WHERE status IN ('DIRTY', 'IN_FLIGHT');
 ```
 
+A `latest_items` row is a tombstone when `deleted_at_ms IS NOT NULL`. The value gives the order of the GC sweep
+(Section 4.2.11) and helps debugging. No rule reads the value of the time, so correctness does not depend on the clock
+(Requirement 9). A split copies the value unchanged.
+
+The other tables of `MaterializationDO` are in the sections that use them: `change_positions` (Section 4.2.5),
+`materialization_targets` (Section 4.2.6), `target_index_keys` (Section 4.2.7), `producer_fences` and
+`ancestor_fences` (Section 4.2.9), and `target_retry` (Section 4.2.10).
+
 `applyLatestImages` is a `group` operation on `MaterializationDO` with `whileMigrating: "throw"`,
-`failurePolicy: "collect"`, and `admissionTag: "batch_write"`:
+`failurePolicy: "collect"`, and `admissionTag: "batch_write"`. For each item, in the `transactionSync` of that item:
 
-- `MaterializationDO` must accept an export only when `incoming.revision > stored.revision`.
-- It must idempotently acknowledge an export when `incoming.revision == stored.revision`.
-- When `MaterializationDO` is above `1.1x maxSizeMb`, its local handler must reject only live upserts
-  (`deleted = 0`), as `unprocessed` with `partition_over_size`, and signal `evaluateSplit`. It must still ingest
-  deletions (`deleted = 1`), so that deletes can reclaim space.
+1. `MaterializationDO` applies the receiver rules of Section 4.2.9 (the producer epoch and the ancestor fences).
+2. It must accept an export only when `incoming.revision > stored.revision`.
+3. It must idempotently acknowledge an export when `incoming.revision == stored.revision`.
+4. When `MaterializationDO` is above `1.1x maxSizeMb`, its local handler must reject only live upserts
+   (`deleted: false`), as `unprocessed` with `partition_over_size`, and signal `evaluateSplit`. It must still ingest
+   deletions (`deleted: true`), so that deletes can reclaim space.
 
-Row lifecycle in `MaterializationDO`:
+The ingest of an accepted image does these steps:
 
-1. **Live item (`deleted = 0` at `revision = R`).** `latest_items` upserts the row (`deleted = 0`,
-   `deleted_at_ms = NULL`, `data`, `est_row_bytes`) and updates `key_size_estimates`. For each target in
-   `this.targets()`, `target_item_state` upserts `(item_id, target_id)` with `desired_revision = R`:
-   - When the row does not exist or its `status` is not `'IN_FLIGHT'`, it sets `status = 'DIRTY'` and
-     `next_attempt_at = 0`.
-   - When its `status` is `'IN_FLIGHT'`, it keeps `status` and `inflight_*` unchanged.
-2. **Deleted item (`deleted = 1` at `revision = R`):**
-   - At ingestion, `MaterializationDO` sets `latest_items.data = NULL`, `deleted = 1`, and `deleted_at_ms = NULL`. It
-     updates `est_row_bytes` to the key-only tombstone size and updates `key_size_estimates`. Thus the item payload is
-     free at once.
-   - For each target row, it sets `desired_revision = R`. It moves each row whose status is not `'IN_FLIGHT'` to
-     `'DIRTY'` with `next_attempt_at = 0`.
-   - When no `target_item_state` row exists for `item_id` (no target is defined), the same transaction sets
-     `latest_items.deleted_at_ms = now`.
-   - When a target finishes the deletion `R` (or marks a deletion violation), `MaterializationDO` deletes that
-     `target_item_state` row. When it deletes the last `target_item_state` row of `item_id` while
-     `latest_items.deleted = 1`, it sets `latest_items.deleted_at_ms = now`.
-   - The `latest_items` tombstone row (`data = NULL`) stays until `now - deleted_at_ms >= deletedRevisionHorizonMs`
-     (default 24 hours). Thus `MaterializationDO` rejects each late export with `revision < R`. Then a background
-     sweep on `idx_latest_items_deleted_gc` deletes the `latest_items` row and subtracts its key bytes from
-     `key_size_estimates`.
-3. **Link-ID delete rule.** Each path that deletes a `latest_items` row (the tombstone GC sweep, and
-   `cleanupSourceStep` on a promotion source) must first delete all `target_item_state` rows with that `item_id`, in
-   the same `transactionSync`. Thus a rowid that SQLite gives again never attaches orphaned `target_item_state` rows
-   to a new base item.
+1. **Live item (`deleted: false` at `revision = R`).** It upserts the `latest_items` row (`revision = R`,
+   `deleted_at_ms = NULL`, `data`, `est_row_bytes`) and updates `key_size_estimates`.
+2. **Deleted item (`deleted: true` at `revision = R`).** It sets `latest_items.data = NULL` and
+   `deleted_at_ms = now`. It updates `est_row_bytes` to the key-only tombstone size and updates `key_size_estimates`.
+   Thus the item payload is free at once. When the item has no `latest_items` row, the ingest stores a tombstone row.
+   A GSI with no key set for the item then sends no call (Section 4.2.7), and a push target gets the tombstone.
+3. **Change position.** It writes or moves the change position of the item with the rules of Section 4.2.5.
+4. **Retry rows.** When the item has `target_retry` rows of kind `'retry'`, it sets `not_before = 0` on them
+   (Section 4.2.10).
+5. **Wake.** After the batch commits, it wakes the target runner (Section 4.2.6).
 
-The row lifecycle must keep these invariants:
+**Link-ID delete rule.** Each path that deletes a `latest_items` row (the tombstone GC sweep, and `cleanupSourceStep`
+on a promotion source) must first delete all `change_positions`, `target_index_keys`, and `target_retry` rows with that
+`item_id`, in the same `transactionSync`. Thus a rowid that SQLite gives again never attaches orphaned rows to a new
+base item.
 
-1. The ingest of a new latest image must update `latest_items` and raise `desired_revision`. It must not change
-   `inflight_*` or the `status` of an `'IN_FLIGHT'` row. Only a row that is not `'IN_FLIGHT'` moves to `'DIRTY'` with
-   `next_attempt_at = 0`.
-2. A `'DIRTY'` row must have `inflight_revision IS NULL`.
-3. A `latest_items` tombstone (`deleted = 1`) must set `deleted_at_ms` as soon as no `target_item_state` row remains for
-   its `item_id`, also when no target is registered.
-4. A `MaterializationDO` split or promotion must move the `latest_items` row and all `target_item_state` rows of a
-   base item in the same slice. Each deletion of a `latest_items` row follows the link-ID delete rule (rule 3 above).
+#### 4.2.5 Change positions
 
-`applied_index_sk` and `inflight_index_sk` store the encoded `gsiSK`, not `physicalSk` (Section 4.2.8). With 1.5 KB
-base keys and 10 GSIs, this saves about 15 KB per item at rest and 30 KB while `'IN_FLIGHT'`. Before
-`MaterializationDO` sends a GSI call, it reads `base_hk` and `base_sk` from `latest_items` by `item_id`. Both columns
-come before the trailing `data` column, so SQLite reads no overflow page. Then it builds
-`physicalSk = encodeGsiSortKey(index_sk, base_hk, base_sk)`.
+```sql
+CREATE TABLE IF NOT EXISTS change_positions (
+    seq      INTEGER PRIMARY KEY,
+    item_id  INTEGER NOT NULL,
+    prev_seq INTEGER            -- the older position of the same item, or NULL
+) STRICT;
+```
 
-#### 4.2.5 Target push state machine and background runner
+`MaterializationDO` gives each accepted image a position in `change_positions`, a table that all targets share.
+`latest_items.newest_seq` is the newest position of the item. The ingest writes the `latest_items` row in all cases, so
+this column adds no row write. `change_positions` has no secondary index. `seq` is the rowid, and the ingest finds the
+positions of an item through `newest_seq` and `prev_seq`.
 
-`MaterializationDO` drives two kinds of targets:
+Each target `t` has two positions:
 
-- **`gsi`.** It writes to `fokos.gsiv1.<n>.<tableName>.<indexName>` with `FokosDB.batchWriteItems` in two phases
-  (`WRITE_NEW -> DELETE_OLD -> COMMIT_APPLIED`).
-- **`push_sink`.** It calls a `WorkerEntrypoint` or a `DurableObject` over Workers RPC in one phase
-  (`PUSH_BATCH -> COMMIT_APPLIED`). A push target keys records by `(baseHashKey, baseSortKey)`, so it has no old
-  secondary key to delete.
+- `C_t` is `cursor_seq` in SQLite (Section 4.2.6). Each position at or below `C_t` is done for `t`.
+- `R_t` is in memory. While a batch of `t` is in flight, `R_t` is the highest position that the batch read. Otherwise,
+  `R_t = C_t`. After a restart, `R_t = C_t`.
 
-Before `MaterializationDO` sends an outbound RPC to a target, it must write these columns to SQLite:
+When `MaterializationDO` accepts an image of item X, it reads `e = latest_items.newest_seq` and the row `e` to get
+`p = prev_seq`. A position at or below `MIN(C_t)` counts as absent. `N` is the next position, above each position in
+the partition. Then the ingest does one of these steps:
 
-- `inflight_revision`, `inflight_phase`, `inflight_attempt`, `inflight_apply_before_ms`, and `next_attempt_at`,
-- for a GSI, also `inflight_index_hk` and `inflight_index_sk`.
+1. **When `e` is absent,** the ingest inserts `(N, X, NULL)` and sets `newest_seq = N`.
+2. **When `R_t < e` for each target,** the ingest writes no position. No target has read `e`, so each target reads the
+   new image at `e`.
+3. **When each target with `C_t < e` also has `C_t < p`,** the ingest moves `e` to `N`
+   (`UPDATE change_positions SET seq = N WHERE seq = e`) and sets `newest_seq = N`. Each target that has not finished
+   `e` reaches `p` first. Each other target finds X at `N`.
+4. **Otherwise,** the ingest inserts `(N, X, e)` and sets `newest_seq = N`.
 
-##### GSI transition phases (`WRITE_NEW -> DELETE_OLD -> COMMIT_APPLIED`)
+When no target is registered, the ingest writes no position. A cleanup step deletes the rows with
+`seq <= MIN(C_t)` in bounded chunks.
 
-For a GSI target, `MaterializationDO` must not freeze a new transition over a row whose `inflight_revision` is not
-`NULL`. It must first finish or clean up the in-flight transition.
+The positions must keep these invariants:
 
-For each due row (`next_attempt_at <= now`) on a `gsi` target:
+1. **Each target reads each change.** When target `t` has not applied the latest image of X, X has a position above
+   `C_t`, or X has a `retry` row for `t` (Section 4.2.10).
+2. **No target starves.** The ingest moves only the newest position of an item, and only when no target depends on
+   that position. Thus the oldest position of X above `C_t` stays fixed until `t` reads it. A hot item cannot move
+   ahead of a lagging cursor.
+3. **Step 2 uses `R_t`, and step 3 uses `C_t`.**
+   - A batch in flight can hold the old image of X from position `e`. If step 2 used `C_t`, the ingest would write no
+     new position, the batch would move the cursor past `e`, and the new image would be lost.
+   - When that batch fails, the target reads again from `C_t`. Thus step 3 must count the target as a target that still
+     needs `e`.
+4. **At most `T + 1` positions for each item.** Each position of X above `MIN(C_t)` serves a different group of
+   cursors. Thus the table grows with the number of changed items, not with the number of mutations.
 
-1. **Resume an `'IN_FLIGHT'` row (`status == 'IN_FLIGHT'`):**
-   - When `inflight_phase == 'DELETE_OLD'`, freeze and send `delete` again for `(applied_index_hk, applied_index_sk)`.
-     On `applied`, go to step 6 (`COMMIT_APPLIED`).
-   - When `inflight_phase == 'WRITE_NEW'` and `desired_revision == inflight_revision`, project `latest_items.data`
-     again, freeze, and send `put` again for `(inflight_index_hk, inflight_index_sk)` with
-     `ttlAt: latest_items.ttl_at`. On `applied`, go to step 5 (`DELETE_OLD`).
-   - When `inflight_phase == 'WRITE_NEW'` and `desired_revision > inflight_revision`, a newer base write replaced
-     `inflight_revision` after the earlier `WRITE_NEW` call failed:
-     - When `(inflight_index_hk, inflight_index_sk)` equals `(applied_index_hk, applied_index_sk)`, clear `inflight_*`
-       and go directly to step 2 (`status = 'DIRTY'`) with zero RPCs. Thus the live `applied_index_*` entry stays.
-     - Otherwise, freeze and send `delete` for `(inflight_index_hk, inflight_index_sk)`. On `applied`, clear
-       `inflight_*`, keep `applied_*` unchanged, and set `status = 'DIRTY'` and `next_attempt_at = 0`.
-2. **Evaluate the desired state of a `'DIRTY'` row (`status == 'DIRTY'`):**
-   - When `inflight_revision IS NOT NULL` (an invariant defect), log one error and run step 1 as for an
-     `'IN_FLIGHT'` row.
-   - The desired state is `absent` (sparse index) in these cases:
-     - `latest_items.deleted == 1`,
-     - the GSI partition key attribute is missing or `null`,
-     - the GSI defines a `sortKey` whose attribute is missing or `null`.
-   - Otherwise, evaluate the GSI key and projection expressions against `latest_items` to get `target_hk` and
-     `target_sk`. The evaluation aliases `base_hk AS hk, base_sk AS sk, revision AS v, ttl_at AS
-     ttl_epoch_utc_seconds`, so that the compiled expression SQL reads the column names it expects.
-   - When the evaluation fails with a permanent violation (Section 4.2.6), run the violation cleanup instead of
-     `WRITE_NEW`.
-3. **Short-circuit when the applied state and the desired state are both absent:**
-   - When `applied_index_hk IS NULL`, `inflight_index_hk IS NULL`, and the desired state is `absent`, send zero RPCs:
-     - When `latest_items.deleted == 1`, delete the `target_item_state` row. When no target row remains, set
-       `latest_items.deleted_at_ms = now`.
-     - Otherwise, set `applied_revision = desired_revision` and `status = 'IDLE'`.
-4. **Phase `WRITE_NEW` (when the desired state is present):**
-   - Freeze `inflight_revision = desired_revision`, `inflight_index_hk = target_hk`, `inflight_index_sk = target_sk`,
-     `inflight_phase = 'WRITE_NEW'`, and `status = 'IN_FLIGHT'` in SQLite.
-   - Then send the `put` entry (with `ttlAt: latest_items.ttl_at`) in `gsiDb.batchWriteItems(...)`. On `applied`, go
-     to step 5.
-5. **Phase `DELETE_OLD` (when the desired state is absent, or when `WRITE_NEW` completed for a different GSI key):**
-   - From step 2, with `desired = absent` and `applied_index_hk IS NOT NULL`: freeze
-     `inflight_revision = desired_revision`, `inflight_index_hk = NULL`, `inflight_index_sk = NULL`,
-     `inflight_phase = 'DELETE_OLD'`, and `status = 'IN_FLIGHT'` in SQLite. Then send a `delete` entry for
-     `(applied_index_hk, applied_index_sk)` in `gsiDb.batchWriteItems(...)`.
-   - After `WRITE_NEW` (`inflight_index_hk IS NOT NULL`): when `applied_index_hk IS NOT NULL` and
-     `(applied_index_hk, applied_index_sk) != (inflight_index_hk, inflight_index_sk)`, set
-     `inflight_phase = 'DELETE_OLD'` and `next_attempt_at = 0`. The next batch then sends `delete` for
-     `(applied_index_hk, applied_index_sk)`. Otherwise, go to step 6 at once, in the same `transactionSync`.
-6. **Phase `COMMIT_APPLIED`:**
-   - When `latest_items.deleted == 1` and `inflight_revision == latest_items.revision`, delete the
-     `target_item_state` row. When no `target_item_state` row remains for `item_id`, set
-     `latest_items.deleted_at_ms = now`.
-   - Otherwise, set `applied_revision = inflight_revision`, `applied_index_hk = inflight_index_hk`, and
-     `applied_index_sk = inflight_index_sk`, and clear `inflight_*`. When `desired_revision > applied_revision`, set
-     `status = 'DIRTY'` and `next_attempt_at = 0`. Otherwise, set `status = 'IDLE'`.
+Example: the GSI `g` reads at the end of the positions. The push target `lake` is down at `C_lake = 10`.
 
-##### Push target phase (`PUSH_BATCH -> COMMIT_APPLIED`)
+| Change of X | Positions of X | Ingest step |
+| --- | --- | --- |
+| rev 1 | 100 | Step 1: X has no position. |
+| `g` reads 100. rev 2 | 100, 205 | Step 4: `lake` needs 100, and `p` is absent. |
+| `g` reads 205. rev 3 | 100, 310 | Step 3: `lake` reaches 100 first, so 205 moves to 310. |
+| `g` reads 310. rev 4 | 100, 415 | Step 3. |
 
-For each due batch on a `push_sink` target:
+When `lake` recovers, it reads position 100 and sends the latest image of X. At position 415, the applied map
+(Section 4.2.6) skips X.
 
-1. Before the call, freeze `inflight_revision = desired_revision`, `inflight_phase = 'PUSH_BATCH'`, and
-   `status = 'IN_FLIGHT'` on each row in SQLite. A resumed `'IN_FLIGHT'` row freezes again with the current
-   `desired_revision` and the current image (or tombstone), because the push target keys items by
-   `(baseHashKey, baseSortKey)`.
-2. Build the batch of `PushTargetItem` records. Apply the optional target projection to live items:
+#### 4.2.6 Target runner and target step
+
+`MaterializationDO` stores the state of each target in one row:
+
+```sql
+CREATE TABLE IF NOT EXISTS materialization_targets (
+    target_id     TEXT    PRIMARY KEY,
+    kind          TEXT    NOT NULL,
+    cursor_seq    INTEGER NOT NULL DEFAULT 0,
+    epoch         INTEGER NOT NULL DEFAULT 1,
+    is_batch_open INTEGER NOT NULL DEFAULT 0  -- 1 while a batch of this target can be in flight
+) WITHOUT ROWID, STRICT;
+```
+
+##### In-memory runner
+
+A Durable Object alarm for each batch is too slow, and it writes alarm storage on each step. Thus `MaterializationDO`
+drives its targets with one in-memory background promise (`#pushPromise`), as `TtlExpiry.runCycle` in
+`packages/fokosdb/src/shared/partition/ttl-expiry.ts` does:
+
+- `applyLatestImages` wakes the loop as soon as a batch commits.
+- The loop starts `targetConcurrency` (default 2) parallel worker coroutines. They round-robin across the targets of
+  the stored target list (Section 4.2.13).
+- Each `target_id` has at most 1 batch in flight, so two workers never claim the same target at the same time. One
+  slow target holds at most 1 of the 2 workers. The other worker drains all the other healthy targets.
+- The workers repeat in memory until no target has due work or `canSweepLocally` becomes `false`. They yield with
+  `scheduler.wait(0)` between batches.
+
+Each target keeps an in-memory map `item_id -> revision`, the applied map:
+
+- The map holds the revisions that the target applied in its current epoch.
+- The map has at most `appliedMapMaxEntries` (default 10,000) entries for each target, with least-recently-used
+  eviction.
+- The map is only an optimization. When the map has no entry for an item, the target sends the item again, and the
+  receiver drops the duplicate or writes the same entry again.
+
+##### Target step
+
+A step of target `t` has these parts:
+
+1. **Claim.** In one `transactionSync`, the step:
+   - takes the due `retry` rows of `t`, up to half of `maxItemsPerStep` (Section 4.2.10),
+   - reads the positions above `C_t` in `seq` order to fill the batch, up to `maxItemsPerStep` (100, the
+     `batchWriteItems` limit) items, `maxBytesPerStep` (16 MiB, below the RPC limit) of item data, and
+     `maxScannedPositions` (5,000) positions,
+   - sets `is_batch_open = 1` when it is `0` (Section 4.2.9).
+
+   The claim stops at the first limit that it reaches. When the claim finds no item to send, it sets `cursor_seq` to
+   the highest position that it read, in the same `transactionSync`. It sends no call and does not set `is_batch_open`.
+   Thus a long run of skipped positions (step 2), for example the positions of a promoted key, moves the cursor in
+   bounded steps.
+2. **Filter.** For each position, the step joins `latest_items` by `item_id`. It skips the position when one of these
+   conditions is true:
+   - the item has a `retry` row for `t`,
+   - the item is already in the batch,
+   - the applied map holds `latest_items.revision` for the item,
+   - the partition does not own the item (`!this.fokos.owns(key)`), because the item moved to another partition.
+
+   A skipped position is done for `t`.
+3. **Build.** The step builds the entries from the latest image of each item: GSI entries (Section 4.2.7) or a push
+   record (Section 4.2.8). It sets `R_t` to the highest position that the claim read.
+4. **Send.** The step sends the call with `producerId`, `epoch`, and the ancestor fences (Section 4.2.9).
+5. **Complete.** In one `transactionSync`, the step applies the response with the rules of Sections 4.2.9 and 4.2.10.
+   When each item of the batch is applied or has a `retry` row, it sets `cursor_seq` to the highest position that the
+   claim read. When the target has no more due work (no position above the new cursor and no due `retry` row), the same
+   update sets `is_batch_open = 0`. This is 1 row update in `materialization_targets` for each batch. Then the step sets
+   `R_t = C_t`.
+
+The cursor moves to the highest position that the claim read, not to the position of the last item that the step
+sent. The skipped positions are done for `t`.
+
+##### Lifecycle guard and alarm fallback
+
+- An export job or a target step must act only on rows that its partition owns. It must write an outcome only for a
+  row that its partition still owns (Section 4.2.9, response rule 2).
+- Neither loop runs when `canSweepLocally` is `false`: the partition is not initialized, is a router, is
+  `awaiting_data` or `importing`, or is fenced for destroy.
+- A `FokosScheduler` job is only the durable fallback when the DO restarts or is evicted: `materialization_export` in
+  `PartitionDO`, and `target_push` in `MaterializationDO`.
+- While the in-memory loop runs, `deadline()` returns `now + fallbackAlarmMs`. Thus `FokosScheduler` does not start a
+  new pass every `fastPathDelayMs` (default 50 ms).
+- While the in-memory loop is idle, `deadline()` returns the earliest due time in SQLite, and `runStep()` starts the
+  in-memory loop. In `PartitionDO`, the due time is the earliest `next_attempt_at`. In `MaterializationDO`, it is
+  `now` when a position above a cursor exists, or else the earliest `not_before` of a `retry` row.
+
+#### 4.2.7 GSI targets and key sets
+
+A `gsi` target writes to `fokos.gsiv1.<n>.<tableName>.<indexName>` with `FokosDB.batchWriteItems`.
+
+##### Desired GSI key
+
+For each item in a batch, the step evaluates the desired GSI key `D` from the latest image:
+
+- `D` is absent (sparse index) in these cases:
+  - `latest_items.deleted_at_ms IS NOT NULL`,
+  - the GSI partition key attribute is missing or `null`,
+  - the GSI defines a `sortKey` whose attribute is missing or `null`.
+- Otherwise, the step evaluates the GSI key and projection expressions against `latest_items` to get `D` and the
+  projected entry. The evaluation aliases `base_hk AS hk, base_sk AS sk, revision AS v, ttl_at AS
+  ttl_epoch_utc_seconds`, so that the compiled expression SQL reads the column names it expects.
+- When the evaluation fails with a permanent violation (Section 4.2.10), the step runs the violation cleanup instead of
+  `put(D)`.
+
+##### Key sets
+
+```sql
+CREATE TABLE IF NOT EXISTS target_index_keys (
+    key_set_id INTEGER PRIMARY KEY,
+    item_id    INTEGER NOT NULL,
+    target_id  TEXT    NOT NULL,
+    index_keys BLOB    NOT NULL,  -- encoded list of (index_hk, gsiSK) pairs
+    UNIQUE (item_id, target_id)
+) STRICT;
+```
+
+The key set of `(item_id, target_id)` holds each GSI key that can have an entry of the item in that GSI. When no row
+exists, the GSI has no entry of the item. The set normally holds 1 key. It holds 2 keys while a key moves. It holds
+more keys only after failed deletes. It is a rowid table, because the keys can be multiple kilobytes (Section 1.3).
+
+`index_keys` stores the encoded `gsiSK`, not `physicalSk` (Section 4.2.14). With 1.5 KB base keys and 10 GSIs, this
+saves about 15 KB for each item at rest and 30 KB while a key moves. Before `MaterializationDO` sends a GSI call, it
+reads `base_hk` and `base_sk` from `latest_items` by `item_id`. Both columns come before the trailing `data` column, so
+SQLite reads no overflow page. Then it builds `physicalSk = encodeGsiSortKey(index_sk, base_hk, base_sk)`.
+
+##### GSI step
+
+After the step evaluates `D`, it does these steps:
+
+1. **When `D` is present and is not in the set,** the claim `transactionSync` adds `D` to the set before the call.
+2. **The first call** sends `put(D)` with `ttlAt: latest_items.ttl_at` when `D` is present. When `D` is absent, it
+   sends `delete(K)` for each key `K` in the set.
+3. **The second call** of the same step sends `delete(K)` for each key `K` in the set other than `D`, after `put(D)`
+   applied. Thus a key move writes the new entry before it deletes the old entry.
+4. **After `delete(K)` applies in the current epoch,** the completion removes `K` from the set. When the set becomes
+   empty, the completion deletes the row.
+
+When `D` is present and is the only key in the set, the step writes no row. `put(D)` overwrites the entry with the
+latest projection. When `D` is absent and no row exists, the step sends no call and writes no row.
+
+The key set prevents an orphan GSI entry in two cases:
+
+- **The sender stops between `put(D)` and a later record of `D`.** Then the item moves to `E`. If `D` were not
+  recorded, no step would delete the entry at `D`. The rule of step 1 stores each key that a call can write before
+  the call.
+- **A `delete(K)` has an `unknown` outcome.** The entry at `K` can still exist. Thus `K` stays in the set until a
+  `delete(K)` applies, and a later step deletes it again.
+
+The two calls of one step run in sequence and carry different GSI keys of the item. Thus they keep the same-epoch
+rule of Section 4.2.9.
+
+`MaterializationDO` validates each item before it calls `batchWriteItems`. When `batchWriteItems` still throws a
+validation error for the whole call before I/O, `MaterializationDO` sends each item of that batch again alone. Thus
+only the item that is not valid becomes a violation.
+
+#### 4.2.8 Push targets
+
+A `push_sink` target calls a `WorkerEntrypoint` or a `DurableObject` over Workers RPC in one call. A push target keys
+records by `(baseHashKey, baseSortKey)`, so it has no old secondary key to delete, and it needs no key set.
+
+For each item, the step sends one `PushTargetItem` with the latest image or the tombstone. It applies the optional
+target projection to live items. The batch carries the producer fields of Section 4.2.9:
 
 ```ts
 export type PushTargetItem = {
@@ -666,6 +826,14 @@ export type PushTargetItem = {
 	ttlAt?: number;
 };
 
+export type PushTargetBatch = {
+	/** The 32-byte `DurableObjectId` of the sending `MaterializationDO`, in hex. */
+	producerId: string;
+	epoch: number;
+	ancestorFences: readonly { ancestorId: string; minEpoch: number }[];
+	items: readonly PushTargetItem[];
+};
+
 /** One result for each item of the batch, in batch order. */
 export type PushTargetResult =
 	| { outcome: "applied" }
@@ -673,8 +841,10 @@ export type PushTargetResult =
 	| { outcome: "rejected"; code: string };
 ```
 
-3. Call `method(batch)` on the configured binding (Section 4.2.7) and apply each returned `PushTargetResult`. When the
-   call throws, fails at the transport, or returns an array of the wrong length, each item of the batch is `unknown`.
+The step calls `method(batch)` on the configured binding (Section 4.2.13) and applies each returned
+`PushTargetResult`. When the call throws, fails at the transport, or returns an array of the wrong length, each item
+of the batch is `unknown`. After an `unknown` outcome, the step raises its epoch and sends again at once
+(Section 4.2.9).
 
 The push target contract:
 
@@ -682,111 +852,325 @@ The push target contract:
 - `revision` strictly increases for each `(baseHashKey, baseSortKey)` across creates, updates, and deletes.
 - Two pushes for one key can arrive out of order when an earlier call stays in flight after a lost response. Thus the
   push target must keep the highest applied `revision` of each key and ignore each push with
-  `revision <= appliedRevision`. It must keep the revision of a deleted key for at least `deletedRevisionHorizonMs`.
+  `revision <= appliedRevision`.
+- A push target that checks the producer epoch with the receiver rules of Section 4.2.9 can delete the revision of a
+  deleted key after it applies the delete. A push target that does not check the epoch must keep that revision. Its
+  retention is the choice of the push target.
 
-##### In-memory background runner and alarm fallback
+#### 4.2.9 Producer epochs and fences
 
-A Durable Object alarm for each batch is too slow, and it writes alarm storage on each step. Thus `PartitionDO` (for
-`materialization_outbox`) and `MaterializationDO` (for `target_item_state`) each drive their work with one in-memory
-background promise, as `TtlExpiry.runCycle` in `packages/fokosdb/src/shared/partition/ttl-expiry.ts` does. A
-`FokosScheduler` job is only the durable fallback when the DO restarts or is evicted.
+##### Producers and receivers
 
-An export or target push job must act only on rows that its partition owns. It must advance `next_attempt_at` on
-skipped unowned copies, so that they never block owned keys or spin the alarm. It must write an outcome only for a row
-that its partition still owns and whose `inflight_attempt` matches the call.
+| Hop | Producer ID | Epoch storage at the producer | Receiver checks |
+| --- | --- | --- | --- |
+| Base `PartitionDO` -> `MaterializationDO` (`applyLatestImages`) | 32-byte `DurableObjectId` of the base partition | `materialization_export_state` | The producer epoch, then the revision (Section 4.2.4) |
+| `MaterializationDO` -> GSI `PartitionDO` (`batchWriteItems`) | 32-byte `DurableObjectId` of the `MaterializationDO` | `materialization_targets.epoch` of the GSI target | The producer epoch |
+| `MaterializationDO` -> push target | 32-byte `DurableObjectId` of the `MaterializationDO` | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 4.2.8). |
 
-1. **One background loop in `MaterializationDO` (`#pushPromise`):**
-   - `applyLatestImages` wakes the loop as soon as a batch commits.
-   - The loop starts `targetConcurrency` (default 2) parallel worker coroutines. They round-robin across the targets
-     that `this.targets()` returns.
-   - Each `target_id` has at most 1 batch call in flight, so two workers never claim the same target at the same
-     time. One slow target holds at most 1 of the 2 workers. The other worker drains all the other healthy targets.
-   - To claim a batch for `target_id`, the worker runs one synchronous `transactionSync`:
-     - It selects up to `maxItemsPerStep` (100) due rows (`next_attempt_at <= now`) from `idx_target_item_state_due`,
-       joined with `latest_items` (`USING (item_id)`), bounded by `maxBytesPerStep` (1 MiB).
-     - For an unowned copy of a promoted key (`!this.fokos.owns(key)`), it sets
-       `next_attempt_at = now + targetRetryMs` (default 30 s) and skips the row.
-     - For each owned row, it freezes the transition. It writes `inflight_attempt = inflight_attempt + 1`,
-       `inflight_apply_before_ms = now + callDeadlineMs`, and
-       `next_attempt_at = inflight_apply_before_ms + maxClockSkewMs`.
-   - The worker `await`s the outbound `batchWriteItems` or `push_sink` RPC with a timeout of `callDeadlineMs`. Then it
-     runs one `transactionSync` that applies the outcome of each row that this partition still owns and whose
-     `inflight_attempt` still matches the call.
-   - The workers repeat in memory until no target has due rows or `canSweepLocally` becomes `false`. They yield with
-     `scheduler.wait(0)` between batches.
-2. **One background loop in `PartitionDO` (`#exportPromise`):**
-   - Each committed base write wakes `#exportPromise`.
-   - In one `transactionSync`, the loop claims up to `maxExportCalls` (default 2) batches of owned, due rows from
-     `idx_materialization_outbox_due`. It `await`s the `applyLatestImages` RPCs in parallel. Then it deletes the
-     acknowledged rows in one `transactionSync`.
-   - It repeats until no due outbox rows remain or `canSweepLocally` becomes `false`.
-3. **Lifecycle guard and alarm fallback:**
-   - Neither loop runs when `canSweepLocally` is `false`: the partition is not initialized, is a router, is
-     `awaiting_data` or `importing`, or is fenced for destroy.
-   - The `FokosScheduler` job (`materialization_export` in `PartitionDO`, `target_push` in `MaterializationDO`) gives
-     the recovery after a crash or an eviction.
-   - While the in-memory loop runs, `deadline()` returns `now + fallbackAlarmMs`. Thus `FokosScheduler` does not
-     start a new pass every `fastPathDelayMs` (default 50 ms).
-   - While the in-memory loop is idle, `deadline()` returns the earliest `next_attempt_at` in SQLite, and `runStep()`
-     starts the in-memory loop.
+Each GSI shard group gets calls from one target only. Thus a GSI partition stores one epoch for each
+`MaterializationDO`, and the producer ID needs no `targetId`. The `DurableObjectId` has a fixed size of 32 bytes. A
+partition ID or a DO name can hold user keys, which can be multiple kilobytes.
 
-##### The write deadline fence
+The base partition stores its export state in one row:
 
-A GSI table stores no revision or tombstone for each entry. Thus a late, forwarded `put(B)` from a timed-out call can
-arrive after the `delete(B)` of the resume, and leave an orphan entry. These rules prevent it:
+```sql
+CREATE TABLE IF NOT EXISTS materialization_export_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch        INTEGER NOT NULL DEFAULT 1,
+    is_call_open INTEGER NOT NULL DEFAULT 0  -- 1 while an export call can be in flight
+) STRICT;
+```
 
-- `MaterializationDO` must send a call for a row only when no earlier call for that row can still apply.
-- Each export call and each GSI `batchWriteItems` call must carry `applyBeforeMs`.
-- The receiver must reject an item with `write_deadline_passed` when its clock is above `applyBeforeMs`.
+Each receiver (`MaterializationDO` for the base hop, and each GSI `PartitionDO`) stores the highest epoch of each
+producer:
 
-The write deadline fence prevents an overlap between two consecutive calls for the same row:
+```sql
+CREATE TABLE IF NOT EXISTS producer_fences (
+    producer_id BLOB    PRIMARY KEY,  -- 32-byte DurableObjectId
+    epoch       INTEGER NOT NULL
+) WITHOUT ROWID, STRICT;
+```
 
-1. **Freeze.** In the `transactionSync` before each call, the step increments `inflight_attempt` and writes
-   `inflight_apply_before_ms = now + callDeadlineMs` (default 30 s) and
-   `next_attempt_at = inflight_apply_before_ms + maxClockSkewMs` (default 2,000 ms).
-2. **Receiver deadline check.** The call carries `applyBeforeMs = inflight_apply_before_ms`. `PartitionDO` (in the
-   `transactionSync` block of each item of `apiBatchWriteItems`) and `MaterializationDO` (in `applyLatestImages`)
-   compare their clock with `applyBeforeMs`. When `clock > applyBeforeMs`, the handler writes nothing and returns
-   `unprocessed` with `write_deadline_passed`.
-3. **Next call scheduling.**
-   - When a call returns a definite outcome (`applied`, `unprocessed`, or `rejected`), no copy of that call can still
-     run. Thus the completion handler updates `next_attempt_at` at once.
-   - When the outcome is `unknown` or the call times out, `next_attempt_at` stays at
-     `inflight_apply_before_ms + maxClockSkewMs`.
-   - `maxClockSkewMs` bounds the clock offset between any two Durable Objects. Thus the receiver clock is past
-     `applyBeforeMs` before the sender clock reaches `applyBeforeMs + maxClockSkewMs`. Each copy of the earlier call
-     has then applied or expired before the next call starts.
-   - `callDeadlineMs` must be longer than the longest normal call, forwards included. TODO: measure that duration.
+##### Receiver rules
+
+For each item of a call, in the `transactionSync` of that item, the receiver does these steps:
+
+1. For each ancestor fence `(ancestorId, minEpoch)` of the call, when the stored epoch of `ancestorId` is below
+   `minEpoch`, it stores `minEpoch`. An absent row has the epoch `0`.
+2. When the epoch of the call is below the stored epoch of `producerId`, it writes nothing for the item and returns
+   `unprocessed` with `producer_epoch_fenced`. This outcome is definite: the item did not apply.
+3. When the epoch of the call is above the stored epoch, it stores the epoch of the call.
+4. It applies the item. `MaterializationDO` also applies the revision rules of Section 4.2.4.
+
+The receiver writes a `producer_fences` row only when an epoch goes up. In normal operation, the epoch stays the same,
+and the check adds no row write. The receiver keeps the row of each producer in memory after the first read.
+
+The receiver must not delete a `producer_fences` row. A deleted row has the epoch `0`, and a late call of that
+producer then applies. The number of rows is the number of producers that ever sent to the receiver. A row is about
+50 bytes, so 10,000 producers use about 500 KB in each receiver. TODO: measure the row size.
+
+A receiver split copies the whole table to each child with `MAX(epoch)` (Section 4.2.12). The partition that applies
+a forwarded call checks it.
+
+A forward or a client retry must not send a second copy of a call that can have applied. `FokosDB.batchWriteItems`
+does not retry, and the runtime sends a forward again only after an error that came before any handler ran on the
+target. Thus each call reaches the receiver at most one time.
+
+##### The same-epoch rule
+
+Two calls of one producer with the same epoch must not carry the same item at the same time.
+
+- **Why.** The receiver cannot order two calls with the same epoch. For example, the base exporter sends X at revision
+  2 and, in a parallel call, the delete of X at revision 3. Revision 3 applies, and the targets read the tombstone, so
+  the garbage collection of Section 4.2.11 deletes it. Then revision 2 arrives, and X is created again.
+- **`MaterializationDO` -> target.** Each target has at most 1 batch in flight, and the two calls of a GSI step run in
+  sequence. Thus the rule is always true.
+- **Base `PartitionDO` -> `MaterializationDO`.** The exporter sends up to `maxExportCalls` (default 2) calls in
+  parallel. It keeps an in-memory set of the item keys in calls in flight. The claim skips each outbox row whose key is
+  in the set. A key leaves the set when its call returns. The calls stay full of other items, and a skipped item merges
+  its newer writes into its outbox row until its call returns.
+
+##### When the producer raises its epoch
+
+The producer raises its epoch by 1 in SQLite before its next call on that hop, in these cases:
+
+1. **After an `unknown` outcome.** An `unknown` outcome is a thrown call, a transport failure, a response of the wrong
+   length, or a timeout at the producer. The old call can still apply. The producer raises the epoch in the
+   `transactionSync` that prepares the next call.
+2. **At a cold start, when a call from before the restart can still be in flight.** That call can still apply. The
+   producer checks this before its first call after the restart:
+   - **`MaterializationDO`, for each target:** `is_batch_open = 1`.
+   - **Base `PartitionDO`:** `is_call_open = 1`.
+
+   When the check finds no call that can be in flight, the epoch stays.
+3. **At a split cutover** (see "Split fences" below).
+
+The producer must store the raised epoch before it sends the next call. If the producer sent the call first and then
+stopped, it could use the old epoch again after the restart.
+
+The cold-start checks keep the epoch stable across idle restarts. If each cold start raised the epoch, the producer
+would write 1 row after each wake, and each receiver that it calls next would write 1 `producer_fences` row. A
+`MaterializationDO` that wakes for each base write would then write 1 row in each GSI partition that it reaches.
+
+- **`is_batch_open`** costs at most 1 more row for each period of target work, not 1 row for each batch:
+  - The claim sets `is_batch_open = 1` only when it is `0`. The runner keeps the value in memory, so the next claims
+    write no row for the marker.
+  - The completion of the last batch clears it in the cursor update, which it writes in all cases (Section 4.2.6,
+    step 5).
+- **`is_call_open`** costs at most 2 rows for each period of export work, not 1 row for each batch or each item:
+  - The claim `transactionSync` sets `is_call_open = 1` only when no export call is in flight. The exporter keeps the
+    value in memory, so a claim while `is_call_open = 1` writes no row for the marker.
+  - The completion `transactionSync` of the last call in flight sets `is_call_open = 0`.
+  - The cold-start check reads 1 row. It does not depend on the size of the outbox, so a large outbox after a long
+    outage does not make each cold start slower.
+- **Optional optimization (not in the first version): delayed clear.** For a partition in memory that gets one write
+  and then a pause, each write is a new period of export work, so it costs 2 rows for `is_call_open`. The exporter can
+  clear `is_call_open` only after no call was in flight for a short time. If the DO is evicted before the clear, the
+  next cold start raises the epoch, which is correct.
+
+After an `unknown` outcome, the producer sends again at once:
+
+- `MaterializationDO` reads again from `C_t`, because the cursor did not move. Thus the new call carries each item of
+  the old call. For a GSI item, it contacts each key in the key set, and the set holds each key that the old call
+  could write. Thus each receiver that the old call could reach gets the new epoch.
+- The base exporter sends the same outbox rows again, at their current revision, to the `MaterializationDO` of each
+  key.
+- At each receiver, the old call and the new call can arrive in two orders:
+  - When the old call arrives first, the new call overwrites or deletes its write.
+  - When the new call arrives first, the receiver stores the new epoch and rejects the old call.
+
+A producer can stop its wait for a slow call after `callTimeoutMs`. The outcome is then `unknown`, and the rules above
+apply. The value of `callTimeoutMs` changes cost and latency, not correctness. Each timeout costs 1 row at the
+producer and 1 row at each receiver that gets the new epoch first. The default of `callTimeoutMs` is 30 s. TODO:
+measure the normal call duration and tune the default.
+
+##### Response rules
+
+The completion handler of a call applies these rules:
+
+1. **Old epochs.** When the epoch of the call is below the current epoch of the hop, the handler discards the response
+   and writes nothing. A call of the new epoch decides the outcome. A `producer_epoch_fenced` result of an old call is
+   not a circuit breaker failure.
+2. **Checks before each write.** In the completion `transactionSync`, the handler checks each condition before it
+   writes for an item. When a check fails, it writes nothing for that item.
+   - The partition still owns the item (`this.fokos.owns(key)`).
+   - For a cursor move, `cursor_seq` still has the value that the claim read.
+   - For a key removal, the key is still in the key set.
+   - For the delete of a `retry` row, `latest_items.revision` equals the revision that the call sent.
+   - For the delete of a `materialization_outbox` row, `stored.revision == acked.revision` (Section 4.2.3).
+3. **Order.** The handler applies the definite per-item results first. Then, when the call has an `unknown` part, it
+   raises the epoch.
+
+##### Split fences
+
+The rules apply to a split or a promotion of a base `PartitionDO` (the base hop) and of a `MaterializationDO` (each
+target hop). The parent is the source of the split, and the child is each target of the split.
+
+1. **The parent raises its epoch.** Before the parent serves the first page of its export state, it raises its epoch
+   by 1 in one `transactionSync`. The base partition raises `materialization_export_state.epoch`. `MaterializationDO`
+   raises the epoch of each target. The parent stores the raised epoch `E` with the repartition ID, so that each child
+   of the split gets the same `E`.
+2. **The parent stops work on the moved slice.** After the cutover, the parent does not own the moved slice. Thus its
+   claims skip those rows, and its completion handlers write nothing for them (response rule 2). The pages that the
+   parent serves after the cutover hold the final export state of the slice.
+3. **The child stores the fences.** The child gets `(parent DO ID, E)` and the fence rows of the parent:
+
+```sql
+CREATE TABLE IF NOT EXISTS ancestor_fences (
+    hop         TEXT    NOT NULL,  -- 'export', or a target_id
+    ancestor_id BLOB    NOT NULL,  -- 32-byte DurableObjectId
+    min_epoch   INTEGER NOT NULL,
+    until_id    INTEGER NOT NULL,  -- the highest copied seq (target hop) or outbox_id (export hop)
+    PRIMARY KEY (hop, ancestor_id)
+) WITHOUT ROWID, STRICT;
+```
+
+4. **The child sends the fences with its inherited work.** The inherited work is the work that the parent can have in
+   flight at the cutover. While the fence rows of a hop exist, each call of that hop carries all of them.
+   - For a `MaterializationDO` target `t`: the positions at or below `until_id`, and the `target_retry` rows that the
+     child copied (`is_inherited = 1`). The fences of `t` stay while `C_t < until_id` or an inherited `retry` row of `t`
+     exists.
+   - For the base hop: each outbox row with `outbox_id <= until_id`. The child takes no writes while it imports (the
+     lifecycle gate `#whileImporting` in `packages/fokosdb/src/sharding/runtime.ts`), so at the end of the import
+     these are exactly the copied rows. A newer write keeps the `outbox_id` of its row (Section 4.2.3, capture step
+     2). The acknowledgement delete removes the row.
+   - The child counts each copied outbox row as inherited, also a row that had `is_local_only = 1` on the parent. A
+     fence on a call that does not need it is safe. The parent sends no later call for the moved slice, and it sends its
+     other keys with an epoch of `E` or higher.
+   - SQLite gives a new row the ID `MAX(rowid) + 1`. When the row with the highest ID is deleted, a new row can get
+     an ID at or below `until_id`. This is safe: that row gets fences that it does not need, and the fence removal
+     waits for its acknowledgement.
+5. **The child removes the fences.** When no inherited work remains for a hop, the child deletes all fence rows of that
+   hop in one `transactionSync`.
+   - For the base hop, each `transactionSync` that deletes an outbox row also runs
+     `SELECT 1 FROM materialization_outbox WHERE outbox_id <= ?1 LIMIT 1` with `until_id`. This is a seek on the
+     primary key that reads at most 1 row. When it returns no row, the same transaction deletes the export fence
+     rows. After that, the exporter does not run the check.
+   - For a target hop `t`, each `transactionSync` that moves `C_t`, or that deletes or changes an inherited `retry`
+     row of `t`, also checks both conditions of step 4. The first is `C_t >= until_id`. The second is that
+     `SELECT 1 FROM target_retry WHERE target_id = ?1 AND is_inherited = 1 AND kind = 'retry' LIMIT 1` returns no row.
+     The query uses `idx_target_retry_inherited` (Section 4.2.10) and reads at most 1 row. When both are true, the
+     same transaction deletes the fence rows of `t`. After that, the target step does not run the check.
+   - The index leaves out `violation` rows, because a `violation` row has no call in flight. The completion sets
+     `kind = 'violation'` only after the violation cleanup deleted each key in the key set (Section 4.2.10). When the
+     parent wrote the row, no parent call for the item was in flight. When the child changes an inherited row to
+     `violation`, the cleanup calls of the child carried the fences to each key that a late parent call can write.
+   - A grandchild copies the fence rows of its parent and adds its own parent. For the export hop, it sets `until_id`
+     of each export fence row to its own mark, because the outbox IDs of the parent have no meaning in the
+     grandchild.
+   - Thus the list normally holds 0 entries. It holds 1 or 2 entries after a split, until the copied work is done.
+
+The child starts its own epoch at 1. Each receiver has no row for the new `producerId`, so it accepts the first call.
+The child does not depend on a parent descendant check at the receiver, because the child names each ancestor in the
+call.
+
+The fences are enough for these reasons:
+
+1. A late parent call can change a receiver only at an item that the parent had in flight at the cutover.
+2. That item is part of the inherited work of the child:
+   - A target cursor moves only after a definite outcome, so the item has a position above the copied cursor, or a
+     copied `retry` row. Step 3 of Section 4.2.5 never moves a position that a cursor still needs.
+   - A base outbox row of a call in flight stays in the outbox of the parent until the response arrives. Thus the
+     child copies it, with an `outbox_id` at or below `until_id`.
+3. For a GSI item, each key that the parent call could write is in the copied key set (Section 4.2.7, step 1).
+4. Thus the child sends a call with the fences to the receiver of each such key or item. A key always maps to the same
+   GSI partition, and a receiver split copies `producer_fences` with `MAX`.
+5. At that receiver, the late parent call and the child call arrive in one of two orders:
+   - When the late call arrives first, the child call overwrites or deletes its write.
+   - When the child call arrives first, the receiver stores `E`, and it rejects the late call, which has an epoch
+     below `E`.
+
+A promotion source continues to send its other keys with an epoch of `E` or higher, and each receiver accepts them.
+Its calls from before the raise can get `producer_epoch_fenced`. The source discards their responses (response rule 1)
+and sends those items again with epoch `E`.
+
+#### 4.2.10 Failed items and permanent violations
+
+```sql
+CREATE TABLE IF NOT EXISTS target_retry (
+    target_id    TEXT    NOT NULL,
+    item_id      INTEGER NOT NULL,
+    kind         TEXT    NOT NULL, -- 'retry' | 'violation'
+    not_before   INTEGER NOT NULL, -- the backoff
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    is_inherited INTEGER NOT NULL DEFAULT 0, -- 1 when a split copied the row from the parent
+    last_error   TEXT,
+    PRIMARY KEY (target_id, item_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_target_retry_due
+    ON target_retry (target_id, not_before)
+    WHERE kind = 'retry';
+
+CREATE INDEX IF NOT EXISTS idx_target_retry_inherited
+    ON target_retry (target_id)
+    WHERE is_inherited = 1 AND kind = 'retry';
+```
+
+`idx_target_retry_inherited` holds only the `retry` rows that a split copied. The split fences use it (Section 4.2.9,
+"Split fences", step 5). Normal writes do not write to it.
+
+##### Retry rows
+
+Each target step takes the due `retry` rows (`not_before <= now`) first, up to half of `maxItemsPerStep`. Then it fills
+the rest of the batch from the cursor (Section 4.2.6). When the cursor has no work, the `retry` rows can fill the whole
+batch. When no `retry` row is due, the cursor fills the whole batch. Thus the `retry` rows cannot stop the cursor, and
+the cursor cannot stop the `retry` rows. Each item gets its latest image. A failed item has its own backoff and no
+position order, so a due index fits it better than a second cursor.
+
+These rules apply:
+
+1. **A `retry` row owns its item for its target.** The cursor skips an item that has a `retry` row. Thus only one path
+   sends an item for a target at one time.
+2. **A change of the item makes its `retry` rows due.** When the ingest accepts an image of an item that has `retry`
+   rows, it sets `not_before = 0` on these rows. This costs 1 row, only for items in retry. The cursor skips the new
+   position of the item (rule 1), so the `retry` row must send the new image.
+3. **A `violation` row does not own its item.** When the item changes, the cursor sends the new image. When the new
+   image applies, the completion deletes the `violation` row.
+
+The `retry` backoff starts at 1 s, doubles after each failure, and stops at 10 s.
+
+A call is a failure of the whole call when each item of the call fails with a code that can be retried (`unprocessed`,
+or push `retry`). Then the step writes no `retry` row and counts one circuit breaker failure (Section 4.2.15). Thus a
+target that fails each item does not create a `retry` row for each item. When at least one item applies, each failed
+item gets its own `retry` row.
 
 ##### Call outcomes
 
-| Outcome | Meaning | Action in the completion handler |
-| --- | --- | --- |
-| `applied` | The write committed. | Go to the next phase. Set `next_attempt_at = 0`. |
-| `unprocessed` (or push `retry`) | Nothing applied. | Keep the frozen state. Back off. Count a breaker failure. |
-| `rejected` (`batch_request_too_large`) | The RPC is above 32 MiB. Nothing applied. | Split the batch and retry. No violation. |
-| `rejected` (any other code) | A permanent item failure. | Move the item to `'VIOLATION'` (Section 4.2.6). |
-| `unknown` | The write can have applied. | Keep the frozen state, and keep `next_attempt_at` at the deadline fence. |
+| Outcome for an item | Action of the completion |
+| --- | --- |
+| `applied`, and `latest_items.revision` equals the sent revision | Record the revision in the applied map. Delete the `retry` or `violation` row when one exists. |
+| `applied`, and the item changed during the call | For a `retry` item, keep the row with `not_before = 0`. For a cursor item, write nothing: the change has a position above the cursor (Section 4.2.5, invariant 1). |
+| `unprocessed`, or push `retry` | Insert or update the `retry` row: `attempts + 1`, and an exponential backoff from 1 s to 10 s. |
+| `rejected` (`batch_request_too_large`) | The RPC is above 32 MiB, and nothing applied. Split the batch and send again. No row. |
+| `rejected` (any other code) | A permanent item failure. Run the violation cleanup, then set `kind = 'violation'`. |
+| The whole call fails with a definite outcome | Keep the cursor. Write no `retry` row. Back off and count a circuit breaker failure. |
+| `unknown` | Raise the epoch, keep the cursor, and send again at once (Section 4.2.9). |
 
-`MaterializationDO` validates each item before it calls `batchWriteItems`. When `batchWriteItems` still throws a
-validation error for the whole call before I/O, `MaterializationDO` retries each item of that batch alone. Thus only
-the item that is not valid becomes `'VIOLATION'`.
+Example: the batch limit is 100, 3 `retry` rows are due, and `C_t = 500`.
 
-#### 4.2.6 Permanent violations
+1. The step takes the 3 retry items.
+2. It reads positions 501 to 610. It skips 4 positions of items with `retry` rows, 3 positions that the applied map
+   skips, and 6 positions of items that are already in the batch. It sends the other 97 items.
+3. The call returns: 2 retry items applied, 1 retry item is `unprocessed` with `partition_migrating`, and the 97 cursor
+   items applied.
+4. One `transactionSync` deletes 2 `retry` rows, updates 1 `retry` row, and sets `cursor_seq = 610`.
+
+##### Permanent violations
 
 When `MaterializationDO` evaluates a GSI key and projection against `latest_items`, or pushes an item, three cases are
 possible:
 
 1. **Missing or `null` GSI key attribute (a sparse omission, not a violation).** The item is absent from that GSI
-   (`desired = absent`).
-2. **GSI key type or size that is not valid (`VIOLATION`):**
+   (`D` is absent).
+2. **GSI key type or size that is not valid (a violation):**
    - **Type violation.** The extracted GSI key is not a valid non-empty string (`text` with no NUL `\0` and no lone
      UTF-16 surrogate) and not a non-empty `Uint8Array` (`bytes`). Examples: a number, a boolean, an array, an object,
      an empty string, a string that contains `\0` (`key_contains_nul`), an empty byte array, a lone UTF-16 surrogate,
      or a JSON path evaluated against a `bytes` or `text` base item.
    - **Size violation.** The encoded GSI hash key is larger than the `maxHashKeyBytes` of the base table, or the
-     encoded GSI sort key is larger than its `maxSortKeyBytes` (Section 4.2.8).
-3. **Entry that cannot be written (`VIOLATION`):**
+     encoded GSI sort key is larger than its `maxSortKeyBytes` (Section 4.2.14).
+3. **Entry that cannot be written (a violation):**
    - **Projected `'bytes'` attribute in a GSI `projection`.** A GSI `projection` builds a JSONB document
      (`kind = "json"`), which cannot store raw binary values (`Uint8Array`). Each projected cell that evaluates to
      `'bytes'` at run time is a violation, as `update_value_is_bytes` is in `UpdateExpression`. The validation of
@@ -797,29 +1181,71 @@ possible:
    - **Target rejection.** The GSI returns `rejected` with a code other than `batch_request_too_large`, or a push
      target returns `{ outcome: "rejected", code }`.
 
-A permanent failure of one item on a target must mark that `(item_id, target_id)` as `'VIOLATION'` after the cleanup
-of each earlier GSI entry. It must not fail the other items of the batch, block base outbox acknowledgements, or trip
-the target circuit breaker. Thus a poison item does not retry forever. `MaterializationDO` handles a violation in
-these steps:
+A permanent failure of one item on a target must not fail the other items of the batch, block base outbox
+acknowledgements, or trip the target circuit breaker. Thus a poison item does not retry forever. `MaterializationDO`
+handles a violation in these steps:
 
-1. **Clean up each earlier GSI entry.**
-   - When the row has an in-flight GSI key (`inflight_index_hk IS NOT NULL`) that is different from
-     `applied_index_*`, first delete `(inflight_index_hk, inflight_index_sk)`.
-   - When `applied_index_hk IS NOT NULL`, run `DELETE_OLD(applied_index_hk, applied_index_sk)`. Thus the GSI keeps no
-     stale entry from an older valid revision.
-2. **Park in `'VIOLATION'`.**
-   - When the violating revision is a deletion (`latest_items.deleted == 1`), log the violation and delete the
-     `target_item_state` row, so that the tombstone can expire.
-   - Otherwise, when `applied_index_hk` and `inflight_index_hk` are `NULL`, set `status = 'VIOLATION'`,
-     `violation_revision = desired_revision`, `last_error_code = code`, and `next_attempt_at = 0`. Write one
-     structured error log.
-   - `idx_target_item_state_due` indexes only `status IN ('DIRTY', 'IN_FLIGHT')`, so a `'VIOLATION'` row costs the
-     runner no work.
-3. **Recover on a newer write.** When a base write or delete arrives with `revision > violation_revision`,
-   `applyLatestImages` sets `desired_revision = revision` and `next_attempt_at = 0`, and moves `status` from
-   `'VIOLATION'` to `'DIRTY'`.
+1. **Clean up each earlier GSI entry.** For a GSI, the step sends `delete(K)` for each key `K` in the key set, with the
+   rules of Section 4.2.7. Thus the GSI keeps no stale entry from an older valid revision. When a delete fails, the
+   item gets a `retry` row, and a later step runs the cleanup again.
+2. **Park the item.**
+   - When the violating image is a tombstone (`latest_items.deleted_at_ms IS NOT NULL`), the completion logs the
+     violation and deletes the `target_retry` row of the item, so that the tombstone can expire.
+   - Otherwise, the completion sets `kind = 'violation'` and `last_error = code`, and writes one structured error log.
+   - `idx_target_retry_due` indexes only `kind = 'retry'`, so a `violation` row costs the runner no work.
+3. **Recover on a newer write.** When the item changes, the cursor sends the new image (rule 3 of "Retry rows").
 
-#### 4.2.7 Target definitions and table destroy
+#### 4.2.11 Tombstones and garbage collection
+
+- The ingest of a delete writes the tombstone (Section 4.2.4, ingest step 2) and gives it a position.
+- A background sweep on `idx_latest_items_deleted_gc` deletes a tombstone row when each condition is true:
+  1. `newest_seq <= MIN(C_t)`: each target read the tombstone.
+  2. No `target_retry` row exists for `item_id`.
+  3. No `target_index_keys` row exists for `item_id`: each GSI deleted its entries.
+- In the same `transactionSync`, the sweep subtracts the key bytes from `key_size_estimates` and deletes the positions
+  of the item. Condition 1 puts these positions at or below `MIN(C_t)`. This keeps the link-ID delete rule of Section
+  4.2.4.
+- The sweep needs no time horizon:
+  - A late export with a lower revision comes from a producer whose stored epoch at the `MaterializationDO` is above
+    the epoch of the late call.
+  - When the producer is the base partition that exported the delete, the same-epoch rule puts the delete in a call
+    with a higher epoch than the late call, or the late call ended before the delete call started.
+  - When the producer is an ancestor partition, the child exported the item with the split fences (Section 4.2.9).
+- While a target is down, the tombstones stay until that target reads them. A tombstone is a key-only row.
+
+#### 4.2.12 Splits and promotions
+
+Section 4.2.1 gives the three tiers that split independently. Section 4.2.9 ("Split fences") gives the epoch rules of
+a split.
+
+A `MaterializationDO` split or promotion migrates these rows for the items of the slice:
+
+1. `latest_items` with `item_id` and `newest_seq` unchanged.
+2. `change_positions` with `seq` unchanged. The child gives each new image a position above each copied position.
+3. `target_index_keys`.
+4. `target_retry`, with `is_inherited = 1`.
+5. `materialization_targets`, with `cursor_seq` unchanged. The child starts each `epoch` at 1.
+6. `ancestor_fences`: the rows of the parent, plus `(parent DO ID, E, until_id)` for each target. `until_id` is the
+   highest copied position.
+7. `producer_fences`: the whole table, with `MAX(epoch)`. A child must reject each late call that its parent rejects.
+8. The KV item `__fokosdb/mat/targets`: the stored target list of the parent (Section 4.2.13).
+
+A base `PartitionDO` split or promotion migrates the `materialization_outbox` rows of Section 4.2.3. The child also
+gets the `ancestor_fences` row `('export', parent DO ID, E, until_id)` and the export fence rows of the parent. The
+child writes these rows in the `transactionSync` that ends the outbox stream, with `until_id = MAX(outbox_id)`. When
+the slice has no outbox row, no work of the slice is in flight, and the child stores no export fence row.
+
+A GSI `PartitionDO` split migrates the whole `producer_fences` table to each child with `MAX(epoch)`.
+
+`cleanupSourceStep` deletes the moved rows of `latest_items`, `change_positions`, `target_index_keys`, and
+`target_retry` on the source, with the link-ID delete rule. A target step on the source skips an unowned item, and its
+position is then done (Section 4.2.6, target step 2).
+
+The split fences need the final export state of the slice. `RepartitionSource.servePage`
+(`packages/fokosdb/src/sharding/repartition-flow.ts`) rejects each page request before the cutover, for each stream of
+`FokosMigrationHost`. Thus the new streams also serve pages only after the cutover.
+
+#### 4.2.13 Target definitions and table destroy
 
 A user declares GSIs and push targets in a subclass of `MaterializationDO` that overrides `targets()`. This is the same
 pattern as `PartitionDO.fokosConfig()`:
@@ -838,7 +1264,7 @@ export type PushSinkTargetDefinition = {
 	targetId: string;
 	/** Name of the Worker env binding: a service binding (`WorkerEntrypoint`) or a `DurableObjectNamespace`. */
 	binding: string;
-	/** RPC method name that receives `PushTargetItem[]`. */
+	/** RPC method name that receives a `PushTargetBatch`. */
 	method: string;
 	/** Target DO name when `binding` is a `DurableObjectNamespace`. */
 	objectName?: string;
@@ -859,32 +1285,37 @@ export type FokosTargetDefinition = GsiTargetDefinition | PushSinkTargetDefiniti
   - At each start, the partition reads `this.targets()` again and compares it with the stored list. When the two are
     different, it logs one error for each instance with the `targetId` values of both lists. It continues with the
     stored list.
-  - Section 4.4.6 tracks how to add, remove, and change targets.
-- The leaf stores the known `targetId` and `kind` values in a local SQLite table `materialization_targets`. Thus
-  `destroy()` knows each GSI that was ever written.
+  - Section 4.3.6 tracks how to add, remove, and change targets.
+- The leaf stores each `targetId` and `kind` in `materialization_targets` (Section 4.2.6). Thus `destroy()` knows each
+  GSI that was ever written.
 - A helper in `packages/fokosdb/src/shared/do-stubs.ts` resolves `binding` (and `objectName` when present) from the
   Worker `env`.
 
 ##### Table destroy
 
-`FokosDB.destroy()` destroys the shard groups of the table in this order: each writer before its receiver. Thus an
-in-flight RPC never creates a destroyed Durable Object again.
+`FokosDB.destroy()` destroys the shard groups of the table in this order: each writer before its receiver.
 
 1. `fokos.tc.<tableName>`.
 2. `fokos.p.<tableName>`. `fokosPrepareDestroy` fences each base partition, stops its in-memory `#exportPromise`, and
-   waits for it. It returns the maximum `apply_before_ms` of each `attempted = 1` row that had no in-memory promise
-   (from an earlier restart). When that timestamp exists, `destroy()` waits until `maxApplyBeforeMs + maxClockSkewMs`
-   before it deletes storage. The wait is 0 ms when all calls settled in memory or when `captureChanges = false`.
+   waits for it.
 3. `fokos.m.<tableName>`, when `nsMat` is configured. `fokosPrepareDestroy` fences each `MaterializationDO`, stops its
    in-memory `#pushPromise`, and waits for it. It collects the union of the GSI `targetId` values from
-   `materialization_targets`. It returns the maximum `inflight_apply_before_ms` of each unresolved `'IN_FLIGHT'` row
-   that survived a restart. When that timestamp exists, `destroy()` waits until
-   `maxInflightApplyBeforeMs + maxClockSkewMs` before it deletes storage.
+   `materialization_targets`.
 4. `fokos.gsiv1.<n>.<tableName>.<indexName>` for each collected GSI `targetId`.
 
 Each step is idempotent. A caller must not use `<tableName>` again until `destroy()` returns `{ ok: true }`.
 
-#### 4.2.8 GSI tables, composite sort key, and queries
+Destroy is best effort for calls in flight:
+
+- After `fokosPrepareDestroy`, no call of the current instance of a producer stays in flight.
+- A call that a producer sent before a restart can still arrive after its receiver was destroyed. When the receiver is
+  a root hash partition, the call creates it again, because a root takes its identity from its first request.
+- A client call that is in flight during a destroy has the same effect today. A second run of `destroy()` deletes a
+  root that a late call created again.
+- If a later version needs a hard bound, each call can carry its send time, and a receiver can reject a call that is
+  older than `callTimeoutMs`.
+
+#### 4.2.14 GSI tables, composite sort key, and queries
 
 Each GSI is a standard `FokosDB` table in the shard group `fokos.gsiv1.<n>.<tableName>.<indexName>`:
 
@@ -898,11 +1329,13 @@ Each GSI is a standard `FokosDB` table in the shard group `fokos.gsiv1.<n>.<tabl
 `MaterializationDO` and `db.gsi(indexName)` construct the internal GSI `FokosDB` client with `captureChanges = false`
 and no transaction coordinator group.
 
-##### `batchWriteItems` deadline extension
+##### `batchWriteItems` producer extension
 
-`apiBatchWriteItems` (`docs/agent-plans/2026-10-17-batch-get-and-write-items.md`) adds the optional field
-`applyBeforeMs?: number` to `BatchWriteItemsOptions` and `BatchWriteItemsRpcRequest`. Section 4.2.5 ("The write
-deadline fence", step 2) gives the check that each item's `transactionSync` block runs.
+`BatchWriteItemsOptions` (`packages/fokosdb/src/shared/batch-api-types.ts`) and `BatchWriteItemsRpcRequest`
+(`packages/fokosdb/src/server/do-partition.ts`) add the optional fields `producerId`, `epoch`, and `ancestorFences`.
+Only `MaterializationDO` sets them. When they are present, the `transactionSync` block of each item in
+`apiBatchWriteItems` runs the receiver rules of Section 4.2.9. A fenced item returns `unprocessed` with
+`producer_epoch_fenced`. The GSI `PartitionDO` stores `producer_fences` and migrates it on a split (Section 4.2.12).
 
 ##### Order-preserving composite sort key with `<L><flag><D>` trailer
 
@@ -1012,7 +1445,7 @@ Measured in SQLite 3.45.1 over 20,000 rows (the average of 25 runs) for a compil
    projection, `db.gsi(indexName)` decodes `physicalSk` into `{ sortKey: gsiSK, baseHashKey: baseHK, baseSortKey:
    baseSK }`.
 4. **Version.** This spec does not change `version` or `{ ref: "v" }`. On a GSI, both give `items.v` of the GSI entry,
-   not the version of the base item. Section 4.4.5 tracks a base version on GSI queries.
+   not the version of the base item. Section 4.3.5 tracks a base version on GSI queries.
 
 ##### Derived GSI key limits
 
@@ -1027,34 +1460,36 @@ are the `maxHashKeyBytes` and `maxSortKeyBytes` of the base table.
   - `s + digits(s) + 2` covers the `'!'` trailer.
 - With the default limits (`h = 1024`, `s = 512`), `maxSortKeyBytes` is 4,618 bytes.
 
-#### 4.2.9 Backpressure, circuit breaking, and cost
+#### 4.2.15 Backpressure, circuit breaking, and cost
 
-##### Circuit breaking and four-stage backpressure
+##### Circuit breaking
 
 Each `MaterializationDO` keeps one circuit breaker for each target, in memory. A breaker does not cover one
 destination GSI partition:
 
 - When calls to a target fail as a whole (each item fails with a code that can be retried), `MaterializationDO` opens
-  the circuit breaker of that target. It stops freezing new transitions for the target, and sends one probe batch
-  every `probeIntervalMs` (default 5 s) until a probe succeeds.
+  the circuit breaker of that target. It stops claiming batches for the target, and sends one probe batch every
+  `probeIntervalMs` (default 5 s) until a probe succeeds.
 - When only some items of a call fail, for example the items of one GSI partition that migrates, the breaker stays
-  closed. Each failed item retries on its own, and the healthy items continue. Thus the per-item retry keeps a bad
-  GSI partition apart from the healthy partitions, and `MaterializationDO` tracks no GSI partition.
+  closed. Each failed item retries on its own (Section 4.2.10), and the healthy items continue. Thus the per-item retry
+  keeps a bad GSI partition apart from the healthy partitions, and `MaterializationDO` tracks no GSI partition.
 
 The size limits do not change: `MaterializationDO` and the base `PartitionDO` use the existing `1.0x` split threshold
 and the `1.1x maxSizeMb` admission limit. A partition that rejects a write above `1.1x` queues its split.
 
+##### Four-stage backpressure
+
 Pressure moves upstream in four stages:
 
 1. **Stage 1 (target down).** The target circuit breaker opens in `MaterializationDO`. Incoming base exports still
-   update `latest_items` and coalesce `desired_revision` in place. Base writes and healthy targets get no delay.
+   update `latest_items` and the change positions. Base writes and healthy targets get no delay.
 2. **Stage 2 (`MaterializationDO` reaches `1.0x maxSizeMb`).** `MaterializationDO` splits into `hashSplitN` children
    (or promotes a hot key). It does not wait for the down target to recover. Each split multiplies the storage
    capacity.
 3. **Stage 3 (`MaterializationDO` migrating, or at the split floor and at `1.1x maxSizeMb`).** `MaterializationDO`
-   rejects live upserts (`deleted = 0`) in `applyLatestImages` with `partition_migrating` or `partition_over_size`. It
-   still accepts deletions (`deleted = 1`). Base `PartitionDO` instances keep and coalesce compact
-   `materialization_outbox` rows, and base writes continue to succeed.
+   rejects live upserts (`deleted: false`) in `applyLatestImages` with `partition_migrating` or
+   `partition_over_size`. It still accepts deletions (`deleted: true`). Base `PartitionDO` instances keep and coalesce
+   compact `materialization_outbox` rows, and base writes continue to succeed.
 4. **Stage 4 (base `PartitionDO` reaches `1.1x maxSizeMb`).** The base `PartitionDO` splits. At the split floor, it
    rejects new writes with `partition_over_size`.
 
@@ -1062,10 +1497,11 @@ Example of the capacity during a 2-hour outage of 1 of 3 GSIs at 100 base writes
 in total: 72,000 new items and 648,000 mutations across 50,000 existing items.
 
 - The base `materialization_outbox` stays near 0 rows, with 0 ms of extra write latency.
-- `MaterializationDO` coalesces the 648,000 updates into 50,000 rows, which is 83% less GSI work.
-- Each item that is created and deleted during the outage (`applied_revision IS NULL` and `deleted = 1`) converges
-  with 0 RPCs to the down GSI.
-- The 122,000 dirty `target_item_state` rows use about 15 MB across the shard group.
+- `MaterializationDO` coalesces the 648,000 updates into 50,000 changed items, which is 83% less GSI work.
+- An item that is created and deleted during the outage has no key set for the down GSI. Its tombstone then converges
+  with 0 RPCs to that GSI.
+- 122,000 items change. Each changed item has at most 2 positions, so `change_positions` holds at most 244,000 rows.
+  TODO: measure the size of a `change_positions` row.
 - When the GSI recovers, the in-memory runner drains the 122,000 to 172,000 `batchWriteItems` operations in 1.5 to 2.5
   minutes, at 1,000 to 2,000 items/s across 4 `MaterializationDO` partitions. The healthy targets continue to share
   the round-robin workers.
@@ -1077,737 +1513,56 @@ for each write):
 
 | Base write | Today | Base partition | `MaterializationDO` | GSI partitions | Total | `T = 10` |
 | --- | --- | --- | --- | --- | --- | --- |
-| Put, every GSI key stays | 2 | 2 + 3 | 2 + 3T | 2T | 7 + 5T | 57 |
-| Put, every GSI key moves | 2 | 2 + 3 | 2 + 4T | 5T | 7 + 9T | 97 |
-| Delete | 3 | 3 + 3 | 4 + 3T | 3T | 10 + 6T | 70 |
+| Put, new item | 2 | 2 + 3 | 4 + T | 2T | 9 + 3T | 39 |
+| Put, every GSI key stays | 2 | 2 + 2 | 4 | 2T | 8 + 2T | 28 |
+| Put, every GSI key moves | 2 | 2 + 2 | 4 + 2T | 5T | 8 + 7T | 78 |
+| Delete | 3 | 3 + 2 | 6 + T | 3T | 11 + 4T | 51 |
 
 - **Base partition.** A put writes `items` and `key_size_estimates` (2). A delete also writes `deletion_metadata` (3).
-  Capture adds 3 outbox writes: the upsert, the `attempted = 1` claim, and the delete on the acknowledgement.
-- **`MaterializationDO`.** The ingest writes `latest_items` and `key_size_estimates` (2) and `T` target rows. Each GSI
-  writes its target row at each freeze and at each commit: 2 when the key stays, 3 when the key moves. For each target,
-  a delete writes the `DELETE_OLD` freeze and deletes the target row. It also writes `deleted_at_ms` and, later, the
-  tombstone GC delete on `latest_items` and `key_size_estimates`.
+  Capture adds 3 outbox writes for a new item: the upsert, the `is_local_only = 0` claim, and the delete on the
+  acknowledgement. It adds 2 for an update or a delete, because their rows have `is_local_only = 0` and the claim
+  writes no row.
+- **`MaterializationDO` ingest.** `latest_items` and `key_size_estimates` (2), and the position insert and its cleanup
+  delete (2). Step 2 of Section 4.2.5 writes no position when no target read the newest position.
+- **GSI key sets.** A new key costs 1 row. A key move costs 2 rows: the add and the removal. A delete costs 1 row: the
+  delete of the key set. A key that stays costs 0 rows.
+- **Delete.** The tombstone GC deletes `latest_items` and updates `key_size_estimates` (2).
 - **GSI partitions.** A put writes `items` and `key_size_estimates` (2). A delete writes 3 rows.
-- **Push target or sparse GSI.** A push target costs 3 rows in `MaterializationDO` and 0 rows in FokosDB. A sparse GSI
-  with an absent key costs 1 to 2 rows in `MaterializationDO` and 0 rows in the GSI.
+- **Push target or sparse GSI.** A push target costs 0 rows for each item in `MaterializationDO` and 0 rows in FokosDB.
+  A sparse GSI with an absent key and no key set costs 0 rows.
+- **Left out of the table:**
+  - The cursor update costs 1 row for each batch of up to 100 items: about 0.01 rows for each item and each target.
+    `is_batch_open` costs at most 1 more row for each period of target work.
+  - A `producer_fences` row costs 1 row the first time that a producer calls a receiver, and 1 row when its epoch goes
+    up.
+  - An epoch raise costs 1 row at the producer.
+  - `is_call_open` costs at most 2 rows in the base partition for each period of export work.
+  - A failed item costs about 2 rows: the insert of its `retry` row and its delete.
+  - A `retry` row that a split copies adds 1 entry to `idx_target_retry_inherited` at the import, and removes 1 entry
+    when the row is deleted or becomes a `violation` row.
+  - The ingest of an item with `retry` rows costs 1 row for each such row.
 
 When `N` base writes of one item coalesce before the export, the cost is `3N` base rows and one downstream export and
 push cycle. Secondary index updates can add billed row writes. TODO: measure the billed `rowsWritten` in the Workers
 runtime.
 
 One live item with full-item projections across `T` GSIs stores `2 + T` payload copies: base `items`, `latest_items`,
-and `T` GSI rows. Each `target_item_state` row adds about `|gsiHK| + |gsiSK| + 64` bytes.
-
-### 4.3 Open Questions
-
-None.
-
-### 4.4 Future Follow-ups
-
-These features are not part of Milestones 1 to 4. Each one can ship later on its own.
-
-#### 4.4.1 Online target backfill
-
-A user can deploy a new GSI or push target in `MaterializationDO.targets()` on a table that already holds data in
-`latest_items`. Each `MaterializationDO` leaf then waits until its `canSweepLocally` guard is true and each parent
-import is complete. Then it:
-
-1. records `backfill_cursor_item_id = 0` in `materialization_targets`,
-2. runs a bounded background scan over `latest_items` (`WHERE item_id > backfill_cursor_item_id AND deleted = 0`),
-3. inserts `'DIRTY'` rows into `target_item_state` with `ON CONFLICT (item_id, target_id) DO NOTHING`.
-
-`MaterializationDO` stores a full mirror in `latest_items.data`. Thus the backfill of a new target reads nothing from
-the base `PartitionDO` partitions.
-
-#### 4.4.2 `FokosDBAutoAdminDO` catalog and activation status
-
-Some applications need a cluster-wide `BACKFILLING | ACTIVE` status check when they add a GSI online. For them, a
-singleton `FokosDBAutoAdminDO` (`fokos.admin.<tableName>`) can walk the `fokos.m.<tableName>` owners. It reports the
-target as `ACTIVE` when each initialized leaf has:
-
-- finished its import (`importState === null || importState === "imported" || importState === "active"`),
-- completed its `latest_items` backfill scan,
-- drained its initial `target_item_state` backlog for the new target.
-
-#### 4.4.3 Per-GSI topology and key-limit overrides
-
-A workload can need a GSI with a higher `rootTreesN`, or a different `maxHashKeyBytes` or `maxSortKeyBytes`, than the
-base table. `FokosTableOptions` (or `db.gsi(indexName, opts)`) can then carry these overrides for each GSI. Thus
-`MaterializationDO` and the caller `FokosDB` client construct identical `FokosRouteContext` topologies for that GSI
-shard group.
-
-#### 4.4.4 Capture on a table that has data
-
-This spec allows `captureChanges` only on a new table (Section 4.2.3). A later spec can enable capture on a table that
-already holds items. It must solve two problems:
-
-- An item that gets no write after the policy change has no outbox row, so it never reaches `latest_items`.
-- A partition that has not yet received the new policy writes no outbox row.
-
-A possible design:
-
-1. The policy change turns on capture with a new `policyVersion`. Each base partition that gets it starts to write
-   outbox rows for new mutations.
-2. Each base partition runs a bounded background scan over `items` with a durable cursor. The scan writes an outbox
-   row for each item that has no outbox row. The export path of Section 4.2.3 then sends the items, and the revision
-   rules of `MaterializationDO` drop each duplicate.
-3. A split or a promotion migrates the scan cursor with the slice.
-4. A catalog, for example `FokosDBAutoAdminDO` (Section 4.4.2), walks the base partitions and reports the capture as
-   active when each owner has finished its scan. Then the targets can backfill from `latest_items` (Section 4.4.1).
-
-#### 4.4.5 Base version on GSI queries
-
-Each GSI is a standard `PartitionDO` table. Thus `items.v` in a GSI partition counts the writes to that
-`(gsiHK, physicalSk)` entry, not the `version` (`revision`) of the base item. This spec keeps the current behavior:
-`version` and `{ ref: "v" }` on a GSI give that local `items.v` (Section 4.2.8).
-
-A later spec can change this:
-
-- `db.gsi(indexName).queryItems` can omit `version`, and the compiler can reject `{ ref: "v" }` in a GSI `filter` or
-  `projection`.
-
-- `MaterializationDO` can store the base `revision` in each GSI entry. `db.gsi(indexName).queryItems` then returns it
-  as `version`, and `{ ref: "v" }` reads it.
-- A caller-provided `external_version` on base writes can travel with the item to the GSIs and the push targets.
-
-#### 4.4.6 Target changes and target versions
-
-The first version fixes the target list of each partition (Section 4.2.7). A later spec must define how to add,
-remove, and change targets. During a gradual rollout, old and new Worker versions run at the same time. One
-`MaterializationDO` can restart on the old version after it ran on the new version, so it can see the two lists one
-after the other. Thus a list change must not depend on the code version that a partition runs. The spec must solve
-these problems:
-
-1. **Versions.** Each target list has an integer version, for example `targetsVersion`, as `policyVersion` has. A
-   partition stores a list only when its version is above the stored version, and it ignores a list with a lower
-   version. Thus an oscillation between two code versions cannot move a partition back.
-2. **One list across the shard group.** In the first version, each root stores the list from its first request. A
-   root that gets its first request after a code change can store a different list. A version scheme, or a catalog
-   such as `FokosDBAutoAdminDO` (Section 4.4.2), must give all partitions the same list.
-3. **Fixed definitions.** A `targetId` keeps one definition for its whole life. A changed definition is a new
-   `targetId` and the removal of the old `targetId`. Thus no GSI holds entries of two definitions.
-4. **Add.** A new target starts its cursor at the highest position, and then runs the backfill of Section 4.4.1. The
-   GSI must not serve queries until each partition finished the backfill (Section 4.4.2).
-5. **Remove.** A bounded background job deletes the rows of the target (cursor, key sets, retry rows). The target then
-   no longer blocks the tombstone GC and the position cleanup. `destroy()` still finds the GSI shard group through
-   `materialization_targets`, and a separate step can destroy it.
-6. **A target that is broken for good**, for example a deleted service binding, keeps all tombstones and positions
-   until it recovers. The removal of item 5 is the way out, so it must not need the target to answer.
-
-## 5. Alternative Options
-
-### 5.1 Base outbox, base shadow, and stateless Queue fan-out
-
-This option keeps `_fokos_change_pending (baseKey, version, newImage)` and
-`_fokos_change_shadow (baseKey, lastShippedKeyAttrs)` in the base `PartitionDO`. It sends batches to a Cloudflare
-Queue. Stateless queue consumers compute `oldGsiKey -> newGsiKey` and apply LWW writes and tombstones to the GSIs. It is
-rejected for five reasons:
-
-1. **Permanent orphan GSI entries under `A -> B -> C` after a crash between `queue.send()` and the shadow update.**
-   `await env.QUEUE.send()` and SQLite `transactionSync` cannot commit atomically:
-   - The DO sends `{ old: A, new: B, v: 2 }` and crashes before it sets `shadow = B`.
-   - A client then writes `v3 (C)`. The next alarm coalesces the outbox to `v3 (C)` with `shadow = A` and sends
-     `{ old: A, new: C, v: 3 }`.
-   - Both messages delete `A`, and `B@v2` stays in the GSI forever.
-   - To set `shadow = B` before `queue.send()` has the opposite defect when `queue.send()` fails: `A@v1` stays forever.
-2. **`last_write_ts` does not strictly increase for each item.** Two writes in `maxClockSkewMs` can share the same
-   `last_write_ts`, which breaks timestamp-based LWW.
-3. **The 128 KB limit of Cloudflare Queues is less than the 400 KB item limit.** An item above 128 KB cannot fit in a
-   Queue message. A pointer fails when the base item changes or is deleted before all consumers read it.
-4. **Base partition bloat and coupling.** A `newImage` in the base outbox duplicates 400 KB payloads during downstream
-   outages. `lastShippedKeyAttrs` couples the base partition to all 10 GSI key extractors.
-5. **Tombstone retention depends on the age of the Queue and its DLQ.** Delayed queue messages force GSI partitions to
-   keep tombstones for days.
-
-### 5.2 Separate `GsiMaintainerDO` worker tier
-
-A separate DO tier that claims dirty work from `MaterializationDO` is rejected. `MaterializationDO` already shards by
-`(baseHK, baseSK)` and holds `latest_items` and `target_item_state` in local SQLite. A push directly from
-`MaterializationDO` has no extra DO hop and no distributed work leases.
-
-### 5.3 Pull cursors (`change_seq`) for push targets
-
-A partition-local `change_seq` for external pull consumers is rejected. With pull cursors, each consumer must track
-partition splits and join the cursor epochs of a parent and its children. Push targets use `target_item_state`, which
-migrates with each `MaterializationDO` split.
-
-### 5.4 One sidecar `MaterializationDO` for each base `PartitionDO`
-
-A sidecar DO `<part>.mat` for each base partition `<part>` is rejected for two reasons:
-
-- A base split or promotion forces the sidecar to split, also when the materialization state is small.
-- Out-of-order exports from an old parent and a new child no longer arrive at the same `MaterializationDO`.
-
-### 5.5 A hash or a local integer ID in the GSI sort key
-
-1. **Fixed-size hash suffix `H128(baseHK, baseSK)`.** Rejected. Two base items can share `(gsiHK, gsiSK)` and have the
-   same hash. Then `WRITE_NEW` overwrites one item, and `DELETE_OLD` deletes the other.
-2. **Partition-local `(baseHK, baseSK) -> id` lookup tables, or reference-counted `KeyBytes -> id` lookup tables.**
-   Rejected for three reasons:
-   - They double or triple `rowsRead` and `rowsWritten` on puts, deletes, and queries.
-   - GSI tables become different from standard `PartitionDO` tables.
-   - A split migration must compute the reference counts again across the child slices.
-
-### 5.6 Per-target cursors over change positions in `MaterializationDO`
-
-**Status:** Not decided. This option replaces `target_item_state`, the target state machine, and the write deadline
-fence of Sections 4.2.4 and 4.2.5. It also replaces `deletedRevisionHorizonMs`. Sections 4.2.1 to 4.2.3 and 4.2.6 to
-4.2.8 stay, with the changes that this section gives.
-
-#### 5.6.1 Why
-
-The design of Section 4.2 has two costs:
-
-1. **Rows written for each item and each target.** Each target writes its `target_item_state` row at the ingest,
-   before each outbound call, and at each commit. Section 4.2.9 gives `2 + 3T` rows in `MaterializationDO` for each
-   base write.
-2. **Correctness that depends on clocks.**
-   - The write deadline fence (Section 4.2.5) prevents an orphan GSI entry only while the clock offset between two
-     Durable Objects stays below `maxClockSkewMs`.
-   - The `latest_items` tombstone rejects a late export only during `deletedRevisionHorizonMs`.
-   - After an `unknown` outcome, an item waits about 32 s before its next call.
-
-This option writes a row for each item and each target only when a GSI key changes or an item fails. No correctness
-rule depends on a clock or a timeout.
-
-#### 5.6.2 Design overview
-
-1. **Change positions (Section 5.6.3).** `MaterializationDO` gives each accepted image a position in a table that all
-   targets share. When an item changes again, the ingest keeps or moves its position. Each target reads each changed
-   item, and no target starves.
-2. **One cursor for each target (Section 5.6.4).** Each target reads the positions above its cursor and sends the
-   latest image of each item in batches. It moves its cursor one time for each batch.
-3. **GSI key sets (Section 5.6.5).** For each item and each GSI, `target_index_keys` holds the GSI keys that can have
-   an entry in the index. `MaterializationDO` writes this row only when a key is added or removed.
-4. **Producer epochs (Section 5.6.6).** Each call carries the ID and the epoch of its sender. A receiver rejects a call
-   whose epoch is below the highest epoch that it stored for that sender. A child partition fences its parent with the
-   same mechanism.
-5. **Retry rows (Section 5.6.7).** An item that fails gets a `target_retry` row, and the cursor continues past it.
-
-```text
-Base PartitionDO (producer: base DO ID, export epoch)
-  - materialization_outbox (Section 4.2.3) + inherited_fence
-          |
-          | applyLatestImages(producerId, epoch, ancestorFences)
-          v
-MaterializationDO (receiver: producer_fences; producer: MaterializationDO DO ID, one epoch per target)
-  - latest_items (+ newest_seq), change_positions
-  - materialization_targets: cursor_seq, epoch, open_batch
-  - target_index_keys (GSI only), target_retry, ancestor_fences
-          |
-          +---------------------------------------------+
-          | batchWriteItems(producerId, epoch,          | PushTargetItem[] + producerId, epoch,
-          |   ancestorFences)                           |   ancestorFences
-          v                                             v
-GSI PartitionDO (receiver: producer_fences)         Push target (drops revision <= applied revision)
-```
-
-#### 5.6.3 Change positions
-
-```sql
-CREATE TABLE IF NOT EXISTS change_positions (
-    seq      INTEGER PRIMARY KEY,
-    item_id  INTEGER NOT NULL,
-    prev_seq INTEGER            -- the older position of the same item, or NULL
-) STRICT;
-```
-
-`latest_items` adds the column `newest_seq INTEGER`, the newest position of the item. The ingest writes the
-`latest_items` row in all cases, so this column adds no row write. `change_positions` has no secondary index. `seq` is
-the rowid, and the ingest finds the positions of an item through `newest_seq` and `prev_seq`.
-
-Each target `t` has two positions:
-
-- `C_t` is `cursor_seq` in SQLite. Each position at or below `C_t` is done for `t`.
-- `R_t` is in memory. While a batch of `t` is in flight, `R_t` is the highest position that the batch read. Otherwise,
-  `R_t = C_t`. After a restart, `R_t = C_t`.
-
-When `MaterializationDO` accepts an image of item X, it reads `e = latest_items.newest_seq` and the row `e` to get
-`p = prev_seq`. A position at or below `MIN(C_t)` counts as absent. `N` is the next position, above each position in
-the partition. Then the ingest does one of these steps:
-
-1. **When `e` is absent,** the ingest inserts `(N, X, NULL)` and sets `newest_seq = N`.
-2. **When `R_t < e` for each target,** the ingest writes no position. No target has read `e`, so each target reads the
-   new image at `e`.
-3. **When each target with `C_t < e` also has `C_t < p`,** the ingest moves `e` to `N`
-   (`UPDATE change_positions SET seq = N WHERE seq = e`) and sets `newest_seq = N`. Each target that has not finished
-   `e` reaches `p` first. Each other target finds X at `N`.
-4. **Otherwise,** the ingest inserts `(N, X, e)` and sets `newest_seq = N`.
-
-When no target is registered, the ingest writes no position. A cleanup step deletes the rows with
-`seq <= MIN(C_t)` in bounded chunks.
-
-The positions must keep these invariants:
-
-1. **Each target reads each change.** When target `t` has not applied the latest image of X, X has a position above
-   `C_t`, or X has a `retry` row for `t` (Section 5.6.7).
-2. **No target starves.** The ingest moves only the newest position of an item, and only when no target depends on
-   that position. Thus the oldest position of X above `C_t` stays fixed until `t` reads it. A hot item cannot move
-   ahead of a lagging cursor.
-3. **Step 2 uses `R_t`, and step 3 uses `C_t`.**
-   - A batch in flight can hold the old image of X from position `e`. If step 2 used `C_t`, the ingest would write no
-     new position, the batch would move the cursor past `e`, and the new image would be lost.
-   - When that batch fails, the target reads again from `C_t`. Thus step 3 must count the target as a target that still
-     needs `e`.
-4. **At most `T + 1` positions for each item.** Each position of X above `MIN(C_t)` serves a different group of
-   cursors. Thus the table grows with the number of changed items, not with the number of mutations.
-
-Example: the GSI `g` reads at the end of the positions. The push target `lake` is down at `C_lake = 10`.
-
-| Change of X | Positions of X | Ingest step |
-| --- | --- | --- |
-| rev 1 | 100 | Step 1: X has no position. |
-| `g` reads 100. rev 2 | 100, 205 | Step 4: `lake` needs 100, and `p` is absent. |
-| `g` reads 205. rev 3 | 100, 310 | Step 3: `lake` reaches 100 first, so 205 moves to 310. |
-| `g` reads 310. rev 4 | 100, 415 | Step 3. |
-
-When `lake` recovers, it reads position 100 and sends the latest image of X. At position 415, the applied map
-(Section 5.6.4) skips X.
-
-#### 5.6.4 Target cursor and target step
-
-`materialization_targets` (Section 4.2.7) adds three columns:
-
-```sql
-CREATE TABLE IF NOT EXISTS materialization_targets (
-    target_id   TEXT    PRIMARY KEY,
-    kind        TEXT    NOT NULL,
-    cursor_seq  INTEGER NOT NULL DEFAULT 0,
-    epoch       INTEGER NOT NULL DEFAULT 1,
-    open_batch  INTEGER NOT NULL DEFAULT 0  -- 1 while a batch of this target can be in flight
-) WITHOUT ROWID, STRICT;
-```
-
-The in-memory runner of Section 4.2.5 stays. `targetConcurrency` (default 2) workers round-robin across the targets,
-and each target has at most 1 batch in flight.
-
-Each target also keeps an in-memory map `item_id -> revision`, the applied map:
-
-- The map holds the revisions that the target applied in its current epoch.
-- The map has at most `appliedMapMaxEntries` (default 10,000) entries for each target, with least-recently-used
-  eviction.
-- The map is only an optimization. When the map has no entry for an item, the target sends the item again, and the
-  receiver drops the duplicate or writes the same entry again.
-
-A step of target `t` has these parts:
-
-1. **Claim.** In one `transactionSync`, the step:
-   - takes the due `retry` rows of `t`, up to half of `maxItemsPerStep` (Section 5.6.7),
-   - reads the positions above `C_t` in `seq` order to fill the batch, up to `maxItemsPerStep` (100, the
-     `batchWriteItems` limit) items, `maxBytesPerStep` (16 MiB, below the RPC limit) of item data, and
-     `maxScannedPositions` (5,000) positions,
-   - sets `open_batch = 1` when it is `0` (Section 5.6.6).
-
-   The claim stops at the first limit that it reaches. When the claim finds no item to send, it sets `cursor_seq` to
-   the highest position that it read, in the same `transactionSync`. It sends no call and does not set `open_batch`. Thus a long run of skipped
-   positions (step 2), for example the positions of a promoted key, moves the cursor in bounded steps.
-2. **Filter.** For each position, the step joins `latest_items` by `item_id`. It skips the position when one of these
-   conditions is true:
-   - the item has a `retry` row for `t`,
-   - the item is already in the batch,
-   - the applied map holds `latest_items.revision` for the item,
-   - the partition does not own the item (`!this.fokos.owns(key)`), because the item moved to another partition.
-
-   A skipped position is done for `t`.
-3. **Build.** The step builds the entries from the latest image of each item: a push record (Section 5.6.8) or GSI
-   entries (Section 5.6.5). It sets `R_t` to the highest position that the claim read.
-4. **Send.** The step sends the call with `producerId`, `epoch`, and the ancestor fences (Section 5.6.6).
-5. **Complete.** In one `transactionSync`, the step applies the response with the rules of Section 5.6.6. When each
-   item of the batch is applied or has a `retry` row, it sets `cursor_seq` to the highest position that the claim read.
-   When the target has no more due work (no position above the new cursor and no due `retry` row), the same update
-   sets `open_batch = 0`. This is 1 row update in `materialization_targets` for each batch. Then the step sets
-   `R_t = C_t`.
-
-The cursor moves to the highest position that the claim read, not to the position of the last item that the step
-sent. The skipped positions are done for `t`.
-
-A new target needs the backfill of Section 4.4.1, because the cleanup deletes the positions that all earlier targets
-passed. Before the backfill scan starts, the new target sets `cursor_seq` to the highest position. Thus each change
-during the scan reaches the target through a position.
-
-#### 5.6.5 GSI key sets
-
-```sql
-CREATE TABLE IF NOT EXISTS target_index_keys (
-    key_set_id  INTEGER PRIMARY KEY,
-    item_id     INTEGER NOT NULL,
-    target_id   TEXT    NOT NULL,
-    index_keys  BLOB    NOT NULL,  -- encoded list of (index_hk, gsiSK) pairs
-    UNIQUE (item_id, target_id)
-) STRICT;
-```
-
-The key set of `(item_id, target_id)` holds each GSI key that can have an entry of the item in that GSI. When no row
-exists, the GSI has no entry of the item. The set normally holds 1 key. It holds 2 keys while a key moves. It holds
-more keys only after failed deletes. `index_keys` stores the encoded `gsiSK`, not `physicalSk`, for the reason of
-Section 4.2.4. It is a rowid table, because the keys can be multiple kilobytes (Section 1.3).
-
-For each item in a batch of GSI target `t`, the step evaluates the desired GSI key `D` from the latest image with the
-rules of Section 4.2.5 (step 2). `D` is absent when the item is deleted or when a GSI key attribute is missing or
-`null`. A permanent violation follows Section 4.2.6. Then the step does these steps:
-
-1. **When `D` is present and is not in the set,** the claim `transactionSync` adds `D` to the set before the call.
-2. **The first call** sends `put(D)` when `D` is present. When `D` is absent, it sends `delete(K)` for each key `K` in
-   the set.
-3. **The second call** of the same step sends `delete(K)` for each key `K` in the set other than `D`, after `put(D)`
-   applied. Thus a key move writes the new entry before it deletes the old entry, as in Section 4.2.5.
-4. **After `delete(K)` applies in the current epoch,** the completion removes `K` from the set. When the set becomes
-   empty, the completion deletes the row.
-
-When `D` is present and is the only key in the set, the step writes no row. `put(D)` overwrites the entry with the
-latest projection. When `D` is absent and no row exists, the step sends no call and writes no row.
-
-The key set prevents an orphan GSI entry in two cases:
-
-- **The sender stops between `put(D)` and a later record of `D`.** Then the item moves to `E`. If `D` were not
-  recorded, no step would delete the entry at `D`. The rule of step 1 stores each key that a call can write before
-  the call.
-- **A `delete(K)` has an `unknown` outcome.** The entry at `K` can still exist. Thus `K` stays in the set until a
-  `delete(K)` applies, and a later step deletes it again.
-
-The two calls of one step run in sequence and carry different GSI keys of the item. Thus they keep the same-epoch
-rule of Section 5.6.6.
-
-#### 5.6.6 Producer epochs and fences
-
-##### Producers and receivers
-
-| Hop | Producer ID | Epoch storage at the producer | Receiver checks |
-| --- | --- | --- | --- |
-| Base `PartitionDO` -> `MaterializationDO` (`applyLatestImages`) | 32-byte `DurableObjectId` of the base partition | `materialization_export_state` | The producer epoch, then the revision (Section 4.2.4) |
-| `MaterializationDO` -> GSI `PartitionDO` (`batchWriteItems`) | 32-byte `DurableObjectId` of the `MaterializationDO` | `materialization_targets.epoch` of the GSI target | The producer epoch |
-| `MaterializationDO` -> push target | 32-byte `DurableObjectId` of the `MaterializationDO` | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 5.6.8). |
-
-Each GSI shard group gets calls from one target only. Thus a GSI partition stores one epoch for each
-`MaterializationDO`, and the producer ID needs no `targetId`. The `DurableObjectId` has a fixed size of 32 bytes. A
-partition ID or a DO name can hold user keys, which can be multiple kilobytes.
-
-The base partition stores its export state in one row:
-
-```sql
-CREATE TABLE IF NOT EXISTS materialization_export_state (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    epoch       INTEGER NOT NULL DEFAULT 1,
-    open_calls  INTEGER NOT NULL DEFAULT 0  -- 1 while an export call can be in flight
-) STRICT;
-```
-
-Each receiver (`MaterializationDO` for the base hop, and each GSI `PartitionDO`) stores the highest epoch of each
-producer:
-
-```sql
-CREATE TABLE IF NOT EXISTS producer_fences (
-    producer_id  BLOB    PRIMARY KEY,  -- 32-byte DurableObjectId
-    epoch        INTEGER NOT NULL
-) WITHOUT ROWID, STRICT;
-```
-
-##### Receiver rules
-
-For each item of a call, in the `transactionSync` of that item, the receiver does these steps:
-
-1. For each ancestor fence `(ancestorId, minEpoch)` of the call, when the stored epoch of `ancestorId` is below
-   `minEpoch`, it stores `minEpoch`. An absent row has the epoch `0`.
-2. When the epoch of the call is below the stored epoch of `producerId`, it writes nothing for the item and returns
-   `unprocessed` with `producer_epoch_fenced`. This outcome is definite: the item did not apply.
-3. When the epoch of the call is above the stored epoch, it stores the epoch of the call.
-4. It applies the item. `MaterializationDO` also applies the revision rules of Section 4.2.4.
-
-The receiver writes a `producer_fences` row only when an epoch goes up. In normal operation, the epoch stays the same,
-and the check adds no row write. The receiver keeps the row of each producer in memory after the first read.
-
-The receiver must not delete a `producer_fences` row. A deleted row has the epoch `0`, and a late call of that
-producer then applies. The number of rows is the number of producers that ever sent to the receiver. A row is about
-50 bytes, so 10,000 producers use about 500 KB in each receiver. TODO: measure the row size.
-
-A receiver split copies the whole table to each child with `MAX(epoch)` (Section 5.6.10). The partition that applies
-a forwarded call checks it.
-
-##### The same-epoch rule
-
-Two calls of one producer with the same epoch must not carry the same item at the same time.
-
-- **Why.** The receiver cannot order two calls with the same epoch. For example, the base exporter sends X at revision
-  2 and, in a parallel call, the delete of X at revision 3. Revision 3 applies, and the targets read the tombstone, so
-  the garbage collection of Section 5.6.9 deletes it. Then revision 2 arrives, and X is created again.
-- **`MaterializationDO` -> target.** Each target has at most 1 batch in flight, and the two calls of a GSI step run in
-  sequence. Thus the rule is always true.
-- **Base `PartitionDO` -> `MaterializationDO`.** The exporter sends up to `maxExportCalls` (default 2) calls in
-  parallel. It keeps an in-memory set of the item keys in calls in flight. The claim skips each outbox row whose key is
-  in the set. A key leaves the set when its call returns. The calls stay full of other items, and a skipped item merges
-  its newer writes into its outbox row until its call returns.
-
-##### When the producer raises its epoch
-
-The producer raises its epoch by 1 in SQLite before its next call on that hop, in these cases:
-
-1. **After an `unknown` outcome.** An `unknown` outcome is a thrown call, a transport failure, a response of the wrong
-   length, or a timeout at the producer. The old call can still apply. The producer raises the epoch in the
-   `transactionSync` that prepares the next call.
-2. **At a cold start, when a call from before the restart can still be in flight.** That call can still apply. The
-   producer checks this before its first call after the restart:
-   - **`MaterializationDO`, for each target:** `open_batch = 1`.
-   - **Base `PartitionDO`:** `open_calls = 1`.
-
-   When the check finds no call that can be in flight, the epoch stays.
-3. **At a split cutover** (see "Split fences" below).
-
-The producer must store the raised epoch before it sends the next call. If the producer sent the call first and then
-stopped, it could use the old epoch again after the restart.
-
-The cold-start checks keep the epoch stable across idle restarts. If each cold start raised the epoch, the producer
-would write 1 row after each wake, and each receiver that it calls next would write 1 `producer_fences` row. A
-`MaterializationDO` that wakes for each base write would then write 1 row in each GSI partition that it reaches.
-
-- **`open_batch`** costs at most 1 more row for each period of target work, not 1 row for each batch:
-  - The claim sets `open_batch = 1` only when it is `0`. The runner keeps the value in memory, so the next claims write
-    no row for the marker.
-  - The completion of the last batch clears it in the cursor update, which it writes in all cases (Section 5.6.4,
-    step 5).
-- **`open_calls`** costs at most 2 rows for each period of export work, not 1 row for each batch or each item:
-  - The claim `transactionSync` sets `open_calls = 1` only when no export call is in flight. The exporter keeps the
-    value in memory, so a claim while `open_calls = 1` writes no row for the marker.
-  - The completion `transactionSync` of the last call in flight sets `open_calls = 0`.
-  - The cold-start check reads 1 row. It does not depend on the size of the outbox, so a large outbox after a long
-    outage does not make each cold start slower.
-- **Optional optimization (not in the first version): delayed clear.** For a partition in memory that gets one write
-  and then a pause, each write is a new period of export work, so it costs 2 rows for `open_calls`. The exporter can
-  clear `open_calls` only after no call was in flight for a short time. If the DO is evicted before the clear, the
-  next cold start raises the epoch, which is correct.
-
-After an `unknown` outcome, the producer sends again at once:
-
-- `MaterializationDO` reads again from `C_t`, because the cursor did not move. Thus the new call carries each item of
-  the old call. For a GSI item, it contacts each key in the key set, and the set holds each key that the old call
-  could write. Thus each receiver that the old call could reach gets the new epoch.
-- The base exporter sends the same outbox rows again, at their current revision, to the `MaterializationDO` of each
-  key.
-- At each receiver, the old call and the new call can arrive in two orders:
-  - When the old call arrives first, the new call overwrites or deletes its write.
-  - When the new call arrives first, the receiver stores the new epoch and rejects the old call.
-
-A producer can stop its wait for a slow call after `callTimeoutMs`. The outcome is then `unknown`, and the rules above
-apply. The value of `callTimeoutMs` changes cost and latency, not correctness. Each timeout costs 1 row at the
-producer and 1 row at each receiver that gets the new epoch first. The default of `callTimeoutMs` is 30 s. TODO:
-measure the normal call duration and tune the default.
-
-##### Response rules
-
-The completion handler of a call applies these rules:
-
-1. **Old epochs.** When the epoch of the call is below the current epoch of the hop, the handler discards the response
-   and writes nothing. A call of the new epoch decides the outcome. A `producer_epoch_fenced` result of an old call is
-   not a circuit breaker failure.
-2. **Checks before each write.** In the completion `transactionSync`, the handler checks each condition before it
-   writes for an item. When a check fails, it writes nothing for that item.
-   - The partition still owns the item (`this.fokos.owns(key)`).
-   - For a cursor move, `cursor_seq` still has the value that the claim read.
-   - For a key removal, the key is still in the key set.
-   - For the delete of a `retry` row, `latest_items.revision` equals the revision that the call sent.
-   - For the delete of a `materialization_outbox` row, `stored.revision == acked.revision` (Section 4.2.3).
-3. **Order.** The handler applies the definite per-item results first. Then, when the call has an `unknown` part, it
-   raises the epoch.
-
-##### Split fences
-
-The rules apply to a split or a promotion of a base `PartitionDO` (the base hop) and of a `MaterializationDO` (each
-target hop). The parent is the source of the split, and the child is each target of the split.
-
-1. **The parent raises its epoch.** Before the parent serves the first page of its export state, it raises its epoch
-   by 1 in one `transactionSync`. The base partition raises `materialization_export_state.epoch`. `MaterializationDO`
-   raises the epoch of each target. The parent stores the raised epoch `E` with the repartition ID, so that each child
-   of the split gets the same `E`.
-2. **The parent stops work on the moved slice.** After the cutover, the parent does not own the moved slice. Thus its
-   claims skip those rows, and its completion handlers write nothing for them (response rule 2). The pages that the
-   parent serves after the cutover hold the final export state of the slice.
-3. **The child stores the fences.** The child gets `(parent DO ID, E)` and the fence rows of the parent:
-
-```sql
-CREATE TABLE IF NOT EXISTS ancestor_fences (
-    hop          TEXT    NOT NULL,  -- 'export', or a target_id
-    ancestor_id  BLOB    NOT NULL,  -- 32-byte DurableObjectId
-    min_epoch    INTEGER NOT NULL,
-    until_seq    INTEGER,           -- MaterializationDO: the highest copied position. NULL for the base hop.
-    PRIMARY KEY (hop, ancestor_id)
-) WITHOUT ROWID, STRICT;
-```
-
-4. **The child sends the fences with its inherited work.** The inherited work is the work that the parent can have in
-   flight at the cutover:
-   - For a `MaterializationDO` target `t`: the positions at or below `until_seq`, and the `target_retry` rows that the
-     child copied (`inherited = 1`). Each call of `t` carries the fences while `C_t < until_seq` or an inherited
-     `retry` row of `t` exists.
-   - For the base hop: the outbox rows copied with `attempted = 1`. The migration sets `inherited_fence = 1` on them.
-     The export of such a row carries the fences. A newer write that replaces the row keeps the flag. The flag goes
-     away with the row at the acknowledgement delete.
-5. **The child removes the fences.** When no inherited work remains for a hop, the child deletes the fence rows of that
-   hop. A grandchild copies the fence rows of its parent and adds its own parent. Thus the list normally holds 0
-   entries, and it holds 1 or 2 entries for a short time after a split.
-
-The child starts its own epoch at 1. Each receiver has no row for the new `producerId`, so it accepts the first call.
-The child does not depend on a parent descendant check at the receiver, because the child names each ancestor in the
-call.
-
-Why the fences are enough:
-
-1. A late parent call can change a receiver only at an item that the parent had in flight at the cutover.
-2. That item is part of the inherited work of the child:
-   - A target cursor moves only after a definite outcome, so the item has a position above the copied cursor, or a
-     copied `retry` row. Step 3 of Section 5.6.3 never moves a position that a cursor still needs.
-   - A base outbox row of a call in flight has `attempted = 1`.
-3. For a GSI item, each key that the parent call could write is in the copied key set (Section 5.6.5, step 1).
-4. Thus the child sends a call with the fences to the receiver of each such key or item. A key always maps to the same
-   GSI partition, and a receiver split copies `producer_fences` with `MAX`.
-5. At that receiver, the late parent call and the child call arrive in one of two orders:
-   - When the late call arrives first, the child call overwrites or deletes its write.
-   - When the child call arrives first, the receiver stores `E`, and it rejects the late call, which has an epoch
-     below `E`.
-
-A promotion source continues to send its other keys with an epoch of `E` or higher, and each receiver accepts them.
-Its calls from before the raise can get `producer_epoch_fenced`. The source discards their responses (response rule 1)
-and sends those items again with epoch `E`.
-
-#### 5.6.7 Failed items (`target_retry`)
-
-```sql
-CREATE TABLE IF NOT EXISTS target_retry (
-    target_id   TEXT    NOT NULL,
-    item_id     INTEGER NOT NULL,
-    kind        TEXT    NOT NULL, -- 'retry' | 'violation'
-    not_before  INTEGER NOT NULL, -- the backoff
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    inherited   INTEGER NOT NULL DEFAULT 0, -- 1 when a split copied the row from the parent
-    last_error  TEXT,
-    PRIMARY KEY (target_id, item_id)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS idx_target_retry_due
-    ON target_retry (target_id, not_before)
-    WHERE kind = 'retry';
-```
-
-Each target step takes the due `retry` rows (`not_before <= now`) first, up to half of `maxItemsPerStep`. Then it fills
-the rest of the batch from the cursor (Section 5.6.4). When the cursor has no work, the `retry` rows can fill the whole
-batch. When no `retry` row is due, the cursor fills the whole batch. Thus the `retry` rows cannot stop the cursor, and
-the cursor cannot stop the `retry` rows. Each item gets its latest image. A failed item has its own backoff and no
-position order, so a due index fits it better than a second cursor.
-
-These rules apply:
-
-1. **A `retry` row owns its item for its target.** The cursor skips an item that has a `retry` row. Thus only one path
-   sends an item for a target at one time.
-2. **A change of the item makes its `retry` rows due.** When the ingest accepts an image of an item that has `retry`
-   rows, it sets `not_before = 0` on these rows. This costs 1 row, only for items in retry. The cursor skips the new
-   position of the item (rule 1), so the `retry` row must send the new image.
-3. **A `violation` row does not own its item.** When the item changes, the cursor sends the new image. When the new
-   image applies, the completion deletes the `violation` row. A violation of a tombstone follows Section 4.2.6: the
-   cleanup runs, and then the completion deletes the row.
-
-| Outcome for an item | Action of the completion |
-| --- | --- |
-| `applied`, and `latest_items.revision` equals the sent revision | Record the revision in the applied map. Delete the `retry` or `violation` row when one exists. |
-| `applied`, and the item changed during the call | For a `retry` item, keep the row with `not_before = 0`. For a cursor item, write nothing: the change has a position above the cursor (Section 5.6.3, invariant 1). |
-| `unprocessed`, or push `retry` | Insert or update the `retry` row: `attempts + 1`, and an exponential backoff from 1 s to 10 s. |
-| `rejected` (`batch_request_too_large`) | Split the batch and send again. No row. |
-| `rejected` (any other code) | Run the cleanup of Section 4.2.6, then set `kind = 'violation'`. |
-| The whole call fails with a definite outcome | Keep the cursor. Write no `retry` row. Back off and count a circuit breaker failure. |
-| `unknown` | Raise the epoch, keep the cursor, and send again at once (Section 5.6.6). |
-
-The `retry` backoff starts at 1 s, doubles after each failure, and stops at 10 s.
-
-A call is a failure of the whole call when each item of the call fails with a code that can be retried (`unprocessed`,
-or push `retry`). Then the step writes no `retry` row and counts one circuit breaker failure (Section 4.2.9). Thus a
-target that fails each item does not create a `retry` row for each item. When at least one item applies, each failed
-item gets its own `retry` row.
-
-Example: the batch limit is 100, 3 `retry` rows are due, and `C_t = 500`.
-
-1. The step takes the 3 retry items.
-2. It reads positions 501 to 610. It skips 4 positions of items with `retry` rows, 3 positions that the applied map
-   skips, and 6 positions of items that are already in the batch. It sends the other 97 items.
-3. The call returns: 2 retry items applied, 1 retry item is `unprocessed` with `partition_migrating`, and the 97 cursor
-   items applied.
-4. One `transactionSync` deletes 2 `retry` rows, updates 1 `retry` row, and sets `cursor_seq = 610`.
-
-#### 5.6.8 Push targets
-
-- A push target needs no key set. The step sends one `PushTargetItem` (Section 4.2.5) for each item, with the latest
-  image or the tombstone.
-- The batch also carries `producerId`, `epoch`, and the ancestor fences.
-- The push target contract of Section 4.2.5 stays. Delivery is at-least-once and coalesced. `revision` strictly
-  increases for each `(baseHashKey, baseSortKey)`. The push target must keep the highest applied `revision` of each key
-  and ignore each push with `revision <= appliedRevision`.
-- A push target that checks the producer epoch with the receiver rules of Section 5.6.6 can delete the revision of a
-  deleted key after it applies the delete. A push target that does not check the epoch must keep that revision. Its
-  retention is the choice of the push target.
-- After an `unknown` outcome, the push step raises its epoch and sends again at once. The push target drops the
-  duplicates by revision.
-
-#### 5.6.9 Tombstones and garbage collection
-
-- The ingest of a delete sets `data = NULL`, `deleted = 1`, `deleted_at_ms = now`, and `newest_seq` on the
-  `latest_items` row. It updates `key_size_estimates` to the key-only size.
-- When a tombstone arrives for an item with no `latest_items` row, the ingest stores a tombstone row. The targets then
-  send a delete that changes nothing.
-- A background sweep on `idx_latest_items_deleted_gc` deletes a tombstone row when each condition is true:
-  1. `newest_seq <= MIN(C_t)`: each target read the tombstone.
-  2. No `target_retry` row exists for `item_id`.
-  3. No `target_index_keys` row exists for `item_id`: each GSI deleted its entries.
-- In the same `transactionSync`, the sweep subtracts the key bytes from `key_size_estimates` and deletes the positions
-  of the item. Condition 1 puts these positions at or below `MIN(C_t)`. This keeps the link-ID delete rule of Section
-  4.2.4.
-- The sweep needs no time horizon:
-  - A late export with a lower revision comes from a producer whose stored epoch at the `MaterializationDO` is above
-    the epoch of the late call.
-  - When the producer is the base partition that exported the delete, the same-epoch rule puts the delete in a call
-    with a higher epoch than the late call, or the late call ended before the delete call started.
-  - When the producer is an ancestor partition, the child exported the item with the split fences (Section 5.6.6).
-- While a target is down, the tombstones stay until that target reads them. A target that leaves `targets()` no longer
-  counts in `MIN(C_t)`.
-
-#### 5.6.10 Splits, promotions, and table destroy
-
-A `MaterializationDO` split or promotion migrates these rows for the items of the slice:
-
-1. `latest_items` with `item_id` and `newest_seq` unchanged.
-2. `change_positions` with `seq` unchanged. The child gives each new image a position above each copied position.
-3. `target_index_keys`.
-4. `target_retry`, with `inherited = 1`.
-5. `materialization_targets`, with `cursor_seq` unchanged. The child starts each `epoch` at 1.
-6. `ancestor_fences`: the rows of the parent, plus `(parent DO ID, E, until_seq)` for each target. `until_seq` is the
-   highest copied position.
-7. `producer_fences`: the whole table, with `MAX(epoch)`. A child must reject each late call that its parent rejects.
-8. The KV item `__fokosdb/mat/targets`: the stored target list of the parent (Section 4.2.7).
-
-A base `PartitionDO` split or promotion migrates the `materialization_outbox` rows of Section 4.2.3. Each row copied
-with `attempted = 1` gets `inherited_fence = 1`. The child also gets the `ancestor_fences` row
-`('export', parent DO ID, E, NULL)` and the export fence rows of the parent.
-
-A GSI `PartitionDO` split migrates the whole `producer_fences` table to each child with `MAX(epoch)`.
-
-`cleanupSourceStep` deletes the moved rows of `latest_items`, `change_positions`, `target_index_keys`, and
-`target_retry` on the source, with the link-ID delete rule. The rule of Section 4.2.5 that advances `next_attempt_at`
-on an unowned copy goes away: the target step skips an unowned item, and the position is done.
-
-The split fences need the final export state of the slice. `RepartitionSource.servePage`
-(`packages/fokosdb/src/sharding/repartition-flow.ts`) rejects each page request before the cutover, for each stream of
-`FokosMigrationHost`. Thus the new streams also serve pages only after the cutover.
-
-##### Table destroy
-
-`FokosDB.destroy()` keeps the order of Section 4.2.7: each writer before its receiver. The waits on `apply_before_ms`
-and `inflight_apply_before_ms` go away:
-
-- `fokosPrepareDestroy` fences each producer, stops its in-memory loop, and waits for it. Thus no call of the current
-  instance stays in flight.
-- A call that a producer sent before a restart can still arrive after its receiver was destroyed. When the receiver is
-  a root hash partition, the call creates it again, because a root takes its identity from its first request.
-- Thus destroy is best effort for such calls. Each caller call that is in flight during a destroy has the same effect
-  today. A second run of `destroy()` deletes a root that a late call created again.
-- If a later version needs a hard bound, each call can carry its send time, and a receiver can reject a call that is
-  older than `callTimeoutMs`.
-
-#### 5.6.11 Item lifecycle
+and `T` GSI rows. Each `target_index_keys` row adds the bytes of its GSI keys. TODO: measure the size of a
+`target_index_keys` row.
+
+##### Trade-offs
+
+- **Reads.** Each target reads the payload of each changed item, so a payload is read `T` times. A row read costs
+  1,000 times less than a row written (Section 1.3).
+- **No time in correctness.** No rule waits for a deadline, `maxClockSkewMs`, or a horizon. After an `unknown`
+  outcome, the target sends again at once. A split needs no wait.
+- **Permanent receiver rows.** Each receiver keeps one `producer_fences` row for each producer that ever sent to it.
+- **Interface changes.** `batchWriteItems` needs the GSI-only options `producerId`, `epoch`, and `ancestorFences`, and
+  the code `producer_epoch_fenced`. `applyLatestImages` needs the same three fields.
+- **Tombstones during an outage.** A target that is down keeps the tombstones of all deleted items until it recovers.
+  A tombstone is a key-only row.
+
+#### 4.2.16 Item lifecycle
 
 Item X has the base key `(hk = "u1", sk = "o9")`. It lives in base partition P and in `MaterializationDO` M as
 `item_id = 42`. The targets are the GSI `byStatus` (hash key `status`) and the push target `lake`. The GSI partitions
@@ -1846,215 +1601,270 @@ Failure: `put(SHIPPED)` in step 2 has an `unknown` outcome.
    after, `G_shipped` has stored epoch 2 and rejects it.
 4. The response of the old call is discarded.
 
-Split: M splits after step 1, while `put(OPEN)` is in flight.
+Split: M splits during step 1, while `put(OPEN)` is in flight.
 
 1. M raises the `byStatus` epoch to `E` before it serves the first export state page.
-2. The child M2 copies item 42, position 100, `{OPEN}`, `cursor_seq`, and the fence `(M, E, until_seq)`.
+2. The child M2 copies item 42, position 100, `{OPEN}`, `cursor_seq`, and the fence `(M, E, until_id)`.
 3. M2 reads position 100 and sends `put(OPEN)` with its own epoch 1 and the fence `(M, E)`.
 4. When the late `put(OPEN)` of M arrives at `G_open` after the call of M2, `G_open` has stored `E` for M and rejects
    it. When it arrives before, the call of M2 overwrites it.
 
-#### 5.6.12 Cost
+### 4.3 Future Follow-ups
 
-SQLite table rows written for each base write, with no coalescing, for a table with `T` GSIs. The columns follow the
-conventions of Section 4.2.9. The base partition and the GSI partitions are the same in both designs.
+These features are not part of Milestones 1 to 4. Each one can ship later on its own.
 
-| Base write | Base partition | GSI partitions | `MaterializationDO` (Section 4.2) | `MaterializationDO` (Section 5.6) | Total (Section 4.2) | Total (Section 5.6) | `T = 10` (Section 4.2 / Section 5.6) |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Put, new item | 2 + 3 | 2T | 2 + 3T | 4 + T | 7 + 5T | 9 + 3T | 57 / 39 |
-| Put, every GSI key stays | 2 + 3 | 2T | 2 + 3T | 4 | 7 + 5T | 9 + 2T | 57 / 29 |
-| Put, every GSI key moves | 2 + 3 | 5T | 2 + 4T | 4 + 2T | 7 + 9T | 9 + 7T | 97 / 79 |
-| Delete | 3 + 3 | 3T | 4 + 3T | 6 + T | 10 + 6T | 12 + 4T | 70 / 52 |
+#### 4.3.1 Online target backfill
 
-- **Ingest.** `latest_items` and `key_size_estimates` (2), and the position insert and its cleanup delete (2). Step 2
-  of Section 5.6.3 writes no position when no target read the newest position.
-- **GSI key sets.** A new key costs 1 row. A key move costs 2 rows: the add and the removal. A delete costs 1 row: the
-  delete of the key set. A key that stays costs 0 rows.
-- **Delete.** The tombstone GC deletes `latest_items` and updates `key_size_estimates` (2).
-- **Push target.** 0 rows for each item and each push target. Section 4.2 writes 3 rows for each item and each push
-  target.
-- **Left out of the table:**
-  - The cursor update costs 1 row for each batch of up to 100 items: about 0.01 rows for each item and each target.
-    `open_batch` costs at most 1 more row for each period of target work.
-  - A `producer_fences` row costs 1 row the first time that a producer calls a receiver, and 1 row when its epoch goes
-    up.
-  - An epoch raise costs 1 row at the producer.
-  - `open_calls` costs at most 2 rows in the base partition for each period of export work.
-  - A failed item costs about 2 rows: the insert of its `retry` row and its delete.
-  - The ingest of an item with `retry` rows costs 1 row for each such row.
+A user can deploy a new GSI or push target on a table that already holds data in `latest_items`. The cleanup deletes
+the positions that all earlier targets passed, so the new target cannot read the existing items from
+`change_positions`. Each `MaterializationDO` leaf then waits until its `canSweepLocally` guard is true and each parent
+import is complete. Then it:
 
-While a target is down, `change_positions` holds at most `T + 1` rows for each changed item. In the outage example of
-Section 4.2.9, 122,000 items change, and one of 3 GSIs is down. Thus each changed item has at most 2 positions, and
-the table holds at most 244,000 rows. TODO: measure the size of a `change_positions` row.
+1. sets `cursor_seq` of the new target to the highest position, so that each change during the scan reaches the
+   target through a position,
+2. records `backfill_cursor_item_id = 0` in `materialization_targets`,
+3. runs a bounded background scan over `latest_items`
+   (`WHERE item_id > backfill_cursor_item_id AND deleted_at_ms IS NULL`) and sends each item to the new target with
+   the target step.
 
-#### 5.6.13 Trade-offs
+The follow-up must define how the scan and the cursor of the same target keep the same-epoch rule (Section 4.2.9).
 
-- **Reads.** Each target reads the payload of each changed item, so a payload is read `T` times. A row read costs
-  $0.001 per million rows, and a row written costs $1.00 per million rows on the Durable Objects SQLite storage
-  backend.
-- **No time in correctness.** No rule waits for `applyBeforeMs`, `maxClockSkewMs`, or a horizon. After an `unknown`
-  outcome, the target sends again at once. A split needs no wait.
-- **Permanent receiver rows.** Each receiver keeps one `producer_fences` row for each producer that ever sent to it.
-- **Interface changes.** `batchWriteItems` needs the GSI-only options `producerId`, `epoch`, and `ancestorFences`, and
-  the code `producer_epoch_fenced`. They replace `applyBeforeMs` and `write_deadline_passed` of Section 4.2.8 and
-  `docs/agent-plans/2026-10-17-batch-get-and-write-items.md`. `applyLatestImages` needs the same three fields.
-- **Comparison with Section 5.3.** Section 5.3 rejects cursors for external consumers, because each consumer must then
-  track the splits of `MaterializationDO`. Here each cursor is internal to `MaterializationDO` and moves with its
-  migration. Thus no consumer sees a split.
-- **Tombstones during an outage.** A target that is down keeps the tombstones of all deleted items until it recovers
-  or leaves `targets()`. A tombstone is a key-only row.
+`MaterializationDO` stores a full mirror in `latest_items.data`. Thus the backfill of a new target reads nothing from
+the base `PartitionDO` partitions.
 
-### 5.7 Compact `target_item_state` with key-change-only pre-RPC writes
+#### 4.3.2 `FokosDBAutoAdminDO` catalog and activation status
 
-**Status:** Not decided. This option keeps `target_item_state` and `idx_target_item_state_due` from Sections 4.2.4 and
-4.2.5, infers seven columns from `latest_items` and `materialization_targets`, and writes before an outbound RPC only
-when a GSI key changes.
+Some applications need a cluster-wide `BACKFILLING | ACTIVE` status check when they add a GSI online. For them, a
+singleton `FokosDBAutoAdminDO` (`fokos.admin.<tableName>`) can walk the `fokos.m.<tableName>` owners. It reports the
+target as `ACTIVE` when each initialized leaf has:
 
-#### 5.7.1 Why
+- finished its import (`importState === null || importState === "imported" || importState === "active"`),
+- completed its `latest_items` backfill scan,
+- moved the cursor of the new target past the position that it set at the start of the backfill.
 
-Section 4.2.5 keeps one `target_item_state` row for each `(item_id, target_id)`. Each item has its own place in
-`idx_target_item_state_due`, and `next_attempt_at` stays `0` when a `'DIRTY'` item changes again. A retry or a
-violation updates the row of that item. This option keeps that model. It does not need the change positions, the
-producer epochs, or the split fences of Section 5.6.
+#### 4.3.3 Per-GSI topology and key-limit overrides
 
-However, Section 4.2.5 writes `target_item_state` before every outbound RPC (`WRITE_NEW`, `DELETE_OLD`, and
-`PUSH_BATCH`):
+A workload can need a GSI with a higher `rootTreesN`, or a different `maxHashKeyBytes` or `maxSortKeyBytes`, than the
+base table. `FokosTableOptions` (or `db.gsi(indexName, opts)`) can then carry these overrides for each GSI. Thus
+`MaterializationDO` and the caller `FokosDB` client construct identical `FokosRouteContext` topologies for that GSI
+shard group.
 
-1. A pre-RPC write on `target_item_state` is necessary to prevent an orphan GSI entry only when `WRITE_NEW` writes a GSI
-   key that is not yet in `target_item_state`.
-2. When the GSI key of an item does not change (`(target_hk, target_sk) == (applied_index_hk, applied_index_sk)`), the
-   key is already durable in `applied_index_*`. A crash during `put` leaves no unrecorded GSI key.
-3. On `DELETE_OLD`, the old key is already durable in `applied_index_*` or `inflight_index_*`. A crash during `delete`
-   leaves no new GSI key.
-4. On `PUSH_BATCH`, the push target keys records by `(baseHashKey, baseSortKey)` and deduplicates by `revision`. It has
-   no old secondary key to delete.
+#### 4.3.4 Capture on a table that has data
 
-#### 5.7.2 Design
+This spec allows `captureChanges` only on a new table (Section 4.2.3). A later spec can enable capture on a table that
+already holds items. It must solve two problems:
 
-1. **Compact schema.** `target_item_state` drops `applied_revision`, `desired_revision`, `inflight_revision`,
-   `inflight_phase`, `inflight_attempt`, `inflight_apply_before_ms`, and `violation_revision`. `materialization_targets`
-   adds `inflight_until`:
+- An item that gets no write after the policy change has no outbox row, so it never reaches `latest_items`.
+- A partition that has not yet received the new policy writes no outbox row.
 
-```sql
-CREATE TABLE IF NOT EXISTS materialization_targets (
-    target_id       TEXT    PRIMARY KEY,
-    kind            TEXT    NOT NULL,
-    inflight_until  INTEGER NOT NULL DEFAULT 0
-) WITHOUT ROWID, STRICT;
+A possible design:
 
-CREATE TABLE IF NOT EXISTS target_item_state (
-    state_id          INTEGER PRIMARY KEY,
-    item_id           INTEGER NOT NULL,
-    target_id         TEXT    NOT NULL,
+1. The policy change turns on capture with a new `policyVersion`. Each base partition that gets it starts to write
+   outbox rows for new mutations.
+2. Each base partition runs a bounded background scan over `items` with a durable cursor. The scan writes an outbox
+   row for each item that has no outbox row. The export path of Section 4.2.3 then sends the items, and the revision
+   rules of `MaterializationDO` drop each duplicate.
+3. A split or a promotion migrates the scan cursor with the slice.
+4. A catalog, for example `FokosDBAutoAdminDO` (Section 4.3.2), walks the base partitions and reports the capture as
+   active when each owner has finished its scan. Then the targets can backfill from `latest_items` (Section 4.3.1).
 
-    applied_index_hk  BLOB,    -- NULL when the GSI holds no entry, or for a push_sink
-    applied_index_sk  BLOB,    -- x'' when the GSI has no sort key
+#### 4.3.5 Base version on GSI queries
 
-    inflight_index_hk BLOB,    -- set only before WRITE_NEW when target_key != applied_index_key
-    inflight_index_sk BLOB,
+Each GSI is a standard `PartitionDO` table. Thus `items.v` in a GSI partition counts the writes to that
+`(gsiHK, physicalSk)` entry, not the `version` (`revision`) of the base item. This spec keeps the current behavior:
+`version` and `{ ref: "v" }` on a GSI give that local `items.v` (Section 4.2.14).
 
-    status            TEXT    NOT NULL, -- 'IDLE' | 'DIRTY' | 'VIOLATION'
-    next_attempt_at   INTEGER NOT NULL DEFAULT 0,
-    last_error_code   TEXT,
+A later spec can change this:
 
-    UNIQUE (item_id, target_id)
-) STRICT;
+- `db.gsi(indexName).queryItems` can omit `version`, and the compiler can reject `{ ref: "v" }` in a GSI `filter` or
+  `projection`.
+- `MaterializationDO` can store the base `revision` in each GSI entry. `db.gsi(indexName).queryItems` then returns it
+  as `version`, and `{ ref: "v" }` reads it.
+- A caller-provided `external_version` on base writes can travel with the item to the GSIs and the push targets.
 
-CREATE INDEX IF NOT EXISTS idx_target_item_state_due
-    ON target_item_state (target_id, next_attempt_at, item_id)
-    WHERE status = 'DIRTY';
-```
+#### 4.3.6 Target changes and target versions
 
-2. **Inferred state:**
-   - **Desired revision.** Always `latest_items.revision` from the join `USING (item_id)`. The worker records the
-     `stepRevision` of each item in memory when it claims the batch.
-   - **In-flight guard.** Each `target_id` has at most 1 batch in flight in memory. No row moves to `'IN_FLIGHT'`. A row
-     stays `'DIRTY'` until `COMMIT_APPLIED` sets `status = 'IDLE'` (when `latest_items.revision == stepRevision`) or
-     deletes the row (when `latest_items.deleted == 1` and `latest_items.revision == stepRevision`). When a newer write
-     arrives during the RPC (`latest_items.revision > stepRevision`), `status` stays `'DIRTY'` with
-     `next_attempt_at = 0`.
-   - **Violation recovery.** `applyLatestImages` accepts a write only when `incoming.revision > latest_items.revision`.
-     Thus every accepted write is newer than any parked violation, and `applyLatestImages` unconditionally sets
-     `status = 'DIRTY'` and `next_attempt_at = 0`.
+The first version fixes the target list of each partition (Section 4.2.13). A later spec must define how to add,
+remove, and change targets. During a gradual rollout, old and new Worker versions run at the same time. One
+`MaterializationDO` can restart on the old version after it ran on the new version, so it can see the two lists one
+after the other. Thus a list change must not depend on the code version that a partition runs. The spec must solve
+these problems:
 
-3. **Target-level fence for crashes and splits.** Before a worker sends a GSI batch with `applyBeforeMs = now +
-   callDeadlineMs`, its claim `transactionSync` writes `inflight_until = applyBeforeMs + maxClockSkewMs` on the one row
-   of `target_id` in `materialization_targets`.
-   - When the batch returns a definite outcome (`applied`, `unprocessed`, or `rejected`) for every item, the completion
-     `transactionSync` sets `inflight_until = 0`.
-   - When an item returns `unknown`, the completion `transactionSync` sets `next_attempt_at = applyBeforeMs +
-     maxClockSkewMs` on that item row and sets `inflight_until = 0`.
-   - After a crash, an eviction, or a cold start, the worker waits until `now >= inflight_until` before it claims a
-     batch for `target_id`.
-   - On a split or a promotion, `FokosMigrationHost` copies `materialization_targets` with `MAX(inflight_until)` to each
-     child before cutover. Thus a child also waits for any in-flight call from the parent to expire.
+1. **Versions.** Each target list has an integer version, for example `targetsVersion`, as `policyVersion` has. A
+   partition stores a list only when its version is above the stored version, and it ignores a list with a lower
+   version. Thus an oscillation between two code versions cannot move a partition back.
+2. **One list across the shard group.** In the first version, each root stores the list from its first request. A
+   root that gets its first request after a code change can store a different list. A version scheme, or a catalog
+   such as `FokosDBAutoAdminDO` (Section 4.3.2), must give all partitions the same list.
+3. **Fixed definitions.** A `targetId` keeps one definition for its whole life. A changed definition is a new
+   `targetId` and the removal of the old `targetId`. Thus no GSI holds entries of two definitions.
+4. **Add.** A new target starts its cursor at the highest position, and then runs the backfill of Section 4.3.1. The
+   GSI must not serve queries until each partition finished the backfill (Section 4.3.2).
+5. **Remove.** A bounded background job deletes the rows of the target (cursor, key sets, retry rows). The target then
+   no longer counts in `MIN(C_t)` and no longer blocks the tombstone GC and the position cleanup. `destroy()` still
+   finds the GSI shard group through `materialization_targets`, and a separate step can destroy it.
+6. **A target that is broken for good**, for example a deleted service binding, keeps all tombstones and positions
+   until it recovers. The removal of item 5 is the way out, so it must not need the target to answer.
 
-4. **GSI execution steps for each due `'DIRTY'` row:**
-   - **Stale `inflight_index_*` cleanup.** When `inflight_index_hk IS NOT NULL` and `(inflight_index_hk,
-     inflight_index_sk)` differs from both `(applied_index_hk, applied_index_sk)` and the desired `(target_hk,
-     target_sk)`, first send `delete(inflight_index_hk, inflight_index_sk)` with zero pre-RPC item writes. On `applied`,
-     clear `inflight_index_* = NULL` in SQLite.
-   - **Same GSI key (`(target_hk, target_sk) == (applied_index_hk, applied_index_sk)`):**
-     - Write nothing to `target_item_state` before the RPC.
-     - Send `put(target_hk, target_sk)` in `batchWriteItems`.
-     - On `applied`, run `COMMIT_APPLIED` (`status = 'IDLE'` when `latest_items.revision == stepRevision`).
-   - **New or changed GSI key (`(target_hk, target_sk) != (applied_index_hk, applied_index_sk)`):**
-     - When `(inflight_index_hk, inflight_index_sk) != (target_hk, target_sk)`, write `inflight_index_hk = target_hk`
-       and `inflight_index_sk = target_sk` in the claim `transactionSync` before `put(target_hk, target_sk)`.
-     - Send `put(target_hk, target_sk)`.
-     - When `put` returns `applied` and `applied_index_hk IS NOT NULL`, send `delete(applied_index_hk,
-       applied_index_sk)` in the same worker step with no intermediate SQLite write to `target_item_state` (only the
-       1-row update to `materialization_targets.inflight_until`).
-     - When `delete` (or `put` when `applied_index_hk IS NULL`) returns `applied`, run `COMMIT_APPLIED`: set
-       `applied_index_hk = target_hk`, `applied_index_sk = target_sk`, `inflight_index_* = NULL`, and update `status`.
-   - **Absent desired key (`DELETE_OLD` for a delete or a sparse omission):**
-     - Write nothing to `target_item_state` before the RPC.
-     - Send `delete(applied_index_hk, applied_index_sk)` (and `delete(inflight_index_*)` when present).
-     - On `applied`, run `COMMIT_APPLIED`.
+## 5. Alternative Options
 
-5. **Push target execution steps (`push_sink`):**
-   - Write nothing to `target_item_state` or `materialization_targets` before the RPC.
-   - Send `method(batch)`.
-   - On `applied`, run `COMMIT_APPLIED` (`status = 'IDLE'` or delete the row when `latest_items.deleted == 1`).
+### 5.1 Base outbox, base shadow, and stateless Queue fan-out
 
-#### 5.7.3 Cost
+This option keeps `_fokos_change_pending (baseKey, version, newImage)` and
+`_fokos_change_shadow (baseKey, lastShippedKeyAttrs)` in the base `PartitionDO`. It sends batches to a Cloudflare
+Queue. Stateless queue consumers compute `oldGsiKey -> newGsiKey` and apply LWW writes and tombstones to the GSIs. It is
+rejected for five reasons:
 
-SQLite table rows written for each base write, with no coalescing, for a table with `T` GSIs (leaving out the 2 writes
-to `materialization_targets.inflight_until` per batch of up to 100 items, which cost 0.02 rows per item):
+1. **Permanent orphan GSI entries under `A -> B -> C` after a crash between `queue.send()` and the shadow update.**
+   `await env.QUEUE.send()` and SQLite `transactionSync` cannot commit atomically:
+   - The DO sends `{ old: A, new: B, v: 2 }` and crashes before it sets `shadow = B`.
+   - A client then writes `v3 (C)`. The next alarm coalesces the outbox to `v3 (C)` with `shadow = A` and sends
+     `{ old: A, new: C, v: 3 }`.
+   - Both messages delete `A`, and `B@v2` stays in the GSI forever.
+   - To set `shadow = B` before `queue.send()` has the opposite defect when `queue.send()` fails: `A@v1` stays forever.
+2. **`last_write_ts` does not strictly increase for each item.** Two writes in `maxClockSkewMs` can share the same
+   `last_write_ts`, which breaks timestamp-based LWW.
+3. **The 128 KB limit of Cloudflare Queues is less than the 400 KB item limit.** An item above 128 KB cannot fit in a
+   Queue message. A pointer fails when the base item changes or is deleted before all consumers read it.
+4. **Base partition bloat and coupling.** A `newImage` in the base outbox duplicates 400 KB payloads during downstream
+   outages. `lastShippedKeyAttrs` couples the base partition to all 10 GSI key extractors.
+5. **Tombstone retention depends on the age of the Queue and its DLQ.** Delayed queue messages force GSI partitions to
+   keep tombstones for days.
 
-| Base write | `MaterializationDO` (Section 4.2.9) | `MaterializationDO` (Section 5.7) | Total (Section 5.7) | `T = 10` (Section 4.2.9 / Section 5.7) |
-| --- | --- | --- | --- | --- |
-| Put, every GSI key stays | 2 + 3T | 2 + 2T | 7 + 4T | 57 / 47 |
-| Put, every GSI key moves | 2 + 4T | 2 + 3T | 7 + 8T | 97 / 87 |
-| Delete | 4 + 3T | 4 + 2T | 10 + 5T | 70 / 60 |
+### 5.2 Separate `GsiMaintainerDO` worker tier
 
-A push target costs 2 rows in `MaterializationDO` instead of 3 (ingest and `COMMIT_APPLIED`).
+A separate DO tier that claims dirty work from `MaterializationDO` is rejected. `MaterializationDO` already shards by
+`(baseHK, baseSK)` and holds `latest_items` and the target state in local SQLite. A push directly from
+`MaterializationDO` has no extra DO hop and no distributed work leases.
 
-#### 5.7.4 Trade-offs
+### 5.3 Pull cursors (`change_seq`) for push targets
 
-- **No hot-item starvation.** A `'DIRTY'` row keeps `next_attempt_at = 0` and stays at its `item_id` position in
-  `idx_target_item_state_due` when new updates arrive.
-- **Per-item failure isolation.** A retry or a violation updates `next_attempt_at` or `status` on that item's own
-  `target_item_state` row, with no extra retry table and no batch failure threshold.
-- **Cold-start fence across the target.** When `MaterializationDO` restarts during an in-flight GSI batch, the target
-  waits for `materialization_targets.inflight_until` before it claims its next batch. Normal in-memory batches and
-  item-level `unknown` outcomes do not wait on `materialization_targets.inflight_until`.
+A partition-local `change_seq` for external pull consumers is rejected. With pull cursors, each consumer must track
+partition splits and join the cursor epochs of a parent and its children. The cursors of Section 4.2.6 are internal to
+`MaterializationDO` and move with its migration. Thus no consumer sees a split.
+
+### 5.4 One sidecar `MaterializationDO` for each base `PartitionDO`
+
+A sidecar DO `<part>.mat` for each base partition `<part>` is rejected for two reasons:
+
+- A base split or promotion forces the sidecar to split, also when the materialization state is small.
+- Out-of-order exports from an old parent and a new child no longer arrive at the same `MaterializationDO`.
+
+### 5.5 A hash or a local integer ID in the GSI sort key
+
+1. **Fixed-size hash suffix `H128(baseHK, baseSK)`.** Rejected. Two base items can share `(gsiHK, gsiSK)` and have the
+   same hash. Then the `put` of one item overwrites the other item, and a `delete` deletes the other item.
+2. **Partition-local `(baseHK, baseSK) -> id` lookup tables, or reference-counted `KeyBytes -> id` lookup tables.**
+   Rejected for three reasons:
+   - They double or triple `rowsRead` and `rowsWritten` on puts, deletes, and queries.
+   - GSI tables become different from standard `PartitionDO` tables.
+   - A split migration must compute the reference counts again across the child slices.
+
+### 5.6 Per-item target state with a write deadline fence
+
+**Status:** Rejected.
+
+This option replaces the change positions, the cursors, the key sets, `target_retry`, and the producer epochs of
+Section 4.2 with one state row for each item and each target:
+
+- **`target_item_state`.** One rowid row for each `(item_id, target_id)` holds the applied revision and GSI key
+  (`applied_revision`, `applied_index_hk`, `applied_index_sk`), `desired_revision`, the in-flight transition
+  (`inflight_revision`, `inflight_index_hk`, `inflight_index_sk`, `inflight_phase`, `inflight_attempt`,
+  `inflight_apply_before_ms`), `status` (`'IDLE'`, `'DIRTY'`, `'IN_FLIGHT'`, or `'VIOLATION'`), `next_attempt_at`,
+  `last_error_code`, and `violation_revision`. The partial index
+  `idx_target_item_state_due (target_id, next_attempt_at, item_id) WHERE status IN ('DIRTY', 'IN_FLIGHT')` gives the
+  due rows.
+- **Ingest.** The ingest raises `desired_revision` on the row of each target. It moves each row that is not
+  `'IN_FLIGHT'` to `'DIRTY'` with `next_attempt_at = 0`.
+- **State machines.** Before each call, the runner freezes the transition in the row. A GSI runs
+  `WRITE_NEW -> DELETE_OLD -> COMMIT_APPLIED`. A push target runs `PUSH_BATCH -> COMMIT_APPLIED`. A violation parks
+  the row in `'VIOLATION'`, and a write with `revision > violation_revision` moves it back to `'DIRTY'`.
+- **Write deadline fence.** Each export call and each GSI call carries `applyBeforeMs = now + callDeadlineMs`
+  (default 30 s). The receiver rejects an item with `write_deadline_passed` when its clock is above `applyBeforeMs`.
+  After an `unknown` outcome, the next call for the row waits until `applyBeforeMs + maxClockSkewMs` (default
+  2,000 ms). A split child waits for the same deadline.
+- **Tombstone horizon.** A `latest_items` tombstone stays for `deletedRevisionHorizonMs` (default 24 hours) after the
+  last target finished the delete. Thus `MaterializationDO` rejects a late export with a lower revision only during
+  that horizon. A push target must keep the revision of a deleted key for the same horizon.
+- **Destroy.** `destroy()` waits until the highest `apply_before_ms` (base) or `inflight_apply_before_ms`
+  (`MaterializationDO`) of the calls that survived a restart, plus `maxClockSkewMs`.
+
+| Topic | Section 4.2 | This option |
+| --- | --- | --- |
+| `MaterializationDO` rows for each put, every GSI key stays | 4 | 2 + 3T |
+| `MaterializationDO` rows for each put, every GSI key moves | 4 + 2T | 2 + 4T |
+| `MaterializationDO` rows for each delete | 6 + T | 4 + 3T |
+| Total rows, `T = 10` (key stays / key moves / delete) | 29 / 79 / 52 | 57 / 97 / 70 |
+| `MaterializationDO` rows for each item and push target | 0 | 3 |
+| Protection against a late call | Producer epochs | `applyBeforeMs` and `maxClockSkewMs` |
+| Tombstone retention | Until each target read the tombstone | 24 hours after the last target finished |
+| Wait after an `unknown` outcome | None | About 32 s |
+| Tables for the target state | 6 | 1 |
+
+Pros:
+
+1. One row gives the full state of an item for a target. It is simple to read, to debug, and to test.
+2. A retry or a violation updates the row of the item. It needs no retry table and no rule for a failure of the whole
+   call.
+3. It needs no change positions, no producer epochs, no split fences, and no `producer_fences` rows in the receivers.
+4. It was fully specified, and `maxClockSkewMs` (default 2,000 ms) already exists in the host configuration.
+
+Cons:
+
+1. **About 2 times the rows written.** At 100 base writes/s with `T = 10` and no coalescing, this option writes about
+   5,700 rows/s against 2,900 rows/s. At $1.00 per million rows, this is about $14,800 against $7,500 for each month.
+2. **Clock skew becomes a safety rule.** Today `maxClockSkewMs` only bounds the clock of a `prepare` in
+   `TransactionParticipant`. With this option, a clock offset above `maxClockSkewMs` between two Durable Objects can
+   leave an orphan GSI entry.
+3. **A time horizon in correctness.** A late export that arrives after `deletedRevisionHorizonMs` can create a deleted
+   item again.
+4. **Latency after a failure.** After an `unknown` outcome, the item waits about 32 s before its next call.
+
+It is rejected because it writes about 2 times the rows, and because its correctness depends on clocks (Requirement 9).
+
+### 5.7 Compact per-item target state with writes only on a GSI key change
+
+**Status:** Rejected.
+
+This option keeps `target_item_state` of Section 5.6 and removes seven columns: `applied_revision`,
+`desired_revision`, `inflight_revision`, `inflight_phase`, `inflight_attempt`, `inflight_apply_before_ms`, and
+`violation_revision`:
+
+- It infers the desired revision from `latest_items.revision`, and the in-flight guard from the 1 batch in flight of
+  each target.
+- It writes the row before a call only when `WRITE_NEW` writes a GSI key that is not yet in `applied_index_*`. When the
+  key stays, the key is already durable. A `delete` or a push writes no new key.
+- One value `inflight_until = applyBeforeMs + maxClockSkewMs` in `materialization_targets` fences the calls of a target
+  after a crash. A split child copies it with `MAX` and waits until it passes.
+
+| Base write | `MaterializationDO` rows | Total, `T = 10` |
+| --- | --- | --- |
+| Put, every GSI key stays | 2 + 2T | 47 |
+| Put, every GSI key moves | 2 + 3T | 87 |
+| Delete | 4 + 2T | 60 |
+
+A push target costs 2 rows in `MaterializationDO` for each item.
+
+Pros: it keeps the per-item state of Section 5.6, with no change positions, no producer epochs, and no split fences.
+
+It is rejected because it still writes about `2T` rows for each base write, and because its correctness still depends
+on `maxClockSkewMs` and on a wait after a restart or a split (Requirement 9).
 
 ### 5.8 Versioned GSI tombstones with a TTL instead of GSI-hop epochs
 
-**Status:** Rejected. Section 5.6 uses producer epochs on all hops. This option changes only the GSI hop of Section
-5.6. It uses the versioned writes of `docs/ideas/2026-10-21-idempotent-sink-writes.md`.
+**Status:** Rejected. Section 4.2 uses producer epochs on all hops. This option changes only the GSI hop. It uses the
+versioned writes of `docs/ideas/2026-10-21-idempotent-sink-writes.md`.
 
 Each GSI entry stores the base `revision`. A `put` applies only when its revision is at or above the stored revision.
 A `delete` writes a key-only tombstone with the revision and a TTL, instead of removing the row. The item TTL sweep
 removes the tombstone. The TTL must be longer than the life of any call, for example 1 hour.
 
-Changes to Section 5.6:
+Changes to Section 4.2:
 
 - **Removed from the GSI hop:**
   - the producer ID, the epoch, and the ancestor fences in `batchWriteItems`,
   - `producer_fences` in GSI partitions,
-  - the epoch raise after an `unknown` outcome, and the `open_batch` marker.
+  - the epoch raise after an `unknown` outcome, and the `is_batch_open` marker.
 
   A late call has a revision at or below the stored revision or tombstone, so the GSI partition rejects it. This is
   also true for a late call of a parent `MaterializationDO`.
@@ -2063,14 +1873,11 @@ Changes to Section 5.6:
   before the `put`.
 - **The base hop is a separate choice.** When the `latest_items` tombstones also expire after a time horizon, the
   base hop can drop its epochs, its fences, its cold-start check, and the same-epoch rule. When they do not, the base
-  hop keeps the rules of Section 5.6.6.
+  hop keeps the rules of Section 4.2.9.
 - **Added:**
   - a revision condition in the GSI path of `batchWriteItems`,
   - tombstone rows in GSI partitions,
   - a tombstone filter in each GSI query.
-
-It is rejected, because cons 1 to 4 below cost more than the rules that it removes. Section 4.4.5 can use the
-revision of each GSI entry without the tombstones.
 
 Pros:
 
@@ -2078,7 +1885,7 @@ Pros:
    write stay.
 2. GSI writes do not depend on order. Copies of a write in any order give the same final state while the tombstone
    exists. A retry needs no coordination.
-3. Each GSI entry holds the base revision, which the follow-up of Section 4.4.5 needs.
+3. Each GSI entry holds the base revision, which the follow-up of Section 4.3.5 needs.
 4. The receiver state expires. `producer_fences` rows stay forever, but a tombstone goes after its TTL.
 
 Cons:
@@ -2089,7 +1896,7 @@ Cons:
 2. **More rows written.** A GSI delete writes the tombstone row and `key_size_estimates` (2), and the sweep later
    deletes them (2 to 3). A plain delete writes 3 rows. This is about 1 to 2 more rows for each GSI delete or key
    move. With `T = 10`, a key move costs about 89 to 99 rows instead of 79, and a delete about 62 to 72 instead of
-   52 (Section 5.6.12). TODO: measure.
+   52 (Section 4.2.15). TODO: measure.
 3. **Storage for the TTL.** A tombstone holds the GSI hash key and `physicalSk`, which holds the base keys. For
    example, 100 deletes or key moves each second with a 1-hour TTL keep 360,000 tombstones in each GSI. TODO: measure
    the size of a tombstone.
@@ -2100,46 +1907,75 @@ Cons:
 6. **Revision ties.** When a `targets()` change alters the sparse rules of a GSI, one revision can be present at a key
    and absent at the same key. The `put` and tombstone rules then need a rule for equal revisions.
 
+It is rejected, because cons 1 to 4 cost more than the rules that it removes. Section 4.3.5 can use the revision of
+each GSI entry without the tombstones.
+
+### 5.9 A time limit for the split fences of a target
+
+The child keeps the fences of target `t` while `C_t < until_id`, and for at least 24 hours after the split. This rule
+replaces the check for inherited `retry` rows (Section 4.2.9, "Split fences", step 5).
+
+- **Pro.** It needs no `idx_target_retry_inherited` and no `is_inherited` column. The index has entries only for a short
+  time after a split.
+- **Con.** The fences protect against a late parent call. No platform limit gives a maximum time for a call in flight,
+  so the 24 hours are a guess.
+- **Con.** Correctness then depends on a clock and a time horizon (Requirement 9).
+
+It is rejected because of Requirement 9. The index costs rows only for the `retry` rows that a split copies, and a
+call that fails as a whole writes no `retry` row (Section 4.2.10).
+
 ## 6. Frequently Asked Questions
 
 ### 6.1 Do GSIs and push targets (for example a data lake) share the same state machine?
 
-Yes. Both are rows in `target_item_state` that `MaterializationDO` drives (Section 4.2.5). A GSI target runs
-`WRITE_NEW -> DELETE_OLD -> COMMIT_APPLIED` with `FokosDB.batchWriteItems`. A push target runs
-`PUSH_BATCH -> COMMIT_APPLIED` over Workers RPC.
+Yes. Both read the same change positions with their own cursor and epoch, and both use `target_retry` for failed
+items (Sections 4.2.5 to 4.2.10). A GSI also keeps a key set, and its step sends `put` and then `delete` with
+`FokosDB.batchWriteItems`. A push target sends one `PushTargetBatch` over Workers RPC.
 
 ### 6.2 Why does `MaterializationDO` keep a full mirror of live items?
 
 With `latest_items.data` for live items, `MaterializationDO` can evaluate projections again on a retry. Future online
-targets (Section 4.4.1) can also backfill from local SQLite with zero reads from the base `PartitionDO` shard group.
+targets (Section 4.3.1) can also backfill from local SQLite with zero reads from the base `PartitionDO` shard group.
 
 ### 6.3 What happens when an item is created, updated, and deleted while `MaterializationDO` is unreachable?
 
-While `MaterializationDO` is unreachable, the outbox row keeps `unexported_create = 1` and `attempted = 0`. A local
-delete removes the `materialization_outbox` row in place and sends zero RPCs (Section 4.2.3).
+While the circuit breaker to `MaterializationDO` is open, the exporter claims no rows. Thus the outbox row of a new
+item keeps `is_local_only = 1`, and the local delete removes it in place with zero RPCs (Section 4.2.3). When a claim
+already set `is_local_only = 0` before the breaker opened, the delete writes an outbox tombstone. The exporter sends
+it when `MaterializationDO` is reachable again.
 
 ### 6.4 Does the change of `max_deleted_v` to `before.v + 1` change the existing transaction behavior?
 
-No. `transactGetItems` still detects each delete between phase 1 and phase 2. New rows still start at
-`d.max_deleted_v + 1`, above each earlier version of that key (Section 4.2.2). Only the version numbers change: a
-recreate after a delete starts one higher than before.
+No. `transactGetItems` still detects each create and each delete between phase 1 and phase 2. New rows still start
+at `d.max_deleted_v + 1`, strictly above each earlier `v` and each earlier delete revision of that key (Section 4.2.2).
+Only the version numbers change: a delete raises `max_deleted_v` by 2 instead of 1, so a recreate after a delete starts
+one higher than before.
+
+### 6.5 Why does the export need epochs when `MaterializationDO` already checks revisions?
+
+Because the tombstone GC has no time horizon (Section 4.2.11). The base exporter can send X at revision 2 and the
+delete at revision 3 in two calls. When revision 3 applies first, the targets read the tombstone, and the GC deletes
+it. Then revision 2 arrives, finds no row, and creates X again. The epochs and the same-epoch rule (Section 4.2.9)
+reject such a late call. A GSI entry stores no revision, so the GSI hop needs the epochs in all cases.
 
 ## 7. References
 
-- `docs/ideas/2026-09-17-coalesced-materialization-and-gsis.md`
 - `docs/agent-plans/2026-10-03-max-deleted-version.md`
 - `docs/agent-plans/2026-09-13-items-link-item_id.md`
 - `docs/agent-plans/2026-09-19-fokos-sharding-runtime.md`
 - `docs/agent-plans/2026-09-26-fokos-sharding-client.md`
 - `docs/agent-plans/2026-10-17-batch-get-and-write-items.md`
+- `docs/ideas/2026-10-21-idempotent-sink-writes.md`
 - `packages/fokosdb/src/shared/partition/partition-store.ts`
 - `packages/fokosdb/src/shared/partition/fokos-migration-host.ts`
 - `packages/fokosdb/src/shared/partition/ttl-expiry.ts`
 - `packages/fokosdb/src/shared/partition-context.ts`
 - `packages/fokosdb/src/shared/do-stubs.ts`
+- `packages/fokosdb/src/shared/batch-api-types.ts`
 - `packages/fokosdb/src/shared/expression/compiler.ts`
 - `packages/fokosdb/src/shared/transaction-limits.ts`
 - `packages/fokosdb/src/sharding/runtime.ts`
+- `packages/fokosdb/src/sharding/repartition-flow.ts`
 - `packages/fokosdb/src/server/do-partition.ts`
 - `packages/fokosdb/formal/p/PSrc/Partition.p`
 - `packages/fokosdb/formal/p/PSpec/Versions.p`
