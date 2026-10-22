@@ -364,6 +364,13 @@ export function isRangePartition(ref: Pick<FokosPartitionRef, "partitionId">): b
 	return ref.partitionId.startsWith(PartitionIdHelper.SCHEMA_RANGE_V1_STR);
 }
 
+/**
+ * Exactly two hex digits. `parseInt` alone stops at the first character that is not a hex digit, and
+ * accepts a sign or a leading space, so it reads "1g" as 1. The test runs first and rejects them. The
+ * expression has no `g` flag, so `test` keeps no state between calls and one shared instance is safe.
+ */
+const HEX_BYTE = /^[0-9a-fA-F]{2}$/;
+
 export class PartitionIdHelper {
 	static readonly SCHEMA_HASH_V1 = 0x00 as const;
 	static readonly SCHEMA_HASH_V1_STR = "00" as const;
@@ -514,9 +521,19 @@ export class PartitionIdHelper {
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${bytes[0]}`);
 		return (bytes[1] << 8) | bytes[2];
 	}
-	static depth(bytes: Uint8Array): number {
-		invariant(bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${bytes[0]}`);
-		return bytes[3];
+	/**
+	 * The depth of a hash partition, from its bytes or from its hex ID. The hex form reads the two
+	 * digits of byte 3 and decodes nothing else.
+	 */
+	static depth(id: Uint8Array | PartitionNodeId): number {
+		if (typeof id === "string") {
+			invariant(id.startsWith(PartitionIdHelper.SCHEMA_HASH_V1_STR), () => `fokos/topology: expected hash schema, got: ${id.slice(0, 2)}`);
+			const digits = id.slice(6, 8);
+			invariant(HEX_BYTE.test(digits), () => `fokos/topology: the hash partition ID ${id} has no valid depth`);
+			return Number.parseInt(digits, 16);
+		}
+		invariant(id[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${id[0]}`);
+		return id[3];
 	}
 	// The last child index is this partition's slot among its siblings (only valid when depth >= 1).
 	static lastChildIdx(bytes: Uint8Array): number {

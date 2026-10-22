@@ -10,6 +10,8 @@
  *
  *   1. `items`      — the committed rows of the slice.
  *   2. `pending_tx_info` — the locks of in-flight transactions over the slice, plus the deletion metadata.
+ *   3. `outbox`     — the `materialization_outbox` rows of the slice. Only a table that captures its
+ *                     changes runs this stream.
  *
  * The two never merge into one page: `items` holds committed state only, and a pending lock is a
  * separate row that commit or cancel resolves later.
@@ -25,6 +27,7 @@ import {
 	type HashKeyWalkEntry,
 	type KeyRange,
 	type MigratedItem,
+	type MigratedOutboxRow,
 	type PendingTransactionCursor,
 	type PendingTxItem,
 	type ScanCursor,
@@ -35,10 +38,14 @@ import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js"
 
 type BelongsToTarget = (key: RouteKey) => boolean;
 
+/** The page size estimate of an outbox row beside its keys: the revision, the flags, and the framing. */
+const OUTBOX_ROW_FIXED_BYTES = 32;
+
 /** Where the host has got to. The flow stores it verbatim and never reads inside it. */
 export type FokosDBHostCursor =
 	| { stream: "items"; cursor: HashKeyWalkCursor<ScanCursor> | null }
-	| { stream: "pending_tx"; cursor: HashKeyWalkCursor<PendingTransactionCursor> | null };
+	| { stream: "pending_tx"; cursor: HashKeyWalkCursor<PendingTransactionCursor> | null }
+	| { stream: "outbox"; cursor: HashKeyWalkCursor<ScanCursor> | null };
 
 export type FokosDBHostPage =
 	| { stream: "items"; items: MigratedItem[] }
@@ -46,12 +53,15 @@ export type FokosDBHostPage =
 			stream: "pending_tx";
 			pendingTransactions: PendingTxItem[];
 			deletionMetadata: { maxDeleteTxOrderTs: number; maxDeletedV: number };
-	  };
+	  }
+	| { stream: "outbox"; rows: MigratedOutboxRow[] };
 
 export type FokosMigrationHostDeps = {
 	store: PartitionStore;
 	/** The log fields of this partition, with its `doName` and `partitionId`, as `TtlExpiry` takes them. */
 	logParams: () => Record<string, unknown>;
+	/** True when the table captures its changes. The source then sends the outbox stream after the locks. */
+	captureChanges: () => boolean;
 };
 
 export class FokosMigrationHost implements MigrationHost {
@@ -72,9 +82,14 @@ export class FokosMigrationHost implements MigrationHost {
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const from = asHostCursor(cursor);
 		const range = sliceKeyRange(slice);
-		return from.stream === "items"
-			? this.#buildItemsPage(from.cursor, range, belongsToTarget, budget)
-			: this.#buildPendingTxPage(from.cursor, range, belongsToTarget, budget);
+		switch (from.stream) {
+			case "items":
+				return this.#buildItemsPage(from.cursor, range, belongsToTarget, budget);
+			case "pending_tx":
+				return this.#buildPendingTxPage(from.cursor, range, belongsToTarget, budget);
+			case "outbox":
+				return this.#buildOutboxPage(from.cursor, range, belongsToTarget, budget);
+		}
 	}
 
 	/**
@@ -83,17 +98,24 @@ export class FokosMigrationHost implements MigrationHost {
 	 */
 	applyPage(page: unknown, _slice: FokosSlice): void {
 		const p = page as FokosDBHostPage;
-		if (p.stream === "items") {
-			this.#applyItems(p.items);
-			return;
+		switch (p.stream) {
+			case "items":
+				this.#applyItems(p.items);
+				return;
+			case "pending_tx":
+				this.#applyPendingTx(p);
+				return;
+			case "outbox":
+				for (const row of p.rows) {
+					this.deps.store.insertMigratedOutboxRow(row);
+				}
 		}
-		this.#applyPendingTx(p);
 	}
 
 	validatePage(cursor: unknown, page: unknown, nextCursor: unknown, inSlice: BelongsToTarget): void {
 		assertHostPageFollowsCursor(cursor, page, nextCursor);
 		const p = page as FokosDBHostPage;
-		for (const row of p.stream === "items" ? p.items : p.pendingTransactions) {
+		for (const row of p.stream === "items" ? p.items : p.stream === "pending_tx" ? p.pendingTransactions : p.rows) {
 			// The closure is made only on a failure, because a page can hold many rows.
 			if (!inSlice({ hashKey: row.hk, sortKey: row.sk })) {
 				invariant(
@@ -179,7 +201,29 @@ export class FokosMigrationHost implements MigrationHost {
 		// Each page of this stream carries the deletion metadata, so a slice with no lock receives it in
 		// one empty page. A promoted key carries the locks that it holds at cutover.
 		const page: FokosDBHostPage = { stream: "pending_tx", pendingTransactions: rows, deletionMetadata: store.getDeletionMetadata() };
-		return { page, nextCursor: nextCursor ? { stream: "pending_tx", cursor: nextCursor } : null };
+		if (nextCursor) {
+			return { page, nextCursor: { stream: "pending_tx", cursor: nextCursor } };
+		}
+		return { page, nextCursor: this.deps.captureChanges() ? { stream: "outbox", cursor: null } : null };
+	}
+
+	// ─── materialization outbox ───────────────────────────────────────────────
+
+	#buildOutboxPage(
+		cursor: HashKeyWalkCursor<ScanCursor> | null,
+		range: KeyRange | null,
+		belongsToTarget: BelongsToTarget,
+		budget: FokosMigrationPageBudget,
+	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
+		const { store } = this.deps;
+		const reader: StreamReader<MigratedOutboxRow, ScanCursor> = {
+			readRange: (c, limit, r) => store.queryOutboxPage(c, limit, r),
+			walk: (c, limit, owns) => store.walkOutboxByHashKey(c, limit, owns),
+			cursorOf: (row) => ({ hk: row.hk, sk: row.sk }),
+			estimateBytes: (row) => row.hk.byteLength + row.sk.byteLength + OUTBOX_ROW_FIXED_BYTES,
+		};
+		const { rows, nextCursor } = collectStream(reader, cursor, range, belongsToTarget, budget);
+		return { page: { stream: "outbox", rows }, nextCursor: nextCursor ? { stream: "outbox", cursor: nextCursor } : null };
 	}
 
 	#applyPendingTx(page: Extract<FokosDBHostPage, { stream: "pending_tx" }>): void {
@@ -334,7 +378,10 @@ function asHostCursor(cursor: unknown): FokosDBHostCursor {
 		return { stream: "items", cursor: null };
 	}
 	const c = cursor as FokosDBHostCursor;
-	invariant(c.stream === "items" || c.stream === "pending_tx", () => `fokos/migration-host: unknown stream ${String(c.stream)}`);
+	invariant(
+		c.stream === "items" || c.stream === "pending_tx" || c.stream === "outbox",
+		() => `fokos/migration-host: unknown stream ${String(c.stream)}`,
+	);
 	assertStreamCursor(c);
 	return c;
 }
@@ -360,13 +407,13 @@ function assertStreamCursor({ stream, cursor }: FokosDBHostCursor): void {
 	const row: { hk?: unknown; sk?: unknown; transaction_id?: unknown } = cursor.row;
 	invariant(isKey(row.hk) && isKey(row.sk), () => `fokos/migration-host: the ${stream} cursor has no hash key or no sort key`);
 	invariant(
-		stream === "items" || typeof row.transaction_id === "string",
+		stream !== "pending_tx" || typeof row.transaction_id === "string",
 		"fokos/migration-host: the pending_tx cursor has no transaction id",
 	);
 }
 
 /** The stream order, so a page can be checked against the cursor that asked for it. */
-const STREAM_ORDER: Record<FokosDBHostCursor["stream"], number> = { items: 0, pending_tx: 1 };
+const STREAM_ORDER: Record<FokosDBHostCursor["stream"], number> = { items: 0, pending_tx: 1, outbox: 2 };
 
 /** Throws when a page would move the host's own streams backwards. */
 export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, nextCursor: unknown): void {
@@ -378,7 +425,7 @@ export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, next
 	);
 	if (nextCursor === null) {
 		invariant(
-			requested.stream === "pending_tx",
+			requested.stream !== "items",
 			() => `fokos/migration-host: a null cursor ends the ${requested.stream} stream, which is not the last`,
 		);
 		return;

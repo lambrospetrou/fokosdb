@@ -202,6 +202,22 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb~r.alice.b1.~max");
 	});
 
+	it("depth reads the hex ID with the same result as the bytes, up to the largest depth", () => {
+		for (const idxs of [[3], [1, 2], [0, 1, 2, 3], [0, ...Array.from({ length: 255 }, (_, i) => i % 7)]]) {
+			const { bytes, opaque } = PartitionIdHelper.fromHashIdxs(base, idxs).encode(true);
+			expect(PartitionIdHelper.depth(opaque)).toBe(PartitionIdHelper.depth(bytes));
+			expect(PartitionIdHelper.depth(opaque.toUpperCase())).toBe(idxs.length - 1);
+		}
+	});
+
+	it("depth rejects a hex ID that is not a hash ID or that has no valid depth", () => {
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(true);
+		expect(() => PartitionIdHelper.depth(opaque)).toThrow(invariantFailure(/expected hash schema/));
+		for (const malformed of ["000001", "000001g0", "0000010"]) {
+			expect(() => PartitionIdHelper.depth(malformed)).toThrow(invariantFailure(/has no valid depth/));
+		}
+	});
+
 	it("hash-only readers reject range IDs", () => {
 		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(invariantFailure(/expected hash schema/));

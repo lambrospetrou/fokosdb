@@ -217,8 +217,8 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   unit tests and the promotion tests. This milestone ships on its own before any materialization code.
 
 ### Milestone 2: Base `materialization_outbox`, export epochs, and `MaterializationDO` mirror
-- Add `captureChanges` and `nsMat` to `FokosTableIdentity`, `FokosTableOptions`, and `FokosDBPolicy`. Store
-  `captureChanges` with the first identity of each partition (Sections 4.2.1 and 4.2.3).
+- Add `nsMat` to `FokosTableIdentity` and `FokosDBPolicy`. Add `captureChanges` to `FokosTableOptions` and
+  `FokosDBPolicy` (Sections 4.2.1 and 4.2.3).
 - Add `materialization_outbox` and `materialization_export_state` to `PartitionStore`. Add the outbox writes to
   `upsertItem`, `updateItemSingleShot`, `deleteItem`, `TransactionParticipant.commitLocal`,
   `TransactionParticipant.executeSingleShot`, and the owned rows of `deleteExpiredItems` (Section 4.2.3).
@@ -385,9 +385,10 @@ The existing transaction invariants stay true (Section 6.4).
 When `captureChanges` is `false`, a partition writes no outbox row and runs no export loop. This includes each GSI
 shard group.
 
-`captureChanges` is fixed when the table is created. Each partition stores it with its first identity (a root from its
-first request, any other partition from `fokosInit`). A request whose policy has a different `captureChanges` value
-fails. Section 4.3.4 tracks capture on a table that has data.
+`captureChanges` is an ordinary option of the policy, so a request with a higher `policyVersion` can change it. Each
+partition reads it from its stored policy at each write. The caller must set it only when the table is created: a
+partition records only the changes after it receives the value, so a table that turns it on when it has data never
+exports its older items. No partition checks this rule. Section 4.3.4 tracks capture on a table that has data.
 
 `PartitionStore` adds the rowid table `materialization_outbox`:
 

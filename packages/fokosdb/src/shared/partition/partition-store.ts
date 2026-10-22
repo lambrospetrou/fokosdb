@@ -255,8 +255,11 @@ export type HashKeyWalkCursor<C extends { hk: KeyBytes; sk: KeyBytes }> = { kind
 /** One entry of a hash-key walk: a row of an owned hash key, or one hash key that the walk skipped. */
 export type HashKeyWalkEntry<T> = { kind: "row"; row: T } | { kind: "skipped"; hk: KeyBytes };
 
-/** The tables that a hash-key walk can read. Both have a unique index that starts with `(hk, sk)`. */
-export type HashKeyWalkTable = "items" | "pending_transactions";
+/** The tables that a hash-key walk can read. Each has a unique index that starts with `(hk, sk)`. */
+export type HashKeyWalkTable = "items" | "pending_transactions" | "materialization_outbox";
+
+/** One `materialization_outbox` row as a migration page carries it. The target gives it a new `outbox_id`. */
+export type MigratedOutboxRow = { hk: KeyBytes; sk: KeyBytes; revision: number; is_deleted: 0 | 1 };
 
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
@@ -508,6 +511,33 @@ export function itemsPageStatement(cursor: ScanCursor | null, limit: number, ran
 }
 
 /**
+ * The SQL of one migration page of `materialization_outbox`, in (hk, sk) order, strictly after
+ * `cursor`. The cursor and range rules of `itemsPageStatement` apply.
+ */
+export function outboxPageStatement(cursor: ScanCursor | null, limit: number, range: KeyRange | null): { sql: string; params: unknown[] } {
+	const conds: string[] = [];
+	const params: unknown[] = [];
+	if (range === null) {
+		if (cursor) {
+			conds.push("(hk, sk) > (?, ?)");
+			params.push(cursor.hk, cursor.sk);
+		}
+	} else {
+		conds.push("hk = ?", cursor ? "sk > ?" : "sk >= ?");
+		params.push(range.hk, cursor ? cursor.sk : range.start);
+		if (range.end !== null) {
+			conds.push("sk < ?");
+			params.push(range.end);
+		}
+	}
+	const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")} ` : "";
+	return {
+		sql: `SELECT hk, sk, revision, is_deleted FROM materialization_outbox ${where}ORDER BY hk, sk LIMIT ?`,
+		params: [...params, limit],
+	};
+}
+
+/**
  * The SQL that finds the first row of the next hash key after `after` (null = the first key of the
  * table). It is one seek on a key index, and it reads one index entry, also when `after` has many rows.
  */
@@ -744,18 +774,55 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
             CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (est_bytes);`,
 	},
+	{
+		idMonotonicInc: 4,
+		description: "Create the materialization outbox",
+		// One row for each changed item that the export has not sent yet. It holds the key and the
+		// revision, never the data: the export reads the data from `items`. A newer change of the item
+		// updates the same row, so many writes before one export cost one row.
+		//
+		// - `revision` is the `v` of the item, or the delete revision `v + 1` when `is_deleted = 1`.
+		// - `is_local_only = 1` means that no receiver can hold a revision of the key. A delete of such a
+		//   row removes it, and nothing is sent. The value changes only from 1 to 0.
+		// - A writer must keep `outbox_id`: use `INSERT ... ON CONFLICT (hk, sk) DO UPDATE`, never
+		//   `INSERT OR REPLACE`.
+		// - A rowid table, because the keys can be some kilobytes (see the items table).
+		sql: `
+            CREATE TABLE IF NOT EXISTS materialization_outbox (
+                outbox_id       INTEGER PRIMARY KEY,
+                hk              BLOB    NOT NULL,
+                sk              BLOB    NOT NULL DEFAULT x'',
+                revision        INTEGER NOT NULL,
+                is_deleted      INTEGER NOT NULL,
+                is_local_only   INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (hk, sk)
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS idx_materialization_outbox_due ON materialization_outbox (next_attempt_at, outbox_id);`,
+	},
 ];
 
 // ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
+export type PartitionStoreOptions = {
+	/**
+	 * True when each item change writes a `materialization_outbox` row in the transaction of the change.
+	 * Read at each write. Default: false.
+	 */
+	captureChanges?: () => boolean;
+};
+
 export class PartitionStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
+	#captureChanges: () => boolean;
 
-	constructor(storage: DurableObjectStorage) {
+	constructor(storage: DurableObjectStorage, opts: PartitionStoreOptions = {}) {
 		this.#storage = storage;
+		this.#captureChanges = opts.captureChanges ?? (() => false);
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
@@ -1070,6 +1137,7 @@ export class PartitionStore {
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
 			`fokos/partition-store.upsertItem: unexpected version value: ${version}`,
 		);
+		this.#captureWrite(opts.hk, opts.sk, version, oldEst === 0);
 		// Exact stored size, measured by SQLite in the statement above (drives the key_size_estimates delta).
 		const newEst = rows[0].est_row_bytes;
 
@@ -1125,6 +1193,7 @@ export class PartitionStore {
 			invariant(before !== undefined, "fokos/partition-store.deleteItem: the DELETE removed a row that the read before it did not find");
 			deleteVersion = before.v + 1;
 			this.#raiseDeletionMetadata(Math.max(opts.txOrderTs, before.last_read_ts), deleteVersion);
+			this.#captureDelete(opts.hk, opts.sk, deleteVersion);
 		} else if (opts.bumpTxOrderTsAlways) {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
 		}
@@ -1132,6 +1201,50 @@ export class PartitionStore {
 			this.#subtractKeySizeEstimate(opts.hk, delEst);
 		}
 		return { deleted, deleteVersion, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
+	}
+
+	/**
+	 * Records a new revision of a present item in the outbox, in the transaction of the write. `created`
+	 * is true when the write made the row. A new row of an item that no receiver can hold yet is local
+	 * only. An existing outbox row keeps its `outbox_id` and its `is_local_only`: a row that is not
+	 * local only holds a delete or a revision that a receiver can have.
+	 */
+	#captureWrite(hk: KeyBytes, sk: KeyBytes, revision: number, created: boolean): void {
+		if (!this.#captureChanges()) {
+			return;
+		}
+		this.#storage.sql.exec(
+			`INSERT INTO materialization_outbox (hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
+			 VALUES (?1, ?2, ?3, 0, ?4, 0)
+			 ON CONFLICT (hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = 0, next_attempt_at = 0`,
+			hk,
+			sk,
+			revision,
+			created ? 1 : 0,
+		);
+	}
+
+	/**
+	 * Records the delete of a present item at `deleteVersion`, in the transaction of the delete. When no
+	 * receiver can hold a revision of the key, the delete removes the outbox row and nothing is sent.
+	 * Otherwise the row becomes a tombstone and keeps its `outbox_id`.
+	 */
+	#captureDelete(hk: KeyBytes, sk: KeyBytes, deleteVersion: number): void {
+		if (!this.#captureChanges()) {
+			return;
+		}
+		const sql = this.#storage.sql;
+		if (exists(sql.exec(`DELETE FROM materialization_outbox WHERE hk = ? AND sk = ? AND is_local_only = 1 RETURNING 1`, hk, sk))) {
+			return;
+		}
+		sql.exec(
+			`INSERT INTO materialization_outbox (hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
+			 VALUES (?1, ?2, ?3, 1, 0, 0)
+			 ON CONFLICT (hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = 1, is_local_only = 0, next_attempt_at = 0`,
+			hk,
+			sk,
+			deleteVersion,
+		);
 	}
 
 	/**
@@ -1184,10 +1297,10 @@ export class PartitionStore {
 				return { deletedRows: 0, deletedBytes: 0, resumeAfter };
 			}
 			const rows = this.#storage.sql
-				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
+				.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
 					`DELETE FROM items
 					 WHERE item_id IN (SELECT value FROM json_each(?1))
-					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
+					 RETURNING hk, sk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 					JSON.stringify(ownedIds),
 				)
 				.toArray();
@@ -1209,6 +1322,7 @@ export class PartitionStore {
 				maxDeleteTxOrderTs = Math.max(maxDeleteTxOrderTs, row.ttl_epoch_utc_seconds * 1000 * TX_ORDER_TS_UNITS_PER_MS, row.last_read_ts);
 				// The expiry of a row at v has the delete revision v + 1, the same as a user delete.
 				maxDeletedV = Math.max(maxDeletedV, row.v + 1);
+				this.#captureDelete(hk, fromSqlKey(row.sk), row.v + 1);
 			}
 
 			for (const { hk, bytes } of bytesByHashKey.values()) {
@@ -1735,6 +1849,7 @@ export class PartitionStore {
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
 			`fokos/partition-store.updateItemSingleShot: unexpected version value: ${version}`,
 		);
+		this.#captureWrite(opts.hk, opts.sk, version, oldEst === 0);
 		const newEst = rows[0].est_row_bytes;
 		const kseRow = tryOne(
 			this.#storage.sql.exec<{ est_bytes: number }>(
@@ -1952,6 +2067,60 @@ export class PartitionStore {
 				kind: kindFromNullableCode(data_kind),
 			};
 		}
+	}
+
+	// ─── materialization_outbox migration ───────────────────────────────────
+
+	/** Pages `materialization_outbox` with the statement of `outboxPageStatement`. The rules of `queryItemsPage` apply. */
+	*queryOutboxPage(cursor: ScanCursor | null, limit: number, range: KeyRange | null): Generator<MigratedOutboxRow> {
+		const { sql, params } = outboxPageStatement(cursor, limit, range);
+		for (const row of this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; revision: number; is_deleted: 0 | 1 }>(sql, ...params)) {
+			yield { hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), revision: row.revision, is_deleted: row.is_deleted };
+		}
+	}
+
+	/** The hash-key walk of `materialization_outbox`, as `walkItemsByHashKey` does for `items`. */
+	walkOutboxByHashKey(
+		cursor: HashKeyWalkCursor<ScanCursor> | null,
+		limit: number,
+		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
+	): Generator<HashKeyWalkEntry<MigratedOutboxRow>> {
+		return this.#walkByHashKey("materialization_outbox", cursor, limit, owns, (after, n, range) => this.queryOutboxPage(after, n, range));
+	}
+
+	/**
+	 * Inserts a migrated outbox row. An export call of the source can be in flight at the cutover, so
+	 * a receiver can hold the revision: the row is never local only, and it is due now. A row that a
+	 * retried page inserted already stays.
+	 */
+	insertMigratedOutboxRow(row: MigratedOutboxRow): void {
+		this.#storage.sql.exec(
+			`INSERT INTO materialization_outbox (hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
+			 VALUES (?, ?, ?, ?, 0, 0)
+			 ON CONFLICT (hk, sk) DO NOTHING`,
+			row.hk,
+			row.sk,
+			row.revision,
+			row.is_deleted,
+		);
+	}
+
+	/**
+	 * Deletes up to `maxRows` outbox copies after a repartition: the rows of `hk`, or all rows when `hk`
+	 * is null. Returns true when no copy is left.
+	 */
+	deleteOutboxCopiesBatch(hk: KeyBytes | null, maxRows: number): boolean {
+		const sql = this.#storage.sql;
+		if (hk === null) {
+			sql.exec(`DELETE FROM materialization_outbox WHERE outbox_id IN (SELECT outbox_id FROM materialization_outbox LIMIT ?)`, maxRows);
+			return !exists(sql.exec(`SELECT 1 FROM materialization_outbox LIMIT 1`));
+		}
+		sql.exec(
+			`DELETE FROM materialization_outbox WHERE outbox_id IN (SELECT outbox_id FROM materialization_outbox WHERE hk = ? LIMIT ?)`,
+			hk,
+			maxRows,
+		);
+		return !exists(sql.exec(`SELECT 1 FROM materialization_outbox WHERE hk = ? LIMIT 1`, hk));
 	}
 
 	// ─── deletion_metadata ──────────────────────────────────────────────────

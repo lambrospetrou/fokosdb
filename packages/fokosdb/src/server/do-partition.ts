@@ -387,7 +387,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		super(ctx, env);
 		// The runtime is created after this store. The callbacks run only when a statement or a
 		// decision needs the answer.
-		this.#store = new PartitionStore(ctx.storage);
+		this.#store = new PartitionStore(ctx.storage, { captureChanges: () => this.#captureEnabled() });
 		this.#participant = new TransactionParticipant({
 			store: this.#store,
 			now: () => this.fokosNow(),
@@ -550,6 +550,11 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			this.#ttl.arm();
 		}
 		return this.fokos.dispatch(op, ctx, req);
+	}
+
+	/** True when the policy of this partition turns on the capture of item changes. */
+	#captureEnabled(): boolean {
+		return this.fokos.initialized() && this.fokos.policy().captureChanges === true;
 	}
 
 	//////////////////////////////
@@ -934,6 +939,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			migration: new FokosMigrationHost({
 				store: this.#store,
 				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
+				captureChanges: () => this.#captureEnabled(),
 			}),
 			// A promotion deletes the size estimate of its key. Every new write of the key goes to the
 			// range tree, so nothing here reads the estimate again. Without the delete, the key stays in
@@ -957,10 +963,16 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				if (plan.kind !== "key_promotion") {
 					// FIXME: A split keeps its item rows. A delete of the rows writes rows, and each row written
 					// has a cost. Compare that cost with the storage cost before a split deletes them.
-					return this.#store.deletePendingTxCopiesBatch(null, cleanupTxLockCopyRows);
+					return (
+						this.#store.deletePendingTxCopiesBatch(null, cleanupTxLockCopyRows) &&
+						this.#store.deleteOutboxCopiesBatch(null, cleanupTxLockCopyRows)
+					);
 				}
 				const hashKey = promotedKeyOf(plan);
-				if (!this.#store.deletePendingTxCopiesBatch(hashKey, cleanupTxLockCopyRows)) {
+				if (
+					!this.#store.deletePendingTxCopiesBatch(hashKey, cleanupTxLockCopyRows) ||
+					!this.#store.deleteOutboxCopiesBatch(hashKey, cleanupTxLockCopyRows)
+				) {
 					return false;
 				}
 				this.#store.deleteItemsBatchForHashKey(hashKey, cleanupPromotedKeyRows);

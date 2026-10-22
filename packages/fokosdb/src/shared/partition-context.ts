@@ -52,6 +52,11 @@ export type FokosDBPolicy = {
 	 * with no overrides sends no extra bytes. Only the client reads it, through `resolveLimits`.
 	 */
 	limits?: FokosDBLimitOverrides;
+	/**
+	 * True when each partition records its item changes for export. Absent when false, so a table
+	 * without capture sends no extra bytes.
+	 */
+	captureChanges?: true;
 };
 
 export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
@@ -147,6 +152,14 @@ export type FokosTableOptions = {
 	 */
 	limits?: FokosDBLimitOverrides;
 	/**
+	 * Records each item change in the partition, for the export to the global secondary indexes and
+	 * the push targets. Default: false.
+	 *
+	 * Set it only when the table is created. A partition records only the changes after it receives
+	 * the value, so a table that turns it on when it has data never exports its older items.
+	 */
+	captureChanges?: boolean;
+	/**
 	 * The version of the options above, a non-negative integer. Default: 0.
 	 *
 	 * Each partition and coordinator stores the options of the requests it receives. It stores them
@@ -180,6 +193,9 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 	}
 	if (table.name.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
 		throw invalid("table.name", table.name, `table.name must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
+	}
+	if (opts.captureChanges !== undefined && typeof opts.captureChanges !== "boolean") {
+		throw invalid("captureChanges", opts.captureChanges, "captureChanges must be a boolean");
 	}
 	const topology: FokosTopology = {
 		shardGroup: `${PARTITION_SHARD_GROUP_PREFIX}${table.name}`,
@@ -219,6 +235,7 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 		rangeSplitConditions,
 		...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
 		...(limits === undefined ? {} : { limits }),
+		...(opts.captureChanges === true ? { captureChanges: true as const } : {}),
 	};
 	const policyVersion = opts.policyVersion ?? 0;
 	validatePolicyVersion(policyVersion);

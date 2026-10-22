@@ -1499,7 +1499,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				throw this.#notInitialized(routeCtx);
 			}
 			invariant(routeCtx.partitionId.length > 0, "fokos/runtime: partitionId must not be empty");
-			if (PartitionIdHelper.depth(Uint8Array.fromHex(routeCtx.partitionId)) > 0) {
+			if (PartitionIdHelper.depth(routeCtx.partitionId) > 0) {
 				throw this.#notInitialized(routeCtx);
 			}
 			return this.#writeIdentity(routeCtx);

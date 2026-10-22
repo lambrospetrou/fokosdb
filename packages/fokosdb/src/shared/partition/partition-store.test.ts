@@ -2197,3 +2197,152 @@ describe("PartitionStore - migration pages", () => {
 		});
 	});
 });
+
+describe("PartitionStore - materialization outbox", () => {
+	type OutboxRow = { outbox_id: number; revision: number; is_deleted: number; is_local_only: number; next_attempt_at: number };
+
+	async function withCaptureStore(capture: boolean, fn: (store: PartitionStore, state: DurableObjectState) => void): Promise<void> {
+		const stub = testPartitionStub(`store-outbox-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			fn(new PartitionStore(state.storage, { captureChanges: () => capture }), state);
+		});
+	}
+	function outboxRow(state: DurableObjectState, hk: string, sk = "s"): OutboxRow | undefined {
+		return state.storage.sql
+			.exec<OutboxRow>(
+				`SELECT outbox_id, revision, is_deleted, is_local_only, next_attempt_at FROM materialization_outbox WHERE hk = ? AND sk = ?`,
+				kb(hk),
+				kb(sk),
+			)
+			.toArray()[0];
+	}
+	function outboxCount(state: DurableObjectState): number {
+		return state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM materialization_outbox`).one().n;
+	}
+	/** The export of a row: no receiver can be sure to lack it any more. */
+	function claim(state: DurableObjectState, hk: string): void {
+		state.storage.sql.exec(`UPDATE materialization_outbox SET is_local_only = 0, next_attempt_at = 99 WHERE hk = ?`, kb(hk));
+	}
+	const put = (store: PartitionStore, hk: string, ttlAt: number | null = null) =>
+		store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt, txOrderTs: 1 }).version;
+	const del = (store: PartitionStore, hk: string) => store.deleteItem({ hk: kb(hk), sk: kb("s"), txOrderTs: 1 });
+
+	it("writes no outbox row when capture is off", async () => {
+		await withCaptureStore(false, (store, state) => {
+			put(store, "x");
+			put(store, "x");
+			del(store, "x");
+			expect(outboxCount(state)).toBe(0);
+		});
+	});
+
+	it("a create is local only, an update keeps the row, and a delete before the export removes it", async () => {
+		await withCaptureStore(true, (store, state) => {
+			expect(put(store, "x")).toBe(1);
+			const created = outboxRow(state, "x")!;
+			expect(created).toMatchObject({ revision: 1, is_deleted: 0, is_local_only: 1, next_attempt_at: 0 });
+
+			expect(put(store, "x")).toBe(2);
+			expect(outboxRow(state, "x")).toEqual({ ...created, revision: 2 });
+
+			expect(del(store, "x").deleteVersion).toBe(3);
+			expect(outboxRow(state, "x")).toBeUndefined();
+		});
+	});
+
+	it("a delete after the export writes a tombstone at v + 1, and a recreate keeps the row and its outbox_id", async () => {
+		await withCaptureStore(true, (store, state) => {
+			put(store, "x");
+			claim(state, "x");
+			const { outbox_id } = outboxRow(state, "x")!;
+
+			expect(del(store, "x").deleteVersion).toBe(2);
+			expect(outboxRow(state, "x")).toEqual({ outbox_id, revision: 2, is_deleted: 1, is_local_only: 0, next_attempt_at: 0 });
+
+			expect(put(store, "x")).toBe(3);
+			expect(outboxRow(state, "x")).toEqual({ outbox_id, revision: 3, is_deleted: 0, is_local_only: 0, next_attempt_at: 0 });
+		});
+	});
+
+	it("an update of an item with no outbox row writes a row that is not local only", async () => {
+		await withCaptureStore(true, (store, state) => {
+			put(store, "x");
+			// The export acknowledged revision 1 and deleted the row.
+			state.storage.sql.exec(`DELETE FROM materialization_outbox`);
+			put(store, "x");
+			expect(outboxRow(state, "x")).toMatchObject({ revision: 2, is_deleted: 0, is_local_only: 0 });
+			// A receiver can hold revision 1, so the delete must reach it.
+			del(store, "x");
+			expect(outboxRow(state, "x")).toMatchObject({ revision: 3, is_deleted: 1, is_local_only: 0 });
+		});
+	});
+
+	it("updateItemSingleShot captures a create as local only and an update with its version", async () => {
+		await withCaptureStore(true, (store, state) => {
+			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
+			store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan, txOrderTs: 1 });
+			expect(outboxRow(state, "x")).toMatchObject({ revision: 1, is_deleted: 0, is_local_only: 1 });
+			claim(state, "x");
+			store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan, txOrderTs: 2 });
+			expect(outboxRow(state, "x")).toMatchObject({ revision: 2, is_deleted: 0, is_local_only: 0, next_attempt_at: 0 });
+		});
+	});
+
+	it("a delete of an absent item writes no outbox row", async () => {
+		await withCaptureStore(true, (store, state) => {
+			store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 1, bumpTxOrderTsAlways: true });
+			del(store, "y");
+			expect(outboxCount(state)).toBe(0);
+		});
+	});
+
+	it("the TTL sweep writes a tombstone for an exported row and removes a local only row", async () => {
+		await withCaptureStore(true, (store, state) => {
+			put(store, "exported", 10);
+			put(store, "local", 10);
+			claim(state, "exported");
+			expect(store.deleteExpiredItems(100, 10, () => true).deletedRows).toBe(2);
+			expect(outboxRow(state, "exported")).toMatchObject({ revision: 2, is_deleted: 1, is_local_only: 0, next_attempt_at: 0 });
+			expect(outboxRow(state, "local")).toBeUndefined();
+		});
+	});
+
+	it("pages the outbox rows of a range and of a hash-key walk, and the copy is due and not local only", async () => {
+		await withCaptureStore(true, (store, state) => {
+			for (const hk of ["a", "b", "c"]) {
+				put(store, hk);
+			}
+			claim(state, "b");
+			del(store, "b");
+			const range = [...store.queryOutboxPage(null, 10, { hk: kb("b"), start: KeyCodec.encodeOptional(undefined), end: null })];
+			expect(range).toEqual([{ hk: kb("b"), sk: kb("s"), revision: 2, is_deleted: 1 }]);
+
+			const walked = [...store.walkOutboxByHashKey(null, 10, (hk) => keyLabel(hk) !== "a")];
+			expect(walked.map((e) => (e.kind === "row" ? `row:${keyLabel(e.row.hk)}` : `skip:${keyLabel(e.hk)}`))).toEqual([
+				"skip:a",
+				"row:b",
+				"row:c",
+			]);
+
+			// The copy on a child: a retried page keeps the first row.
+			state.storage.sql.exec(`DELETE FROM materialization_outbox`);
+			store.insertMigratedOutboxRow({ hk: kb("b"), sk: kb("s"), revision: 2, is_deleted: 1 });
+			store.insertMigratedOutboxRow({ hk: kb("b"), sk: kb("s"), revision: 1, is_deleted: 0 });
+			expect(outboxRow(state, "b")).toMatchObject({ revision: 2, is_deleted: 1, is_local_only: 0, next_attempt_at: 0 });
+		});
+	});
+
+	it("deletes the outbox copies of one hash key or of all keys in bounded batches", async () => {
+		await withCaptureStore(true, (store, state) => {
+			for (const sk of ["1", "2", "3"]) {
+				store.upsertItem({ hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			}
+			put(store, "stays");
+			expect(store.deleteOutboxCopiesBatch(kb("moved"), 2)).toBe(false);
+			expect(store.deleteOutboxCopiesBatch(kb("moved"), 2)).toBe(true);
+			expect(outboxCount(state)).toBe(1);
+			expect(store.deleteOutboxCopiesBatch(null, 1)).toBe(true);
+			expect(outboxCount(state)).toBe(0);
+		});
+	});
+});

@@ -223,7 +223,11 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,
 			hooks: {
 				evaluateSplit: () => false,
-				migration: new FokosMigrationHost({ store, logParams: () => ({ doName, partitionId: ctx.partitionId }) }),
+				migration: new FokosMigrationHost({
+					store,
+					logParams: () => ({ doName, partitionId: ctx.partitionId }),
+					captureChanges: () => false,
+				}),
 				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
 				cleanupSourceStep: (plan) => {
 					if (plan.kind !== "key_promotion") {
