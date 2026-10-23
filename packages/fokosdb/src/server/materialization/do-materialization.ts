@@ -191,8 +191,9 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	 * Then an image applies only when its revision is above the stored revision. An equal or lower
 	 * revision is acknowledged with no write: this partition holds that revision or a newer one.
 	 *
-	 * Above its size limit the partition refuses each live image with `partition_over_size`, and asks
-	 * for a split. It still applies each delete, because a delete makes the partition smaller.
+	 * Above its size limit the partition refuses each newer live image with `partition_over_size`, and
+	 * asks for a split. The receiver rules still apply first, so the fences and the epochs of the call
+	 * are stored. It still applies each delete, because a delete makes the partition smaller.
 	 */
 	private applyLatestImagesLocal(req: ApplyLatestImagesRequest, call: FokosLocalCall): ApplyLatestImagesResponse {
 		const out: ApplyLatestImagesResponse = { acknowledged: [], failed: [], partitions: [this.selfPartition()] };
@@ -203,35 +204,37 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 		const fail = (error: unknown, opIndex: number) =>
 			out.failed.push({ ...classifyBatchFailure(error, { write: true, local: true }), opIndexes: [opIndex], partitionIndex: 0 });
 		for (const item of req.items) {
-			if (overSize && !item.deleted) {
-				fail(overSize, item.opIndex);
-				continue;
-			}
-			let fenced: boolean;
+			let result: "applied" | "fenced" | "over_size";
 			try {
-				fenced = this.#store.transactionSync(() => {
+				result = this.#store.transactionSync(() => {
 					for (const fence of req.ancestorFences) {
 						this.#store.raiseProducerEpoch(fence.ancestorId, fence.minEpoch);
 					}
 					const stored = this.#store.producerEpoch(req.producerId);
 					if (req.epoch < stored) {
-						return true;
+						return "fenced";
 					}
 					if (req.epoch > stored) {
 						this.#store.raiseProducerEpoch(req.producerId, req.epoch);
 					}
 					const current = this.#store.storedImage(item.hashKey, item.sortKey);
-					if (current === undefined || item.revision > current.revision) {
-						this.#store.putLatestImage(item, this.fokosNow(), current?.estRowBytes ?? 0);
+					if (current !== undefined && item.revision <= current.revision) {
+						return "applied";
 					}
-					return false;
+					if (overSize && !item.deleted) {
+						return "over_size";
+					}
+					this.#store.putLatestImage(item, this.fokosNow(), current?.estRowBytes ?? 0);
+					return "applied";
 				});
 			} catch (e) {
 				fail(e, item.opIndex);
 				continue;
 			}
-			if (fenced) {
+			if (result === "fenced") {
 				fail(producerEpochFenced(req.epoch), item.opIndex);
+			} else if (result === "over_size") {
+				fail(overSize, item.opIndex);
 			} else {
 				out.acknowledged.push({ opIndex: item.opIndex, partitionIndex: 0 });
 			}

@@ -26,7 +26,7 @@ import type {
 	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
-import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
+import { materializationTableConfig, type FokosDBPolicy, type FokosDBRouteContext } from "../shared/partition-context.js";
 import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { SplitType } from "../sharding/types.js";
@@ -90,7 +90,10 @@ import {
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
-import { partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
+import { FokosShardingClient } from "../sharding/client.js";
+import { MaterializationExporter, type ExportCall, type ExportItemOutcome } from "../shared/partition/materialization-export.js";
+import type { MaterializationOps } from "./materialization/do-materialization.js";
 import {
 	ADMISSION_MARGIN,
 	applyBatchImageCap,
@@ -335,6 +338,9 @@ export type PartitionRpc = FokosShardingRpc & {
 /** The host job that asks the coordinator of each stale lock to resolve it. */
 const JOB_STALE_TX_RECOVERY = "stale_tx_recovery";
 
+/** The host job that starts the materialization export again after a restart or an eviction. */
+const JOB_MATERIALIZATION_EXPORT = "materialization_export";
+
 /**
  * The longest time that one step of the stale-transaction job starts coordinator calls. The passes of
  * the scheduler run one at a time, so a long step delays the import and repartition jobs.
@@ -361,6 +367,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#ttl: TtlExpiry;
+	#exporter: MaterializationExporter;
+	/** The client of the materialization partitions, and the route context that it was made from. */
+	#materialization: { routeCtx: FokosDBRouteContext; client: FokosShardingClient<FokosDBPolicy, MaterializationOps> } | undefined;
 	/** True after the split floor was logged. Every refused write runs the decision, so it logs once. */
 	#splitFloorLogged = false;
 	// Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
@@ -372,7 +381,10 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		super(ctx, env);
 		// The runtime is created after this store. The callbacks run only when a statement or a
 		// decision needs the answer.
-		this.#store = new PartitionStore(ctx.storage, { captureChanges: () => this.#captureEnabled() });
+		this.#store = new PartitionStore(ctx.storage, {
+			captureChanges: () => this.#captureEnabled(),
+			onChangeCaptured: () => this.#exporter.wake(),
+		});
 		this.#participant = new TransactionParticipant({
 			store: this.#store,
 			now: () => this.fokosNow(),
@@ -386,6 +398,24 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			ownerCheck: () => ownsByHashKey(this.fokos.ownerCheck()),
 			logParams: () => this.logParams(),
 			config: () => this.config().ttlSweep,
+		});
+		this.#exporter = new MaterializationExporter({
+			store: this.#store,
+			canRun: () => this.#captureEnabled() && this.canSweepLocally(this.fokos.lifecycle()),
+			ownerCheck: () => ownsByHashKey(this.fokos.ownerCheck()),
+			send: async (call) => await this.#sendExport(call),
+			config: () => this.config().materializationExport,
+			scheduleRetry: (runAt) => {
+				this.fokos.scheduleJob(JOB_MATERIALIZATION_EXPORT, runAt).catch((error: unknown) => {
+					console.error({
+						...this.logParams(),
+						message: "fokos/partition: failed to schedule the materialization export",
+						error: String(error),
+					});
+				});
+			},
+			now: () => this.fokosNow(),
+			logParams: () => this.logParams(),
 		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
@@ -504,6 +534,8 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		await this.fokos.fokosPrepareDestroy(req);
 		// After the pass the fence waited for, never before it: the pass can arm the sweep.
 		this.#ttl.disarm();
+		// The fence stops the export loop. No export call of this instance stays in flight after it.
+		await this.#exporter.settled();
 	}
 	async fokosDestroy(): Promise<void> {
 		this.#ttl.disarm();
@@ -540,6 +572,70 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	/** True when the policy of this partition turns on the capture of item changes. */
 	#captureEnabled(): boolean {
 		return this.fokos.initialized() && this.fokos.policy().captureChanges === true;
+	}
+
+	/**
+	 * The client of the materialization partitions of this table. The first export makes it, and each
+	 * later export uses it. The runtime replaces its route context only when it stores a new identity
+	 * or policy, and the client is made again only then, so it always sends the current policy.
+	 */
+	#materializationClient(): FokosShardingClient<FokosDBPolicy, MaterializationOps> {
+		const self = this.fokos.routeContext();
+		if (this.#materialization?.routeCtx === self) {
+			return this.#materialization.client;
+		}
+		const table = materializationTableConfig({
+			topology: self.topology,
+			rangeConfig: self.rangeConfig,
+			policy: self.policy,
+			policyVersion: self.policyVersion,
+		});
+		const client = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
+			...table,
+			stub: (ctx, doName) => materializationStubByName(this.env, ctx, doName),
+		});
+		this.#materialization = { routeCtx: self, client };
+		return client;
+	}
+
+	/**
+	 * Sends one export call. The images go to the materialization root of each key, one
+	 * `applyLatestImages` call for each root, and each root forwards to the owner of each key. The
+	 * call is sent one time: a failed group gives each of its items the outcome of its error.
+	 */
+	async #sendExport(call: ExportCall): Promise<ExportItemOutcome[]> {
+		const client = this.#materializationClient();
+		const outcomes: Array<ExportItemOutcome | undefined> = Array.from({ length: call.images.length });
+		const groups = client.resolveAll(call.images.map((image) => ({ hashKey: image.hashKey, sortKey: image.sortKey })));
+		const producerId = this.ctx.id.toString();
+		await Promise.all(
+			groups.map(async ({ ctx, indexes }) => {
+				const items = indexes.map((i) => call.images[i]);
+				try {
+					const { value } = await client.send(
+						"applyLatestImages",
+						ctx,
+						{ producerId, epoch: call.epoch, ancestorFences: call.ancestorFences, items },
+						[],
+					);
+					for (const { opIndex } of value.acknowledged) {
+						outcomes[opIndex] = { outcome: "acknowledged" };
+					}
+					for (const failure of value.failed) {
+						for (const opIndex of failure.opIndexes) {
+							outcomes[opIndex] = { outcome: failure.outcome, code: failure.code };
+						}
+					}
+				} catch (error) {
+					const failure = classifyBatchFailure(error, { write: true, local: false });
+					for (const image of items) {
+						outcomes[image.opIndex] = { outcome: failure.outcome, code: failure.code };
+					}
+				}
+			}),
+		);
+		// An item with no answer can have applied.
+		return outcomes.map((o) => o ?? { outcome: "unknown", code: "no_answer" });
 	}
 
 	//////////////////////////////
@@ -925,7 +1021,16 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				store: this.#store,
 				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
 				captureChanges: () => this.#captureEnabled(),
+				selfId: () => this.ctx.id.toString(),
 			}),
+			// After the cutover the export claims skip the moved rows, so only the export calls from before
+			// the cutover can carry them. The raise commits with the cutover, so each of those calls has an
+			// epoch below the new epoch, which each target gets at the end of its outbox stream.
+			onRepartitionCutover: () => {
+				if (this.#captureEnabled()) {
+					this.#store.raiseExportEpoch();
+				}
+			},
 			// A promotion deletes the size estimate of its key. Every new write of the key goes to the
 			// range tree, so nothing here reads the estimate again. Without the delete, the key stays in
 			// the promotion list of the split decision until the cleanup deletes its last row, and the
@@ -988,6 +1093,15 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					deadline: () => this.#store.earliestPendingTxRecoveryAt(),
 					runStep: async () => {
 						await this.recoverStaleTransactions();
+						return { nextRunAt: null };
+					},
+				},
+				{
+					name: JOB_MATERIALIZATION_EXPORT,
+					canRun: (lifecycle) => this.#captureEnabled() && this.canSweepLocally(lifecycle),
+					deadline: () => this.#exporter.deadline(),
+					runStep: () => {
+						this.#exporter.wake();
 						return { nextRunAt: null };
 					},
 				},

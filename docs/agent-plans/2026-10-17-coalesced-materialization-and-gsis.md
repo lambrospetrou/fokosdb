@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-17
 **Author:** Lambros Petrou
-**Status:** The delete revision `v + 1` (Section 4.2.2) and Milestone 1 are built. Nothing else is built. This document specifies
+**Status:** The delete revision `v + 1` (Section 4.2.2), Milestone 1, and Milestone 2 are built. Nothing else is built. This document specifies
 global secondary indexes (GSIs) and push targets.
 
 ## Table of Contents
@@ -216,7 +216,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 - Update the comment of `deleteExpiredItems`, which says that the sweep does not test the owner of each row. Update the
   unit tests and the promotion tests. This milestone ships on its own before any materialization code.
 
-### Milestone 2: Base `materialization_outbox`, export epochs, and `MaterializationDO` mirror
+### Milestone 2 — DONE — Base `materialization_outbox`, export epochs, and `MaterializationDO` mirror
 - Add `nsMat` to `FokosTableIdentity` and `FokosDBPolicy`. Add `captureChanges` to `FokosTableOptions` and
   `FokosDBPolicy` (Sections 4.2.1 and 4.2.3).
 - Add `materialization_outbox` and `materialization_export_state` to `PartitionStore`. Add the outbox writes to
@@ -443,17 +443,24 @@ set it to 0:
 
 ##### Export loop
 
-`PartitionDO` drives the export of `materialization_outbox` with one in-memory background promise
-(`#exportPromise`):
+`PartitionDO` drives the export of `materialization_outbox` with up to `maxExportCalls` (default 2) in-memory
+workers. Each worker sends at most one call at a time:
 
-- Each committed base write wakes `#exportPromise`.
-- In one `transactionSync`, the loop claims up to `maxExportCalls` (default 2) batches of owned, due rows from
-  `idx_materialization_outbox_due`. It `await`s the `applyLatestImages` RPCs in parallel. Then it applies the
-  responses in one `transactionSync`.
-- It repeats until no due outbox rows remain or `canSweepLocally` becomes `false`.
-- When the circuit breaker to `MaterializationDO` is open, the exporter claims no rows, and `is_local_only` does not
-  change.
-  TODO: define the trigger and the probe of this circuit breaker.
+- Each committed base write wakes the exporter. A wake starts a worker when fewer than `maxExportCalls` run, so a
+  new change can go in a second call while a slow call is in flight.
+- A worker claims a batch of owned, due rows from `idx_materialization_outbox_due` in one `transactionSync`. It
+  `await`s the `applyLatestImages` RPCs. Then it applies the responses in one `transactionSync`.
+- A worker repeats until no due outbox row remains or `canSweepLocally` becomes `false`. A worker that claims no
+  row claims again when a wake came after its claim.
+- **Backoff (the circuit breaker of the export).** A call fails as a whole when each item is `unknown` or
+  `unprocessed` with a code that can be retried. Then the workers stop for a backoff in memory: 1 s, doubled after
+  each such failure, at most 30 s. The exporter sets the alarm for the end of the backoff (`scheduleJob`), and the
+  alarm starts a worker again. During the backoff the exporter claims no rows and writes no row, and
+  `is_local_only` does not change. A call with at least one applied item ends the backoff.
+- The workers stop for the backoff instead of a wait in memory. A pending timer prevents hibernation and eviction,
+  and a Durable Object is billed for duration while it cannot hibernate. Thus a wait in memory makes each base
+  partition with changes billed for the whole outage of `MaterializationDO`. The alarm costs one row write and one
+  request for each attempt.
 - Section 4.2.6 ("Lifecycle guard and alarm fallback") gives the alarm fallback.
 
 ##### Export step
@@ -490,7 +497,9 @@ The base partition must delete a `materialization_outbox` row on acknowledgement
 
 For example, a newer write (`revision = 12`) arrives while `revision = 11` is in flight. The `DELETE` for `11` then
 matches zero rows and leaves `12` in the outbox with `next_attempt_at = 0`. For an item that returned `unprocessed`,
-the exporter sets `next_attempt_at` to a backoff timestamp. TODO: give the backoff values of the export.
+the exporter sets `next_attempt_at = now + 5 s`, when other items of the call applied. When the call failed as a
+whole, the exporter writes no row and starts the backoff of the export loop. A `rejected` item is a defect: the
+exporter logs it and sets `next_attempt_at = now + 30 s`, so no change is lost.
 
 ##### Splits, promotions, and TTL sweeps
 
@@ -736,7 +745,7 @@ sent. The skipped positions are done for `t`.
 - While the in-memory loop runs, `deadline()` returns `now + fallbackAlarmMs`. Thus `FokosScheduler` does not start a
   new pass every `fastPathDelayMs` (default 50 ms).
 - While the in-memory loop is idle, `deadline()` returns the earliest due time in SQLite, and `runStep()` starts the
-  in-memory loop. In `PartitionDO`, the due time is the earliest `next_attempt_at`. In `MaterializationDO`, it is
+  in-memory loop. In `PartitionDO`, the due time is the earliest `next_attempt_at`, or the end of a backoff when it is later. In `MaterializationDO`, it is
   `now` when a position above a cursor exists, or else the earliest `not_before` of a `retry` row.
 
 #### 4.2.7 GSI targets and key sets
@@ -1010,22 +1019,38 @@ The completion handler of a call applies these rules:
 The rules apply to a split or a promotion of a base `PartitionDO` (the base hop) and of a `MaterializationDO` (each
 target hop). The parent is the source of the split, and the child is each target of the split.
 
-1. **The parent raises its epoch.** Before the parent serves the first page of its export state, it raises its epoch
-   by 1 in one `transactionSync`. The base partition raises `materialization_export_state.epoch`. `MaterializationDO`
-   raises the epoch of each target. The parent stores the raised epoch `E` with the repartition ID, so that each child
-   of the split gets the same `E`.
+1. **The parent raises its epoch.** The parent raises its epoch by 1 in the cutover transaction of the split, in the
+   runtime hook `onRepartitionCutover`. The base partition raises `materialization_export_state.epoch`.
+   `MaterializationDO` raises the epoch of each target. The last page of the export state gives each child the
+   current epoch `E` of the parent. The parent stores nothing for the split.
+   - After the cutover, the claims of the parent skip the rows of the moved slice (step 2). Thus only the calls that
+     the parent claimed before the cutover can carry those rows, and the raise gives each of them an epoch below
+     `E`.
 2. **The parent stops work on the moved slice.** After the cutover, the parent does not own the moved slice. Thus its
    claims skip those rows, and its completion handlers write nothing for them (response rule 2). The pages that the
    parent serves after the cutover hold the final export state of the slice.
 3. **The child stores the fences.** The child gets `(parent DO ID, E)` and the fence rows of the parent:
 
+Each producer class has its own `ancestor_fences` table. A base `PartitionDO` sends on the export hop only, so its
+table has no hop column:
+
 ```sql
 CREATE TABLE IF NOT EXISTS ancestor_fences (
-    hop         TEXT    NOT NULL,  -- 'export', or a target_id
+    ancestor_id TEXT    PRIMARY KEY,  -- DurableObjectId in hex
+    min_epoch   INTEGER NOT NULL,
+    until_id    INTEGER NOT NULL      -- the highest copied outbox_id
+) WITHOUT ROWID, STRICT;
+```
+
+`MaterializationDO` sends on one hop for each target, so its table keys each fence by the target:
+
+```sql
+CREATE TABLE IF NOT EXISTS ancestor_fences (
+    target_id   TEXT    NOT NULL,
     ancestor_id TEXT    NOT NULL,  -- DurableObjectId in hex
     min_epoch   INTEGER NOT NULL,
-    until_id    INTEGER NOT NULL,  -- the highest copied seq (target hop) or outbox_id (export hop)
-    PRIMARY KEY (hop, ancestor_id)
+    until_id    INTEGER NOT NULL,  -- the highest copied seq
+    PRIMARY KEY (target_id, ancestor_id)
 ) WITHOUT ROWID, STRICT;
 ```
 
@@ -1235,7 +1260,7 @@ A `MaterializationDO` split or promotion migrates these rows for the items of th
 8. The KV item `__fokosdb/mat/targets`: the stored target list of the parent (Section 4.2.13).
 
 A base `PartitionDO` split or promotion migrates the `materialization_outbox` rows of Section 4.2.3. The child also
-gets the `ancestor_fences` row `('export', parent DO ID, E, until_id)` and the export fence rows of the parent. The
+gets the `ancestor_fences` row `(parent DO ID, E, until_id)` and the export fence rows of the parent. The
 child writes these rows in the `transactionSync` that ends the outbox stream, with `until_id = MAX(outbox_id)`. When
 the slice has no outbox row, no work of the slice is in flight, and the child stores no export fence row.
 
@@ -1300,8 +1325,8 @@ export type FokosTargetDefinition = GsiTargetDefinition | PushSinkTargetDefiniti
 `FokosDB.destroy()` destroys the shard groups of the table in this order: each writer before its receiver.
 
 1. `fokos.tc.<tableName>`.
-2. `fokos.p.<tableName>`. `fokosPrepareDestroy` fences each base partition, stops its in-memory `#exportPromise`, and
-   waits for it.
+2. `fokos.p.<tableName>`. `fokosPrepareDestroy` fences each base partition, stops its in-memory export workers, and
+   waits for them.
 3. `fokos.m.<tableName>`, when `nsMat` is configured. `fokosPrepareDestroy` fences each `MaterializationDO`, stops its
    in-memory `#pushPromise`, and waits for it. It collects the union of the GSI `targetId` values from
    `materialization_targets`.
@@ -1943,9 +1968,9 @@ targets (Section 4.3.1) can also backfill from local SQLite with zero reads from
 
 ### 6.3 What happens when an item is created, updated, and deleted while `MaterializationDO` is unreachable?
 
-While the circuit breaker to `MaterializationDO` is open, the exporter claims no rows. Thus the outbox row of a new
+While the export is in a backoff (Section 4.2.3), the exporter claims no rows. Thus the outbox row of a new
 item keeps `is_local_only = 1`, and the local delete removes it in place with zero RPCs (Section 4.2.3). When a claim
-already set `is_local_only = 0` before the breaker opened, the delete writes an outbox tombstone. The exporter sends
+already set `is_local_only = 0` before the backoff started, the delete writes an outbox tombstone. The exporter sends
 it when `MaterializationDO` is reachable again.
 
 ### 6.4 Does the change of `max_deleted_v` to `before.v + 1` change the existing transaction behavior?

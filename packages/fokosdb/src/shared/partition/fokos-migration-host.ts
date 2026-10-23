@@ -28,6 +28,7 @@ import {
 	type KeyRange,
 	type MigratedItem,
 	type MigratedOutboxRow,
+	type ExportFence,
 	type PendingTransactionCursor,
 	type PendingTxItem,
 	type ScanCursor,
@@ -54,7 +55,15 @@ export type FokosDBHostPage =
 			pendingTransactions: PendingTxItem[];
 			deletionMetadata: { maxDeleteTxOrderTs: number; maxDeletedV: number };
 	  }
-	| { stream: "outbox"; rows: MigratedOutboxRow[] };
+	| {
+			stream: "outbox";
+			rows: MigratedOutboxRow[];
+			/**
+			 * The export fences of the target. Only the last page of the stream carries them: the source
+			 * at its export epoch for this repartition, and the export fences of the source.
+			 */
+			fences?: { sourceId: string; epoch: number; inherited: ExportFence[] };
+	  };
 
 export type FokosMigrationHostDeps = {
 	store: PartitionStore;
@@ -62,6 +71,8 @@ export type FokosMigrationHostDeps = {
 	logParams: () => Record<string, unknown>;
 	/** True when the table captures its changes. The source then sends the outbox stream after the locks. */
 	captureChanges: () => boolean;
+	/** The `DurableObjectId` of this partition, in hex: the producer ID of its export calls. */
+	selfId: () => string;
 };
 
 export class FokosMigrationHost implements MigrationHost {
@@ -108,6 +119,9 @@ export class FokosMigrationHost implements MigrationHost {
 			case "outbox":
 				for (const row of p.rows) {
 					this.deps.store.insertMigratedOutboxRow(row);
+				}
+				if (p.fences) {
+					this.deps.store.importExportFences(p.fences.sourceId, p.fences.epoch, p.fences.inherited);
 				}
 		}
 	}
@@ -209,6 +223,13 @@ export class FokosMigrationHost implements MigrationHost {
 
 	// ─── materialization outbox ───────────────────────────────────────────────
 
+	/**
+	 * The pages of the outbox serve only after the cutover, so they hold the final export state of the
+	 * slice. The source raised its export epoch in the cutover transaction (`onRepartitionCutover`), so
+	 * each of its export calls that can carry a row of the slice has a lower epoch. The last page gives
+	 * the current epoch E to the target. The target sends E with its inherited rows, so each receiver
+	 * rejects a late call of the source for those rows.
+	 */
 	#buildOutboxPage(
 		cursor: HashKeyWalkCursor<ScanCursor> | null,
 		range: KeyRange | null,
@@ -223,7 +244,11 @@ export class FokosMigrationHost implements MigrationHost {
 			estimateBytes: (row) => row.hk.byteLength + row.sk.byteLength + OUTBOX_ROW_FIXED_BYTES,
 		};
 		const { rows, nextCursor } = collectStream(reader, cursor, range, belongsToTarget, budget);
-		return { page: { stream: "outbox", rows }, nextCursor: nextCursor ? { stream: "outbox", cursor: nextCursor } : null };
+		if (nextCursor) {
+			return { page: { stream: "outbox", rows }, nextCursor: { stream: "outbox", cursor: nextCursor } };
+		}
+		const fences = { sourceId: this.deps.selfId(), epoch: store.exportState().epoch, inherited: store.exportFences() };
+		return { page: { stream: "outbox", rows, fences }, nextCursor: null };
 	}
 
 	#applyPendingTx(page: Extract<FokosDBHostPage, { stream: "pending_tx" }>): void {

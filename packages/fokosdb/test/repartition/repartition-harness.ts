@@ -94,6 +94,8 @@ export type Cluster = {
 	failNextInit(doName: string, message?: string): void;
 	/** Makes the next `fokosMigrationPull` this node serves answer with `page`, once. */
 	nextPullPage(doName: string, page: FokosMigrationPage): void;
+	/** Each `onRepartitionCutover` call of a node, with the stored state of the repartition during the call. */
+	cutovers(doName: string): Array<{ id: string; kind: string; state: string | undefined }>;
 };
 
 export type ClusterOptions = {
@@ -126,6 +128,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 	const alarms = new Map<string, number[]>();
 	const initFailures = new Map<string, string>();
 	const cannedPages = new Map<string, FokosMigrationPage>();
+	const cutovers = new Map<string, Array<{ id: string; kind: string; state: string | undefined }>>();
 	const suffix = crypto.randomUUID();
 
 	const cluster: Cluster = {
@@ -150,6 +153,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		alarms: (doName) => alarms.get(doName) ?? [],
 		failNextInit: (doName, message = "simulated init failure") => initFailures.set(doName, message),
 		nextPullPage: (doName, page) => cannedPages.set(doName, page),
+		cutovers: (doName) => cutovers.get(doName) ?? [],
 	};
 
 	function makeNode(ctx: FokosDBRouteContext): Node {
@@ -227,8 +231,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					store,
 					logParams: () => ({ doName, partitionId: ctx.partitionId }),
 					captureChanges: () => false,
+					selfId: () => doName,
 				}),
 				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
+				onRepartitionCutover: (plan) => {
+					const calls = cutovers.get(doName) ?? [];
+					calls.push({ id: plan.id, kind: plan.kind, state: sharding.getRepartition(plan.id)?.state });
+					cutovers.set(doName, calls);
+				},
 				cleanupSourceStep: (plan) => {
 					if (plan.kind !== "key_promotion") {
 						return store.deletePendingTxCopiesBatch(null, CLEANUP_BATCH);

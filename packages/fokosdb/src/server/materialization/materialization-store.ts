@@ -168,6 +168,11 @@ export class MaterializationStore {
 					image.data,
 				);
 		const newEst = row.one().est_row_bytes;
+		// An update writes the estimate row even when its value does not change. A stored image always
+		// has a size above 0, so an equal size means that the row exists and needs no write.
+		if (newEst === oldEstRowBytes) {
+			return;
+		}
 		sql.exec(
 			`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
 			 ON CONFLICT (hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)`,

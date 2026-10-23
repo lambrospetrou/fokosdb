@@ -261,6 +261,15 @@ export type HashKeyWalkTable = "items" | "pending_transactions" | "materializati
 /** One `materialization_outbox` row as a migration page carries it. The target gives it a new `outbox_id`. */
 export type MigratedOutboxRow = { hk: KeyBytes; sk: KeyBytes; revision: number; is_deleted: 0 | 1 };
 
+/** One due `materialization_outbox` row, as the export claim reads it. */
+export type DueOutboxRow = { hk: KeyBytes; sk: KeyBytes; revision: number; isDeleted: boolean; isLocalOnly: boolean };
+
+/** An ancestor whose late export calls a receiver must reject, with the lowest epoch that it may still send. */
+export type ExportFence = { ancestorId: string; minEpoch: number };
+
+/** The stored representation of a live item for its export: a json item is its JSONB blob. */
+export type ExportItemImage = { v: number; data: string | Uint8Array; kind: DataKind; ttlAt: number | null; estRowBytes: number };
+
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
 	hk: KeyBytes;
@@ -799,7 +808,33 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 UNIQUE (hk, sk)
             ) STRICT;
 
-            CREATE INDEX IF NOT EXISTS idx_materialization_outbox_due ON materialization_outbox (next_attempt_at, outbox_id);`,
+            CREATE INDEX IF NOT EXISTS idx_materialization_outbox_due ON materialization_outbox (next_attempt_at, outbox_id);
+
+            -- The export epoch of this partition, and whether an export call can be in flight. A restart
+            -- with is_call_open = 1 raises the epoch before the next call, because a call of the old
+            -- instance can still apply.
+            CREATE TABLE IF NOT EXISTS materialization_export_state (
+                id           INTEGER PRIMARY KEY CHECK (id = 1),
+                epoch        INTEGER NOT NULL DEFAULT 1,
+                is_call_open INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            INSERT OR IGNORE INTO materialization_export_state (id, epoch, is_call_open) VALUES (1, 1, 0);
+
+            -- The ancestors whose late export calls (applyLatestImages) a receiver must reject. A split
+            -- child stores them when its outbox stream ends, and each export call carries them while any
+            -- outbox row with outbox_id <= until_id remains. All rows have the same until_id.
+            --
+            -- ancestor_id : the DurableObjectId (hex) of the ancestor: the split source, or an ancestor
+            --               of the source whose fence the source still had.
+            -- min_epoch   : the lowest export epoch of the ancestor that a receiver still accepts. A call
+            --               of the ancestor with a lower epoch applies nothing.
+            -- until_id    : the highest outbox_id of the rows that the child copied. Those rows are the
+            --               inherited work, the only rows that a late call of the ancestor can still change.
+            CREATE TABLE IF NOT EXISTS ancestor_fences (
+                ancestor_id TEXT    PRIMARY KEY,
+                min_epoch   INTEGER NOT NULL,
+                until_id    INTEGER NOT NULL
+            ) WITHOUT ROWID, STRICT;`,
 	},
 ];
 
@@ -813,16 +848,20 @@ export type PartitionStoreOptions = {
 	 * Read at each write. Default: false.
 	 */
 	captureChanges?: () => boolean;
+	/** Called after a write adds or changes an outbox row that the export must send. The write is not committed yet. */
+	onChangeCaptured?: () => void;
 };
 
 export class PartitionStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
 	#captureChanges: () => boolean;
+	#onChangeCaptured: () => void;
 
 	constructor(storage: DurableObjectStorage, opts: PartitionStoreOptions = {}) {
 		this.#storage = storage;
 		this.#captureChanges = opts.captureChanges ?? (() => false);
+		this.#onChangeCaptured = opts.onChangeCaptured ?? (() => {});
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
@@ -1213,15 +1252,8 @@ export class PartitionStore {
 		if (!this.#captureChanges()) {
 			return;
 		}
-		this.#storage.sql.exec(
-			`INSERT INTO materialization_outbox (hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
-			 VALUES (?1, ?2, ?3, 0, ?4, 0)
-			 ON CONFLICT (hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = 0, next_attempt_at = 0`,
-			hk,
-			sk,
-			revision,
-			created ? 1 : 0,
-		);
+		this.#upsertOutboxRow(hk, sk, revision, { deleted: false, newRowLocalOnly: created });
+		this.#onChangeCaptured();
 	}
 
 	/**
@@ -1235,16 +1267,40 @@ export class PartitionStore {
 		}
 		const sql = this.#storage.sql;
 		if (exists(sql.exec(`DELETE FROM materialization_outbox WHERE hk = ? AND sk = ? AND is_local_only = 1 RETURNING 1`, hk, sk))) {
+			this.#dropDoneExportFences();
 			return;
 		}
-		sql.exec(
-			`INSERT INTO materialization_outbox (hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
-			 VALUES (?1, ?2, ?3, 1, 0, 0)
-			 ON CONFLICT (hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = 1, is_local_only = 0, next_attempt_at = 0`,
-			hk,
-			sk,
-			deleteVersion,
+		this.#upsertOutboxRow(hk, sk, deleteVersion, { deleted: true, newRowLocalOnly: false });
+		this.#onChangeCaptured();
+	}
+
+	/**
+	 * Writes the outbox row of a key at `revision`, due now: a new row, or the new revision of an
+	 * existing row, which keeps its `outbox_id`. An existing row keeps `is_local_only`, except that a
+	 * delete clears it.
+	 *
+	 * The `SET` does not name `next_attempt_at`. SQLite rewrites the due index when the `SET` names one
+	 * of its columns, also when the value does not change, and that is one more billed row on each
+	 * write. The row is due already in normal operation, so only a deferred row gets a second statement.
+	 */
+	#upsertOutboxRow(hk: KeyBytes, sk: KeyBytes, revision: number, opts: { deleted: boolean; newRowLocalOnly: boolean }): void {
+		const sql = this.#storage.sql;
+		const { next_attempt_at } = one(
+			sql.exec<{ next_attempt_at: number }>(
+				`INSERT INTO materialization_outbox (hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
+				 VALUES (?1, ?2, ?3, ?4, ?5, 0)
+				 ON CONFLICT (hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = excluded.is_deleted${opts.deleted ? ", is_local_only = 0" : ""}
+				 RETURNING next_attempt_at`,
+				hk,
+				sk,
+				revision,
+				opts.deleted ? 1 : 0,
+				opts.newRowLocalOnly ? 1 : 0,
+			),
 		);
+		if (next_attempt_at !== 0) {
+			sql.exec(`UPDATE materialization_outbox SET next_attempt_at = 0 WHERE hk = ? AND sk = ?`, hk, sk);
+		}
 	}
 
 	/**
@@ -2113,6 +2169,7 @@ export class PartitionStore {
 		const sql = this.#storage.sql;
 		if (hk === null) {
 			sql.exec(`DELETE FROM materialization_outbox WHERE outbox_id IN (SELECT outbox_id FROM materialization_outbox LIMIT ?)`, maxRows);
+			this.#dropDoneExportFences();
 			return !exists(sql.exec(`SELECT 1 FROM materialization_outbox LIMIT 1`));
 		}
 		sql.exec(
@@ -2120,7 +2177,189 @@ export class PartitionStore {
 			hk,
 			maxRows,
 		);
+		this.#dropDoneExportFences();
 		return !exists(sql.exec(`SELECT 1 FROM materialization_outbox WHERE hk = ? LIMIT 1`, hk));
+	}
+
+	// ─── materialization export ─────────────────────────────────────────────
+
+	/**
+	 * Up to `limit` outbox rows that are due at `now`, in the order of `idx_materialization_outbox_due`.
+	 * It reads every row before it returns, because the export claim writes to the outbox while it
+	 * walks the rows, and a write must not change an index that an open cursor reads.
+	 */
+	dueOutboxRows(now: number, limit: number): DueOutboxRow[] {
+		const rows: DueOutboxRow[] = [];
+		for (const row of this.#storage.sql.exec<{
+			hk: ArrayBuffer;
+			sk: ArrayBuffer;
+			revision: number;
+			is_deleted: number;
+			is_local_only: number;
+		}>(
+			`SELECT hk, sk, revision, is_deleted, is_local_only FROM materialization_outbox INDEXED BY idx_materialization_outbox_due
+			  WHERE next_attempt_at <= ? ORDER BY next_attempt_at, outbox_id LIMIT ?`,
+			now,
+			limit,
+		)) {
+			rows.push({
+				hk: fromSqlKey(row.hk),
+				sk: fromSqlKey(row.sk),
+				revision: row.revision,
+				isDeleted: row.is_deleted === 1,
+				isLocalOnly: row.is_local_only === 1,
+			});
+		}
+		return rows;
+	}
+
+	/** The earliest `next_attempt_at` of the outbox, or null when the outbox is empty. One seek of the due index. */
+	earliestOutboxAttemptAt(): number | null {
+		return (
+			tryOne(
+				this.#storage.sql.exec<{ next_attempt_at: number }>(
+					`SELECT next_attempt_at FROM materialization_outbox INDEXED BY idx_materialization_outbox_due ORDER BY next_attempt_at LIMIT 1`,
+				),
+			)?.next_attempt_at ?? null
+		);
+	}
+
+	/** A claimed row is no longer local only: a receiver can hold its revision from now on. */
+	markOutboxRowExported(hk: KeyBytes, sk: KeyBytes): void {
+		this.#storage.sql.exec(`UPDATE materialization_outbox SET is_local_only = 0 WHERE hk = ? AND sk = ? AND is_local_only = 1`, hk, sk);
+	}
+
+	/**
+	 * Moves the next attempt of an outbox row to `at`, when the row still holds `revision`. A newer write
+	 * made the row due again, and a delay must not push it back.
+	 */
+	deferOutboxRow(hk: KeyBytes, sk: KeyBytes, revision: number, at: number): void {
+		this.#storage.sql.exec(
+			`UPDATE materialization_outbox SET next_attempt_at = ? WHERE hk = ? AND sk = ? AND revision = ?`,
+			at,
+			hk,
+			sk,
+			revision,
+		);
+	}
+
+	/**
+	 * Deletes an outbox row when it still holds `revision`: the receiver acknowledged that revision. A
+	 * newer write changed the revision, so its row stays and the export sends it.
+	 */
+	deleteOutboxRow(hk: KeyBytes, sk: KeyBytes, revision: number): void {
+		if (
+			exists(
+				this.#storage.sql.exec(`DELETE FROM materialization_outbox WHERE hk = ? AND sk = ? AND revision = ? RETURNING 1`, hk, sk, revision),
+			)
+		) {
+			this.#dropDoneExportFences();
+		}
+	}
+
+	/** Deletes an outbox row with any revision, after the export found that it does not match its item. */
+	discardOutboxRow(hk: KeyBytes, sk: KeyBytes): void {
+		this.#storage.sql.exec(`DELETE FROM materialization_outbox WHERE hk = ? AND sk = ?`, hk, sk);
+		this.#dropDoneExportFences();
+	}
+
+	/** The stored representation of a live item for its export, or undefined when the item is absent. */
+	exportItemImage(hk: KeyBytes, sk: KeyBytes): ExportItemImage | undefined {
+		const row = tryOne(
+			this.#storage.sql.exec<{
+				v: number;
+				data: string | ArrayBuffer;
+				data_kind: number;
+				ttl_epoch_utc_seconds: number | null;
+				est_row_bytes: number;
+			}>(`SELECT v, data_kind, ttl_epoch_utc_seconds, est_row_bytes, data FROM items WHERE hk = ? AND sk = ?`, hk, sk),
+		);
+		if (!row) {
+			return undefined;
+		}
+		return {
+			v: row.v,
+			data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
+			kind: DATA_KINDS[row.data_kind],
+			ttlAt: row.ttl_epoch_utc_seconds,
+			estRowBytes: row.est_row_bytes,
+		};
+	}
+
+	exportState(): { epoch: number; isCallOpen: boolean } {
+		const row = one(
+			this.#storage.sql.exec<{ epoch: number; is_call_open: number }>(
+				`SELECT epoch, is_call_open FROM materialization_export_state WHERE id = 1`,
+			),
+		);
+		return { epoch: row.epoch, isCallOpen: row.is_call_open === 1 };
+	}
+
+	/** Raises the export epoch by 1 and returns the new epoch. */
+	raiseExportEpoch(): number {
+		return this.updateExportState({ raiseEpoch: true });
+	}
+
+	/**
+	 * Changes the export state in one statement, so a raise and a change of `is_call_open` together
+	 * write one row. It writes nothing when nothing changes. Returns the epoch after the change.
+	 */
+	updateExportState(change: { raiseEpoch?: boolean; callOpen?: boolean }): number {
+		const sql = this.#storage.sql;
+		const sets = [
+			...(change.raiseEpoch ? ["epoch = epoch + 1"] : []),
+			...(change.callOpen === undefined ? [] : [`is_call_open = ${change.callOpen ? 1 : 0}`]),
+		];
+		if (sets.length === 0) {
+			return this.exportState().epoch;
+		}
+		return one(sql.exec<{ epoch: number }>(`UPDATE materialization_export_state SET ${sets.join(", ")} WHERE id = 1 RETURNING epoch`))
+			.epoch;
+	}
+
+	/** The fences that each export call carries. Empty in normal operation. */
+	exportFences(): ExportFence[] {
+		const fences: ExportFence[] = [];
+		for (const row of this.#storage.sql.exec<{ ancestor_id: string; min_epoch: number }>(
+			`SELECT ancestor_id, min_epoch FROM ancestor_fences`,
+		)) {
+			fences.push({ ancestorId: row.ancestor_id, minEpoch: row.min_epoch });
+		}
+		return fences;
+	}
+
+	/**
+	 * Deletes the export fences when no outbox row of the inherited work is left. Each statement that
+	 * deletes an outbox row runs it in the same transaction. With no fence row, it reads an empty range.
+	 */
+	#dropDoneExportFences(): void {
+		this.#storage.sql.exec(
+			`DELETE FROM ancestor_fences
+			  WHERE NOT EXISTS (SELECT 1 FROM materialization_outbox WHERE outbox_id <= ancestor_fences.until_id)`,
+		);
+	}
+
+	/**
+	 * Stores the export fences of a split target at the end of its outbox stream: its source at the
+	 * epoch `epoch`, and each export fence of the source. They cover the copied rows, which are the rows
+	 * up to `MAX(outbox_id)`, because the target takes no write while it imports. A target with no
+	 * copied row has no inherited work and stores no fence.
+	 */
+	importExportFences(sourceId: string, epoch: number, inherited: readonly ExportFence[]): void {
+		const sql = this.#storage.sql;
+		const untilId = one(sql.exec<{ until_id: number | null }>(`SELECT MAX(outbox_id) AS until_id FROM materialization_outbox`)).until_id;
+		if (untilId === null) {
+			return;
+		}
+		for (const fence of [...inherited, { ancestorId: sourceId, minEpoch: epoch }]) {
+			sql.exec(
+				`INSERT INTO ancestor_fences (ancestor_id, min_epoch, until_id) VALUES (?1, ?2, ?3)
+				 ON CONFLICT (ancestor_id) DO UPDATE SET min_epoch = MAX(min_epoch, excluded.min_epoch), until_id = excluded.until_id`,
+				fence.ancestorId,
+				fence.minEpoch,
+				untilId,
+			);
+		}
 	}
 
 	// ─── deletion_metadata ──────────────────────────────────────────────────

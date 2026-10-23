@@ -297,6 +297,29 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(0));
 	});
 
+	it("calls onRepartitionCutover one time, inside the cutover transaction, before the state moves to cutover", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") }, T0);
+		});
+		// Plan, initialize the target, and cut over.
+		for (let step = 0; step < 3; step++) {
+			await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
+		}
+		await root.enter(({ sharding }) => expect(sharding.getRepartition("r1")!.state).toBe("cutover"));
+		expect(c.cutovers(root.doName)).toEqual([{ id: "r1", kind: "key_promotion", state: "planned" }]);
+
+		// The import, the completion, and the cleanup do not call it again.
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
+		await drainImport(rangeRoot);
+		await sendAck(rangeRoot);
+		await cleanUpSource(root);
+		expect(c.cutovers(root.doName)).toHaveLength(1);
+	});
+
 	it("retains the plan head through cutover and reuses it after a partial initialization", async () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);

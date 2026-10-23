@@ -3,12 +3,20 @@
  * split-status narrowing, and log capture. Split, migration, and promotion drivers live in
  * `partition-harness.ts`.
  */
-import { runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import { testPartitionStub } from "../stub-helpers.js";
 export { conditionTree } from "../../src/shared/expression/test-fixtures.js";
-import { createTableConfig, type FokosTableIdentity, type FokosTableOptions } from "../../src/shared/partition-context.js";
+import {
+	createTableConfig,
+	materializationTableConfig,
+	type FokosDBRouteContext,
+	type FokosTableIdentity,
+	type FokosTableOptions,
+} from "../../src/shared/partition-context.js";
+import { materializationStubByName } from "../../src/shared/do-stubs.js";
+import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { ItemRpcPartitions, LeafMetrics, PartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
@@ -155,4 +163,34 @@ export function captureConsoleError() {
 			return spy.mock.calls.map(([entry]) => entry as LoggedEntry).filter((log) => log.message === message);
 		},
 	};
+}
+
+/** The materialization root that owns `hashKey`, from the route context of a base partition of the same table. */
+export function materializationOf(base: FokosDBRouteContext, hashKey: string): DurableObjectStub<MaterializationDO> {
+	const mat = materializationTableConfig({
+		topology: base.topology,
+		rangeConfig: base.rangeConfig,
+		policy: base.policy,
+		policyVersion: base.policyVersion,
+	});
+	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion).rootContext(kb(hashKey));
+	return materializationStubByName(env, ctx, ctx.doName);
+}
+
+/** The latest image of one base item in a materialization partition, or undefined when it has none. */
+export async function latestImage(
+	stub: DurableObjectStub<MaterializationDO>,
+	hashKey: string,
+	sortKey = "s",
+): Promise<{ revision: number; deleted: boolean; data: SqlStorageValue } | undefined> {
+	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+		const row = state.storage.sql
+			.exec<{
+				revision: number;
+				deleted_at_ms: number | null;
+				data: SqlStorageValue;
+			}>(`SELECT revision, deleted_at_ms, data FROM latest_items WHERE base_hk = ? AND base_sk = ?`, kb(hashKey), kb(sortKey))
+			.toArray()[0];
+		return row && { revision: row.revision, deleted: row.deleted_at_ms !== null, data: row.data };
+	});
 }

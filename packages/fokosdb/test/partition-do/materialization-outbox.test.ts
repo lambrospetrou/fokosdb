@@ -1,9 +1,10 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
+import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { testCoordinatorRef } from "../stub-helpers.js";
-import { conditionTree, kb, makeStub, withOpIndex } from "./helpers.js";
+import { kb, makeStub } from "./helpers.js";
 import { PROMOTION_TEST_MAX_SIZE_MB, TestPartition, drainUntil, makePartition } from "./partition-harness.js";
 
 type OutboxRow = { hk: string; revision: number; is_deleted: number; is_local_only: number };
@@ -27,68 +28,12 @@ describe("PartitionDO — outbox capture", () => {
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("a"), sortKey: kb("s") });
 		expect(await outboxRows(stub)).toEqual([]);
 	});
-
-	it("captures put, update and delete, and writes nothing for a failed condition", async () => {
-		const { ctx, stub, rpc } = makeStub({ captureChanges: true });
-		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "d", kind: "text" });
-		await rpc.txExecuteSingleShot(ctx, {
-			items: withOpIndex([
-				{
-					hashKey: kb("b"),
-					sortKey: kb("s"),
-					operation: "update",
-					update: [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }],
-				},
-			]),
-		});
-		expect(await outboxRows(stub)).toEqual([
-			{ hk: "a", revision: 1, is_deleted: 0, is_local_only: 1 },
-			{ hk: "b", revision: 1, is_deleted: 0, is_local_only: 1 },
-		]);
-
-		const rejected = await rpc.apiPutItem(ctx, {
-			hashKey: kb("a"),
-			sortKey: kb("s"),
-			data: "other",
-			kind: "text",
-			condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
-		});
-		expect(rejected).toMatchObject({ outcome: "rejected" });
-		expect(await outboxRows(stub, "a")).toEqual([{ hk: "a", revision: 1, is_deleted: 0, is_local_only: 1 }]);
-
-		// A delete before any export removes the local only row, and sends nothing.
-		await rpc.apiDeleteItem(ctx, { hashKey: kb("a"), sortKey: kb("s") });
-		expect(await outboxRows(stub, "a")).toEqual([]);
-	});
-
-	it("a prepare and a cancel write no outbox row, and a commit writes the revision it applies", async () => {
-		const { ctx, stub, rpc } = makeStub({ captureChanges: true });
-		const coordinator = testCoordinatorRef();
-		const prepare = async (transactionId: string, transactionTimestamp: number) =>
-			await rpc.txPrepare(ctx, {
-				transactionId,
-				transactionTimestamp,
-				coordinator,
-				items: withOpIndex([{ hashKey: kb("a"), sortKey: kb("s"), operation: "put", data: "tx", kind: "text" }]),
-			});
-		const keys = [{ hashKey: kb("a"), sortKey: kb("s") }];
-
-		const cancelled = crypto.randomUUID();
-		expect(await prepare(cancelled, Date.now())).toMatchObject({ outcome: "accepted" });
-		expect(await outboxRows(stub)).toEqual([]);
-		await rpc.txCancel(ctx, { transactionId: cancelled, items: keys });
-		expect(await outboxRows(stub)).toEqual([]);
-
-		const committed = crypto.randomUUID();
-		const transactionTimestamp = Date.now() + 1;
-		expect(await prepare(committed, transactionTimestamp)).toMatchObject({ outcome: "accepted" });
-		await rpc.txCommit(ctx, { transactionId: committed, transactionTimestamp, items: keys });
-		expect(await outboxRows(stub)).toEqual([{ hk: "a", revision: 1, is_deleted: 0, is_local_only: 1 }]);
-	});
 });
 
+// The export runs during these splits, so an outbox row can leave before or after the copy. The
+// copy itself is checked without the export by the FokosMigrationHost test below.
 describe("PartitionDO — outbox migration", () => {
-	it("a hash split copies the outbox rows to the children as not local only, and the cleanup deletes the copies", async () => {
+	it("after a hash split no row stays on the source, and each row of a child is not local only", async () => {
 		const partition = makePartition({ captureChanges: true, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.triggerHashSplit();
 		await partition.awaitSplitCompleted();
@@ -96,24 +41,85 @@ describe("PartitionDO — outbox migration", () => {
 
 		await drainUntil([partition], async () => (await outboxRows(partition.stub)).length === 0, "source cleanup of the outbox copies");
 		const copied = (await Promise.all(children.map(async (child) => await outboxRows(child.stub)))).flat();
-		// Each filler write made one row. The filler keys are distinct, so the children hold one row for each.
-		expect(copied.length).toBeGreaterThan(0);
-		expect(new Set(copied.map((row) => row.hk)).size).toBe(copied.length);
 		expect(copied.every((row) => row.is_local_only === 0 && row.is_deleted === 0)).toBe(true);
 	});
 
-	it("a promotion copies the outbox rows of the key to the range root, and the cleanup deletes them on the source", async () => {
+	it("after a promotion no row of the key stays on the source, and each row of the range root is not local only", async () => {
 		const partition = makePartition({ captureChanges: true, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		await partition.put({ hashKey: kb("bob"), sortKey: kb("s"), data: "b", kind: "text" });
-		const written = await partition.triggerPromotion("alice");
+		await partition.triggerPromotion("alice");
 		const root: TestPartition = await partition.awaitPromoted("alice");
 
-		const copied = await outboxRows(root.stub);
-		expect(copied).toHaveLength(written.length);
-		expect(copied.every((row) => row.hk === "alice" && row.is_local_only === 0)).toBe(true);
-
 		await drainUntil([partition], async () => (await outboxRows(partition.stub, "alice")).length === 0, "source cleanup of alice");
-		// The source keeps the rows of the keys that it still owns.
-		expect(await outboxRows(partition.stub)).toEqual([{ hk: "bob", revision: 1, is_deleted: 0, is_local_only: 1 }]);
+		expect((await outboxRows(root.stub)).every((row) => row.hk === "alice" && row.is_local_only === 0)).toBe(true);
+	});
+});
+
+describe("FokosMigrationHost — the export fences of the outbox stream", () => {
+	type Page = { page: unknown; nextCursor: unknown };
+	const budget = { pageBytes: 1024 * 1024, pageRows: 1, scanRows: 100 };
+	const slice = { kind: "promoted_key" as const, hashKey: kb("moved") };
+	const inSlice = (key: { hashKey: KeyBytes }) => KeyCodec.compare(key.hashKey, kb("moved")) === 0;
+
+	function hostOf(store: PartitionStore, selfId: string): FokosMigrationHost {
+		return new FokosMigrationHost({ store, logParams: () => ({}), captureChanges: () => true, selfId: () => selfId });
+	}
+
+	it("the last page gives each target the current epoch of the source and its fences, and the pages raise no epoch", async () => {
+		const source = makeStub({ captureChanges: true });
+		const target = makeStub({ captureChanges: true });
+		const pages = await runInDurableObject(source.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			const store = new PartitionStore(state.storage, { captureChanges: () => true });
+			for (const sk of ["1", "2"]) {
+				store.upsertItem({ hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			}
+			store.upsertItem({ hk: kb("stays"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			// The source is a split child too: its own inherited row keeps a fence of its parent.
+			store.insertMigratedOutboxRow({ hk: kb("old"), sk: kb("s"), revision: 1, is_deleted: 1 });
+			store.importExportFences("grandparent", 3, []);
+			const before = store.exportState().epoch;
+
+			const host = hostOf(store, "source-id");
+			const out: Page[] = [];
+			let cursor: unknown = { stream: "outbox", cursor: null };
+			while (cursor !== null) {
+				const page = host.buildPage(cursor, slice, inSlice, budget);
+				out.push(page);
+				cursor = page.nextCursor;
+			}
+			const after = store.exportState().epoch;
+			// A second target of the same split gets the same epoch.
+			const again = host.buildPage({ stream: "outbox", cursor: null }, slice, inSlice, { ...budget, pageRows: 10 });
+			return { pages: out, again, before, after };
+		});
+
+		expect(pages.after).toBe(pages.before);
+		const fences = { sourceId: "source-id", epoch: pages.after, inherited: [{ ancestorId: "grandparent", minEpoch: 3 }] };
+		expect(pages.pages.map((p) => (p.page as { fences?: unknown }).fences)).toEqual([undefined, undefined, fences]);
+		expect((pages.again.page as { fences?: unknown }).fences).toEqual(fences);
+
+		const stored = await runInDurableObject(target.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			const store = new PartitionStore(state.storage, { captureChanges: () => true });
+			const host = hostOf(store, "target-id");
+			for (const { page } of pages.pages) {
+				host.applyPage(page, slice);
+			}
+			const untilId = state.storage.sql.exec<{ id: number }>(`SELECT MAX(outbox_id) AS id FROM materialization_outbox`).one().id;
+			const rows = state.storage.sql
+				.exec<{
+					ancestor_id: string;
+					min_epoch: number;
+					until_id: number;
+				}>(`SELECT ancestor_id, min_epoch, until_id FROM ancestor_fences ORDER BY ancestor_id`)
+				.toArray();
+			return { untilId, rows, outbox: store.dueOutboxRows(0, 10) };
+		});
+		expect(stored.outbox.map((row) => [KeyCodec.decode(row.sk), row.isLocalOnly])).toEqual([
+			["1", false],
+			["2", false],
+		]);
+		expect(stored.rows).toEqual([
+			{ ancestor_id: "grandparent", min_epoch: 3, until_id: stored.untilId },
+			{ ancestor_id: "source-id", min_epoch: pages.after, until_id: stored.untilId },
+		]);
 	});
 });

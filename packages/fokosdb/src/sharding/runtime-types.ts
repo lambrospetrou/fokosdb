@@ -321,7 +321,7 @@ export type FokosJob = {
 };
 
 /**
- * Every hook is synchronous. Four of them run inside a `transactionSync`, and an `await` there is a
+ * Every hook is synchronous. Five of them run inside a `transactionSync`, and an `await` there is a
  * defect. A hook returns its policy result and does not throw to express one: a thrown error is a
  * defect that the runtime logs, and the durable state stays unchanged until the next pass.
  */
@@ -358,6 +358,12 @@ export interface FokosShardingHooks<TPolicy> {
 	 * cutover transaction. Return false to hold the plan at its current state.
 	 */
 	beforeCutover?(plan: FokosRepartitionPlan<TPolicy>): boolean;
+	/**
+	 * Source side. Runs inside the cutover transaction, after `beforeCutover` allowed the cutover and
+	 * before the state moves to `cutover`. It runs one time for each repartition: a write here commits
+	 * with the change of ownership, so no operation of this partition runs between the two.
+	 */
+	onRepartitionCutover?(plan: FokosRepartitionPlan<TPolicy>): void;
 	/** Source side. Runs inside the completion transaction, after the last acknowledgement. */
 	beforeComplete?(plan: FokosRepartitionPlan<TPolicy>): void;
 	/**

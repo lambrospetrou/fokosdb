@@ -6,6 +6,7 @@
  */
 import invariant from "../shared/invariant.js";
 import { validateTtlSweepConfig, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
+import { validateMaterializationExportConfig, type MaterializationExportConfig } from "../shared/partition/materialization-export.js";
 import { DEFAULT_FANOUT_REQUEST_BUDGET_MS, DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
 
 /**
@@ -55,9 +56,14 @@ export type PartitionDOConfig = Readonly<{
 	 * deletes all copies of one transaction together, so it can delete up to 99 rows more.
 	 */
 	cleanupTxLockCopyRows: number;
+	/** The export of the item changes of a table with `captureChanges` to `MaterializationDO`. */
+	materializationExport: Readonly<MaterializationExportConfig>;
 }>;
 
-export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSweep">> & { ttlSweep?: Partial<TtlSweepConfig> };
+export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSweep" | "materializationExport">> & {
+	ttlSweep?: Partial<TtlSweepConfig>;
+	materializationExport?: Partial<MaterializationExportConfig>;
+};
 
 export type ParticipantRetryConfig = Readonly<{
 	/** The first retry waits a random time up to this value. */
@@ -128,6 +134,19 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 	staleLockScanRows: 10,
 	cleanupPromotedKeyRows: 10_000,
 	cleanupTxLockCopyRows: 10_000,
+	materializationExport: {
+		maxCalls: 2,
+		maxItems: 100,
+		maxBytes: 10 * 1024 * 1024,
+		maxScannedRows: 1_000,
+		unownedRetryMs: 30_000,
+		unprocessedRetryMs: 5_000,
+		rejectedRetryMs: 30_000,
+		failureBackoffMinMs: 1_000,
+		failureBackoffMaxMs: 30_000,
+		callTimeoutMs: 30_000,
+		fallbackAlarmMs: 60_000,
+	},
 });
 
 export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFreeze({
@@ -160,6 +179,7 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 	checkInteger(c, "cleanupPromotedKeyRows", 1);
 	checkInteger(c, "cleanupTxLockCopyRows", 1);
 	validateTtlSweepConfig(c.ttlSweep);
+	validateMaterializationExportConfig(c.materializationExport);
 	return c;
 }
 

@@ -111,6 +111,8 @@ describe("MaterializationDO — applyLatestImages revisions", () => {
 
 		expect(await apply(m, { items: [live(0, "x", 5)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		expect(await storedImage(m.stub, "x")).toMatchObject({ revision: 5, data: "v5" });
+		// The update has the same size, so the estimate of the hash key stays the size of its one row.
+		expect(await keyEstimate(m.stub, "x")).toBe((await storedImage(m.stub, "x"))!.est_row_bytes);
 	});
 
 	it("a delete keeps a tombstone with no data, and a late live image below it does not create the item again", async () => {
@@ -197,14 +199,23 @@ describe("MaterializationDO — applyLatestImages producer epochs", () => {
 });
 
 describe("MaterializationDO — applyLatestImages size and routing", () => {
-	it("above its size limit refuses each live image with partition_over_size and still applies each delete", async () => {
+	it("above its size limit refuses each newer live image with partition_over_size, and still applies each delete and each fence", async () => {
 		const m = makeMaterialization({ maxSizeMb: 0.0001 }).at("x");
-		const res = await apply(m, { items: [live(0, "x", 1), deleted(1, "y", 2)] });
+		const res = await apply(m, {
+			epoch: 2,
+			ancestorFences: [{ ancestorId: OTHER_PRODUCER, minEpoch: 4 }],
+			items: [live(0, "x", 1), deleted(1, "y", 2)],
+		});
 		expect(res).toMatchObject({
 			acknowledged: [{ opIndex: 1 }],
 			failed: [{ outcome: "unprocessed", code: "partition_over_size", opIndexes: [0] }],
 		});
 		expect(await storedImage(m.stub, "x")).toBeUndefined();
+		// The receiver rules ran for the refused image too.
+		expect(await producerEpoch(m.stub, PRODUCER)).toBe(2);
+		expect(await producerEpoch(m.stub, OTHER_PRODUCER)).toBe(4);
+		// A live image at or below the stored revision needs no write, so it is acknowledged.
+		expect(await apply(m, { epoch: 2, items: [live(0, "y", 1)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }], failed: [] });
 	});
 
 	it("answers each item of a call by its opIndex, at the root that owns its key", async () => {

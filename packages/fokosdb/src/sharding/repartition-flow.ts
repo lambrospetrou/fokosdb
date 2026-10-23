@@ -83,9 +83,9 @@ export type RepartitionIdentity = {
 /**
  * What both halves need: the peer factory, the host hooks, and this partition's own identity.
  *
- * The source reads `hooks.computeRangeBoundaries`, `beforeCutover`, `beforeComplete`,
+ * The source reads `hooks.computeRangeBoundaries`, `beforeCutover`, `onRepartitionCutover`, `beforeComplete`,
  * `cleanupSourceStep`, and `migration.buildPage`. The target reads `migration.applyPage` and
- * `migration.validatePage`. Every hook is synchronous, and four of them run inside a transaction.
+ * `migration.validatePage`. Every hook is synchronous, and five of them run inside a transaction.
  */
 export type RepartitionCommonDeps = {
 	/** Resolves a peer for one remote participant. Only the host acquires stubs. */
@@ -532,6 +532,7 @@ export class RepartitionSource {
 				return "progressed";
 			}
 
+			this.deps.hooks.onRepartitionCutover?.(this.#hookPlan(current));
 			this.store.setRepartitionState(row.id, "cutover", { cutoverAt: now });
 			this.store.refreshRepartitionDue(row.id, now);
 			return "progressed";
