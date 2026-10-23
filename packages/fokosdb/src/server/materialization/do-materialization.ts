@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { FokosDBPolicy, FokosDBRouteContext } from "../../shared/partition-context.js";
 import { FokosShardingRuntime } from "../../sharding/runtime.js";
 import type { FokosRuntimeConfigOverrides } from "../../sharding/runtime-config.js";
-import type { FokosEnvelope, FokosLocalCall, FokosOperations, FokosShardingHooks } from "../../sharding/runtime-types.js";
+import type { FokosEnvelope, FokosLifecycle, FokosLocalCall, FokosOperations, FokosShardingHooks } from "../../sharding/runtime-types.js";
 import type {
 	FokosExecuteLocalRequest,
 	FokosInitRequest,
@@ -18,16 +18,31 @@ import type {
 	MigrationHost,
 } from "../../sharding/repartition-types.js";
 import { identityDepth } from "../../sharding/partition-id.js";
-import { materializationStubByName } from "../../shared/do-stubs.js";
+import { materializationStubByName, pushTargetStub } from "../../shared/do-stubs.js";
 import { CONFLICT_CODES, FokosConflictError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../shared/errors.js";
 import invariant from "../../shared/invariant.js";
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
 import { mergeBatchParts, withOffset, type BatchFailure } from "../../shared/batch-merge.js";
 import { ADMISSION_MARGIN } from "../../shared/transaction-limits.js";
 import type { WirePartitionMeta } from "../../shared/types.js";
-import { MaterializationStore, type LatestImage } from "./materialization-store.js";
+import { resolveMaterializationConfig, type MaterializationDOConfig, type MaterializationDOConfigOverrides } from "../host-config.js";
+import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
+import { MaterializationCleanup } from "./materialization-cleanup.js";
+import { TargetRunner } from "./target-runner.js";
+import { validateTargets, type FokosTargetDefinition } from "./targets.js";
 
 export type { LatestImage } from "./materialization-store.js";
+export type {
+	FokosTargetDefinition,
+	GsiTargetDefinition,
+	PushSinkTargetDefinition,
+	PushTargetBatch,
+	PushTargetItem,
+	PushTargetResult,
+} from "./targets.js";
+
+/** The host job that starts the target runner again after a restart, an eviction, a backoff, or a probe time. */
+const JOB_TARGET_PUSH = "target_push";
 
 /** An ancestor that a split child names, so that each receiver rejects the late calls of that ancestor. */
 export type AncestorFence = {
@@ -86,15 +101,49 @@ function noSplit(): never {
  * The latest image of each changed base item of a table, in the shard group `fokos.m.<tableName>`. It
  * routes by the base key `(hashKey, sortKey)`, so a split of the base table does not change the owner
  * of an item here. Each base partition exports its changes with `applyLatestImages`.
+ *
+ * Each accepted image gets a change position, and the target runner sends the latest image of each
+ * changed item to each target of `fokosTargets()`.
  */
 export class MaterializationDO extends DurableObject<Env> implements MaterializationRpc {
 	/** The sharding runtime: identity, routing, and the alarm. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, MaterializationOps>;
 	#store: MaterializationStore;
+	#runner: TargetRunner;
+	#cleanup: MaterializationCleanup;
+	/** The stored target list, read one time for each instance. */
+	#targetList: readonly FokosTargetDefinition[] | undefined;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new MaterializationStore(ctx.storage);
+		this.#cleanup = new MaterializationCleanup({
+			store: this.#store,
+			config: () => this.config().cleanup,
+		});
+		this.#runner = new TargetRunner({
+			store: this.#store,
+			cleanup: this.#cleanup,
+			targets: () => this.#targets(),
+			canRun: () => this.#canRunLocally(this.fokos.lifecycle()),
+			ownerCheck: () => {
+				const owns = this.fokos.ownerCheck();
+				return (row) => owns({ hashKey: row.hk, sortKey: row.sk });
+			},
+			producerId: () => this.ctx.id.toString(),
+			push: async (target, batch) => {
+				const stub = pushTargetStub(this.env, target) as Record<string, (batch: unknown) => Promise<unknown>>;
+				return await stub[target.method](batch);
+			},
+			config: () => this.config().targetRunner,
+			scheduleRetry: (runAt) => {
+				this.fokos.scheduleJob(JOB_TARGET_PUSH, runAt).catch((error: unknown) => {
+					console.error({ ...this.logParams(), message: "fokos/mat: failed to schedule the target runner", error: String(error) });
+				});
+			},
+			now: () => this.fokosNow(),
+			logParams: () => this.logParams(),
+		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, MaterializationOps>({
 			ctx,
@@ -136,8 +185,10 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	fokosPromotions(req: FokosPromotionsRequest) {
 		return this.fokos.fokosPromotions(req);
 	}
-	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		return this.fokos.fokosPrepareDestroy(req);
+	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
+		await this.fokos.fokosPrepareDestroy(req);
+		// The fence stops the target runner. No call of this instance to a target stays in flight after it.
+		await this.#runner.settled();
 	}
 	fokosDestroy(): Promise<void> {
 		return this.fokos.fokosDestroy();
@@ -176,7 +227,64 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 		return {
 			evaluateSplit: () => false,
 			migration: NO_MIGRATION,
+			jobs: [
+				{
+					name: JOB_TARGET_PUSH,
+					canRun: (lifecycle) => this.#canRunLocally(lifecycle),
+					deadline: () => this.#runner.deadline(),
+					runStep: () => {
+						this.#runner.wake();
+						return { nextRunAt: null };
+					},
+				},
+			],
 		};
+	}
+
+	/**
+	 * The target runner needs complete local state. An uninitialized partition has none. An importing
+	 * target does not hold it yet. A split router no longer holds it. A fenced partition is on its way
+	 * out and must make no transition.
+	 */
+	#canRunLocally(lifecycle: FokosLifecycle): boolean {
+		if (!this.fokos.initialized()) {
+			return false;
+		}
+		if (lifecycle.destroying || lifecycle.role === "router") {
+			return false;
+		}
+		return lifecycle.import === null || (lifecycle.import.state !== "awaiting_data" && lifecycle.import.state !== "importing");
+	}
+
+	/**
+	 * The stored target list. The first call of a partition with no stored list validates
+	 * `this.fokosTargets()`, and stores it with a state row for each target. Each later call uses only the
+	 * stored list. When `this.fokosTargets()` is different from it, the partition logs one error for each
+	 * instance and continues with the stored list.
+	 */
+	#targets(): readonly FokosTargetDefinition[] {
+		if (this.#targetList !== undefined) {
+			return this.#targetList;
+		}
+		const declared = this.fokosTargets();
+		const stored = this.#store.storedTargets();
+		if (stored === undefined) {
+			validateTargets(declared);
+			const list = structuredClone(declared);
+			this.#store.storeTargets(list);
+			this.#targetList = list;
+			return list;
+		}
+		if (JSON.stringify(stored) !== JSON.stringify(declared)) {
+			console.error({
+				...this.logParams(),
+				message: "fokos/mat: fokosTargets() is different from the stored target list, and the partition uses the stored list",
+				storedTargetIds: stored.map((t) => t.targetId),
+				declaredTargetIds: declared.map((t) => t.targetId),
+			});
+		}
+		this.#targetList = stored;
+		return stored;
 	}
 
 	/**
@@ -197,6 +305,13 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	 */
 	private applyLatestImagesLocal(req: ApplyLatestImagesRequest, call: FokosLocalCall): ApplyLatestImagesResponse {
 		const out: ApplyLatestImagesResponse = { acknowledged: [], failed: [], partitions: [this.selfPartition()] };
+		this.#targets();
+		// The handler is synchronous, so no cursor and no batch in flight changes while it runs.
+		const targets: TargetPositions[] = this.#store.targetRows().map((row) => ({
+			cursor: row.cursorSeq,
+			read: Math.max(row.cursorSeq, this.#runner.readPosition(row.targetId) ?? row.cursorSeq),
+		}));
+		let accepted = false;
 		const overSize = req.items.some((item) => !item.deleted) ? this.sizeRefusal() : undefined;
 		if (overSize) {
 			call.signal({ evaluateSplit: true });
@@ -224,7 +339,12 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 					if (overSize && !item.deleted) {
 						return "over_size";
 					}
-					this.#store.putLatestImage(item, this.fokosNow(), current?.estRowBytes ?? 0);
+					this.#store.putLatestImage(item, this.fokosNow(), current, targets);
+					if (item.deleted && targets.length === 0) {
+						// No target reads the tombstone, so the cleanup can delete it now.
+						this.#cleanup.tombstoneUnblocked();
+					}
+					accepted = true;
 					return "applied";
 				});
 			} catch (e) {
@@ -240,6 +360,9 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 			}
 		}
 		out.partitions = [{ ...this.selfPartition(), databaseSize: this.#store.databaseSize }];
+		if (accepted) {
+			this.#runner.wake();
+		}
 		return out;
 	}
 
@@ -256,6 +379,20 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 		return undefined;
 	}
 
+	/** The active settings: the overrides of `fokosConfig()` over the defaults, validated. */
+	private __cachedConfig?: MaterializationDOConfig;
+	private config(): MaterializationDOConfig {
+		if (!this.__cachedConfig) {
+			this.__cachedConfig = resolveMaterializationConfig(this.fokosConfig());
+		}
+		return this.__cachedConfig;
+	}
+
+	private logParams(): Record<string, unknown> {
+		// Cloudflare Workers can truncate this to 1024 bytes. The runtime logs the full doName with its own lines.
+		return { actorId: this.ctx.id.toString(), actorName: this.ctx.id.name };
+	}
+
 	/** The entry of this partition in the `partitions` of an answer, with the depth that it has. */
 	private selfPartition(): WirePartitionMeta {
 		const identity = this.fokos.identity();
@@ -266,6 +403,22 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	//////////////////////////////
 	// User overridable methods.
 	//////////////////////////////
+
+	/**
+	 * Override to declare the targets of this table. A partition stores the first valid result, and then
+	 * uses only the stored list, so the list cannot change after the first request. Each `targetId` is
+	 * not empty, has no `~`, and is unique.
+	 */
+	protected fokosTargets(): readonly FokosTargetDefinition[] {
+		return [];
+	}
+
+	/**
+	 * Override to change the settings of this class. The rules of `PartitionDO.fokosConfig` apply.
+	 */
+	protected fokosConfig(): MaterializationDOConfigOverrides {
+		return {};
+	}
 
 	/**
 	 * Override to change the settings of the sharding runtime of this class. The rules of

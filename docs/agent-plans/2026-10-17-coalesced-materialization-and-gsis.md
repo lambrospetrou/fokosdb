@@ -138,7 +138,6 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 | Change position | A row of `change_positions` that points to one changed item. All targets share the positions. |
 | Cursor (`C_t`) | `materialization_targets.cursor_seq` of target `t`. Each position at or below `C_t` is done for `t`. |
 | Read position (`R_t`) | In memory: the highest position that the batch in flight of target `t` read, or `C_t`. |
-| Applied map | An in-memory map `item_id -> revision` of the revisions that a target applied in its current epoch. |
 | Key set | The `target_index_keys` row of one item and one GSI: each GSI key that can have an entry of the item. |
 | Producer | The sender on a hop: a base `PartitionDO` for the export, or a `MaterializationDO` for a target. |
 | Receiver | The partition that applies a call: a `MaterializationDO`, a GSI `PartitionDO`, or a push target. |
@@ -158,7 +157,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   projection.
 - Support push targets (a `WorkerEntrypoint` or a `DurableObject` called over Workers RPC) from the same target
   runner in `MaterializationDO`.
-- Define GSIs and push targets in a subclass of `MaterializationDO` that overrides `targets()`.
+- Define GSIs and push targets in a subclass of `MaterializationDO` that overrides `fokosTargets()`.
 - When `captureChanges = true`, capture one coalesced outbox marker in the base `PartitionDO`, in the same SQLite
   transaction as each item mutation.
 - Route the materialization state by `(baseHashKey, baseSortKey)` in an independent shard group
@@ -232,12 +231,12 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   4.2.3, 4.2.9, and 4.2.12).
 
 ### Milestone 3: Target runner and push targets
-- Add the `MaterializationDO.targets()` method override and the stored target list `__fokosdb/mat/targets`
+- Add the `MaterializationDO.fokosTargets()` method override and the stored target list `__fokosdb/mat/targets`
   (Section 4.2.13).
 - Build these parts (Sections 4.2.5 to 4.2.12):
   - `change_positions`, the ingest steps, and the position cleanup,
   - `materialization_targets` with the cursor, the epoch, and `is_batch_open`,
-  - the in-memory round-robin target runner with 2 parallel workers, the target step, and the applied map,
+  - the in-memory round-robin target runner with 2 parallel workers, and the target step,
   - `push_sink` targets with `PushTargetBatch`,
   - `target_retry` with `idx_target_retry_inherited`, violation handling, and the circuit breaker of each target,
   - the tombstone GC,
@@ -271,7 +270,7 @@ Base Shard Group: fokos.p.<tableName> (PartitionDO)
           | applyLatestImages(producerId, epoch, ancestorFences): batched group RPC, failurePolicy: "collect"
           v
 Materialization Shard Group: fokos.m.<tableName> (MaterializationDO)
-  - Routed by (baseHK, baseSK); the first targets() result is stored and fixed
+  - Routed by (baseHK, baseSK); the first fokosTargets() result is stored and fixed
   - Full mirror of live items in latest_items (1 payload copy per live item)
   - change_positions shared by all targets; 1 cursor and 1 epoch per target
   - target_index_keys (GSI keys that can hold an entry), target_retry (failed items)
@@ -660,8 +659,9 @@ Example: the GSI `g` reads at the end of the positions. The push target `lake` i
 | `g` reads 205. rev 3 | 100, 310 | Step 3: `lake` reaches 100 first, so 205 moves to 310. |
 | `g` reads 310. rev 4 | 100, 415 | Step 3. |
 
-When `lake` recovers, it reads position 100 and sends the latest image of X. At position 415, the applied map
-(Section 4.2.6) skips X.
+When `lake` recovers, it reads position 100 and sends the latest image of X. When the same claim also reads
+position 415, the claim skips X, because X is already in the batch. When a later claim reads 415, `lake` sends X again,
+and the receiver drops the duplicate (Section 4.3.7).
 
 #### 4.2.6 Target runner and target step
 
@@ -691,26 +691,20 @@ drives its targets with one in-memory background promise (`#pushPromise`), as `T
 - The workers repeat in memory until no target has due work or `canSweepLocally` becomes `false`. They yield with
   `scheduler.wait(0)` between batches.
 
-Each target keeps an in-memory map `item_id -> revision`, the applied map:
-
-- The map holds the revisions that the target applied in its current epoch.
-- The map has at most `appliedMapMaxEntries` (default 10,000) entries for each target, with least-recently-used
-  eviction.
-- The map is only an optimization. When the map has no entry for an item, the target sends the item again, and the
-  receiver drops the duplicate or writes the same entry again.
-
 ##### Target step
 
 A step of target `t` has these parts:
 
 1. **Claim.** In one `transactionSync`, the step:
-   - takes the due `retry` rows of `t`, up to half of `maxItemsPerStep` (Section 4.2.10),
+   - takes the due `retry` rows of `t`, up to half of `maxItemsPerStep` and half of `maxBytesPerStep`
+     (Section 4.2.10),
    - reads the positions above `C_t` in `seq` order to fill the batch, up to `maxItemsPerStep` (100, the
      `batchWriteItems` limit) items, `maxBytesPerStep` (16 MiB, below the RPC limit) of item data, and
      `maxScannedPositions` (5,000) positions,
    - sets `is_batch_open = 1` when it is `0` (Section 4.2.9).
 
-   The claim stops at the first limit that it reaches. When the claim finds no item to send, it sets `cursor_seq` to
+   The claim stops at the first limit that it reaches, but the positions always add at least one item. Thus the
+   `retry` rows cannot stop the cursor. When the claim finds no item to send, it sets `cursor_seq` to
    the highest position that it read, in the same `transactionSync`. It sends no call and does not set `is_batch_open`.
    Thus a long run of skipped positions (step 2), for example the positions of a promoted key, moves the cursor in
    bounded steps.
@@ -718,7 +712,6 @@ A step of target `t` has these parts:
    conditions is true:
    - the item has a `retry` row for `t`,
    - the item is already in the batch,
-   - the applied map holds `latest_items.revision` for the item,
    - the partition does not own the item (`!this.fokos.owns(key)`), because the item moved to another partition.
 
    A skipped position is done for `t`.
@@ -1168,7 +1161,7 @@ item gets its own `retry` row.
 
 | Outcome for an item | Action of the completion |
 | --- | --- |
-| `applied`, and `latest_items.revision` equals the sent revision | Record the revision in the applied map. Delete the `retry` or `violation` row when one exists. |
+| `applied`, and `latest_items.revision` equals the sent revision | Delete the `retry` or `violation` row when one exists. |
 | `applied`, and the item changed during the call | For a `retry` item, keep the row with `not_before = 0`. For a cursor item, write nothing: the change has a position above the cursor (Section 4.2.5, invariant 1). |
 | `unprocessed`, or push `retry` | Insert or update the `retry` row: `attempts + 1`, and an exponential backoff from 1 s to 10 s. |
 | `rejected` (`batch_request_too_large`) | The RPC is above 32 MiB, and nothing applied. Split the batch and send again. No row. |
@@ -1179,11 +1172,11 @@ item gets its own `retry` row.
 Example: the batch limit is 100, 3 `retry` rows are due, and `C_t = 500`.
 
 1. The step takes the 3 retry items.
-2. It reads positions 501 to 610. It skips 4 positions of items with `retry` rows, 3 positions that the applied map
-   skips, and 6 positions of items that are already in the batch. It sends the other 97 items.
+2. It reads positions 501 to 607. It skips 4 positions of items with `retry` rows and 6 positions of items that are
+   already in the batch. It sends the other 97 items.
 3. The call returns: 2 retry items applied, 1 retry item is `unprocessed` with `partition_migrating`, and the 97 cursor
    items applied.
-4. One `transactionSync` deletes 2 `retry` rows, updates 1 `retry` row, and sets `cursor_seq = 610`.
+4. One `transactionSync` deletes 2 `retry` rows, updates 1 `retry` row, and sets `cursor_seq = 607`.
 
 ##### Permanent violations
 
@@ -1276,7 +1269,7 @@ The split fences need the final export state of the slice. `RepartitionSource.se
 
 #### 4.2.13 Target definitions and table destroy
 
-A user declares GSIs and push targets in a subclass of `MaterializationDO` that overrides `targets()`. This is the same
+A user declares GSIs and push targets in a subclass of `MaterializationDO` that overrides `fokosTargets()`. This is the same
 pattern as `PartitionDO.fokosConfig()`:
 
 ```ts
@@ -1303,15 +1296,15 @@ export type PushSinkTargetDefinition = {
 export type FokosTargetDefinition = GsiTargetDefinition | PushSinkTargetDefinition;
 ```
 
-- At startup, each `MaterializationDO` leaf validates `this.targets()`:
+- At startup, each `MaterializationDO` leaf validates `this.fokosTargets()`:
   - at most 10 GSIs,
   - unique, non-empty `targetId` values with no `~`,
   - valid `hashKey`, `sortKey`, and `projection` expressions.
-- **The target list is fixed in the first version.** A partition stores the first valid `this.targets()` result in
+- **The target list is fixed in the first version.** A partition stores the first valid `this.fokosTargets()` result in
   the KV item `__fokosdb/mat/targets`, and then uses only the stored list:
   - A root stores the list from its first request. A split or promotion child gets the stored list of its parent
-    through the migration, not from `this.targets()`.
-  - At each start, the partition reads `this.targets()` again and compares it with the stored list. When the two are
+    through the migration, not from `this.fokosTargets()`.
+  - At each start, the partition reads `this.fokosTargets()` again and compares it with the stored list. When the two are
     different, it logs one error for each instance with the `targetId` values of both lists. It continues with the
     stored list.
   - Section 4.3.6 tracks how to add, remove, and change targets.
@@ -1735,6 +1728,94 @@ these problems:
 6. **A target that is broken for good**, for example a deleted service binding, keeps all tombstones and positions
    until it recovers. The removal of item 5 is the way out, so it must not need the target to answer.
 
+#### 4.3.7 Applied map for each target
+
+When a target catches up after a lag, an item can have an older position for that target and a newer position above
+it (Section 4.2.5). The target sends the latest image of the item from the older position. When a later claim reads the
+newer position and the item did not change, the target sends the same revision again. An item has at most `T + 1`
+positions, so each target that catches up sends an item at most `T` extra times. The cost of a duplicate depends on the
+target:
+
+- A push target gets one extra item in a call. It must accept duplicates in all cases, because an `unknown` outcome
+  sends the batch again.
+- A GSI target writes the entry again. `batchWriteItems` has no revision check, so the upsert rewrites the row and
+  increments its `v`, also when the data did not change. Each duplicate costs at least one row write in the GSI
+  partition, and a GSI query returns a new `v` for an entry that did not change.
+
+The duplicates occur only while a target is more than one claim behind another target. When the two positions of an
+item are in the same claim, the claim skips the second position, because the item is already in the batch. Section
+4.3.8 removes the duplicate GSI writes without the map.
+
+An in-memory map `item_id -> revision` for each target can skip these duplicates. The map holds the revisions that the
+target applied in its current epoch, and the claim skips a position when the map holds the current revision of its
+item. The map must keep these rules:
+
+- It is only an optimization. A restart, an eviction, or an epoch raise clears it, and an LRU limit evicts its entries.
+- SQLite can give the `item_id` of a deleted tombstone to a new item, and the new item can have the same revision. Thus
+  the cleanup must remove each ID that it deletes from each map. A split or a promotion that deletes items must do the
+  same.
+- It costs memory for each target. With 10,000 entries for each target and 11 targets, this is several MB.
+
+Add the map when a workload shows that the duplicate sends during a catch-up cost too much.
+
+#### 4.3.8 Skip a GSI write that changes nothing
+
+Each change of a base item sends a GSI `put`, and the `put` rewrites the entry and increments its `v`. This occurs for a
+duplicate during a catch-up (Section 4.3.7), and also for a base change that does not change the projected entry, for
+example an update of an attribute that a `KEYS_ONLY` GSI does not project. Two options can skip these writes. Neither
+option covers a late `put` after a `delete(K)`, because no row holds a value to compare after the delete. Thus the
+epochs and the split fences (Section 4.2.9) stay in both options.
+
+##### Option A: `external_version` with a conditional put
+
+Each item gets an optional `external_version` column that the writer sets. `MaterializationDO` sets it to the base
+revision on each GSI `put`. The GSI partition compares the incoming value with the stored value:
+
+| Incoming value | Action | Result |
+| --- | --- | --- |
+| Higher, or no row | Write the row. | `applied` |
+| Equal | No write, and `v` stays. | `applied` |
+| Lower | No write. | `applied` |
+
+- **Pros.**
+  - It skips each duplicate with one integer comparison on the row that the upsert reads.
+  - It drops a late `put` to a live entry, in addition to the epoch check.
+  - A GSI entry holds the base revision, which Section 4.3.5 needs.
+  - Users can use the field, for example in a sink that copies items and must be idempotent.
+- **Cons.**
+  - It writes the entry on each base change, also when the projected entry did not change, because the revision is
+    higher.
+  - A `fokosTargets()` change can alter the projection or the sparse rules at the same base revision (Section 4.3.6). The
+    compared value must then be `(target version, revision)`, not the revision alone.
+  - An equal or a lower value must answer `applied`. A condition failure would make the runner record a correct
+    duplicate as a violation or a `retry`.
+  - It adds a public field and one nullable column to `items`.
+
+##### Option B: a hash of the entry
+
+The GSI path stores a hash of the projected entry (the data, the data kind, and the TTL) in each GSI entry, and skips a
+`put` when the stored hash equals the incoming hash.
+
+- **Pros.**
+  - It skips each duplicate, and also each base change that does not change the projected entry.
+  - A `fokosTargets()` change that alters the projection changes the hash, so it needs no rule for equal revisions.
+  - It is internal to the GSI path and adds no public field.
+- **Cons.**
+  - It applies a late `put` that has older, different content. Only the epochs stop it.
+  - A GSI entry holds no base revision, so it does not help Section 4.3.5.
+  - The writer computes a hash on each `put`. When the SQLite of Durable Objects has no hash function, the hash runs in
+    JS. `crypto.subtle.digest` is async, so it runs outside `transactionSync`, for example after the claim.
+  - The hash must have at least 128 bits. A collision skips a real change with no error.
+  - The projection must give the same bytes for the same content. Test this for JSONB.
+
+A variant of Option B stores the hash of the last sent entry in the `target_index_keys` row of `MaterializationDO`.
+Then `MaterializationDO` sends no call for an unchanged entry. It writes the key set row only when the hash changes, and
+a GSI write occurs at that time anyway.
+
+The two options do not combine at full value. When a GSI entry holds the base revision for Section 4.3.5, each base
+change must write the entry to update the revision, and the hash then skips only the duplicates. Choose Option B to
+write fewer GSI rows, or Option A to keep the base revision on each entry.
+
 ## 5. Alternative Options
 
 ### 5.1 Base outbox, base shadow, and stateless Queue fan-out
@@ -1897,7 +1978,7 @@ Changes to Section 4.2:
 
   A late call has a revision at or below the stored revision or tombstone, so the GSI partition rejects it. This is
   also true for a late call of a parent `MaterializationDO`.
-- **Unchanged:** the change positions, the cursors, the applied map, `target_retry`, the GSI key sets, and the two
+- **Unchanged:** the change positions, the cursors, `target_retry`, the GSI key sets, and the two
   calls in sequence for a key move. A tombstone still needs its GSI key, so the key set must still store the key
   before the `put`.
 - **The base hop is a separate choice.** When the `latest_items` tombstones also expire after a time horizon, the
@@ -1933,7 +2014,7 @@ Cons:
    burst of deletes can split GSI partitions, and the partitions stay split after the tombstones expire.
 5. **Query cost.** Each GSI query reads the tombstones in its range and skips them. A page with a `limit` can hold
    fewer items.
-6. **Revision ties.** When a `targets()` change alters the sparse rules of a GSI, one revision can be present at a key
+6. **Revision ties.** When a `fokosTargets()` change alters the sparse rules of a GSI, one revision can be present at a key
    and absent at the same key. The `put` and tombstone rules then need a rule for equal revisions.
 
 It is rejected, because cons 1 to 4 cost more than the rules that it removes. Section 4.3.5 can use the revision of

@@ -17,6 +17,8 @@ export const CODE_DEFS: Record<FokosErrorCode, FokosCodeDef> = Object.assign({},
 export { PartitionDO } from "../src/server/do-partition.js";
 export { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
 export { MaterializationDO } from "../src/server/materialization/do-materialization.js";
+// A materialization class with a push target, and the push target that it sends to.
+export { PushMaterializationDO, PushSinkDO } from "./materialization-do/push-target-host.js";
 
 // db.test.ts runs its whole suite over CUSTOM_PARTITION_DO as well, so that a
 // subclassed PartitionDO stays covered.

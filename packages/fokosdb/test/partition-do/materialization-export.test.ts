@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
@@ -15,7 +15,9 @@ async function outboxSize(stub: DurableObjectStub<PartitionDO>): Promise<number>
 
 describe("PartitionDO — materialization export", () => {
 	it("exports each change to the materialization partition of its key, and empties the outbox", async () => {
-		const { ctx, stub, rpc } = makeStub({ captureChanges: true });
+		// The push target refuses each item, so its cursor stays, and the tombstone stays for the read.
+		const { ctx, stub, rpc } = makeStub({ captureChanges: true, nsMat: "PUSH_MATERIALIZATION_DO" });
+		await env.PUSH_SINK_DO.getByName("sink").refuse(materializationOf(ctx, "a").id.toString());
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "one", kind: "text" });
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "two", kind: "text" });
 		await rpc.apiPutItem(ctx, { hashKey: kb("b"), sortKey: kb("s"), data: JSON.stringify({ n: 1 }), kind: "json" });

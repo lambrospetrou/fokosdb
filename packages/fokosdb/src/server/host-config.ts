@@ -1,5 +1,5 @@
 /**
- * The settings of `PartitionDO` and `TransactionCoordinatorDO`. Each class has a `fokosConfig()` method
+ * The settings of `PartitionDO`, `TransactionCoordinatorDO`, and `MaterializationDO`. Each class has a `fokosConfig()` method
  * that returns overrides. The class merges them with the defaults below, validates the result, and
  * reads it at each use. A subclass can therefore return a value that depends on `this.env`, or on the
  * identity or the policy of the partition, and a changed value applies at its next read.
@@ -7,6 +7,8 @@
 import invariant from "../shared/invariant.js";
 import { validateTtlSweepConfig, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
 import { validateMaterializationExportConfig, type MaterializationExportConfig } from "../shared/partition/materialization-export.js";
+import { validateTargetRunnerConfig, type TargetRunnerConfig } from "./materialization/target-runner.js";
+import { validateMaterializationCleanupConfig, type MaterializationCleanupConfig } from "./materialization/materialization-cleanup.js";
 import { DEFAULT_FANOUT_REQUEST_BUDGET_MS, DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
 
 /**
@@ -63,6 +65,18 @@ export type PartitionDOConfig = Readonly<{
 export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSweep" | "materializationExport">> & {
 	ttlSweep?: Partial<TtlSweepConfig>;
 	materializationExport?: Partial<MaterializationExportConfig>;
+};
+
+export type MaterializationDOConfig = Readonly<{
+	/** The runner that sends the changes to the targets. */
+	targetRunner: Readonly<TargetRunnerConfig>;
+	/** The cleanup of the finished change positions and of the tombstones that no target needs. */
+	cleanup: Readonly<MaterializationCleanupConfig>;
+}>;
+
+export type MaterializationDOConfigOverrides = {
+	targetRunner?: Partial<TargetRunnerConfig>;
+	cleanup?: Partial<MaterializationCleanupConfig>;
 };
 
 export type ParticipantRetryConfig = Readonly<{
@@ -149,6 +163,26 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 	},
 });
 
+export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreeze({
+	targetRunner: {
+		concurrency: 2,
+		// The item limit of `batchWriteItems`.
+		maxItemsPerStep: 100,
+		// Below the RPC limit of 32 MiB.
+		maxBytesPerStep: 16 * 1024 * 1024,
+		maxScannedPositions: 5_000,
+		retryBackoffMinMs: 1_000,
+		retryBackoffMaxMs: 10_000,
+		breakerFailures: 3,
+		probeIntervalMs: 5_000,
+		callTimeoutMs: 30_000,
+		fallbackAlarmMs: 60_000,
+	},
+	// A step deletes a bounded number of rows, because one large delete holds each request of the
+	// partition until its write is durable.
+	cleanup: { deleteRows: 500, scanRows: 1_000 },
+});
+
 export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFreeze({
 	staleTransactionMs: DEFAULT_STALE_TRANSACTION_MS,
 	fanoutRequestBudgetMs: DEFAULT_FANOUT_REQUEST_BUDGET_MS,
@@ -180,6 +214,17 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 	checkInteger(c, "cleanupTxLockCopyRows", 1);
 	validateTtlSweepConfig(c.ttlSweep);
 	validateMaterializationExportConfig(c.materializationExport);
+	return c;
+}
+
+/** Merges `overrides` with the defaults of `MaterializationDO` and validates the result. */
+export function resolveMaterializationConfig(overrides: MaterializationDOConfigOverrides): MaterializationDOConfig {
+	const c = merge(DEFAULT_MATERIALIZATION_CONFIG, overrides);
+	if (c === DEFAULT_MATERIALIZATION_CONFIG) {
+		return c;
+	}
+	validateTargetRunnerConfig(c.targetRunner);
+	validateMaterializationCleanupConfig(c.cleanup);
 	return c;
 }
 

@@ -13,6 +13,12 @@ export { MaterializationDO } from "./materialization/do-materialization.js";
 export type {
 	ApplyLatestImagesRequest,
 	ApplyLatestImagesResponse,
+	FokosTargetDefinition,
+	GsiTargetDefinition,
 	LatestImage,
 	MaterializationOps,
+	PushSinkTargetDefinition,
+	PushTargetBatch,
+	PushTargetItem,
+	PushTargetResult,
 } from "./materialization/do-materialization.js";

@@ -84,3 +84,14 @@ export function txCoordinatorStubForParticipant(
 	const ns: DurableObjectNamespace<TransactionCoordinatorDO> = env[address.nsTx];
 	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(doName);
 }
+
+/**
+ * The stub of a push target: the service binding `binding` of the Worker env, or the Durable Object
+ * `objectName` of the namespace binding `binding`. A push target is not a FokosDB class, so no
+ * jurisdiction and no location hint of the table apply.
+ */
+export function pushTargetStub(env: Env, target: { binding: string; objectName?: string }): unknown {
+	const binding: unknown = (env as unknown as Record<string, unknown>)[target.binding];
+	invariant(typeof binding === "object" && binding !== null, () => `fokos/do-stubs: the Worker env has no binding ${target.binding}`);
+	return target.objectName === undefined ? binding : (binding as DurableObjectNamespace).getByName(target.objectName);
+}

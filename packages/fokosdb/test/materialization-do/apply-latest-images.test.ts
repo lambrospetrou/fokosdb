@@ -18,14 +18,18 @@ type StoredImage = {
 	est_row_bytes: number;
 };
 
-/** A root of the materialization group of a new table, and the router of that group. */
-function makeMaterialization(opts: { rootTreesN?: number; maxSizeMb?: number } = {}) {
+/**
+ * A root of the materialization group of a new table, and the router of that group. A partition with
+ * no target deletes a tombstone at once, so a test that reads a tombstone uses `keepTombstones`: the
+ * partition then has a push target that refuses each item, and the cursor of the target stays.
+ */
+function makeMaterialization(opts: { rootTreesN?: number; maxSizeMb?: number; keepTombstones?: boolean } = {}) {
 	const table = createTableConfig({
 		table: {
 			name: `mat.${crypto.randomUUID()}`,
 			ns: "PARTITION_DO",
 			nsTx: "TRANSACTION_COORDINATOR_DO",
-			nsMat: "MATERIALIZATION_DO",
+			nsMat: opts.keepTombstones ? "PUSH_MATERIALIZATION_DO" : "MATERIALIZATION_DO",
 			rootTreesN: opts.rootTreesN ?? 1,
 			hashSplitN: 2,
 		},
@@ -38,7 +42,7 @@ function makeMaterialization(opts: { rootTreesN?: number; maxSizeMb?: number } =
 		const ctx = router.rootContext(kb(hashKey));
 		return { ctx, stub: materializationStubByName(env, ctx, ctx.doName) };
 	};
-	return { at };
+	return { at, refuse: async (hashKey: string) => await env.PUSH_SINK_DO.getByName("sink").refuse(at(hashKey).stub.id.toString()) };
 }
 
 const PRODUCER = "aa".repeat(32);
@@ -116,7 +120,9 @@ describe("MaterializationDO — applyLatestImages revisions", () => {
 	});
 
 	it("a delete keeps a tombstone with no data, and a late live image below it does not create the item again", async () => {
-		const m = makeMaterialization().at("x");
+		const mat = makeMaterialization({ keepTombstones: true });
+		await mat.refuse("x");
+		const m = mat.at("x");
 		await apply(m, { items: [live(0, "x", 1, "x".repeat(1000))] });
 		const liveBytes = (await storedImage(m.stub, "x"))!.est_row_bytes;
 		expect(await keyEstimate(m.stub, "x")).toBe(liveBytes);
@@ -132,7 +138,9 @@ describe("MaterializationDO — applyLatestImages revisions", () => {
 	});
 
 	it("stores a delete of an item that it never saw as a tombstone", async () => {
-		const m = makeMaterialization().at("x");
+		const mat = makeMaterialization({ keepTombstones: true });
+		await mat.refuse("x");
+		const m = mat.at("x");
 		await apply(m, { items: [deleted(0, "x", 4)] });
 		expect(await storedImage(m.stub, "x")).toMatchObject({ revision: 4, deleted: true, data: null });
 	});
@@ -200,7 +208,9 @@ describe("MaterializationDO — applyLatestImages producer epochs", () => {
 
 describe("MaterializationDO — applyLatestImages size and routing", () => {
 	it("above its size limit refuses each newer live image with partition_over_size, and still applies each delete and each fence", async () => {
-		const m = makeMaterialization({ maxSizeMb: 0.0001 }).at("x");
+		const mat = makeMaterialization({ maxSizeMb: 0.0001, keepTombstones: true });
+		await mat.refuse("x");
+		const m = mat.at("x");
 		const res = await apply(m, {
 			epoch: 2,
 			ancestorFences: [{ ancestorId: OTHER_PRODUCER, minEpoch: 4 }],
