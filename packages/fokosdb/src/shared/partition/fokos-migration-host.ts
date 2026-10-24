@@ -10,7 +10,9 @@
  *
  *   1. `items`      — the committed rows of the slice.
  *   2. `pending_tx_info` — the locks of in-flight transactions over the slice, plus the deletion metadata.
- *   3. `outbox`     — the `materialization_outbox` rows of the slice. Only a table that captures its
+ *   3. `producer_fences` — the whole `producer_fences` table. The target merges it with MAX, so that it
+ *                     rejects each late call that the source rejects.
+ *   4. `outbox`     — the `materialization_outbox` rows of the slice. Only a table that captures its
  *                     changes runs this stream.
  *
  * The two never merge into one page: `items` holds committed state only, and a pending lock is a
@@ -31,6 +33,7 @@ import {
 	type ExportFence,
 	type PendingTransactionCursor,
 	type PendingTxItem,
+	type ProducerFence,
 	type ScanCursor,
 } from "./partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
@@ -46,7 +49,10 @@ const OUTBOX_ROW_FIXED_BYTES = 32;
 export type FokosDBHostCursor =
 	| { stream: "items"; cursor: HashKeyWalkCursor<ScanCursor> | null }
 	| { stream: "pending_tx"; cursor: HashKeyWalkCursor<PendingTransactionCursor> | null }
+	| { stream: "producer_fences"; after: string | null }
 	| { stream: "outbox"; cursor: HashKeyWalkCursor<ScanCursor> | null };
+
+type KeyStreamCursor = Exclude<FokosDBHostCursor, { stream: "producer_fences" }>;
 
 export type FokosDBHostPage =
 	| { stream: "items"; items: MigratedItem[] }
@@ -55,6 +61,7 @@ export type FokosDBHostPage =
 			pendingTransactions: PendingTxItem[];
 			deletionMetadata: { maxDeleteTxOrderTs: number; maxDeletedV: number };
 	  }
+	| { stream: "producer_fences"; fences: ProducerFence[] }
 	| {
 			stream: "outbox";
 			rows: MigratedOutboxRow[];
@@ -98,6 +105,8 @@ export class FokosMigrationHost implements MigrationHost {
 				return this.#buildItemsPage(from.cursor, range, belongsToTarget, budget);
 			case "pending_tx":
 				return this.#buildPendingTxPage(from.cursor, range, belongsToTarget, budget);
+			case "producer_fences":
+				return this.#buildProducerFencesPage(from.after, budget);
 			case "outbox":
 				return this.#buildOutboxPage(from.cursor, range, belongsToTarget, budget);
 		}
@@ -116,6 +125,11 @@ export class FokosMigrationHost implements MigrationHost {
 			case "pending_tx":
 				this.#applyPendingTx(p);
 				return;
+			case "producer_fences":
+				for (const fence of p.fences) {
+					this.deps.store.raiseProducerEpoch(fence.producerId, fence.epoch);
+				}
+				return;
 			case "outbox":
 				for (const row of p.rows) {
 					this.deps.store.insertMigratedOutboxRow(row);
@@ -129,6 +143,9 @@ export class FokosMigrationHost implements MigrationHost {
 	validatePage(cursor: unknown, page: unknown, nextCursor: unknown, inSlice: BelongsToTarget): void {
 		assertHostPageFollowsCursor(cursor, page, nextCursor);
 		const p = page as FokosDBHostPage;
+		if (p.stream === "producer_fences") {
+			return;
+		}
 		for (const row of p.stream === "items" ? p.items : p.stream === "pending_tx" ? p.pendingTransactions : p.rows) {
 			// The closure is made only on a failure, because a page can hold many rows.
 			if (!inSlice({ hashKey: row.hk, sortKey: row.sk })) {
@@ -198,6 +215,21 @@ export class FokosMigrationHost implements MigrationHost {
 		const page: FokosDBHostPage = { stream: "pending_tx", pendingTransactions: rows, deletionMetadata: store.getDeletionMetadata() };
 		if (nextCursor) {
 			return { page, nextCursor: { stream: "pending_tx", cursor: nextCursor } };
+		}
+		return { page, nextCursor: { stream: "producer_fences", after: null } };
+	}
+
+	// ─── producer fences ──────────────────────────────────────────────────────
+
+	/** Each target gets the whole table: a fence is not a key of the slice. */
+	#buildProducerFencesPage(
+		after: string | null,
+		budget: FokosMigrationPageBudget,
+	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
+		const fences = this.deps.store.producerFencesAfter(after, budget.pageRows);
+		const page: FokosDBHostPage = { stream: "producer_fences", fences };
+		if (fences.length === budget.pageRows) {
+			return { page, nextCursor: { stream: "producer_fences", after: fences[fences.length - 1].producerId } };
 		}
 		return { page, nextCursor: this.deps.captureChanges() ? { stream: "outbox", cursor: null } : null };
 	}
@@ -385,7 +417,7 @@ function asHostCursor(cursor: unknown): FokosDBHostCursor {
 	}
 	const c = cursor as FokosDBHostCursor;
 	invariant(
-		c.stream === "items" || c.stream === "pending_tx" || c.stream === "outbox",
+		c.stream === "items" || c.stream === "pending_tx" || c.stream === "producer_fences" || c.stream === "outbox",
 		() => `fokos/migration-host: unknown stream ${String(c.stream)}`,
 	);
 	assertStreamCursor(c);
@@ -397,7 +429,12 @@ function asHostCursor(cursor: unknown): FokosDBHostCursor {
  * bytes makes the seek `hk > ?` match no row, and the read would then end the stream with no error,
  * and the target would miss the rest of its rows.
  */
-function assertStreamCursor({ stream, cursor }: FokosDBHostCursor): void {
+function assertStreamCursor(c: FokosDBHostCursor): void {
+	if (c.stream === "producer_fences") {
+		invariant(c.after === null || typeof c.after === "string", "fokos/migration-host: the producer_fences cursor is not a string");
+		return;
+	}
+	const { stream, cursor } = c;
 	if (cursor === null) {
 		return;
 	}
@@ -419,7 +456,7 @@ function assertStreamCursor({ stream, cursor }: FokosDBHostCursor): void {
 }
 
 /** The stream order, so a page can be checked against the cursor that asked for it. */
-const STREAM_ORDER: Record<FokosDBHostCursor["stream"], number> = { items: 0, pending_tx: 1, outbox: 2 };
+const STREAM_ORDER: Record<FokosDBHostCursor["stream"], number> = { items: 0, pending_tx: 1, producer_fences: 2, outbox: 3 };
 
 /** Throws when a page would move the host's own streams backwards. */
 export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, nextCursor: unknown): void {
@@ -447,13 +484,24 @@ export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, next
 	);
 	// A cursor that does not move forward makes the target pull the same page again and again.
 	invariant(
-		next.stream !== requested.stream ||
-			(next.cursor !== null && (requested.cursor === null || comparePositions(next.cursor, requested.cursor) > 0)),
+		next.stream !== requested.stream || movesForward(requested, next),
 		() => `fokos/migration-host: the ${requested.stream} cursor of the page does not move forward`,
 	);
 }
 
-export type StreamPosition = NonNullable<FokosDBHostCursor["cursor"]>;
+function movesForward(requested: FokosDBHostCursor, next: FokosDBHostCursor): boolean {
+	if (requested.stream === "producer_fences" || next.stream === "producer_fences") {
+		return (
+			requested.stream === "producer_fences" &&
+			next.stream === "producer_fences" &&
+			next.after !== null &&
+			(requested.after === null || next.after > requested.after)
+		);
+	}
+	return next.cursor !== null && (requested.cursor === null || comparePositions(next.cursor, requested.cursor) > 0);
+}
+
+export type StreamPosition = NonNullable<KeyStreamCursor["cursor"]>;
 
 /**
  * Compares two positions of one stream in its read order: `(hk, sk)` for items, and

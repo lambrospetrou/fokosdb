@@ -208,6 +208,34 @@ export type BatchWriteRpcItem = {
 
 export type BatchWriteItemsRpcRequest = { items: BatchWriteRpcItem[] };
 
+/**
+ * One entry of a GSI write. `hashKey` is the GSI hash key and `sortKey` is the stored physical sort key
+ * (`gsiItemSortKey`), so that the runtime routes the entry as any other item.
+ */
+export type GsiWriteEntry = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes } & (
+	| { op: "put"; data: string | Uint8Array; kind: DataKind; ttlAt?: number; baseRevision: number }
+	| { op: "delete" }
+);
+
+/** An ancestor of the producer whose late calls the receiver must reject. */
+export type GsiProducerFence = { ancestorId: string; minEpoch: number };
+
+/** A write of one `MaterializationDO` to a GSI table. Only `MaterializationDO` sends it. */
+export type GsiWriteEntriesRequest = {
+	/** The `DurableObjectId` of the producer, as `DurableObjectId.toString()` gives it. */
+	producerId: string;
+	/** The epoch of the producer. A receiver that stored a higher epoch applies nothing. */
+	epoch: number;
+	ancestorFences: readonly GsiProducerFence[];
+	items: GsiWriteEntry[];
+};
+
+export type GsiWriteEntriesResponse = {
+	applied: Array<{ opIndex: number; partitionIndex: number }>;
+	failed: BatchFailure[];
+	partitions: WirePartitionMeta[];
+};
+
 export type BatchWriteItemsRpcResponse = {
 	appliedPuts: Array<{ opIndex: number; version: number; partitionIndex: number }>;
 	appliedDeletes: Array<{ opIndex: number; deleted: boolean; partitionIndex: number }>;
@@ -315,6 +343,7 @@ export type PartitionOps = {
 	apiQueryItems: { req: QueryItemsRpcRequest; res: QueryItemsRpcResponse };
 	apiBatchGetItems: { req: BatchGetItemsRpcRequest; res: BatchGetItemsRpcResponse };
 	apiBatchWriteItems: { req: BatchWriteItemsRpcRequest; res: BatchWriteItemsRpcResponse };
+	gsiWriteEntries: { req: GsiWriteEntriesRequest; res: GsiWriteEntriesResponse };
 	txPrepare: { req: PrepareRequest; res: PrepareResponse };
 	txCommit: { req: CommitRequest; res: CommitResponse };
 	txCancel: { req: CancelRequest; res: CancelResponse };
@@ -467,6 +496,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 	async apiBatchWriteItems(ctx: FokosDBRouteContext, req: BatchWriteItemsRpcRequest) {
 		return await this.#api("apiBatchWriteItems", ctx, req);
+	}
+	async gsiWriteEntries(ctx: FokosDBRouteContext, req: GsiWriteEntriesRequest) {
+		return await this.#api("gsiWriteEntries", ctx, req);
 	}
 	async txPrepare(ctx: FokosDBRouteContext, req: PrepareRequest) {
 		return await this.#api("txPrepare", ctx, req);
@@ -806,6 +838,19 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					applyBatchImageCap(merged.failed);
 					return merged;
 				},
+			},
+			gsiWriteEntries: {
+				shape: "group",
+				whileMigrating: "throw",
+				admissionTag: "batch_write",
+				failurePolicy: "collect",
+				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
+				subRequest: (req, items) => ({ ...req, items: items as GsiWriteEntry[] }),
+				local: (req, call) => this.gsiWriteLocal(req, call),
+				merge: (parts) =>
+					this.mergeBatch(parts, true, { applied: [], failed: [], partitions: [] }, (out, result, offset) => {
+						out.applied.push(...result.applied.map((entry) => withOffset(entry, offset)));
+					}),
 			},
 			txPrepare: {
 				shape: "group",
@@ -1367,6 +1412,66 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return out;
 	}
 
+	/**
+	 * Applies the entries of one GSI write, each in its own `transactionSync`. Each block raises the
+	 * stored epochs of the ancestor fences, rejects the entry when the epoch of the call is below the
+	 * stored epoch of the producer, raises that epoch, and then writes the entry. A GSI table has no
+	 * transaction and no condition. Above 1.1 times the cap, the puts are refused and the deletes apply.
+	 */
+	private gsiWriteLocal(req: GsiWriteEntriesRequest, call: FokosLocalCall): GsiWriteEntriesResponse {
+		const out: GsiWriteEntriesResponse = { applied: [], failed: [], partitions: [] };
+		const puts = req.items.filter((item) => item.op === "put").map((item) => item.opIndex);
+		const overSize = puts.length > 0 ? this.sizeRefusal("gsiWriteEntries", this.fokos.policy()) : undefined;
+		if (overSize) {
+			call.signal({ evaluateSplit: true });
+			out.failed.push({ ...classifyBatchFailure(overSize, { write: true, local: true }), opIndexes: puts, partitionIndex: 0 });
+		}
+		const candidates: PromotionCandidate[] = [];
+		let rowsRead = 0;
+		let rowsWritten = 0;
+		for (const item of req.items) {
+			if (item.op === "put" && overSize) {
+				continue;
+			}
+			try {
+				const res = this.#store.transactionSync(() => {
+					for (const fence of req.ancestorFences) {
+						this.#store.raiseProducerEpoch(fence.ancestorId, fence.minEpoch);
+					}
+					const stored = this.#store.producerEpoch(req.producerId);
+					if (req.epoch < stored) {
+						return undefined;
+					}
+					if (req.epoch > stored) {
+						this.#store.raiseProducerEpoch(req.producerId, req.epoch);
+					}
+					return item.op === "put" ? this.upsertNow(item) : this.deleteNow(item.hashKey, item.sortKey);
+				});
+				if (res === undefined) {
+					out.failed.push({
+						...classifyBatchFailure(producerEpochFenced(req.epoch), { write: true, local: true }),
+						opIndexes: [item.opIndex],
+						partitionIndex: 0,
+					});
+					continue;
+				}
+				rowsRead += res.rowsRead;
+				rowsWritten += res.rowsWritten;
+				if (!("deleted" in res)) {
+					candidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
+				}
+				out.applied.push({ opIndex: item.opIndex, partitionIndex: 0 });
+			} catch (e) {
+				out.failed.push({ ...classifyBatchFailure(e, { write: true, local: true }), opIndexes: [item.opIndex], partitionIndex: 0 });
+			}
+		}
+		if (candidates.length > 0) {
+			this.signalGrowth(call, candidates);
+		}
+		out.partitions = this.answered({ rowsRead, rowsWritten });
+		return out;
+	}
+
 	/** Joins the parts of a batch operation of this class: `mergeBatchParts` with this partition as `self`. */
 	private mergeBatch<
 		Req extends { items: Array<{ opIndex: number }> },
@@ -1841,4 +1946,11 @@ function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number
 		rowsWritten += r.rowsWritten;
 	}
 	return { rowsRead, rowsWritten };
+}
+
+function producerEpochFenced(epoch: number): FokosConflictError {
+	return new FokosConflictError(CONFLICT_CODES.producer_epoch_fenced, {
+		message: "the producer sent this call with an epoch below the epoch that the receiver stored",
+		attributes: { epoch },
+	});
 }

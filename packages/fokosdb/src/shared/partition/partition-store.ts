@@ -269,6 +269,9 @@ export type DueOutboxRow = { hk: KeyBytes; sk: KeyBytes; revision: number; isDel
 /** An ancestor whose late export calls a receiver must reject, with the lowest epoch that it may still send. */
 export type ExportFence = { ancestorId: string; minEpoch: number };
 
+/** The highest epoch that a receiver stored for one producer. */
+export type ProducerFence = { producerId: string; epoch: number };
+
 /** The stored representation of a live item for its export: a json item is its JSONB blob. */
 export type ExportItemImage = { v: number; data: string | Uint8Array; kind: DataKind; ttlAt: number | null; estRowBytes: number };
 
@@ -817,6 +820,18 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 ancestor_id TEXT    PRIMARY KEY,
                 min_epoch   INTEGER NOT NULL,
                 until_id    INTEGER NOT NULL
+            ) WITHOUT ROWID, STRICT;`,
+	},
+	{
+		idMonotonicInc: 4,
+		description: "Create the producer fences",
+		// The highest epoch of each producer that writes to this partition with gsiWriteEntries. A call
+		// with a lower epoch applies nothing. A row is never deleted: an absent row has the epoch 0, and
+		// a late call of that producer would then apply.
+		sql: `
+            CREATE TABLE IF NOT EXISTS producer_fences (
+                producer_id TEXT    PRIMARY KEY,
+                epoch       INTEGER NOT NULL
             ) WITHOUT ROWID, STRICT;`,
 	},
 ];
@@ -2301,5 +2316,40 @@ export class PartitionStore {
 	/** Migration ingest: idempotent, merges both values with MAX. */
 	mergeDeletionMetadata(meta: { maxDeleteTxOrderTs: number; maxDeletedV: number }): void {
 		this.#raiseDeletionMetadata(meta.maxDeleteTxOrderTs, meta.maxDeletedV);
+	}
+
+	// ─── producer_fences ────────────────────────────────────────────────────
+
+	/** The stored epoch of a producer, or 0 when the producer never called. */
+	producerEpoch(producerId: string): number {
+		return (
+			tryOne(this.#storage.sql.exec<{ epoch: number }>(`SELECT epoch FROM producer_fences WHERE producer_id = ?`, producerId))?.epoch ?? 0
+		);
+	}
+
+	/**
+	 * Raises the stored epoch of a producer to `epoch` when `epoch` is higher. It never lowers it. Keep
+	 * the `WHERE` of the update: without it, the update writes the row also when the value does not change.
+	 */
+	raiseProducerEpoch(producerId: string, epoch: number): void {
+		this.#storage.sql.exec(
+			`INSERT INTO producer_fences (producer_id, epoch) VALUES (?, ?)
+			 ON CONFLICT (producer_id) DO UPDATE SET epoch = excluded.epoch WHERE excluded.epoch > producer_fences.epoch`,
+			producerId,
+			epoch,
+		);
+	}
+
+	/** One migration page of `producer_fences`, in `producer_id` order, strictly after `after`. */
+	producerFencesAfter(after: string | null, limit: number): ProducerFence[] {
+		const fences: ProducerFence[] = [];
+		for (const row of this.#storage.sql.exec<{ producer_id: string; epoch: number }>(
+			`SELECT producer_id, epoch FROM producer_fences WHERE producer_id > ?1 ORDER BY producer_id LIMIT ?2`,
+			after ?? "",
+			limit,
+		)) {
+			fences.push({ producerId: row.producer_id, epoch: row.epoch });
+		}
+		return fences;
 	}
 }

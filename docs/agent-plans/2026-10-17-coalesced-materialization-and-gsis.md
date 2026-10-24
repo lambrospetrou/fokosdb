@@ -200,7 +200,8 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
    import must not write a new `materialization_outbox` revision.
 5. A TTL sweep must delete only the expired rows that its partition owns. When `captureChanges = true`, it must write
    an outbox tombstone for each deleted row. It must keep unowned copies until `cleanupSourceStep` deletes them.
-6. Each GSI must be a standard FokosDB table (`PartitionDO`) written with `batchWriteItems` and queried with
+6. Each GSI must be a standard FokosDB table (`PartitionDO`) written with the internal `gsiWriteEntries` operation
+   and queried with
    `queryItems` over the composite sort key. The physical key of each valid base item must fit the derived key limits
    of each GSI table.
 7. Each background scan, export batch, and target push step must enforce bounds on the item count, the byte count, and
@@ -246,10 +247,11 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   - the `MaterializationDO` split and promotion migration with the split fences.
 
 ### Milestone 4: Static GSIs and `db.gsi(indexName)`
-- Add `producerId`, `epoch`, `ancestorFences`, and `producer_epoch_fenced` to `batchWriteItems`. Add
-  `producer_fences` to the GSI `PartitionDO` and to its split migration (Sections 4.2.9 and 4.2.14).
-- Build the GSI target step with `target_index_keys` and two calls in sequence (`put` and then `delete`) with
-  `FokosDB.batchWriteItems` (Section 4.2.7).
+- Add the internal `PartitionDO` operation `gsiWriteEntries` with `producerId`, `epoch`, `ancestorFences`, and the
+  outcome `producer_epoch_fenced`. Add `producer_fences` to the GSI `PartitionDO` and to its split migration
+  (Sections 4.2.9 and 4.2.14). The public `batchWriteItems` does not change.
+- Build the GSI target step with `target_index_keys` and two calls in sequence (`put` and then `delete`) with the
+  internal GSI writer (Section 4.2.7).
 - Add the composite sort key codec (`<L><flag><D>`), the `{ ref: "sortKey" }` compiler rules, the derived GSI key
   limits, `db.gsi(indexName).queryItems`, and `FokosDB.destroy()` across all shard groups of the table (Sections
   4.2.13 and 4.2.14).
@@ -280,8 +282,8 @@ Materialization Shard Group: fokos.m.<tableName> (MaterializationDO)
   - Receiver: producer_fences; in-memory runner round-robins targets (2 workers); alarm is fallback
           |
           +-----------------------------------------------+
-          | batchWriteItems(producerId, epoch,            | PushTargetBatch(producerId, epoch,
-          |   ancestorFences)                             |   ancestorFences, items)
+          | gsiWriteEntries(producerId, epoch,            | PushTargetBatch(producerId, epoch,
+          |   ancestorFences, entries)                    |   ancestorFences, items)
           v                                               v
 GSI Shard Groups (up to 10):                       Remote Push Targets:
   fokos.gsiv1.<n>.<tableName>.<indexName>            Workers RPC to a WorkerEntrypoint or DurableObject
@@ -301,7 +303,7 @@ GSI Shard Groups (up to 10):                       Remote Push Targets:
    the change positions above its cursor, sends the latest image of each item, and moves its cursor one time for each
    batch.
    - For a GSI, the step records each new GSI key in the key set before the call. It writes the new entry with
-     `FokosDB.batchWriteItems`, and then deletes the old entry when the key moved.
+     `gsiWriteEntries`, and then deletes the old entry when the key moved.
    - For a push target, the step pushes a batch of `PushTargetItem` records over Workers RPC.
    - A failed item gets a `target_retry` row, and the cursor continues past it.
 4. **Late calls.** Each call carries the ID and the epoch of its sender. A sender raises its epoch after an `unknown`
@@ -748,7 +750,8 @@ sent. The skipped positions are done for `t`.
 
 #### 4.2.7 GSI targets and key sets
 
-A `gsi` target writes to `fokos.gsiv1.<n>.<tableName>.<indexName>` with `FokosDB.batchWriteItems`.
+A `gsi` target writes to `fokos.gsiv1.<n>.<tableName>.<indexName>` with the internal `gsiWriteEntries` operation
+(Section 4.2.14).
 
 ##### Desired GSI key
 
@@ -811,7 +814,7 @@ The key set prevents an orphan GSI entry in two cases:
 The two calls of one step run in sequence and carry different GSI keys of the item. Thus they keep the same-epoch
 rule of Section 4.2.9.
 
-`MaterializationDO` validates each item before it calls `batchWriteItems`. When `batchWriteItems` still throws a
+`MaterializationDO` validates each item before it calls `gsiWriteEntries`. When `gsiWriteEntries` still throws a
 validation error for the whole call before I/O, `MaterializationDO` sends each item of that batch again alone. Thus
 only the item that is not valid becomes a violation.
 
@@ -874,7 +877,7 @@ The push target contract:
 | Hop | Producer ID | Epoch storage at the producer | Receiver checks |
 | --- | --- | --- | --- |
 | Base `PartitionDO` -> `MaterializationDO` (`applyLatestImages`) | `DurableObjectId` of the base partition, in hex | `materialization_export_state` | The producer epoch, then the revision (Section 4.2.4) |
-| `MaterializationDO` -> GSI `PartitionDO` (`batchWriteItems`) | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the GSI target | The producer epoch |
+| `MaterializationDO` -> GSI `PartitionDO` (`gsiWriteEntries`) | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the GSI target | The producer epoch |
 | `MaterializationDO` -> push target | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 4.2.8). |
 
 Each GSI shard group gets calls from one target only. Thus a GSI partition stores one epoch for each
@@ -923,7 +926,7 @@ producer then applies. The number of rows is the number of producers that ever s
 A receiver split copies the whole table to each child with `MAX(epoch)` (Section 4.2.12). The partition that applies
 a forwarded call checks it.
 
-A forward or a client retry must not send a second copy of a call that can have applied. `FokosDB.batchWriteItems`
+A forward or a client retry must not send a second copy of a call that can have applied. The GSI writer
 does not retry, and the runtime sends a forward again only after an error that came before any handler ran on the
 target. Thus each call reaches the receiver at most one time.
 
@@ -1425,16 +1428,42 @@ Each GSI is a standard `FokosDB` table in the shard group `fokos.gsiv1.<n>.<tabl
   no collision with the names of `gsiv1`.
 - The shard group name is the address of the GSI data. Thus the `gsiv1` encoding must never change.
 
-`MaterializationDO` and `db.gsi(indexName)` construct the internal GSI `FokosDB` client with `captureChanges = false`
-and no transaction coordinator group.
+The GSI table config has `captureChanges = false` and no transaction coordinator group. `db.gsi(indexName)` reads
+it through a `FokosShardingClient` of the GSI shard group. `MaterializationDO` writes it through the GSI writer.
 
-##### `batchWriteItems` producer extension
+##### Internal GSI write operation `gsiWriteEntries`
 
-`BatchWriteItemsOptions` (`packages/fokosdb/src/shared/batch-api-types.ts`) and `BatchWriteItemsRpcRequest`
-(`packages/fokosdb/src/server/do-partition.ts`) add the optional fields `producerId`, `epoch`, and `ancestorFences`.
-Only `MaterializationDO` sets them. When they are present, the `transactionSync` block of each item in
-`apiBatchWriteItems` runs the receiver rules of Section 4.2.9. A fenced item returns `unprocessed` with
-`producer_epoch_fenced`. The GSI `PartitionDO` stores `producer_fences` and migrates it on a split (Section 4.2.12).
+The public `batchWriteItems` does not change. A GSI write uses an internal `PartitionDO` operation,
+`gsiWriteEntries`. Its descriptor is the same as the descriptor of `apiBatchWriteItems`: `shape: "group"`,
+`failurePolicy: "collect"`, and `whileMigrating: "throw"`. The client entry `fokosdb/client` does not expose it.
+
+The request is:
+
+```ts
+type GsiWriteEntriesRequest = {
+  producerId: string;  // DurableObjectId of the MaterializationDO, in hex
+  epoch: number;
+  ancestorFences: readonly { ancestorId: string; minEpoch: number }[];
+  items: readonly GsiWriteEntry[];
+};
+// hashKey is gsiHK. sortKey is the stored physical sort key 0xFF || encodeGsiSortKey(gsiSK, baseHK, baseSK).
+type GsiWriteEntry = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes } & (
+  | { op: "put"; data: Uint8Array | string; kind: DataKind; ttlAt?: number; baseRevision: number }
+  | { op: "delete" }
+);
+```
+
+The GSI writer builds the physical sort key of each entry, because the runtime routes each entry by its
+`(hashKey, sortKey)`, and a range tree of a GSI table splits on the physical sort key. The request has no condition
+and no `returnValues`. The `transactionSync` block of each entry runs the receiver rules of Section 4.2.9 and then
+applies the upsert or the delete. A fenced entry returns `unprocessed` with `producer_epoch_fenced`. The GSI
+`PartitionDO` stores `producer_fences` and migrates it on a split in the `producer_fences` migration stream
+(Section 4.2.12). This spec does not store `baseRevision` (Section 4.3.5).
+
+The GSI writer (`packages/fokosdb/src/server/materialization/gsi-writer.ts`) holds one `FokosShardingClient` for each
+GSI shard group. It resolves the owner partition of each entry, sends `gsiWriteEntries`, and maps each entry to one
+outcome. It does not use `FokosDB`. Like each other `PartitionDO` method, a Worker that has the `PartitionDO` binding
+can call `gsiWriteEntries`.
 
 ##### Order-preserving composite sort key with `<L><flag><D>` trailer
 
@@ -1456,7 +1485,7 @@ builds `physicalSk`:
     contains a `0x00` byte. In that case, the unescaped `rawGsiSK` comes directly before `<L>!<D>`.
   - `<D>` at offset `-1` is the ASCII digit `'1'..'9'` that gives the byte length of `<L>`.
 
-`MaterializationDO` passes `physicalSk` to `batchWriteItems` as a `Uint8Array`. `KeyCodec.encode` prepends the binary
+The GSI `PartitionDO` stores `physicalSk` as a binary sort key. `KeyCodec.encode` prepends the binary
 tag `0xFF`, so `i.sk` in SQLite is `0xFF || physicalSk`. Byte `n` of `physicalSk` is byte `n + 1` of `i.sk`:
 
 ```text
@@ -1601,7 +1630,7 @@ in total: 72,000 new items and 648,000 mutations across 50,000 existing items.
   with 0 RPCs to that GSI.
 - 122,000 items change. Each changed item has at most 2 positions, so `change_positions` holds at most 244,000 rows.
   TODO: measure the size of a `change_positions` row.
-- When the GSI recovers, the in-memory runner drains the 122,000 to 172,000 `batchWriteItems` operations in 1.5 to 2.5
+- When the GSI recovers, the in-memory runner drains the 122,000 to 172,000 `gsiWriteEntries` operations in 1.5 to 2.5
   minutes, at 1,000 to 2,000 items/s across 4 `MaterializationDO` partitions. The healthy targets continue to share
   the round-robin workers.
 
@@ -1656,8 +1685,9 @@ and `T` GSI rows. Each `target_index_keys` row adds the bytes of its GSI keys. T
 - **No time in correctness.** No rule waits for a deadline, `maxClockSkewMs`, or a horizon. After an `unknown`
   outcome, the target sends again at once. A split needs no wait.
 - **Permanent receiver rows.** Each receiver keeps one `producer_fences` row for each producer that ever sent to it.
-- **Interface changes.** `batchWriteItems` needs the GSI-only options `producerId`, `epoch`, and `ancestorFences`, and
-  the code `producer_epoch_fenced`. `applyLatestImages` needs the same three fields.
+- **Interface changes.** The internal operation `gsiWriteEntries` carries `producerId`, `epoch`, and
+  `ancestorFences`, and returns the code `producer_epoch_fenced`. `applyLatestImages` carries the same three fields.
+  The public `batchWriteItems` does not change.
 - **Tombstones during an outage.** A target that is down keeps the tombstones of all deleted items until it recovers.
   A tombstone is a key-only row.
 
@@ -1777,8 +1807,8 @@ A later spec can change this:
 
 - `db.gsi(indexName).queryItems` can omit `version`, and the compiler can reject `{ ref: "v" }` in a GSI `filter` or
   `projection`.
-- `MaterializationDO` can store the base `revision` in each GSI entry. `db.gsi(indexName).queryItems` then returns it
-  as `version`, and `{ ref: "v" }` reads it.
+- The GSI `PartitionDO` can store the `baseRevision` of each `gsiWriteEntries` entry.
+  `db.gsi(indexName).queryItems` then returns it as `version`, and `{ ref: "v" }` reads it.
 - A caller-provided `external_version` on base writes can travel with the item to the GSIs and the push targets.
 
 #### 4.3.6 Target changes and target versions
@@ -1815,7 +1845,7 @@ target:
 
 - A push target gets one extra item in a call. It must accept duplicates in all cases, because an `unknown` outcome
   sends the batch again.
-- A GSI target writes the entry again. `batchWriteItems` has no revision check, so the upsert rewrites the row and
+- A GSI target writes the entry again. `gsiWriteEntries` has no revision check, so the upsert rewrites the row and
   increments its `v`, also when the data did not change. Each duplicate costs at least one row write in the GSI
   partition, and a GSI query returns a new `v` for an entry that did not change.
 
@@ -2060,7 +2090,7 @@ removes the tombstone. The TTL must be longer than the life of any call, for exa
 Changes to Section 4.2:
 
 - **Removed from the GSI hop:**
-  - the producer ID, the epoch, and the ancestor fences in `batchWriteItems`,
+  - the producer ID, the epoch, and the ancestor fences in `gsiWriteEntries`,
   - `producer_fences` in GSI partitions,
   - the epoch raise after an `unknown` outcome, and the `is_batch_open` marker.
 
@@ -2073,7 +2103,7 @@ Changes to Section 4.2:
   base hop can drop its epochs, its fences, its cold-start check, and the same-epoch rule. When they do not, the base
   hop keeps the rules of Section 4.2.9.
 - **Added:**
-  - a revision condition in the GSI path of `batchWriteItems`,
+  - a revision condition in `gsiWriteEntries`,
   - tombstone rows in GSI partitions,
   - a tombstone filter in each GSI query.
 
@@ -2128,7 +2158,7 @@ call that fails as a whole writes no `retry` row (Section 4.2.10).
 
 Yes. Both read the same change positions with their own cursor and epoch, and both use `target_retry` for failed
 items (Sections 4.2.5 to 4.2.10). A GSI also keeps a key set, and its step sends `put` and then `delete` with
-`FokosDB.batchWriteItems`. A push target sends one `PushTargetBatch` over Workers RPC.
+`gsiWriteEntries`. A push target sends one `PushTargetBatch` over Workers RPC.
 
 ### 6.2 Why does `MaterializationDO` keep a full mirror of live items?
 
