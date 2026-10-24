@@ -13,11 +13,12 @@ import type {
 import type { ItemBatcher } from "../../src/shared/batch-api-types.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
-import { MAX_ITEM_BYTES, MAX_ITEMS_PER_BATCH } from "../../src/shared/transaction-limits.js";
+import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES, MAX_ITEMS_PER_BATCH } from "../../src/shared/transaction-limits.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { recordedTxCalls } from "../controlled-partition-do.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { betweenPhases, controlledPartition, holdPendingLock, keysAcrossPartitions, makeDB } from "../transactions/tx-helpers.js";
+import invariant from "../../src/shared/invariant.js";
 import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
@@ -51,6 +52,36 @@ const deleteItem = (opIndex: number, hashKey: string, sortKey: string): BatchWri
 async function batchWrite(partition: TestPartition, req: BatchWriteItemsRpcRequest): Promise<FokosEnvelope<BatchWriteItemsRpcResponse>> {
 	return (await partition.stub.apiBatchWriteItems(partition.ctx, req)) as unknown as FokosEnvelope<BatchWriteItemsRpcResponse>;
 }
+
+// Just under the item limit: the store measures the whole row, so the data leaves room for the keys.
+const IMAGE_BYTES = MAX_ITEM_BYTES - 2048;
+const IMAGE_DATA = "x".repeat(IMAGE_BYTES);
+const FITTING_IMAGES = Math.floor(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX / IMAGE_BYTES);
+
+/** A put that fails its condition on an existing item and asks for the old image. */
+const imagePut = (opIndex: number, hashKey: string, sortKey: string): BatchWriteRpcItem => ({
+	...putItem(opIndex, hashKey, sortKey, "new"),
+	condition: notExists,
+	returnValuesOnConditionCheckFailure: "all_old",
+});
+
+/** The opIndexes of the failed conditions whose image the cap dropped. Each other failed condition has its image. */
+function omittedImages(failed: BatchWriteItemsRpcResponse["failed"]): number[] {
+	const omitted: number[] = [];
+	for (const entry of failed) {
+		expect(entry.code).toBe("condition_failed");
+		invariant(entry.reason?.code === "condition_failed", "a failed condition has a reason");
+		if (entry.itemOmitted) {
+			expect(entry.reason.item).toBeUndefined();
+			omitted.push(...entry.opIndexes);
+		} else {
+			expect(entry.reason.item?.data).toBe(IMAGE_DATA);
+		}
+	}
+	return omitted.sort((a, b) => a - b);
+}
+
+const range = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => from + i);
 
 async function readData(partition: TestPartition, hashKey: string, sortKey: string): Promise<string | undefined> {
 	const res = await partition.get({ hashKey: kb(hashKey), sortKey: kb(sortKey) });
@@ -146,7 +177,14 @@ describe.concurrent("PartitionDO — apiBatchWriteItems", () => {
 
 		expect(value.failed).toEqual([
 			{ outcome: "unprocessed", code: "partition_over_size", error_id: expect.any(String), opIndexes: [0], partitionIndex: 0 },
-			{ outcome: "rejected", code: "condition_failed", error_id: expect.stringMatching(/^e_usbs9w_/), opIndexes: [2], partitionIndex: 0 },
+			{
+				outcome: "rejected",
+				code: "condition_failed",
+				error_id: expect.stringMatching(/^e_usbs9w_/),
+				opIndexes: [2],
+				partitionIndex: 0,
+				reason: { code: "condition_failed", hashKey: "big", sortKey: "sk1" },
+			},
 		]);
 		expect(value.appliedDeletes).toEqual([{ opIndex: 1, deleted: true, partitionIndex: 0 }]);
 		expect(await readData(low, "big", "sk1")).toBeDefined();
@@ -163,6 +201,42 @@ describe.concurrent("PartitionDO — apiBatchWriteItems", () => {
 		]);
 		expect(value.appliedPuts.map((p) => p.opIndex)).toEqual([1]);
 		expect(await readData(partition, "a", "1")).toBeUndefined();
+	});
+
+	it("caps the images of failed conditions in one partition answer, in opIndex order", async () => {
+		const partition = makePartition({ hashSplitConditions: { maxSizeMb: 100 } });
+		const count = FITTING_IMAGES + 2;
+		for (let i = 0; i < count; i++) {
+			await partition.put({ hashKey: kb("cap"), sortKey: kb(`sk${i}`), data: IMAGE_DATA, kind: "text" });
+		}
+
+		const { value } = await batchWrite(partition, { items: range(0, count).map((i) => imagePut(i, "cap", `sk${i}`)) });
+
+		expect(value.failed).toHaveLength(count);
+		expect(omittedImages(value.failed)).toEqual(range(FITTING_IMAGES, count));
+	});
+
+	it("caps the images of failed conditions in the joined answer of a router", async () => {
+		const small = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		await small.splitHash();
+		// A larger cap, so that the children hold the images without a refusal or a new split.
+		const policy = { ...small.ctx.policy, hashSplitConditions: { ...small.ctx.policy.hashSplitConditions, maxSizeMb: 100 } };
+		const partition = TestPartition.at({ ...small.ctx, policy }, small.stub);
+		const count = FITTING_IMAGES + 2;
+		const owners = new Map<string, number>();
+		for (let i = 0; i < count; i++) {
+			const owner = await partition.childOwning(`r-${i}`);
+			owners.set(owner.doName, (owners.get(owner.doName) ?? 0) + 1);
+			await partition.put({ hashKey: kb(`r-${i}`), sortKey: kb("sk"), data: IMAGE_DATA, kind: "text" });
+		}
+		// Each child answers under the cap, so only the router can drop an image.
+		expect(owners.size).toBe(2);
+		expect(Math.max(...owners.values())).toBeLessThan(FITTING_IMAGES);
+
+		const { value } = await batchWrite(partition, { items: range(0, count).map((i) => imagePut(i, `r-${i}`, "sk")) });
+
+		expect(value.failed).toHaveLength(count);
+		expect(omittedImages(value.failed)).toEqual(range(FITTING_IMAGES, count));
 	});
 
 	it("answers unknown for the items of a child whose answer is lost after it applied", async () => {
@@ -203,12 +277,14 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 			{ operation: "delete", hashKey: "a", data: "v" },
 			{ operation: "delete", hashKey: "a", ttlAt: 10 },
 			{ ...put, update: { set: [] } },
-			{ ...put, returnValuesOnConditionCheckFailure: "all_old" },
 		];
 		for (const item of notValid) {
 			await expect(db.batchWriteItems({ items: [item as never] })).rejects.toThrow(fokosErrorWith("batch_operation_fields_invalid"));
 		}
 		await expect(db.batchWriteItems({ items: [{ ...put, ttlAt: -1 }] })).rejects.toThrow(fokosErrorWith("ttl_at_invalid"));
+		await expect(db.batchWriteItems({ items: [{ ...put, returnValuesOnConditionCheckFailure: "all_new" as never }] })).rejects.toThrow(
+			fokosErrorWith("return_values_option_invalid"),
+		);
 		await expect(db.batchWriteItems({ items: [{ ...put, condition: { op: "nope" } as never }] })).rejects.toThrow(
 			fokosErrorWith("expression_invalid"),
 		);
@@ -284,6 +360,59 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 		expect((await db.getItem(keys[2])).found).toBe(false);
 		expect(await db.getItem(keys[3])).toMatchObject({ found: true, item: { data: "old", version: 1 } });
 		expect(await db.getItem(keys[4])).toMatchObject({ found: true, item: { data: "new", version: 1 } });
+	});
+
+	it("returns the old image of a failed condition with all_old, and no image with none or for an absent item", async () => {
+		const db = makeDB();
+		const keys = keysAcrossPartitions(db, 3, "batch-image");
+		await db.putItem({ ...keys[0], data: "old" });
+		await db.putItem({ ...keys[1], data: "old" });
+
+		const write = await db.batchWriteItems({
+			items: [
+				{ operation: "put", ...keys[0], data: "new", condition: notExists, returnValuesOnConditionCheckFailure: "all_old" },
+				{ operation: "put", ...keys[1], data: "new", condition: notExists, returnValuesOnConditionCheckFailure: "none" },
+				{ operation: "delete", ...keys[2], condition: exists, returnValuesOnConditionCheckFailure: "all_old" },
+			],
+		});
+
+		const [withImage, noneAsked, absent] = write.results;
+		expect(withImage).toMatchObject({
+			outcome: "rejected",
+			code: "condition_failed",
+			reason: { code: "condition_failed", ...keys[0], item: { ...keys[0], data: "old", version: 1 } },
+		});
+		for (const [i, result] of [noneAsked, absent].entries()) {
+			invariant(result.outcome === "rejected", "the condition fails");
+			expect(result.reason).toEqual({ code: "condition_failed", ...keys[i + 1] });
+			expect(result).not.toHaveProperty("itemOmitted");
+		}
+		expect(withImage).not.toHaveProperty("itemOmitted");
+		expect(withImage).not.toHaveProperty("imageBytes");
+	});
+
+	it("caps the images of failed conditions across the answers of all roots, in opIndex order", async () => {
+		const db = makeDB();
+		const keys = keysAcrossPartitions(db, FITTING_IMAGES + 2, `batch-cap-${crypto.randomUUID()}`);
+		for (const key of keys) {
+			await db.putItem({ ...key, data: IMAGE_DATA });
+		}
+
+		const write = await db.batchWriteItems({
+			items: keys.map((key) => ({ operation: "delete", ...key, condition: notExists, returnValuesOnConditionCheckFailure: "all_old" })),
+		});
+
+		for (const [i, result] of write.results.entries()) {
+			invariant(result.outcome === "rejected" && result.reason, `operation ${i} fails its condition`);
+			if (i < FITTING_IMAGES) {
+				expect(result.itemOmitted).toBeUndefined();
+				expect(result.reason.item?.data).toBe(IMAGE_DATA);
+			} else {
+				expect(result.itemOmitted).toBe("response_too_large");
+				expect(result.reason.item).toBeUndefined();
+			}
+		}
+		expect(write.unprocessedItems).toEqual([]);
 	});
 
 	it("checks the lock of an item before its condition", async () => {
