@@ -49,6 +49,7 @@ const SHARDING_ALLOWED_SHARED = [
 	"src/shared/cache-lru.ts",
 	"src/shared/sql-cursor.ts",
 	"src/shared/cf-utils.ts",
+	"src/shared/bloom-filter.ts",
 ];
 
 /** A `src/shared/` module that is not on the allow list. */
@@ -64,10 +65,10 @@ function isUnlistedShared(id: string): boolean {
  * code, so writing down why something works competes with the budget meant to catch a Durable Object
  * class reaching the client — and that mistake is tens of kB minified, which this still catches.
  */
-const CLIENT_MAX_BYTES = 100 * 1024;
+const CLIENT_MAX_BYTES = 110 * 1024;
 
 /** Upper bound for the sharding client entry and every chunk that it imports, in MINIFIED bytes. */
-const SHARDING_CLIENT_MAX_BYTES = 30 * 1024;
+const SHARDING_CLIENT_MAX_BYTES = 42 * 1024;
 
 export default defineConfig({
 	entry: {

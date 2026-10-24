@@ -130,4 +130,31 @@ describe("LRUCache as a set (null sentinel)", () => {
 		expect(seen.has("a")).toBe(true);
 		expect(seen.has("b")).toBe(false);
 	});
+
+	it("with a weight, evicts the least recently used entries until the total fits, and never the new entry", () => {
+		const cache = new LRUCache<string, number>(100, { maxWeight: 10, weightOf: (v) => v });
+		cache.set("a", 4);
+		cache.set("b", 3);
+		cache.set("c", 2);
+		cache.get("a"); // "b" is now the oldest
+		cache.set("d", 4); // 13 > 10: evicts "b" (3), then 10 fits
+		expect([cache.has("a"), cache.has("b"), cache.has("c"), cache.has("d")]).toEqual([true, false, true, true]);
+		expect(cache.weightTotal).toBe(10);
+		cache.set("e", 25); // larger than the limit: every other entry goes, the new entry stays
+		expect(cache.size).toBe(1);
+		expect(cache.get("e")).toBe(25);
+		expect(cache.weightTotal).toBe(25);
+	});
+
+	it("with a weight, a set of an existing key counts its new weight only", () => {
+		const cache = new LRUCache<string, number>(100, { maxWeight: 10, weightOf: (v) => v });
+		cache.set("a", 6);
+		cache.set("b", 4);
+		cache.set("b", 3);
+		expect(cache.weightTotal).toBe(9);
+		cache.set("a", 7); // 10 fits: nothing goes
+		expect(cache.size).toBe(2);
+		cache.delete("a");
+		expect(cache.weightTotal).toBe(3);
+	});
 });

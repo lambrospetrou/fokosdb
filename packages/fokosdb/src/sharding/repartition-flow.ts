@@ -97,6 +97,8 @@ export type RepartitionCommonDeps = {
 	logParams: () => Record<string, unknown>;
 	/** The active runtime settings: the retry intervals and the page budgets. Read at each use. */
 	config: () => FokosRuntimeConfig;
+	/** Runs inside the completion transaction, after `beforeComplete`. Synchronous. */
+	onCompleted?: (plan: FokosRepartitionPlan, completedAt: number) => void;
 };
 
 export type RepartitionSourceDeps = RepartitionCommonDeps;
@@ -751,8 +753,10 @@ export class RepartitionSource {
 			);
 
 			this.store.setRepartitionState(row.id, "completed", { completedAt: now });
+			const plan = this.#hookPlan(row);
 			// Every target now holds its own copy of the slice, so the host can drop what it kept for them.
-			this.deps.hooks.beforeComplete?.(this.#hookPlan(row));
+			this.deps.hooks.beforeComplete?.(plan);
+			this.deps.onCompleted?.(plan, now);
 			this.store.setRepartitionAttempt(row.id, 0, now);
 		});
 		this.deps.scheduleWork();

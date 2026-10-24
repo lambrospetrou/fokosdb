@@ -7,7 +7,7 @@
  */
 import invariant from "../shared/invariant.js";
 import { WORKERS_RPC_MAX_BYTES } from "./rpc-limits.js";
-import { bloomInitialLayerBytes } from "./bloom-filter.js";
+import { bloomInitialLayerBytes } from "../shared/bloom-filter.js";
 
 /**
  * The maximum serialized size of one migration or promotion page. It is 62.5% of

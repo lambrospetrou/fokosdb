@@ -1,5 +1,5 @@
-import { hash32 } from "./hash-primitives.js";
-import invariant from "../shared/invariant.js";
+import { hash32 } from "../sharding/hash-primitives.js";
+import invariant from "./invariant.js";
 
 /**
  * Layered Bloom Filter
@@ -93,6 +93,25 @@ interface Layer {
 	k: number;
 	m: number;
 	layerIndex: number;
+}
+
+/** The bits of one layer. A reader can keep a view over bytes that it did not copy. */
+export type BloomLayerBits = { bits: Uint8Array; k: number; m: number; layerIndex: number };
+
+/**
+ * Returns true if all k bit positions for the key are set in this layer.
+ * Computes positions inline with early exit on the first unset bit.
+ */
+export function layerHas(layer: BloomLayerBits, key: string | Uint8Array): boolean {
+	const h1 = hash32(key, layer.layerIndex * 2);
+	const h2 = hash32(key, layer.layerIndex * 2 + 1) || 1;
+	for (let i = 0; i < layer.k; i++) {
+		const pos = (h1 + i * h2) % layer.m;
+		if ((layer.bits[pos >> 3] & (1 << (pos & 7))) === 0) {
+			return false;
+		}
+	}
+	return true;
 }
 
 interface LayerSnapshot {
@@ -307,20 +326,4 @@ function layerAddIfAbsent(layer: Layer, key: string | Uint8Array): AddResult {
 	}
 	layer.count++;
 	return AddResult.Added;
-}
-
-/**
- * Returns true if all k bit positions for the key are set in this layer.
- * Computes positions inline with early exit on the first unset bit.
- */
-function layerHas(layer: Layer, key: string | Uint8Array): boolean {
-	const h1 = hash32(key, layer.layerIndex * 2);
-	const h2 = hash32(key, layer.layerIndex * 2 + 1) || 1;
-	for (let i = 0; i < layer.k; i++) {
-		const pos = (h1 + i * h2) % layer.m;
-		if ((layer.bits[pos >> 3] & (1 << (pos & 7))) === 0) {
-			return false;
-		}
-	}
-	return true;
 }
