@@ -931,13 +931,14 @@ export class BatchGet extends ModelCommand {
 	}
 }
 
-/** One operation of a batch write, in the vocabulary of the model. */
-export type BatchOp = { key: ItemKey } & ({ operation: "put"; data: ItemData } | { operation: "delete" });
+/** One operation of a batch write, in the vocabulary of the model. `expectExists` is as in `TxOp`. */
+export type BatchOp = { key: ItemKey; expectExists?: boolean } & ({ operation: "put"; data: ItemData } | { operation: "delete" });
 
 /**
  * A batch write is not atomic. The model applies each `ok` result. An `unprocessed` operation applied
  * nothing, so the model does not change. An `unknown` operation can have applied, so the command reads
- * the key, and the model takes the state that the read shows.
+ * the key, and the model takes the state that the read shows. An operation whose condition the model
+ * says fails must not apply, as `putItem` and `deleteItem` with that condition do not.
  */
 export class BatchWrite extends ModelCommand {
 	constructor(readonly ops: BatchOp[]) {
@@ -946,16 +947,25 @@ export class BatchWrite extends ModelCommand {
 	async run(m: Model, db: FokosDB): Promise<void> {
 		// A write orders itself with a millisecond timestamp, as a transaction does.
 		await sleep(2);
-		const items = this.ops.map(
-			(op): BatchWriteItem =>
-				op.operation === "put" ? { operation: "put", ...op.key, data: op.data } : { operation: "delete", ...op.key },
-		);
+		const items = this.ops.map((op): BatchWriteItem => {
+			const condition = op.expectExists === undefined ? undefined : existsCondition(op.expectExists);
+			return op.operation === "put"
+				? { operation: "put", ...op.key, data: op.data, condition }
+				: { operation: "delete", ...op.key, condition };
+		});
 		const res = await db.batchWriteItems({ items });
 		expect(res.results).toHaveLength(this.ops.length);
 		for (const [i, op] of this.ops.entries()) {
 			const result = res.results[i];
 			const id = keyId(op.key);
-			expect(result.outcome, `${id}: the model knows no reason to reject a write`).not.toBe("rejected");
+			if (op.expectExists !== undefined && op.expectExists !== m.items.has(id)) {
+				expect(result.outcome, `${id}: a failed condition must not apply`).not.toBe("ok");
+				if (result.outcome === "rejected") {
+					expect(result.code).toBe("condition_failed");
+				}
+			} else {
+				expect(result.outcome, `${id}: the model knows no reason to reject a write`).not.toBe("rejected");
+			}
 			if (result.outcome === "ok" && result.operation === "put") {
 				applyPut(m, op.key, (op as { data: ItemData }).data);
 				expectVersion(m, op.key, result.version);
@@ -973,7 +983,8 @@ export class BatchWrite extends ModelCommand {
 		}
 	}
 	toString(): string {
-		return `BatchWrite(${this.ops.map((op) => `${op.operation}(${keyId(op.key)})`).join(", ")})`;
+		const condition = (op: BatchOp) => (op.expectExists === undefined ? "" : op.expectExists ? "?exists" : "?absent");
+		return `BatchWrite(${this.ops.map((op) => `${op.operation}${condition(op)}(${keyId(op.key)})`).join(", ")})`;
 	}
 }
 
@@ -1034,8 +1045,11 @@ export function commandArbitraries(
 	// A batch rejects two operations on one key, so the keys of a batch are unique.
 	const arbBatchOps: fc.Arbitrary<BatchOp[]> = fc.uniqueArray(
 		fc
-			.tuple(keys, fc.option(data, { nil: undefined }))
-			.map(([key, d]): BatchOp => (d === undefined ? { key, operation: "delete" } : { key, operation: "put", data: d })),
+			.tuple(keys, fc.option(data, { nil: undefined }), arbOptionalCondition)
+			.map(
+				([key, d, expectExists]): BatchOp =>
+					d === undefined ? { key, expectExists, operation: "delete" } : { key, expectExists, operation: "put", data: d },
+			),
 		{ minLength: 1, maxLength: 4, selector: (op) => keyId(op.key) },
 	);
 

@@ -44,6 +44,11 @@ export type FokosCodeDef<T extends string = string, C extends string = string> =
 /** The codes of one table that `defineCodes` made. */
 export type FokosCodesOf<R extends Record<string, FokosCodeDef>> = R[keyof R]["code"];
 
+/** A new `error_id` for an error of `code`. */
+export function newErrorId(code: FokosCodeDef): string {
+	return `e_${code.segment}_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
 /** Defines the codes of one category, with the origin and the hint they have in common. Each key is a code, and each value is its segment. */
 export function defineCodes<T extends string, S extends Record<string, string>>(
 	tag: T,
@@ -146,7 +151,7 @@ export abstract class FokosError<T extends string = string, C extends string = s
 			.replace(/\B[A-Z]/g, "_$&")
 			.toLowerCase();
 		this.code = code.code;
-		this.error_id = options.error_id ?? `e_${code.segment}_${crypto.randomUUID().replaceAll("-", "")}`;
+		this.error_id = options.error_id ?? newErrorId(code);
 		this.origin = options.origin ?? code.origin;
 		this.httpStatusHint = options.httpStatusHint ?? code.httpStatusHint;
 		this.attributes = options.attributes ?? {};
@@ -502,6 +507,7 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	batch_operation_fields_invalid: "bfvz4s",
 	batch_request_too_large: "nhncs4",
 	batch_max_response_bytes_invalid: "7zkqbc",
+	batch_conditions_too_large: "q7cb3m",
 });
 
 export const EXPRESSION_CODES = defineCodes("FokosExpressionError", "caller", 400, {

@@ -1474,12 +1474,15 @@ export class FokosDB {
 			return { results: [], unprocessedItems: [], meta: { forwardCount: 0, partitions: [] } };
 		}
 		const items: BatchWriteRpcItem[] = opts.items.map((item, opIndex) => {
+			this.#checkCondition(item.condition);
+			const condition = item.condition === undefined ? {} : { condition: item.condition };
 			if (item.operation === "delete") {
-				return { opIndex, ...keys[opIndex], operation: "delete" };
+				return { opIndex, ...keys[opIndex], operation: "delete", ...condition };
 			}
 			const encoded = encodeItemData(item.data);
 			validateItemDataSize(encoded.data, "batchWriteItems");
-			return { opIndex, ...keys[opIndex], operation: "put", ...encoded, ...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }) };
+			const ttlAt = item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt };
+			return { opIndex, ...keys[opIndex], operation: "put", ...encoded, ...ttlAt, ...condition };
 		});
 
 		// No retry: a write whose answer is lost could then apply twice.

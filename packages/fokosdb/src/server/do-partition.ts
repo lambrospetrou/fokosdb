@@ -35,6 +35,7 @@ import {
 	estimateItemBytes,
 	estimateProjectedRowBytes,
 	PartitionStore,
+	type ItemImageRead,
 	type StoredItem,
 	type ScanCursor,
 	type PromotedKeyStatus,
@@ -104,8 +105,11 @@ import {
 	FokosError,
 	FokosRoutingError,
 	FokosUnavailableError,
+	newErrorId,
 	UNAVAILABLE_CODES,
 } from "../shared/errors.js";
+import { CONDITION_CHECK_CODES } from "../shared/errors-operations.js";
+import type { ConditionEvaluationResult } from "../shared/expression/runtime.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES } from "../sharding/errors.js";
 import { routedError } from "../sharding/envelope.js";
 import type { BatchUnprocessedCode } from "../shared/batch-api-types.js";
@@ -190,7 +194,7 @@ export type BatchGetItemsRpcResponse = {
 	partitions: WirePartitionMeta[];
 };
 
-export type BatchWriteRpcItem = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes } & (
+export type BatchWriteRpcItem = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; condition?: ConditionExpression } & (
 	| { operation: "put"; data: string | Uint8Array; kind: DataKind; ttlAt?: number }
 	| { operation: "delete" }
 );
@@ -203,6 +207,11 @@ export type BatchWriteItemsRpcResponse = {
 	failed: BatchFailure[];
 	partitions: WirePartitionMeta[];
 };
+
+/** The answer of `conditionalWrite`. `image` is present only when the caller asked for it and the item exists. */
+type ConditionalWriteResult<W> =
+	| { outcome: "rejected"; conditionRes: ConditionEvaluationResult; image?: ItemImageRead }
+	| { outcome: "ok"; writeRes: W; conditionRes: ConditionEvaluationResult | null };
 
 /** One error that stopped one or more items. */
 export type BatchFailure = {
@@ -1095,23 +1104,37 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return this.#store.deleteItem({ hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
 	}
 
+	/**
+	 * Writes one item in its own `transactionSync`: the lock check, then the condition, then `write`.
+	 * A failed condition writes nothing. It reads the old image when `wantsImage` is true and the item
+	 * exists. `putItem`, `deleteItem`, and each operation of a batch write share it.
+	 */
+	private conditionalWrite<W>(
+		hashKey: KeyBytes,
+		sortKey: KeyBytes,
+		condition: ConditionExpression | undefined,
+		wantsImage: boolean,
+		write: () => W,
+	): ConditionalWriteResult<W> {
+		return this.#store.transactionSync((): ConditionalWriteResult<W> => {
+			this.assertNotLocked(hashKey, sortKey);
+
+			const conditionRes = condition ? this.#store.evaluateCondition(condition, hashKey, sortKey) : null;
+			if (conditionRes && !conditionRes.conditionOk) {
+				const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(hashKey, sortKey) : undefined;
+				return { outcome: "rejected", conditionRes, image };
+			}
+
+			return { outcome: "ok", writeRes: write(), conditionRes };
+		});
+	}
+
 	// ═══ local handlers ══════════════════════════════════════════════════════
 
 	private putItemLocal(req: PutItemRpcRequest, call: FokosLocalCall): PutItemRpcResponse {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
-		const localRes = this.#store.transactionSync(() => {
-			this.assertNotLocked(hashKey, sortKey);
-
-			const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
-			if (conditionRes && !conditionRes.conditionOk) {
-				const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(hashKey, sortKey) : undefined;
-				return { outcome: "rejected" as const, conditionRes, image };
-			}
-
-			const writeRes = this.upsertNow(req);
-			return { outcome: "ok" as const, writeRes, conditionRes };
-		});
+		const localRes = this.conditionalWrite(hashKey, sortKey, req.condition, wantsImage, () => this.upsertNow(req));
 
 		if (localRes.outcome === "rejected") {
 			return {
@@ -1135,18 +1158,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	private deleteItemLocal(req: DeleteItemRpcRequest): DeleteItemRpcResponse {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
-		const localRes = this.#store.transactionSync(() => {
-			this.assertNotLocked(hashKey, sortKey);
-
-			const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
-			if (conditionRes && !conditionRes.conditionOk) {
-				const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(hashKey, sortKey) : undefined;
-				return { outcome: "rejected" as const, conditionRes, image };
-			}
-
-			const writeRes = this.deleteNow(hashKey, sortKey);
-			return { outcome: "ok" as const, writeRes, conditionRes };
-		});
+		const localRes = this.conditionalWrite(hashKey, sortKey, req.condition, wantsImage, () => this.deleteNow(hashKey, sortKey));
 
 		if (localRes.outcome === "rejected") {
 			return {
@@ -1233,7 +1245,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	/**
 	 * Applies the operations of one part of a batch write, in request order, each in its own
 	 * `transactionSync` block. A block that throws rolls back its own writes, and the next operation
-	 * runs. After a block commits, the handler only appends to its answer, and that code does not throw,
+	 * runs. A failed condition writes nothing and gives its operation `rejected` with `condition_failed`. After a block commits, the handler only appends to its answer, and that code does not throw,
 	 * so the handler never throws after its first write. All blocks run in one synchronous call, so no
 	 * other request runs between two operations.
 	 *
@@ -1256,18 +1268,25 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				continue;
 			}
 			const { opIndex, hashKey, sortKey } = item;
-			let res: ReturnType<PartitionDO["upsertNow"]> | ReturnType<PartitionDO["deleteNow"]>;
+			let local: ConditionalWriteResult<ReturnType<PartitionDO["upsertNow"]> | ReturnType<PartitionDO["deleteNow"]>>;
 			try {
 				// TODO: This might be performance slowdown instead of doing a transaction for all the items.
 				//       The only reason we do this is to allow partial application of the batch, but might reconsider.
-				res = this.#store.transactionSync(() => {
-					this.assertNotLocked(hashKey, sortKey);
-					return item.operation === "put" ? this.upsertNow(item) : this.deleteNow(hashKey, sortKey);
-				});
+				local = this.conditionalWrite(hashKey, sortKey, item.condition, false, () =>
+					item.operation === "put" ? this.upsertNow(item) : this.deleteNow(hashKey, sortKey),
+				);
 			} catch (e) {
 				out.failed.push({ ...classifyBatchFailure(e, { write: true, local: true }), opIndexes: [opIndex], partitionIndex: 0 });
 				continue;
 			}
+			rowsRead += local.conditionRes?.rowsRead ?? 0;
+			rowsWritten += local.conditionRes?.rowsWritten ?? 0;
+			if (local.outcome === "rejected") {
+				const code = CONDITION_CHECK_CODES.condition_failed;
+				out.failed.push({ outcome: "rejected", code: code.code, error_id: newErrorId(code), opIndexes: [opIndex], partitionIndex: 0 });
+				continue;
+			}
+			const res = local.writeRes;
 			rowsRead += res.rowsRead;
 			rowsWritten += res.rowsWritten;
 			if (!("deleted" in res)) {

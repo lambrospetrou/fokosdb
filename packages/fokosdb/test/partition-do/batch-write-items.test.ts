@@ -11,6 +11,7 @@ import type {
 	PartitionDO,
 } from "../../src/server/do-partition.js";
 import type { ItemBatcher } from "../../src/shared/batch-api-types.js";
+import type { ConditionExpression } from "../../src/shared/expression/types.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_BATCH } from "../../src/shared/transaction-limits.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
@@ -21,6 +22,16 @@ import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
 const MB = 1024 * 1024;
+
+const exists: ConditionExpression = { op: "exists", args: [{ ref: "hashKey" }] };
+const notExists: ConditionExpression = { op: "not_exists", args: [{ ref: "hashKey" }] };
+const versionIs = (v: number): ConditionExpression => ({ op: "eq", args: [{ ref: "v" }, { val: v }] });
+
+/** A condition that is valid and that compiles to more SQL than `compiledSqlBytes`. */
+const ABOVE_SQL_LIMIT: ConditionExpression = {
+	op: "or",
+	args: Array.from({ length: 200 }, () => ({ op: "contains", args: [{ ref: "data", path: "$.state" }, { val: "open" }] })),
+};
 
 const putItem = (opIndex: number, hashKey: string, sortKey: string, data: string): BatchWriteRpcItem => ({
 	opIndex,
@@ -118,6 +129,42 @@ describe.concurrent("PartitionDO — apiBatchWriteItems", () => {
 		expect(await low.promotedKeyStatus("big")).toBeDefined();
 	});
 
+	it("applies a delete with a condition in an over-size partition", async () => {
+		const partition = makePartition();
+		for (let i = 0; i < 4; i++) {
+			await partition.put({ hashKey: kb("big"), sortKey: kb(`sk${i}`), data: "x".repeat(64 * 1024), kind: "text" });
+		}
+		const low = await overSize(partition);
+
+		const { value } = await batchWrite(low, {
+			items: [
+				{ ...putItem(0, "big", "new", "v"), condition: notExists },
+				{ ...deleteItem(1, "big", "sk0"), condition: exists },
+				{ ...deleteItem(2, "big", "sk1"), condition: notExists },
+			],
+		});
+
+		expect(value.failed).toEqual([
+			{ outcome: "unprocessed", code: "partition_over_size", error_id: expect.any(String), opIndexes: [0], partitionIndex: 0 },
+			{ outcome: "rejected", code: "condition_failed", error_id: expect.stringMatching(/^e_usbs9w_/), opIndexes: [2], partitionIndex: 0 },
+		]);
+		expect(value.appliedDeletes).toEqual([{ opIndex: 1, deleted: true, partitionIndex: 0 }]);
+		expect(await readData(low, "big", "sk1")).toBeDefined();
+	});
+
+	it("gives a condition that raises sql_limit rejected for its operation only", async () => {
+		const partition = makePartition();
+		const { value } = await batchWrite(partition, {
+			items: [{ ...putItem(0, "a", "1", "v"), condition: ABOVE_SQL_LIMIT }, putItem(1, "a", "2", "v")],
+		});
+
+		expect(value.failed).toEqual([
+			{ outcome: "rejected", code: "expression_invalid", error_id: expect.any(String), opIndexes: [0], partitionIndex: 0 },
+		]);
+		expect(value.appliedPuts.map((p) => p.opIndex)).toEqual([1]);
+		expect(await readData(partition, "a", "1")).toBeUndefined();
+	});
+
 	it("answers unknown for the items of a child whose answer is lost after it applied", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.splitHash();
@@ -155,13 +202,21 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 			{ operation: "put", hashKey: "a" },
 			{ operation: "delete", hashKey: "a", data: "v" },
 			{ operation: "delete", hashKey: "a", ttlAt: 10 },
-			{ ...put, condition: { op: "exists", args: [{ ref: "hashKey" }] } },
+			{ ...put, update: { set: [] } },
 			{ ...put, returnValuesOnConditionCheckFailure: "all_old" },
 		];
 		for (const item of notValid) {
 			await expect(db.batchWriteItems({ items: [item as never] })).rejects.toThrow(fokosErrorWith("batch_operation_fields_invalid"));
 		}
 		await expect(db.batchWriteItems({ items: [{ ...put, ttlAt: -1 }] })).rejects.toThrow(fokosErrorWith("ttl_at_invalid"));
+		await expect(db.batchWriteItems({ items: [{ ...put, condition: { op: "nope" } as never }] })).rejects.toThrow(
+			fokosErrorWith("expression_invalid"),
+		);
+		// Each condition is valid. Together they are above the 4 MB of `MAX_PAYLOAD_BYTES_PER_TX`.
+		const large: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.x" }, { val: "x".repeat(43_000) }] };
+		const tooLarge = Array.from({ length: MAX_ITEMS_PER_BATCH }, (_, i) => ({ ...put, hashKey: `k-${i}`, condition: large }));
+		await expect(db.batchWriteItems({ items: tooLarge })).rejects.toThrow(fokosErrorWith("batch_conditions_too_large"));
+		await expect(db.batchWriteItems({ items: tooLarge.slice(0, 90) })).resolves.toMatchObject({ unprocessedItems: [] });
 		await expect(db.batchWriteItems({ items: [{ ...put, data: 3 as never }] })).rejects.toThrow(fokosErrorWith("item_data_wrong_type"));
 		await expect(db.batchWriteItems({ items: [{ ...put, data: "x".repeat(MAX_ITEM_BYTES + 1) }] })).rejects.toThrow(
 			fokosErrorWith("item_data_too_large"),
@@ -191,6 +246,56 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 		const read = await db.getItem({ ...keys[0] });
 		expect(read).toMatchObject({ found: true, item: { data: { n: 0 }, ttlAt: 4_000_000_000, version: 1 } });
 		expect((await db.getItem(keys[1])).found).toBe(false);
+	});
+
+	it("applies each operation whose condition holds, and rejects each operation whose condition fails", async () => {
+		const db = makeDB();
+		const keys = keysAcrossPartitions(db, 6, "batch-condition");
+		for (const key of keys.slice(0, 4)) {
+			await db.putItem({ ...key, data: "old" });
+		}
+
+		const write = await db.batchWriteItems({
+			items: [
+				{ operation: "put", ...keys[0], data: "new", condition: versionIs(1) },
+				{ operation: "put", ...keys[1], data: "new", condition: versionIs(2) },
+				{ operation: "delete", ...keys[2], condition: exists },
+				{ operation: "delete", ...keys[3], condition: notExists },
+				{ operation: "put", ...keys[4], data: "new", condition: notExists },
+				{ operation: "delete", ...keys[5], condition: exists },
+			],
+		});
+
+		const conditionFailed = { outcome: "rejected", code: "condition_failed", error_id: expect.stringMatching(/^e_usbs9w_/) };
+		expect(write.results).toMatchObject([
+			{ outcome: "ok", operation: "put", version: 2 },
+			conditionFailed,
+			{ outcome: "ok", operation: "delete", deleted: true },
+			conditionFailed,
+			{ outcome: "ok", operation: "put", version: 1 },
+			conditionFailed,
+		]);
+		for (const i of [1, 3, 5]) {
+			expect(write.results[i]).toHaveProperty("partitionIndex");
+		}
+		expect(write.unprocessedItems).toEqual([]);
+		expect(await db.getItem(keys[0])).toMatchObject({ found: true, item: { data: "new", version: 2 } });
+		expect(await db.getItem(keys[1])).toMatchObject({ found: true, item: { data: "old", version: 1 } });
+		expect((await db.getItem(keys[2])).found).toBe(false);
+		expect(await db.getItem(keys[3])).toMatchObject({ found: true, item: { data: "old", version: 1 } });
+		expect(await db.getItem(keys[4])).toMatchObject({ found: true, item: { data: "new", version: 1 } });
+	});
+
+	it("checks the lock of an item before its condition", async () => {
+		const db = makeDB();
+		const [locked] = keysAcrossPartitions(db, 1, "batch-locked-condition");
+		const release = await holdPendingLock(db, locked, { operation: "put", data: "tx", kind: "text" });
+		try {
+			const write = await db.batchWriteItems({ items: [{ operation: "put", ...locked, data: "batch", condition: exists }] });
+			expect(write.results).toMatchObject([{ outcome: "unprocessed", code: "item_locked_by_transaction" }]);
+		} finally {
+			await release();
+		}
 	});
 
 	it("answers a locked item unprocessed, as putItem refuses it, and applies the others", async () => {

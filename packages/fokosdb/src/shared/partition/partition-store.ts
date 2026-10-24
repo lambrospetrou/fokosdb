@@ -279,6 +279,11 @@ export type PromotedKeyStatus = "queued" | "promoting" | "promoted";
 
 export type SqlMetrics = { rowsRead: number; rowsWritten: number };
 
+/** The answer of `PartitionStore.getItemImage`. `row` is absent when the item is absent. `imageBytes` is the byte length of `data`. */
+export type ItemImageRead = SqlMetrics & {
+	row?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number; imageBytes: number };
+};
+
 /**
  * The range split of one slice: its boundaries, or why it has none.
  * - `fewer_items`: the slice holds fewer items than children.
@@ -811,14 +816,7 @@ export class PartitionStore {
 	 * Secondary read run only after a failed condition on an existing row when the caller
 	 * asked for an image.
 	 */
-	getItemImage(
-		hk: KeyBytes,
-		sk: KeyBytes,
-	): {
-		row?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number; imageBytes: number };
-		rowsRead: number;
-		rowsWritten: number;
-	} {
+	getItemImage(hk: KeyBytes, sk: KeyBytes): ItemImageRead {
 		const res = this.#storage.sql.exec<{
 			data: string | ArrayBuffer;
 			data_kind: number;
