@@ -150,7 +150,8 @@ also needs a batch write: its Milestone 3 writes each GSI table with `batchWrite
 ### 2.3 Out of scope
 
 - Conditions, update expressions, and `returnValuesOnConditionCheckFailure` in a batch write. `BatchWriteItem` has
-  none of them, and `putItem`, `deleteItem` and `transactWriteItems` cover them.
+  none of them, and `putItem`, `deleteItem` and `transactWriteItems` cover them. The RFC
+  `2026-10-24-batch-write-conditions.md` adds conditions and `returnValuesOnConditionCheckFailure`.
 - Eventually consistent reads. Every FokosDB read is strongly consistent.
 - More than one table per call. One `FokosDB` client is one table.
 - Retries inside `batchGetItems` and `batchWriteItems`.

@@ -1,9 +1,9 @@
 # RFC — Conditions and condition images in `batchWriteItems`
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-24
 **Author:** Lambros Petrou
-**Status:** Nothing is built. Section 1 and the word "today" describe the code before this spec.
+**Status:** All milestones are built. Section 1 and the word "today" describe the code before this spec.
 
 ## Table of Contents
 
