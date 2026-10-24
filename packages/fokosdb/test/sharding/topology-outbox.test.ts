@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	FokosShardingClient,
 	KeyCodec,
+	hashChildIndex,
+	resolveDescendantHashPartitionContext,
 	fokosTopologyEntrypointFetch,
 	topologyAdminName,
 	type FokosTopologyRead,
@@ -11,6 +13,7 @@ import {
 import { parseHashBody } from "../../src/sharding/topology-codec.js";
 import type { CounterOps, CounterPolicy } from "./counter-host.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
+import { hashSplitReport } from "./topology-events.js";
 
 const WAIT = { timeout: 20_000, interval: 50 };
 
@@ -88,6 +91,42 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 		expect(result.value.val).toBe(2);
 	});
 
+	it("a root forwards with the topology to a leaf two levels down that its own forwards never showed", async () => {
+		const { table, shardGroup } = await splitTable();
+		await withRootTopologyCache(table);
+		await splitRoot(table);
+		// The writes go directly to the child, so the root never forwards through it and its arena knows depth 1 only.
+		const [inside, outside] = keysByChild(0);
+		const child = resolveDescendantHashPartitionContext(table.root, [0]);
+		for (const key of inside) {
+			await table.client.send("increment", child, { hashKey: KeyCodec.encode(key), amount: 1 }, [counterKey(key)]);
+		}
+		await vi.waitFor(async () => expect((await servedTopology(shardGroup)).bitCount).toBe(1 + 4 + 4), WAIT);
+		await refreshRootTopology(table, outside);
+
+		const result = await table.increment(inside[0]);
+		expect(result.routing.servedBy[0].hashDepth).toBe(2);
+		expect(result.routing.forwardCount).toBe(1);
+		expect(result.value.val).toBe(2);
+	});
+
+	it("a root that misses at a topology hint cuts the hint and forwards to its arena hint", async () => {
+		const { table, shardGroup } = await splitTable();
+		await withRootTopologyCache(table);
+		await splitRoot(table);
+		// A report of a split that did not occur: the children of child 0 do not exist.
+		await admin(shardGroup).registerRepartition(hashSplitReport(shardGroup, table.root.topology, 0, [0]));
+		await vi.waitFor(async () => expect((await servedTopology(shardGroup)).bitCount).toBe(1 + 4 + 4), WAIT);
+		const [inside, outside] = keysByChild(0);
+		await refreshRootTopology(table, outside);
+
+		for (const key of inside.slice(0, 2)) {
+			const result = await table.increment(key);
+			expect(result.routing.servedBy[0].hashDepth).toBe(1);
+			expect(result.value.val).toBe(1);
+		}
+	});
+
 	it("keeps a report whose send throws, and sends it after a restart of the source", async () => {
 		const { table, shardGroup } = await splitTable();
 		// Every send throws until the test has seen the stored retry.
@@ -133,4 +172,33 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 
 function root(table: ReturnType<typeof makeCounterTable>) {
 	return stub(table.root.doName);
+}
+
+/** Turns on the topology cache of the root, and restarts the root so the flag takes effect. */
+async function withRootTopologyCache(table: ReturnType<typeof makeCounterTable>) {
+	await root(table).debugSetOutbox({ topologyCache: true });
+	await root(table)
+		.debugAbort()
+		.catch(() => {});
+}
+
+/** Six keys under the hash child `c` of the root, and six keys under the other children. */
+function keysByChild(c: number): [string[], string[]] {
+	const inside: string[] = [];
+	const outside: string[] = [];
+	for (let i = 0; inside.length < 6 || outside.length < 6; i++) {
+		const key = `t-${i}`;
+		(hashChildIndex(KeyCodec.encode(key), 0, 4) === c ? inside : outside).push(key);
+	}
+	return [inside.slice(0, 6), outside.slice(0, 6)];
+}
+
+/**
+ * Writes keys that are not under the changed child through the root, so the root starts a refresh of
+ * its topology, and waits for the refresh. The root has a refresh time of 50 ms.
+ */
+async function refreshRootTopology(table: ReturnType<typeof makeCounterTable>, outside: string[]) {
+	await scheduler.wait(100);
+	await table.increment(outside[0]);
+	await scheduler.wait(500);
 }

@@ -22,6 +22,7 @@ import {
 	type FokosStatusPage,
 	type FokosStatusRequest,
 	type KeyBytes,
+	fokosTopologyEntrypointFetch,
 	topologyAdminName,
 } from "../../src/sharding/index-server.js";
 
@@ -90,6 +91,7 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 			operations: this.operations(),
 			// The constructor reads the test control, so a restart can remove the hook.
 			...(this.readMeta("outboxDisabled") === 1 ? {} : { adminOutbox: { send: (entry) => this.sendToAdmin(entry) } }),
+			...(this.readMeta("topologyCacheEnabled") === 1 ? { topologyCache: this.topologyCache() } : {}),
 		});
 	}
 
@@ -106,6 +108,20 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 		}
 		const shardGroup = this.fokos.routeContext().topology.shardGroup;
 		await this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)).registerRepartition(entry.event);
+	}
+
+	/** The topology cache through the entrypoint helper. A short refresh, so a test waits little for a new topology. */
+	private topologyCache() {
+		return {
+			fetch: (path: string, signal: AbortSignal) =>
+				fokosTopologyEntrypointFetch(new Request(`http://topology${path}`, { signal }), {
+					admin: (shardGroup) => this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)),
+					maxAgeS: 0,
+					staleWhileRevalidateS: 0,
+				}),
+			waitUntil: (promise: Promise<unknown>) => this.ctx.waitUntil(promise),
+			refreshMs: 50,
+		};
 	}
 
 	async increment(
@@ -177,10 +193,13 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 	}
 
 	/**
-	 * `disabled` takes effect at the next start of the instance. `failures` is the number of the next
-	 * outbox sends that throw.
+	 * `disabled` and `topologyCache` take effect at the next start of the instance. `failures` is the
+	 * number of the next outbox sends that throw.
 	 */
-	async debugSetOutbox(opts: { disabled?: boolean; failures?: number }): Promise<void> {
+	async debugSetOutbox(opts: { disabled?: boolean; failures?: number; topologyCache?: boolean }): Promise<void> {
+		if (opts.topologyCache !== undefined) {
+			this.writeMeta("topologyCacheEnabled", opts.topologyCache ? 1 : 0);
+		}
 		if (opts.disabled !== undefined) {
 			this.writeMeta("outboxDisabled", opts.disabled ? 1 : 0);
 		}

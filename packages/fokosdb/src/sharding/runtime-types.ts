@@ -15,6 +15,7 @@ import type { SkInterval } from "./sk-interval.js";
 import type { FokosRuntimeConfigOverrides } from "./runtime-config.js";
 import type { ScanCursor } from "../shared/partition/partition-store.js";
 import type { RangeAncestorInfo } from "./types.js";
+import type { FokosTopologyCacheOptions } from "./topology-cache.js";
 
 export type { RouteKey };
 
@@ -46,6 +47,12 @@ export type FokosRuntimeOptions<TPolicy> = {
 		/** Host code. Sends one entry to an admin DO, chosen from `eventType`. A throw means "retry later". */
 		send(this: void, entry: { eventType: string; id: string; event: unknown }): Promise<void>;
 	};
+	/**
+	 * The topology cache of the isolate. With it, a router forwards a hash key to the deepest known hash
+	 * partition of the topology, also for a key that its own forwards never showed. The host gives the
+	 * `waitUntil` of its `DurableObjectState`. Absent: a router uses its hash arena only.
+	 */
+	topologyCache?: FokosTopologyCacheOptions;
 };
 
 // ─── the primitive API ───────────────────────────────────────────────────────

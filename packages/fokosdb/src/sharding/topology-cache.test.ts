@@ -34,7 +34,11 @@ function hashBody(opts: { version: number; R?: number; K?: number; splits?: Uint
  * A client of a new shard group with R 2 and K 2. `bodies` gives the answer of each path, and
  * `failAt` the DO names that answer that they have no identity.
  */
-function setup(bodies: Map<string, () => Uint8Array>, failAt: (doName: string) => FokosRoutingError | null = () => null) {
+function setup(
+	bodies: Map<string, () => Uint8Array>,
+	failAt: (doName: string) => FokosRoutingError | null = () => null,
+	overrides: Partial<FokosTopologyCacheOptions> = {},
+) {
 	const shardGroup = `tc_${crypto.randomUUID()}`;
 	const pending: Promise<unknown>[] = [];
 	const fetched: string[] = [];
@@ -47,6 +51,7 @@ function setup(bodies: Map<string, () => Uint8Array>, failAt: (doName: string) =
 		},
 		waitUntil: (p) => pending.push(p),
 		refreshMs: -1,
+		...overrides,
 	};
 	const client = new FokosShardingClient<null, Ops>({
 		topology: { shardGroup, rootTreesN: 2, hashSplitN: 2 },
@@ -106,6 +111,27 @@ describe("topology cache — hash entries", () => {
 		expect(t.pending).toHaveLength(1);
 		await t.settle();
 		expect(t.fetched).toHaveLength(2);
+	});
+
+	it("stops waiting for a fetch that does not end, aborts its signal, and can refresh again", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const key = { hashKey: KeyCodec.encode("hung"), sortKey: NO_SORT_KEY };
+		const signals: AbortSignal[] = [];
+		// The fetch ignores the signal and never settles, so only the timeout of the refresh can end it.
+		const t = setup(new Map(), undefined, {
+			fetchTimeoutMs: 50,
+			fetch: (_path, signal) => {
+				signals.push(signal);
+				return new Promise<Response>(() => {});
+			},
+		});
+		t.client.resolve(key);
+		await t.settle();
+		expect(signals[0].aborted).toBe(true);
+		t.client.resolve(key);
+		expect(t.pending).toHaveLength(1);
+		await t.settle();
+		expect(signals).toHaveLength(2);
 	});
 
 	it("refuses an older version", async () => {
