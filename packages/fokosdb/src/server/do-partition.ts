@@ -1262,9 +1262,10 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	/**
 	 * Applies the operations of one part of a batch write, in request order, each in its own
 	 * `transactionSync` block. A block that throws rolls back its own writes, and the next operation
-	 * runs. A failed condition writes nothing and gives its operation `rejected` with `condition_failed`. After a block commits, the handler only appends to its answer, and that code does not throw,
-	 * so the handler never throws after its first write. All blocks run in one synchronous call, so no
-	 * other request runs between two operations.
+	 * runs. A failed condition writes nothing and gives its operation `rejected` with `condition_failed`.
+	 * After a block commits, the handler only appends to its answer, and that code does not throw, so the
+	 * handler never throws after its first write. All blocks run in one synchronous call, so no other
+	 * request runs between two operations.
 	 *
 	 * Above 1.1 times the cap, the puts are refused and the deletes still apply: a delete is how a
 	 * client brings an over-size partition back under its cap.
