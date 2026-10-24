@@ -93,6 +93,7 @@ import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
 import {
 	ADMISSION_MARGIN,
+	applyBatchImageCap,
 	applyImageCap,
 	conditionFailedReason,
 	decodeItemKeys,
@@ -194,10 +195,13 @@ export type BatchGetItemsRpcResponse = {
 	partitions: WirePartitionMeta[];
 };
 
-export type BatchWriteRpcItem = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; condition?: ConditionExpression } & (
-	| { operation: "put"; data: string | Uint8Array; kind: DataKind; ttlAt?: number }
-	| { operation: "delete" }
-);
+export type BatchWriteRpcItem = {
+	opIndex: number;
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
+	condition?: ConditionExpression;
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+} & ({ operation: "put"; data: string | Uint8Array; kind: DataKind; ttlAt?: number } | { operation: "delete" });
 
 export type BatchWriteItemsRpcRequest = { items: BatchWriteRpcItem[] };
 
@@ -222,6 +226,11 @@ export type BatchFailure = {
 	/** Absent when no partition answered. */
 	partitionIndex?: number;
 	opIndexes: number[];
+	/** Only for `condition_failed`, which stops one operation. `reason.item` is the old image. */
+	reason?: RejectionReasonEncoded;
+	/** The byte length of the image in `reason.item`, which `applyBatchImageCap` adds up. */
+	imageBytes?: number;
+	itemOmitted?: "response_too_large";
 };
 
 // ─── queryItems internal types ────────────────────────────────────────────────
@@ -689,11 +698,19 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 				subRequest: (req, items) => ({ items: items as BatchWriteRpcItem[] }),
 				local: (req, call) => this.batchWriteLocal(req, call),
-				merge: (parts) =>
-					this.mergeBatch(parts, true, { appliedPuts: [], appliedDeletes: [], failed: [], partitions: [] }, (out, result, offset) => {
-						out.appliedPuts.push(...result.appliedPuts.map((entry) => withOffset(entry, offset)));
-						out.appliedDeletes.push(...result.appliedDeletes.map((entry) => withOffset(entry, offset)));
-					}),
+				merge: (parts) => {
+					const merged = this.mergeBatch(
+						parts,
+						true,
+						{ appliedPuts: [], appliedDeletes: [], failed: [], partitions: [] },
+						(out, result, offset) => {
+							out.appliedPuts.push(...result.appliedPuts.map((entry) => withOffset(entry, offset)));
+							out.appliedDeletes.push(...result.appliedDeletes.map((entry) => withOffset(entry, offset)));
+						},
+					);
+					applyBatchImageCap(merged.failed);
+					return merged;
+				},
 			},
 			txPrepare: {
 				shape: "group",
@@ -1272,7 +1289,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			try {
 				// TODO: This might be performance slowdown instead of doing a transaction for all the items.
 				//       The only reason we do this is to allow partial application of the batch, but might reconsider.
-				local = this.conditionalWrite(hashKey, sortKey, item.condition, false, () =>
+				local = this.conditionalWrite(hashKey, sortKey, item.condition, item.returnValuesOnConditionCheckFailure === "all_old", () =>
 					item.operation === "put" ? this.upsertNow(item) : this.deleteNow(hashKey, sortKey),
 				);
 			} catch (e) {
@@ -1283,7 +1300,18 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			rowsWritten += local.conditionRes?.rowsWritten ?? 0;
 			if (local.outcome === "rejected") {
 				const code = CONDITION_CHECK_CODES.condition_failed;
-				out.failed.push({ outcome: "rejected", code: code.code, error_id: newErrorId(code), opIndexes: [opIndex], partitionIndex: 0 });
+				const row = local.image?.row;
+				rowsRead += local.image?.rowsRead ?? 0;
+				rowsWritten += local.image?.rowsWritten ?? 0;
+				out.failed.push({
+					outcome: "rejected",
+					code: code.code,
+					error_id: newErrorId(code),
+					opIndexes: [opIndex],
+					partitionIndex: 0,
+					reason: conditionFailedReason(decodeItemKeys(hashKey, sortKey), row),
+					...(row ? { imageBytes: row.imageBytes } : {}),
+				});
 				continue;
 			}
 			const res = local.writeRes;
@@ -1299,6 +1327,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		if (candidates.length > 0) {
 			this.signalGrowth(call, candidates);
 		}
+		applyBatchImageCap(out.failed);
 		out.partitions = this.answered({ rowsRead, rowsWritten });
 		return out;
 	}

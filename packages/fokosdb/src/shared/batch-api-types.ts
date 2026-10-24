@@ -7,7 +7,8 @@
 import type { FokosErrorCode } from "./errors-operations.js";
 import type { ConditionExpression, ProjectionExpression } from "./expression/types.js";
 import type { JsonComposite } from "./json-types.js";
-import type { FokosMeta, HashKey, ItemKey, ReadItem, SortKey } from "./types.js";
+import type { ConditionFailedReason } from "./transaction-api-types.js";
+import type { FokosMeta, HashKey, ItemKey, ReadItem, ReturnValuesOnConditionCheckFailure, SortKey } from "./types.js";
 
 /** One key of `batchGetItems`. Its projection replaces the projection of the request. */
 export type BatchGetItemKey = ItemKey & { projection?: readonly ProjectionExpression[] };
@@ -59,7 +60,8 @@ export type BatchGetItemsResult<Ts extends readonly unknown[] = never[]> = {
 /**
  * One operation of `batchWriteItems`. It has no update expression. A `condition` runs in the same
  * transaction as the write of its item, as in `putItem` and `deleteItem`, and a failed condition
- * gives the operation `rejected` with the code `condition_failed`.
+ * gives the operation `rejected` with the code `condition_failed`. `returnValuesOnConditionCheckFailure`
+ * is as in `putItem`.
  */
 export type BatchWriteItem =
 	| {
@@ -70,8 +72,15 @@ export type BatchWriteItem =
 			/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
 			ttlAt?: number;
 			condition?: ConditionExpression;
+			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  }
-	| { operation: "delete"; hashKey: HashKey; sortKey?: SortKey; condition?: ConditionExpression };
+	| {
+			operation: "delete";
+			hashKey: HashKey;
+			sortKey?: SortKey;
+			condition?: ConditionExpression;
+			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+	  };
 
 export type BatchWriteItemsOptions = {
 	/**
@@ -90,14 +99,24 @@ export type BatchWriteItemsOptions = {
  * - `unprocessed`: nothing of the operation applied. Send it again.
  * - `rejected`: nothing of the operation applied, and the same operation against the same state of the
  *   item fails the same way again. A failed condition has the code `condition_failed`. After an
- *   `unknown` answer, a resend can fail its condition because the first try applied.
+ *   `unknown` answer, a resend can fail its condition because the first try applied. A failed
+ *   condition has `reason`. `reason.item` is the old image, when the operation asked for `all_old`
+ *   and the item exists. `itemOmitted` tells that the image did not fit in
+ *   `MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX`, in `opIndex` order. Then read the item with `getItem`.
  * - `unknown`: the operation can have applied. A caller can send it again: then the item gets a new
  *   `version`, and the write replaces a write that another client made between the two.
  */
 export type BatchWriteItemResult =
 	| { outcome: "ok"; operation: "put"; version: number; partitionIndex: number }
 	| { outcome: "ok"; operation: "delete"; deleted: boolean; partitionIndex: number }
-	| { outcome: "rejected"; code: FokosErrorCode; error_id: string; partitionIndex?: number }
+	| {
+			outcome: "rejected";
+			code: FokosErrorCode;
+			error_id: string;
+			partitionIndex?: number;
+			reason?: ConditionFailedReason;
+			itemOmitted?: "response_too_large";
+	  }
 	| { outcome: "unprocessed"; code: FokosErrorCode; error_id: string; partitionIndex?: number }
 	| { outcome: "unknown"; code: FokosErrorCode; error_id: string; partitionIndex?: number };
 

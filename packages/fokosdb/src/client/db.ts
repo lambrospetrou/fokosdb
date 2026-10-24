@@ -86,6 +86,7 @@ import {
 	validateBatchGetItems,
 	MAX_BATCH_GET_RESPONSE_BYTES,
 	validateBatchWriteItems,
+	applyBatchImageCap,
 	decodeItemKeys,
 	resolveLimits,
 	type FokosDBLimits,
@@ -401,7 +402,8 @@ function joinBatchAnswers<R extends { failed: BatchFailure[]; partitions: WirePa
 	write: boolean,
 	on: {
 		answer(value: R, at: (partitionIndex: number) => number): void;
-		failure(opIndex: number, failure: { outcome: BatchFailureOutcome; fields: BatchFailureFields }): void;
+		/** `entry` is the failure of an answer. It is absent for a call that failed. */
+		failure(opIndex: number, failure: { outcome: BatchFailureOutcome; fields: BatchFailureFields }, entry?: BatchFailure): void;
 	},
 ): FokosMeta {
 	const join = new PartitionMetaJoin();
@@ -414,14 +416,15 @@ function joinBatchAnswers<R extends { failed: BatchFailure[]; partitions: WirePa
 			const indexes = answer.partitions.map((entry) => join.add(entry));
 			const at = (partitionIndex: number) => indexes[partitionIndex];
 			on.answer(value, at);
-			for (const { outcome, code, error_id, partitionIndex, opIndexes } of value.failed) {
+			for (const entry of value.failed) {
+				const { outcome, code, error_id, partitionIndex, opIndexes } = entry;
 				const fields: BatchFailureFields = {
 					code: publicBatchCode(code),
 					...(error_id === undefined ? {} : { error_id }),
 					...(partitionIndex === undefined ? {} : { partitionIndex: at(partitionIndex) }),
 				};
 				for (const opIndex of opIndexes) {
-					on.failure(opIndex, { outcome, fields });
+					on.failure(opIndex, { outcome, fields }, entry);
 				}
 			}
 			return;
@@ -1475,7 +1478,12 @@ export class FokosDB {
 		}
 		const items: BatchWriteRpcItem[] = opts.items.map((item, opIndex) => {
 			this.#checkCondition(item.condition);
-			const condition = item.condition === undefined ? {} : { condition: item.condition };
+			const condition = {
+				...(item.condition === undefined ? {} : { condition: item.condition }),
+				...(item.returnValuesOnConditionCheckFailure === undefined
+					? {}
+					: { returnValuesOnConditionCheckFailure: item.returnValuesOnConditionCheckFailure }),
+			};
 			if (item.operation === "delete") {
 				return { opIndex, ...keys[opIndex], operation: "delete", ...condition };
 			}
@@ -1494,7 +1502,10 @@ export class FokosDB {
 			}),
 		);
 
+		// Each root caps the images of its own answer, so the answers together can still be above the cap.
+		applyBatchImageCap(settled.flatMap((r) => (r.status === "fulfilled" ? r.value.value.failed : [])));
 		const results: Array<BatchWriteItemResult | undefined> = Array.from({ length: items.length });
+		const conditionFailures: Array<{ opIndex: number; reason: RejectionReasonEncoded; itemOmitted?: "response_too_large" }> = [];
 		const meta = joinBatchAnswers(settled, groups, true, {
 			answer: (value, at) => {
 				for (const { opIndex, version, partitionIndex } of value.appliedPuts) {
@@ -1504,11 +1515,24 @@ export class FokosDB {
 					results[opIndex] = { outcome: "ok", operation: "delete", deleted, partitionIndex: at(partitionIndex) };
 				}
 			},
-			failure: (opIndex, f) => {
+			failure: (opIndex, f, entry) => {
 				const error_id = f.fields.error_id ?? defectErrorId("a failed write has no error_id", { opIndex });
 				results[opIndex] = { outcome: f.outcome, ...f.fields, code: f.fields.code as FokosErrorCode, error_id };
+				if (entry?.reason) {
+					conditionFailures.push({ opIndex, reason: entry.reason, itemOmitted: entry.itemOmitted });
+				}
 			},
 		});
+		for (const { opIndex, reason: encoded, itemOmitted } of conditionFailures) {
+			const result = results[opIndex];
+			const reason = withAnswerMeta(meta, () => decodeRejectionReason(encoded));
+			if (result?.outcome === "rejected" && reason.code === "condition_failed") {
+				result.reason = reason;
+				if (itemOmitted) {
+					result.itemOmitted = itemOmitted;
+				}
+			}
+		}
 		const out = results.map(
 			(result, opIndex): BatchWriteItemResult =>
 				result ?? {

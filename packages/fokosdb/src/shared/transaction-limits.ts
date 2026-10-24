@@ -571,9 +571,9 @@ export function validateBatchGetItems(
 
 /**
  * Validates a `batchWriteItems` request: the item count, the fields of each operation, the key rules,
- * `ttlAt`, no two operations on one item, and the sum of the condition sizes. A put carries data. A
- * delete carries no data and no `ttlAt`. No operation carries an update or
- * `returnValuesOnConditionCheckFailure`. The caller validates each condition tree.
+ * `ttlAt`, `returnValuesOnConditionCheckFailure`, no two operations on one item, and the sum of the
+ * condition sizes. A put carries data. A delete carries no data and no `ttlAt`. No operation carries
+ * an update. The caller validates each condition tree.
  * Encodes each key one time and returns the bytes in request order. The caller encodes the data of
  * each put and checks its size.
  */
@@ -596,10 +596,11 @@ export function validateBatchWriteItems(items: readonly BatchWriteItemLike[], li
 		if (item.operation === "delete" && (item.data != null || item.ttlAt !== undefined)) {
 			throw invalidFields(`batchWriteItems "delete" operation must not carry data or ttlAt`);
 		}
-		if (item.update !== undefined || item.returnValuesOnConditionCheckFailure !== undefined) {
-			throw invalidFields("batchWriteItems operation must not carry an update or returnValuesOnConditionCheckFailure");
+		if (item.update !== undefined) {
+			throw invalidFields("batchWriteItems operation must not carry an update");
 		}
 		validateTtlAt(item.ttlAt, "batchWriteItems");
+		validateReturnValuesOnConditionCheckFailure(item.returnValuesOnConditionCheckFailure as string | undefined);
 		if (item.condition !== undefined) {
 			conditionBytes += itemDataBytes(JSON.stringify(item.condition) ?? "");
 		}
@@ -692,6 +693,35 @@ export function conditionFailedReason(
 			...(imageRow.ttlAt !== undefined ? { ttlAt: imageRow.ttlAt } : {}),
 		},
 	};
+}
+
+/**
+ * Applies `applyImageCap` to the entries of one batch write answer. An entry with a `reason` answers
+ * one failed condition. A dropped image loses `reason.item`, and its entry gets `itemOmitted`.
+ */
+export function applyBatchImageCap(
+	failed: Array<{ opIndexes: number[]; reason?: RejectionReasonEncoded; imageBytes?: number; itemOmitted?: "response_too_large" }>,
+): void {
+	const views = failed.flatMap((entry) =>
+		entry.reason
+			? [
+					{
+						outcome: "rejected" as const,
+						opIndex: entry.opIndexes[0],
+						reason: entry.reason,
+						imageBytes: entry.imageBytes,
+						itemOmitted: entry.itemOmitted,
+						entry,
+					},
+				]
+			: [],
+	);
+	applyImageCap(views);
+	for (const view of views) {
+		if (view.itemOmitted) {
+			view.entry.itemOmitted = view.itemOmitted;
+		}
+	}
 }
 
 /**
