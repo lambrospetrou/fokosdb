@@ -1,13 +1,13 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { FokosError, FokosTransactionCancelledError } from "fokosdb/client";
+import { FokosConditionCheckError, FokosError, FokosTransactionCancelledError } from "fokosdb/client";
 import { PartitionDO } from "fokosdb/server";
 import { databasesRoutes } from "./databases/routes.js";
 import { demo2Routes } from "./demo2/index.js";
 import { helloRoutes } from "./hello/routes.js";
 import { rpcRoutes } from "./rpc/routes.js";
-import { serializeTransactWriteResults } from "./rpc/serialize.js";
+import { serializeConditionFailedReason, serializeTransactWriteResults } from "./rpc/serialize.js";
 import type { AppEnv } from "./shared.js";
 
 // Wrangler resolves Durable Object bindings against this module, so the classes must be re-exported
@@ -35,6 +35,7 @@ api.onError((err, c) => {
 				error_id: err.error_id,
 				message: err.message,
 				...(FokosTransactionCancelledError.is(err) ? { results: serializeTransactWriteResults(err.results) } : {}),
+				...(FokosConditionCheckError.is(err) ? { reason: serializeConditionFailedReason(err.reason) } : {}),
 			},
 			err.httpStatusHint as ContentfulStatusCode,
 		);

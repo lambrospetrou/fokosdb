@@ -219,8 +219,22 @@ describe("http-api example worker", () => {
 		const second = await rpc(table, "batchWriteItems", body);
 		expect(second.status).toBe(200);
 		expect(await second.json()).toMatchObject({
-			results: [{ outcome: "rejected", code: "condition_failed" }],
+			results: [{ outcome: "rejected", code: "condition_failed", reason: { code: "condition_failed", hashKey: "b-1" } }],
 			unprocessedItems: [],
+		});
+
+		const third = await rpc(table, "batchWriteItems", {
+			items: [{ ...body.items[0], returnValuesOnConditionCheckFailure: "all_old" }],
+		});
+		expect(third.status).toBe(200);
+		expect(await third.json()).toMatchObject({
+			results: [
+				{
+					outcome: "rejected",
+					code: "condition_failed",
+					reason: { code: "condition_failed", hashKey: "b-1", item: { data: "v", dataEncoding: "utf8", version: 1 } },
+				},
+			],
 		});
 	});
 
@@ -277,6 +291,27 @@ describe("http-api example worker", () => {
 		const res = await rpc(`t-${crypto.randomUUID()}`, "putItem", { hashKey: "absent", data: "v", condition });
 		expect(res.status).toBe(409);
 		expect(await res.json()).toMatchObject({ error: "FokosConditionCheckError", code: "condition_failed" });
+	});
+
+	it("returns the old image of a failed condition on putItem and deleteItem with all_old", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		await rpc(table, "putItem", { hashKey: "img", data: "old" });
+		const notExists = { op: "not_exists", args: [{ ref: "hashKey" }] };
+		const put = await rpc(table, "putItem", {
+			hashKey: "img",
+			data: "new",
+			condition: notExists,
+			returnValuesOnConditionCheckFailure: "all_old",
+		});
+		expect(put.status).toBe(409);
+		expect(await put.json()).toMatchObject({
+			code: "condition_failed",
+			reason: { code: "condition_failed", hashKey: "img", item: { data: "old", dataEncoding: "utf8", version: 1 } },
+		});
+		const del = await rpc(table, "deleteItem", { hashKey: "img", condition: notExists, returnValuesOnConditionCheckFailure: "none" });
+		expect(del.status).toBe(409);
+		const body = (await del.json()) as { reason: object };
+		expect(body.reason).toEqual({ code: "condition_failed", hashKey: "img" });
 	});
 
 	it("reports a cancelled transaction as 409, with the result of each operation", async () => {
