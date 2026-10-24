@@ -79,14 +79,6 @@ item again.
 
 - **`last_write_ts` cannot order last-writer-wins updates across retries** (RFC Section 1.3 of the coalesced
   materialization spec). A sink needs a version from the writer.
-- **A failed condition in a batch is not a thrown error.** `classifyBatchFailure` (`src/shared/batch-failure.ts`)
-  gives an error of the local part the outcome `unprocessed` (rule 3). A `FokosConditionCheckError` is not a
-  validation error, so the handler must give a condition failure its outcome directly.
-- **`conditionPlanOf` compiles on each call** (`src/shared/expression/request-plans.ts`). `projectionPlanOf` and
-  `updatePlanOf` keep the plan of a tree object in a `WeakMap`.
-- **`batchWriteItems` has no payload cap in the client.** A root RPC above 32 MiB gives each item of that root
-  `rejected` with `batch_request_too_large`. `transactWriteItems` adds the JSON size of each condition to
-  `MAX_PAYLOAD_BYTES_PER_TX` (4 MB) in `validateTransactWriteOperations`.
 - **`items.data` is `ANY NOT NULL`** (migration 1 of `PartitionStore`). A row with no payload needs a schema change or
   a sentinel value.
 - **Partitions never merge.** `RepartitionKind` (`src/sharding/sharding-store.ts`) is `hash_split`, `range_split`, or
@@ -112,7 +104,8 @@ item again.
 
 ### 2.1 In scope
 
-1. `batchWriteItems` accepts an optional `condition` on each `put` and `delete` item (Milestone 1).
+1. `batchWriteItems` accepts a `condition` and `returnValuesOnConditionCheckFailure` on each `put` and `delete` item
+   (Milestone 1). `docs/agent-plans/2026-10-24-batch-write-conditions.md` specifies it.
 2. `putItem`, `deleteItem`, and the `put` and `delete` items of `batchWriteItems` accept `externalVersion`. A stale
    write changes nothing (Milestone 2).
 3. A read returns the stored external version of an item (Milestone 2).
@@ -131,16 +124,14 @@ item again.
 
 ### 2.3 Out of scope
 
-- Update expressions and `returnValuesOnConditionCheckFailure` in `batchWriteItems`. The batch spec keeps them out,
-  and `transactWriteItems` covers them. Milestone 1 keeps this boundary.
 - The choice between producer epoch fences and versioned tombstones for the GSIs of the coalesced materialization RFC.
 - A tombstone without a TTL. Each tombstone must expire (Section 4.2.5).
 - A merge of partitions after a burst of tombstones.
 
 ## 3. Milestones
 
-1. **Conditions in `batchWriteItems`** (Section 4.2.1). The public type, the validation, the wire type, the handler,
-   and the outcome. The HTTP example test that expects 400 for a batch condition changes.
+1. **Conditions in `batchWriteItems`**, with the image of a failed condition.
+   `docs/agent-plans/2026-10-24-batch-write-conditions.md` specifies it.
 2. **The external version** (Section 4.2.2). The `items` column, the write option on the three write paths, the
    stale rule, and the read field. It works without Milestone 3, with one limit: a late write after a delete creates
    the item again.
@@ -154,9 +145,8 @@ item again.
 The three features are independent options of the existing write paths. Each one runs inside the `transactionSync`
 of its item, so a check and its write are atomic.
 
-1. **A batch condition.** Each `put` or `delete` of a batch can carry a condition. The partition evaluates it as
-   `putItem` does. A failed condition gives that item `rejected` with `condition_failed`, and the other items of the
-   batch continue.
+1. **A batch condition.** Each `put` or `delete` of a batch can carry a condition, as `putItem` does
+   (`docs/agent-plans/2026-10-24-batch-write-conditions.md`).
 2. **An external version.** A write carries `externalVersion`. The partition stores it in a new `items` column. The
    write applies only when the stored external version is absent or lower. A stale write changes nothing, and the
    caller treats it as done.
@@ -180,41 +170,13 @@ of its item, so a check and its write are atomic.
 
 #### 4.2.1 Milestone 1: conditions in `batchWriteItems`
 
-**API.** The `put` and `delete` variants of `BatchWriteItem` get `condition?: ConditionExpression`, the type of
-`PutItemOptions.condition`. `validateBatchWriteItems` accepts `condition` and still refuses `update` and
-`returnValuesOnConditionCheckFailure` with `batch_operation_fields_invalid`. `db.ts` validates each condition tree with
-`expression/semantic.ts` before any I/O, as for `putItem`. `BatchWriteRpcItem` carries the tree.
-
-**Handler.** In `batchWriteLocal`, the block of each item runs these steps:
-
-1. `assertNotLocked`.
-2. When the item has a condition, `PartitionStore.evaluateCondition`. When the condition fails, the block writes
-   nothing and returns a condition failure.
-3. The upsert or the delete.
-
-The handler gives a condition failure the outcome `rejected` with the code `condition_failed` and a new `error_id`. It
-does not throw, because `classifyBatchFailure` gives a thrown local error `unprocessed` (Section 1.3). The next item
-runs. `putItemLocal`, `deleteItemLocal`, and `batchWriteLocal` share one function for the steps 1 to 3.
-
-**Outcome.** `rejected` means "nothing of the operation applied, and the same operation fails the same way again"
-(`BatchWriteItemResult`). A condition failure fits for the current state of the item: the same item against the same
-state fails again, and `FokosStd.batchWriteItemsWithRetry` does not send a `rejected` item again. The state can change
-later and make the condition pass, so the fit is not exact. Open Question 4.3.1 lists a separate outcome.
-
-**Compile cost.** Many items of one batch can share one condition shape, for example "the stored version is lower than
-X" with a different X for each item. `conditionPlanOf` compiles each tree on each call. A batch of 100 conditions
-compiles 100 times. TODO: decide the caching (Open Question 4.3.2). The expression compile cost plan
-(`docs/agent-plans/2026-10-10-expression-compile-cost.md`, Section 5.4) did not choose a plan cache in the partition.
-
-**Size.** A condition counts toward the size of the request. `batchWriteItems` has no client payload cap, so the
-condition counts toward the 32 MiB RPC limit, and an oversize root gives `batch_request_too_large`. TODO: decide
-whether the batch counts the JSON size of each condition, as `validateTransactWriteOperations` does.
+`docs/agent-plans/2026-10-24-batch-write-conditions.md` specifies Milestone 1.
 
 #### 4.2.2 Milestone 2: the external version
 
 **API.** `PutItemOptions`, `DeleteItemOptions`, and the `put` and `delete` variants of `BatchWriteItem` get
 `externalVersion?: number`. It must be a non-negative safe integer, or the call throws a validation error before any
-I/O. TODO: decide the range (Open Question 4.3.3) and the name of the validation code.
+I/O. TODO: decide the range (Open Question 4.3.1) and the name of the validation code.
 
 **Schema.** The `items` table gets one column, for example `ext_version INTEGER`, NULL when no write gave a version.
 TODO: name the column. The column works for each data kind and needs no expression compile.
@@ -223,9 +185,9 @@ TODO: name the column. The column works for each data kind and needs no expressi
 `E`. The partition checks the rule in the `transactionSync` of the item, after the lock check and with the condition:
 
 - When the item has both a `condition` and an `externalVersion`, both checks must pass.
-- When the stored version is equal to `E`, the result is open (Open Question 4.3.4).
-- A stale write writes no row. Its result is open (Open Question 4.3.5).
-- A write without `externalVersion` on a row with a stored version is open (Open Question 4.3.6).
+- When the stored version is equal to `E`, the result is open (Open Question 4.3.2).
+- A stale write writes no row. Its result is open (Open Question 4.3.3).
+- A write without `externalVersion` on a row with a stored version is open (Open Question 4.3.4).
 
 `PartitionStore.upsertItem` reads `est_row_bytes` with `#storedEstRowBytes` before the upsert. The same read can return
 the stored external version, so the check adds no row read. That read uses the covering index `idx_items_scan`. TODO:
@@ -239,16 +201,16 @@ whether the expression engine gets a reference to the column, as `{ ref: "v" }`.
 **Interactions.**
 
 - `v` still increases on each applied write. A stale write does not change `v`.
-- `transactWriteItems`: allowed or not is open (Open Question 4.3.7).
+- `transactWriteItems`: allowed or not is open (Open Question 4.3.5).
 - The `update` operation of `transactWriteItems` and `updateItemSingleShot`: an update without a version keeps or
-  clears the stored version (Open Question 4.3.6).
+  clears the stored version (Open Question 4.3.4).
 - The migration pages of `FokosMigrationHost` and the ingest must carry the column.
 
 #### 4.2.3 Milestone 3: the versioned tombstone delete
 
 **API.** `DeleteItemOptions` and the `delete` variant of `BatchWriteItem` get `tombstoneTtlSeconds?: number`. It needs
 `externalVersion`, or the call throws a validation error. TODO: the validation code, and a policy maximum or a
-default (Open Question 4.3.9).
+default (Open Question 4.3.7).
 
 **The tombstone row.** A delete with `externalVersion = E` that passes the rule of Section 4.2.2 keeps one `items` row
 for the key:
@@ -259,7 +221,7 @@ for the key:
 | a deleted flag | set. TODO: a new column, or a code in `data_kind` (an on-disk index of `DATA_KINDS`). |
 | `ext_version` | `E` |
 | `ttl_epoch_utc_seconds` | `now + tombstoneTtlSeconds` |
-| `v` | open (Open Question 4.3.8) |
+| `v` | open (Open Question 4.3.6) |
 | `est_row_bytes` | the key bytes plus `EST_ROW_BYTES_K` (108), with no payload |
 
 TODO: decide whether the delete writes a tombstone when no row exists for the key. A sink needs it when a late put
@@ -275,13 +237,13 @@ was present.
   count it.
 - A condition evaluates a tombstone as an absent item. The `update` operation uses the empty document as the
   pre-image.
-- A read transaction treats a tombstone as an absent item. Open Question 4.3.8 covers the revision that it compares.
+- A read transaction treats a tombstone as an absent item. Open Question 4.3.6 covers the revision that it compares.
 - TODO: list every statement that reads `items` (the point read, the image read, the query statements, the
   transaction reads, the range split boundaries) and add the tombstone test to each one.
 
 **Writes over a tombstone.** A put or a delete with an external version at or below the tombstone version is stale,
 with the rule of Section 4.2.2. A higher version replaces the tombstone: a put writes the item, and a delete writes a
-new tombstone. A write without a version over a tombstone is open (Open Question 4.3.6).
+new tombstone. A write without a version over a tombstone is open (Open Question 4.3.4).
 
 **The TTL sweep.** `deleteExpiredItems` removes an expired tombstone, as it removes an expired item. It updates
 `key_size_estimates` and `deletion_metadata` in the same `transactionSync`. Milestone 1 of the coalesced
@@ -290,7 +252,7 @@ delete the copy of a tombstone before the range root pulls it. Then the range ro
 with a lower version applies.
 
 **Revisions.** The tombstone row must fit the delete revision rule, and the next put over a tombstone must get a `v`
-above every earlier revision. Open Question 4.3.8 has the options.
+above every earlier revision. Open Question 4.3.6 has the options.
 
 **`captureChanges`.** With `captureChanges = true` (coalesced materialization RFC), a tombstone delete is a delete for
 the outbox. TODO: decide what the outbox gets when the sweep removes a tombstone. The item was already deleted.
@@ -303,7 +265,6 @@ above 1.1 times its cap. TODO: decide whether a tombstone over an absent key goe
 
 | Milestone | Extra rows read | Extra rows written |
 | --- | --- | --- |
-| 1: batch condition | the rows that the condition statement reads (1 for a point condition). TODO: measure. | 0 |
 | 2: external version | 0, with the read before the write (Section 4.2.2) | 0. A column of the `items` row. |
 | 3: tombstone delete | 0 | about 1 to 2 for each delete (below) |
 
@@ -338,10 +299,7 @@ measure the size on disk.
 
 #### 4.2.7 Testing
 
-- **Milestone 1.** `test/partition-do/batch-write-items.test.ts`: a passing and a failing condition on a put and a
-  delete, a failed item next to applied items, a condition on an absent item, and a locked item with a condition. The
-  HTTP example test "rejects a batchWriteItems operation with a condition as 400" changes to accept the condition.
-- **Milestone 2.** A higher version applies, a lower version is stale, an equal version follows Open Question 4.3.4,
+- **Milestone 2.** A higher version applies, a lower version is stale, an equal version follows Open Question 4.3.2,
   each data kind, a version with a condition, `v` after a stale write, the read field, and a migration that keeps the
   column.
 - **Milestone 3.** A tombstone is not found by `getItem`, `batchGetItems`, and `queryItems`. A condition sees an absent
@@ -353,49 +311,36 @@ measure the size on disk.
 
 ### 4.3 Open Questions
 
-#### 4.3.1 A separate outcome for a batch condition failure
-
-`rejected` fits for the current state, but a later state can make the condition pass (Section 4.2.1). Options: keep
-`rejected` with `condition_failed`, or add an outcome such as `condition_failed`. A new outcome changes
-`BatchWriteItemResult`, the `FokosStd` helper, and the property-based model.
-
-#### 4.3.2 The compile of many conditions in one batch
-
-Options: compile each tree (today), keep the plan of a tree object in a `WeakMap` as `projectionPlanOf` does, or key a
-cache by the canonical identity of the tree. A `WeakMap` helps only when items share one tree object. TODO: verify
-whether a tree that the client shares between items stays one object after the RPC. Values that differ for each item
-make different trees, so only a cache by shape with separate bindings helps that case.
-
-#### 4.3.3 The range of `externalVersion`
+#### 4.3.1 The range of `externalVersion`
 
 Options: a non-negative safe integer (up to 2^53 - 1), or a `bigint` up to the SQLite `INTEGER` maximum (2^63 - 1).
 A `bigint` fits a source system with 64-bit versions. It changes the type of each read field and the JSON surface of
 the HTTP example.
 
-#### 4.3.4 A write with an equal version
+#### 4.3.2 A write with an equal version
 
 Options: an equal version applies again (an idempotent overwrite), or it is stale. An overwrite is necessary when a
 projection definition changes and the producer sends the same revision with a new value. Elasticsearch has both:
 `version_type=external` needs a higher version, and `external_gte` accepts an equal one.
 
-#### 4.3.5 The result of a stale write
+#### 4.3.3 The result of a stale write
 
 Options: a success with a flag (for example `applied: false`), or `rejected` with a new code such as
 `external_version_stale`. The caller of a sink treats a stale write as done, so a success flag can fit better. For
 `putItem` and `deleteItem`, `rejected` means a thrown error.
 
-#### 4.3.6 A write without `externalVersion` on a versioned row
+#### 4.3.4 A write without `externalVersion` on a versioned row
 
 This covers a put, a delete, and the `update` operation of `transactWriteItems`. Options: the write applies and keeps
 the stored version, the write applies and clears it, or the write is refused. Over a tombstone, the same choice
 decides whether a write without a version can create the item again.
 
-#### 4.3.7 `externalVersion` in `transactWriteItems`
+#### 4.3.5 `externalVersion` in `transactWriteItems`
 
 Options: allowed on `put`, `delete`, and `update`, or refused. When allowed, the rule runs in the prepare and in the
 commit, and a stale operation cancels the transaction or gives a flag.
 
-#### 4.3.8 The revisions of a tombstone
+#### 4.3.6 The revisions of a tombstone
 
 Options:
 
@@ -407,7 +352,7 @@ A read transaction compares `max_deleted_v` for an item that is absent in both p
 "tombstone, put, tombstone" between the two phases does not change `max_deleted_v`, so the read transaction must also
 compare the `v` of the tombstone. Option 2 costs one more row written (`deletion_metadata`) for each delete.
 
-#### 4.3.9 The limit of `tombstoneTtlSeconds`
+#### 4.3.7 The limit of `tombstoneTtlSeconds`
 
 Options: no limit, a policy maximum, a default, or a minimum such as 1 hour. A long TTL keeps more rows (Section 4.2.4).
 A short TTL makes the time-bound risk larger (Section 4.2.5).
@@ -422,7 +367,8 @@ queries return the markers, and every caller must filter them. It works only for
 ### 5.2 Conditions only, with no tombstone
 
 The caller checks a version attribute with a condition on each write. Not chosen as the complete solution: a late write
-after a delete finds no row and creates the item again. It stays as Milestone 1.
+after a delete finds no row and creates the item again. It stays as Milestone 1
+(`docs/agent-plans/2026-10-24-batch-write-conditions.md`).
 
 ### 5.3 Producer epoch fences
 
@@ -447,11 +393,11 @@ No. It protects until the sweep removes it, at the earliest `tombstoneTtlSeconds
 
 ## 7. References
 
+- `docs/agent-plans/2026-10-24-batch-write-conditions.md`
 - `docs/agent-plans/2026-10-17-batch-get-and-write-items.md`
 - `docs/agent-plans/2026-10-17-coalesced-materialization-and-gsis.md`
 - `docs/agent-plans/2026-10-03-max-deleted-version.md`
 - `docs/agent-plans/2026-08-30-item-ttl-expiration.md`
-- `docs/agent-plans/2026-10-10-expression-compile-cost.md`
 - `docs/agent-plans/2026-09-14-read-projections-and-query-filters.md`
 - [Elasticsearch: Index API, versioning](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html#index-versioning)
 - [Elasticsearch: Delete API, versioning](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-delete.html)
