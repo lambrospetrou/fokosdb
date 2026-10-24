@@ -20,14 +20,22 @@ import {
 import type { FokosTopology } from "./route-context.js";
 
 export type FokosTopologyCacheOptions = {
-	/** Host code. Fetches one encoded topology, for example through `ctx.exports.FokosTopologyCache.fetch`. */
-	fetch(this: void, path: string): Promise<Response>;
+	/**
+	 * Host code. Fetches one encoded topology, for example through `ctx.exports.FokosTopologyCache.fetch`.
+	 * Give `signal` to the fetch, so the request stops when the refresh stops waiting for it.
+	 */
+	fetch(this: void, path: string, signal: AbortSignal): Promise<Response>;
 	/** The `waitUntil` of the request (Worker) or of the `DurableObjectState` (Durable Object). */
 	waitUntil(this: void, promise: Promise<unknown>): void;
 	/** The age of an entry that starts a refresh. Default 10,000. */
 	refreshMs?: number;
 	/** The time after which a refresh that did not end can start again. Default 30,000. */
 	refreshTimeoutMs?: number;
+	/**
+	 * The time after which a refresh stops waiting for its fetch. The refresh then settles, so the
+	 * promise in `waitUntil` does not keep a Durable Object in memory. Default 5,000.
+	 */
+	fetchTimeoutMs?: number;
 };
 
 /** The memory of the topology cache of one isolate, in bytes. */
@@ -37,6 +45,7 @@ export const TOPOLOGY_CUT_MAX = 1_024;
 
 const DEFAULT_REFRESH_MS = 10_000;
 const DEFAULT_REFRESH_TIMEOUT_MS = 30_000;
+const DEFAULT_FETCH_TIMEOUT_MS = 5_000;
 
 export type TopologyEntry<V> = {
 	key: string;
@@ -157,13 +166,21 @@ async function refresh(
 	parse: (body: Uint8Array) => HashTopologyView | RangeTopologyView,
 ): Promise<void> {
 	const startedAt = refreshStartedAt.get(key);
+	const signal = AbortSignal.timeout(opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS);
 	try {
-		const response = await opts.fetch(path);
-		if (response.status !== 200) {
-			await response.body?.cancel();
-			throw new Error(`the topology read answered ${response.status}`);
-		}
-		const view = parse(new Uint8Array(await response.arrayBuffer()));
+		const read = async () => {
+			const response = await opts.fetch(path, signal);
+			if (response.status !== 200) {
+				await response.body?.cancel();
+				throw new Error(`the topology read answered ${response.status}`);
+			}
+			return new Uint8Array(await response.arrayBuffer());
+		};
+		// The refresh also stops when the host fetch does not read the signal.
+		const aborted = new Promise<never>((_, reject) => {
+			signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+		});
+		const view = parse(await Promise.race([read(), aborted]));
 		const current = cache.get(key);
 		if (current && compareTopologyVersions(view, current.view as TopologyVersion) <= 0) {
 			// The same version keeps its cut set, and an older version changes nothing.

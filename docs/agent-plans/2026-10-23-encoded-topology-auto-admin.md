@@ -684,13 +684,15 @@ key. So:
 ```ts
 topologyCache?: {
 	/** Host code. Fetches one encoded topology, for example through `ctx.exports.FokosTopologyCache.fetch`. */
-	fetch(this: void, path: string): Promise<Response>;
+	fetch(this: void, path: string, signal: AbortSignal): Promise<Response>;
 	/** The `waitUntil` of the request (Worker) or of the `DurableObjectState` (Durable Object). */
 	waitUntil(this: void, promise: Promise<unknown>): void;
 	/** The age of an entry that starts a refresh. Default 10,000. */
 	refreshMs?: number;
 	/** The time after which a refresh that did not end can start again. Default 30,000. */
 	refreshTimeoutMs?: number;
+	/** The time after which a refresh stops waiting for its fetch. Default 5,000. */
+	fetchTimeoutMs?: number;
 };
 ```
 
@@ -738,7 +740,10 @@ entry is about 26 KB.
 1. `resolve` reads the entry. It does no I/O.
 2. When the entry is absent, or `now - fetchedAt > refreshMs`, and no refresh started in the last
    `refreshTimeoutMs`, `resolve` sets `refreshStartedAt` and calls `waitUntil(refresh(key))`.
-3. `refresh` calls `fetch`, reads the header of the body, and checks it (Section 4.2.4).
+3. `refresh` calls `fetch` with `AbortSignal.timeout(fetchTimeoutMs)`, reads the header of the body, and checks it
+   (Section 4.2.4). When the signal fires, `refresh` stops waiting also when the host fetch does not read the
+   signal. Thus the promise in `waitUntil` settles in at most `fetchTimeoutMs`, and a fetch that does not end does
+   not keep a Durable Object in memory for the 15 minutes that `waitUntil` allows.
 4. When the result is valid and its topology version is equal to or higher than the cached one, `refresh` stores a
    new entry. A new entry has an empty `cut` set.
 5. In all cases, `refresh` clears `refreshStartedAt`. A failure logs one warning and keeps the old entry.
@@ -780,12 +785,15 @@ cache:
 
 - It calls `findLeaf` for the key. When the result depth is larger than the depth of the partition, the walk went
   through this partition, because the key belongs to this partition (`#ownsByTopology`).
-- The target is the deeper of the two hints.
-- A miss from a topology hint uses `#fallbackAfterMiss` with the cut of Section 4.2.6, in place of
-  `HashTopology.invalidate`.
+- The target is the deeper of the two hints. When the two hints give the same depth, the resolution keeps both.
+- A `hash_partition_not_initialized` miss at a target deeper than the child goes to `#missLadder`. It adds the
+  bitmap position of a topology hint to the cut of Section 4.2.6, and it calls `HashTopology.invalidate` for the
+  arena hint, as today. The retry then resolves again without the hint that missed.
 
-The runtime gets `topologyCache` from `FokosRuntimeOptions`, with `this.ctx.waitUntil`. A partition then uses
-the topology also for keys that its own forwards never showed.
+The host gives `topologyCache` in `FokosRuntimeOptions`, with the `waitUntil` of its `DurableObjectState`. A
+partition then uses the topology also for keys that its own forwards never showed. This applies to the `point`,
+`group`, and `single_owner` shapes. The range frontier (`#planRange`) keeps the arena hint only, because a visit
+has no fallback after a hash miss.
 
 #### 4.2.8 FokosDB (M4)
 

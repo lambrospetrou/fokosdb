@@ -86,7 +86,8 @@ import { jitterBackoff } from "durable-utils/retries";
 import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
 import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
-import { TOPOLOGY_EVENT_TYPE, type FokosTopologyEvent } from "./topology-codec.js";
+import { cachedHashTopology, cutTopologyHint, type TopologyEntry } from "./topology-cache.js";
+import { findLeaf, TOPOLOGY_EVENT_TYPE, type FokosTopologyEvent, type HashTopologyView } from "./topology-codec.js";
 import { topologyEventToJson } from "./topology-encode.js";
 import type { RangeAncestorInfo } from "./types.js";
 
@@ -118,6 +119,8 @@ type Resolution =
 			via: "override" | "bloom" | "hash" | "range";
 			/** The levels a hash jump skipped, when `via` is "hash". 1 is the immediate child. */
 			relDepth?: number;
+			/** The topology cache entry and the bitmap position of the hash target, when the topology chose it. */
+			topologyHint?: { entry: TopologyEntry<HashTopologyView>; pos: number };
 			/** The learned slice a range target came from, or null for the durable child or root. */
 			learned: LearnedRangeSlice | null;
 	  }
@@ -191,6 +194,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #scheduler: FokosScheduler;
 	readonly #configOverrides: FokosRuntimeOptions<TPolicy>["config"];
 	readonly #adminOutbox: FokosRuntimeOptions<TPolicy>["adminOutbox"];
+	readonly #topologyCache: FokosRuntimeOptions<TPolicy>["topologyCache"];
 
 	/** The immutable identity, from `__fokos/identity`. Absent until the first request or `fokosInit`. */
 	#identity?: FokosPartitionIdentity;
@@ -215,6 +219,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#validateOperations();
 		this.#configOverrides = opts.config;
 		this.#adminOutbox = opts.adminOutbox;
+		this.#topologyCache = opts.topologyCache;
 		// A configuration that is not valid fails the construction.
 		this.#config();
 		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: () => this.#config().rangeHierarchyMaxRows });
@@ -509,6 +514,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			(resolution.relDepth ?? 1) > 1 &&
 			FokosError.isCode(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized)
 		) {
+			// The hint that missed is the one at `relDepth`: the topology, the arena, or both.
+			if (resolution.topologyHint) {
+				cutTopologyHint(resolution.topologyHint.entry, resolution.topologyHint.pos);
+			}
 			const arena = this.#arena();
 			if (arena?.invalidate(hashKey, resolution.relDepth!)) {
 				this.#store.putHashArena(arena.toSnapshot());
@@ -1686,15 +1695,38 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/**
 	 * The owner of a hash key that has no cut-over route override on this hash partition: local on an
-	 * owner, else the hash descendant that the hash arena names. `router` is `routerRole()`, which
-	 * reads SQLite, so a caller that asks for many keys reads it once.
+	 * owner, else the deeper of the hash descendants that the hash arena and the topology cache name.
+	 * `router` is `routerRole()`, which reads SQLite, so a caller that asks for many keys reads it once.
+	 *
+	 * The key belongs to this partition, so the topology walk of the key goes through this partition,
+	 * and its depth below this partition is the depth of the walk minus the depth of this partition. An
+	 * older topology can stop above this partition, and then it gives no hint.
 	 */
 	#hashTopologyOwner(hashKey: KeyBytes, router: boolean): OwnedResolution {
 		if (!router) {
 			return { kind: "local" };
 		}
-		const relDepth = Math.max(1, this.#arena()?.findLeaf(hashKey) ?? 0);
-		return { kind: "remote", target: this.#hashDescendant(hashKey, relDepth), speculative: false, via: "hash", relDepth, learned: null };
+		let relDepth = Math.max(1, this.#arena()?.findLeaf(hashKey) ?? 0);
+		let topologyHint: RemoteResolution["topologyHint"];
+		const entry = this.#topologyCache && cachedHashTopology(this.#topologyCache, this.identity().topology);
+		if (entry) {
+			const { rootTreesN, hashSplitN } = this.identity().topology;
+			const leaf = findLeaf(entry.view, rootTreesN, hashSplitN, hashKey, entry.cut);
+			const topologyDepth = leaf.path.length - identityDepth(this.identity());
+			if (topologyDepth >= relDepth) {
+				relDepth = topologyDepth;
+				topologyHint = { entry, pos: leaf.pos };
+			}
+		}
+		return {
+			kind: "remote",
+			target: this.#hashDescendant(hashKey, relDepth),
+			speculative: false,
+			via: "hash",
+			relDepth,
+			...(topologyHint ? { topologyHint } : {}),
+			learned: null,
+		};
 	}
 
 	/** The range partition that serves a promoted key: the deepest learned slice that contains the sort key, or the root. */
