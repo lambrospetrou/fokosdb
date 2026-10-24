@@ -22,6 +22,7 @@ import {
 	type FokosStatusPage,
 	type FokosStatusRequest,
 	type KeyBytes,
+	topologyAdminName,
 } from "../../src/sharding/index-server.js";
 
 /**
@@ -87,7 +88,24 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 			stub: (_routeCtx, doName) => env.COUNTER_PARTITION_DO.getByName(doName),
 			hooks: this.hooks(),
 			operations: this.operations(),
+			// The constructor reads the test control, so a restart can remove the hook.
+			...(this.readMeta("outboxDisabled") === 1 ? {} : { adminOutbox: { send: (entry) => this.sendToAdmin(entry) } }),
 		});
+	}
+
+	/**
+	 * Sends a topology report to the admin of the shard group. The test control `outboxFailures` makes
+	 * the next sends throw.
+	 */
+	private async sendToAdmin(entry: { eventType: string; id: string; event: unknown }): Promise<void> {
+		this.writeMeta("outboxSends", this.readMeta("outboxSends") + 1);
+		const failures = this.readMeta("outboxFailures");
+		if (failures > 0) {
+			this.writeMeta("outboxFailures", failures - 1);
+			throw new Error("counter host: the admin outbox send fails");
+		}
+		const shardGroup = this.fokos.routeContext().topology.shardGroup;
+		await this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)).registerRepartition(entry.event);
 	}
 
 	async increment(
@@ -156,6 +174,27 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 	/** Evicts this instance, as a crash does. The storage stays, and an interrupted alarm runs again. */
 	async debugAbort(): Promise<void> {
 		this.ctx.abort("test kill");
+	}
+
+	/**
+	 * `disabled` takes effect at the next start of the instance. `failures` is the number of the next
+	 * outbox sends that throw.
+	 */
+	async debugSetOutbox(opts: { disabled?: boolean; failures?: number }): Promise<void> {
+		if (opts.disabled !== undefined) {
+			this.writeMeta("outboxDisabled", opts.disabled ? 1 : 0);
+		}
+		if (opts.failures !== undefined) {
+			this.writeMeta("outboxFailures", opts.failures);
+		}
+	}
+
+	/** The rows of the admin outbox, and the number of sends that the hook received. */
+	async debugOutbox(): Promise<{ rows: Array<{ id: string; attempt: number }>; sends: number }> {
+		return {
+			rows: this.ctx.storage.sql.exec<{ id: string; attempt: number }>("SELECT id, attempt FROM fokos_admin_outbox").toArray(),
+			sends: this.readMeta("outboxSends"),
+		};
 	}
 
 	async getCounterStats(): Promise<CounterStats> {

@@ -37,6 +37,15 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * its first request. Absent: every setting takes its default.
 	 */
 	config?(this: void): FokosRuntimeConfigOverrides;
+	/**
+	 * The admin outbox. With it, the transaction that completes a repartition also writes one outbox
+	 * row, and the `admin_outbox` job sends each row through `send` until `send` resolves. Absent: the
+	 * runtime writes no outbox row, and the job deletes the rows that remain.
+	 */
+	adminOutbox?: {
+		/** Host code. Sends one entry to an admin DO, chosen from `eventType`. A throw means "retry later". */
+		send(this: void, entry: { eventType: string; id: string; event: unknown }): Promise<void>;
+	};
 };
 
 // ─── the primitive API ───────────────────────────────────────────────────────

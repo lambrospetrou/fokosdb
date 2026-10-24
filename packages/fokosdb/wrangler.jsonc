@@ -29,6 +29,10 @@
 			],
 			"tag": "v1",
 		},
+		{
+			"new_sqlite_classes": ["TestTopologyAdminDO"],
+			"tag": "v2",
+		},
 	],
 	"durable_objects": {
 		"bindings": [
@@ -75,6 +79,10 @@
 			{
 				"class_name": "CounterPartitionDO",
 				"name": "COUNTER_PARTITION_DO",
+			},
+			{
+				"class_name": "TestTopologyAdminDO",
+				"name": "TOPOLOGY_ADMIN_DO",
 			},
 		],
 	},

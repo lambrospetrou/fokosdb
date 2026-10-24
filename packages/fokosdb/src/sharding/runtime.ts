@@ -13,7 +13,7 @@ import { FokosError, FokosInternalError, FokosRoutingError, FokosUnavailableErro
 import invariant from "../shared/invariant.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
 import { throttleTrailing } from "../shared/tsutils.js";
-import { AddResult } from "./bloom-filter.js";
+import { AddResult } from "../shared/bloom-filter.js";
 import { attachRouting, envelope, RouteCollector, routedError } from "./envelope.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import { hashChildIndex, hashRootIndex } from "./hash-primitives.js";
@@ -73,6 +73,7 @@ import type {
 	FokosOwner,
 	FokosRangeInput,
 	FokosRangeVisit,
+	FokosRepartitionPlan,
 	FokosRequestPromotionResult,
 	FokosRouteNode,
 	FokosRuntimeOptions,
@@ -81,9 +82,12 @@ import type {
 	FokosSignals,
 } from "./runtime-types.js";
 import { FokosScheduler } from "./scheduler.js";
+import { jitterBackoff } from "durable-utils/retries";
 import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
 import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
+import { TOPOLOGY_EVENT_TYPE, type FokosTopologyEvent } from "./topology-codec.js";
+import { topologyEventToJson } from "./topology-encode.js";
 import type { RangeAncestorInfo } from "./types.js";
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
@@ -93,7 +97,12 @@ const LOCAL: OwnedResolution = { kind: "local" };
 const NO_COMMIT = (): void => {};
 
 /** The names of the built-in jobs. They run first, in this order. */
-const BUILTIN_JOBS = ["target_import", "target_ack", "source_repartition", "source_cleanup"] as const;
+const BUILTIN_JOBS = ["target_import", "target_ack", "source_repartition", "source_cleanup", "admin_outbox"] as const;
+
+/** The most outbox rows that one step of the `admin_outbox` job sends. */
+const ADMIN_OUTBOX_BATCH = 16;
+const ADMIN_OUTBOX_RETRY_BASE_MS = 1_000;
+const ADMIN_OUTBOX_RETRY_MAX_MS = 5 * 60_000;
 
 /**
  * Where a point key lives, with the facts the retry paths need: which step of the resolution chose
@@ -181,6 +190,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #target: RepartitionTarget;
 	readonly #scheduler: FokosScheduler;
 	readonly #configOverrides: FokosRuntimeOptions<TPolicy>["config"];
+	readonly #adminOutbox: FokosRuntimeOptions<TPolicy>["adminOutbox"];
 
 	/** The immutable identity, from `__fokos/identity`. Absent until the first request or `fokosInit`. */
 	#identity?: FokosPartitionIdentity;
@@ -204,6 +214,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#ops = opts.operations as Record<string, AnyOperation>;
 		this.#validateOperations();
 		this.#configOverrides = opts.config;
+		this.#adminOutbox = opts.adminOutbox;
 		// A configuration that is not valid fails the construction.
 		this.#config();
 		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: () => this.#config().rangeHierarchyMaxRows });
@@ -215,6 +226,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			scheduleWork: () => this.#scheduler.wake(),
 			logParams: () => this.#logParams(),
 			config: () => this.#config(),
+			onCompleted: (plan, completedAt) => this.#recordCompletion(plan, completedAt),
 		};
 		this.#source = new RepartitionSource(this.#store, deps);
 		this.#target = new RepartitionTarget(this.#store, {
@@ -2233,8 +2245,86 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					return { nextRunAt: null };
 				},
 			},
+			admin_outbox: {
+				name: "admin_outbox",
+				canRun,
+				deadline: () => this.#store.earliestAdminOutboxDeadline(),
+				runStep: async () => {
+					await this.#adminOutboxStep();
+					return { nextRunAt: null };
+				},
+			},
 		};
 		return BUILTIN_JOBS.map((name) => jobs[name]);
+	}
+
+	/**
+	 * Writes the report of a completed repartition to the admin outbox. It runs inside the completion
+	 * transaction, so the report exists exactly when the state is `completed`. The outbox keeps its
+	 * own copy of the event, because the cleanup deletes the plan before it writes `cleaned`.
+	 */
+	#recordCompletion(plan: FokosRepartitionPlan, completedAt: number): void {
+		if (!this.#adminOutbox) {
+			return;
+		}
+		const ctx = this.routeContext();
+		// The local repartition id repeats on other partitions, and the source DO name makes it unique.
+		const id = `${plan.source.doName}/${plan.id}`;
+		const event: FokosTopologyEvent = {
+			schema: 1,
+			id,
+			kind: plan.kind,
+			shardGroup: ctx.topology.shardGroup,
+			rootTreesN: ctx.topology.rootTreesN,
+			hashSplitN: ctx.topology.hashSplitN,
+			source: plan.source,
+			actorId: this.#ctx.id.toString(),
+			// A stub is not an RPC: its ID comes from the name and the jurisdiction that the host applies.
+			targets: plan.targets.map((t) => ({ ref: t.ref, slice: t.slice, actorId: this.#stub(ctx, t.ref.doName).id.toString() })),
+			completedAt,
+		};
+		this.#store.insertAdminOutbox(TOPOLOGY_EVENT_TYPE, id, topologyEventToJson(event), completedAt);
+	}
+
+	/**
+	 * Sends the due outbox rows, at most `ADMIN_OUTBOX_BATCH`, one at a time. The rows are read in
+	 * full first, because a cursor does not stay valid across the `await` of a send. A row goes after its
+	 * send resolves. A send that throws keeps the row, and its next attempt waits an exponential
+	 * backoff. Without a hook, the step deletes every row.
+	 */
+	async #adminOutboxStep(): Promise<void> {
+		if (this.#store.isDestroying()) {
+			return;
+		}
+		const outbox = this.#adminOutbox;
+		if (!outbox) {
+			this.#store.transactionSync(() => this.#store.deleteAllAdminOutbox());
+			return;
+		}
+		for (const row of this.#store.selectDueAdminOutbox(Date.now(), ADMIN_OUTBOX_BATCH)) {
+			if (this.#store.isDestroying()) {
+				return;
+			}
+			try {
+				await outbox.send({ eventType: row.eventType, id: row.id, event: JSON.parse(row.eventJson) });
+				this.#store.transactionSync(() => this.#store.deleteAdminOutbox(row.eventType, row.id));
+			} catch (error) {
+				const attempt = row.attempt + 1;
+				// The base delay plus a jittered backoff, so each retry waits from 1 s to 5 min.
+				const delay =
+					ADMIN_OUTBOX_RETRY_BASE_MS +
+					jitterBackoff(attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS);
+				this.#store.transactionSync(() => this.#store.setAdminOutboxAttempt(row.eventType, row.id, attempt, Date.now() + delay));
+				console.warn({
+					...this.#logParams(),
+					message: "fokos/runtime: an admin outbox send failed. The runtime sends it again later.",
+					eventType: row.eventType,
+					id: row.id,
+					attempt,
+					error: String(error),
+				});
+			}
+		}
 	}
 
 	// ═══ plumbing ═══════════════════════════════════════════════════════════

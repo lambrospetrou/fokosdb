@@ -32,6 +32,8 @@ export { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coo
 
 // The example host of the sharding runtime. It uses no FokosDB module.
 export { CounterPartitionDO } from "./sharding/counter-host.js";
+// The topology admin of the sharding tests. It builds soon after a report.
+export { TestTopologyAdminDO } from "./sharding/topology-admin.js";
 
 export default {
 	async fetch(): Promise<Response> {

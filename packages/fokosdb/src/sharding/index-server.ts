@@ -11,8 +11,8 @@ export * from "./exports-client.js";
 
 // ─── Bloom filter ─────────────────────────────────────────────────────────────
 
-export { AddResult, BloomFilter } from "./bloom-filter.js";
-export type { BloomFilterSnapshot } from "./bloom-filter.js";
+export { AddResult, BloomFilter } from "../shared/bloom-filter.js";
+export type { BloomFilterSnapshot } from "../shared/bloom-filter.js";
 
 // ─── The runtime ──────────────────────────────────────────────────────────────
 
@@ -54,10 +54,28 @@ export { PartialRangeTopology } from "./partial-range-topology.js";
 export type { PartialRangeTopologySnapshot } from "./partial-range-topology.js";
 export { selectRangeAncestors } from "./range-ancestors.js";
 
+// ─── Topology keeper ──────────────────────────────────────────────────────────
+
+export {
+	FokosShardingAutoAdminDO,
+	FokosTopologyKeeper,
+	TOPOLOGY_BODY_CHUNK_BYTES,
+	fokosTopologyEntrypointFetch,
+	topologyAdminName,
+} from "./topology-keeper.js";
+export { topologyEventFromWire, topologyEventToJson } from "./topology-encode.js";
+export type {
+	FokosTopologyAdminRpc,
+	FokosTopologyEntrypointOptions,
+	FokosTopologyKeeperOptions,
+	FokosTopologyRead,
+} from "./topology-keeper.js";
+
 // ─── Sharding store ───────────────────────────────────────────────────────────
 
 export { FOKOS_KV_KEYS, FokosShardingStore } from "./sharding-store.js";
 export type {
+	AdminOutboxRow,
 	FokosShardingStoreOptions,
 	LearnedRangeSlice,
 	PromotedKeyCursor,

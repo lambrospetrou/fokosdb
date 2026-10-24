@@ -111,6 +111,21 @@ function compare(a: KeyBytes, b: KeyBytes): number {
 }
 
 /**
+ * `compare(bytes[start..end), key)` without a view object: a reader can compare a key with a key that
+ * is stored inside a larger buffer.
+ */
+function compareSlice(bytes: Uint8Array, start: number, end: number, key: KeyBytes): number {
+	const len = end - start;
+	const minLen = Math.min(len, key.length);
+	for (let i = 0; i < minLen; i++) {
+		if (bytes[start + i] !== key[i]) {
+			return bytes[start + i] - key[i];
+		}
+	}
+	return len - key.length;
+}
+
+/**
  * Increments the last byte below 0xFF and drops the bytes after it. Returns `null` when every byte
  * is 0xFF (or the input is empty): no byte string of this form is above the input.
  */
@@ -341,6 +356,7 @@ export const KeyCodec = {
 	encodeOptional,
 	decode,
 	compare,
+	compareSlice,
 	successor,
 	publicSuccessor,
 	shortestSeparator,

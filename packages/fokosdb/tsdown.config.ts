@@ -49,6 +49,7 @@ const SHARDING_ALLOWED_SHARED = [
 	"src/shared/cache-lru.ts",
 	"src/shared/sql-cursor.ts",
 	"src/shared/cf-utils.ts",
+	"src/shared/bloom-filter.ts",
 ];
 
 /** A `src/shared/` module that is not on the allow list. */
@@ -67,7 +68,7 @@ function isUnlistedShared(id: string): boolean {
 const CLIENT_MAX_BYTES = 110 * 1024;
 
 /** Upper bound for the sharding client entry and every chunk that it imports, in MINIFIED bytes. */
-const SHARDING_CLIENT_MAX_BYTES = 30 * 1024;
+const SHARDING_CLIENT_MAX_BYTES = 42 * 1024;
 
 export default defineConfig({
 	entry: {

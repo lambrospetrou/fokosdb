@@ -128,6 +128,9 @@ export type RepartitionStatusRow = {
 	acknowledged: boolean;
 };
 
+/** One row of the admin outbox. `eventJson` is the JSON text of the event. */
+export type AdminOutboxRow = { eventType: string; id: string; eventJson: string; attempt: number };
+
 /** Scan checkpoint of the route-override stream, in `hash_key` order. */
 export type PromotedKeyCursor = { hashKey: KeyBytes };
 
@@ -369,6 +372,27 @@ const sqlMigrations: SQLSchemaMigration[] = [
             ) WITHOUT ROWID, STRICT;
             CREATE INDEX IF NOT EXISTS idx_fokos_range_hierarchy_depth
                 ON fokos_range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary);`,
+	},
+	{
+		idMonotonicInc: 2,
+		description: "The admin outbox: the events that this partition sends to an admin Durable Object",
+		// - One row for each event, unique by its type and its id. A repeated insert of one event
+		//   changes nothing.
+		// - `event` is the JSON of the event as JSONB. The outbox job reads it with `json()` and does
+		//   not look inside it.
+		// - `next_at` is the deadline of the next send, and idx_fokos_admin_outbox_next_at serves the
+		//   due-row scan and the job deadline.
+		sql: `
+            CREATE TABLE IF NOT EXISTS fokos_admin_outbox (
+                event_type TEXT    NOT NULL,
+                id         TEXT    NOT NULL,
+                event      BLOB    NOT NULL,
+                attempt    INTEGER NOT NULL DEFAULT 0,
+                next_at    INTEGER NOT NULL,
+                PRIMARY KEY (event_type, id)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_fokos_admin_outbox_next_at
+                ON fokos_admin_outbox (next_at);`,
 	},
 ];
 
@@ -977,6 +1001,56 @@ export class FokosShardingStore {
 				initialization: r.initialization,
 				acknowledged: r.acknowledged === 1,
 			}));
+	}
+
+	// ─── fokos_admin_outbox ─────────────────────────────────────────────────
+
+	/** Adds one event to the admin outbox. A repeated event changes nothing. `eventJson` is JSON text. */
+	insertAdminOutbox(eventType: string, id: string, eventJson: string, nextAt: number): void {
+		this.#storage.sql.exec(
+			`INSERT OR IGNORE INTO fokos_admin_outbox (event_type, id, event, next_at) VALUES (?1, ?2, jsonb(?3), ?4)`,
+			eventType,
+			id,
+			eventJson,
+			nextAt,
+		);
+	}
+
+	/** The due outbox rows in `next_at` order, at most `limit`. `event` is JSON text. */
+	selectDueAdminOutbox(now: number, limit: number): AdminOutboxRow[] {
+		const rows: AdminOutboxRow[] = [];
+		for (const r of this.#storage.sql.exec<{ event_type: string; id: string; event: string; attempt: number }>(
+			`SELECT event_type, id, json(event) AS event, attempt FROM fokos_admin_outbox
+			  WHERE next_at <= ?1 ORDER BY next_at LIMIT ?2`,
+			now,
+			limit,
+		)) {
+			rows.push({ eventType: r.event_type, id: r.id, eventJson: r.event, attempt: r.attempt });
+		}
+		return rows;
+	}
+
+	deleteAdminOutbox(eventType: string, id: string): void {
+		this.#storage.sql.exec(`DELETE FROM fokos_admin_outbox WHERE event_type = ?1 AND id = ?2`, eventType, id);
+	}
+
+	deleteAllAdminOutbox(): void {
+		this.#storage.sql.exec(`DELETE FROM fokos_admin_outbox`);
+	}
+
+	setAdminOutboxAttempt(eventType: string, id: string, attempt: number, nextAt: number): void {
+		this.#storage.sql.exec(
+			`UPDATE fokos_admin_outbox SET attempt = ?3, next_at = ?4 WHERE event_type = ?1 AND id = ?2`,
+			eventType,
+			id,
+			attempt,
+			nextAt,
+		);
+	}
+
+	/** The lowest `next_at` of the outbox, or null when it is empty. */
+	earliestAdminOutboxDeadline(): number | null {
+		return one(this.#storage.sql.exec<{ deadline: number | null }>(`SELECT MIN(next_at) AS deadline FROM fokos_admin_outbox`)).deadline;
 	}
 
 	// ─── fokos_range_hierarchy ──────────────────────────────────────────────

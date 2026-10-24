@@ -248,10 +248,14 @@ cache entry. A read that depends on the hash key (`topology.GetForRange`) has it
 | Topology cache | `sharding/topology-cache.ts` | `fokosdb/sharding/client` |
 | Keeper, `FokosShardingAutoAdminDO`, entrypoint helper | `sharding/topology-keeper.ts` | `fokosdb/sharding/server` |
 | Admin outbox, `admin_outbox` job | `sharding/sharding-store.ts`, `sharding/runtime.ts` | `fokosdb/sharding/server` |
+| `BloomFilter` and `layerHas` | `shared/bloom-filter.ts` | both sharding entries |
 | `FokosDBAutoAdminDO` | `server/do-auto-admin.ts` | `fokosdb/server` |
 | `FokosTopologyCache` entrypoint | `server/topology-entrypoint.ts` | `fokosdb/server` |
 
 The client entry must not reach `topology-keeper.ts`. The build check of the client entry enforces it. The
+bundler puts all of `shared/bloom-filter.ts` in a chunk that the server entries share with the client entries, so
+the sharding client bundle also holds the `BloomFilter` class, of which it uses only `layerHas`. Its budget is
+42 kB for this reason. The
 topology cache module must be in the shared chunk with `router.ts`, so that each isolate has one instance (Section
 4.3.1 of `docs/agent-plans/2026-09-26-fokos-sharding-client.md`).
 
@@ -332,54 +336,82 @@ older, and Requirement 2.3.1 makes that safe.
 **The keeper.** `FokosTopologyKeeper` takes `SqlStorage` and owns these tables. The prefix `fokos_topo_` keeps
 them apart from the tables of the host.
 
-- `fokos_topo_groups`, key `shard_group`: `root_trees_n`, `hash_split_n`, `epoch`, `version`, `reset_at`,
-  `built_version`, `built_seq`, `build_due_at`.
+- `fokos_topo_groups`, key `shard_group`: `root_trees_n`, `hash_split_n`, `epoch`, `version`, `hash_version`,
+  `reset_at`, `built_version`, `build_due_at`, `promoted_n`, `hash_nodes_n`.
 - `fokos_topo_repartitions`, key `(shard_group, id)`: `kind`, `repartition_key`, `data` (`jsonb()` of the event),
   `actor_id`, `completed_at`, `received_at`, `seq`.
+- `fokos_topo_hash_nodes`, key `(shard_group, node)`, `WITHOUT ROWID`: one row for each hash partition that split.
 - `fokos_topo_range_intervals`, key `(shard_group, hash_key, start, end_is_max DESC, end DESC)`: the known range
   intervals of each promoted hash key, in the order of the range build (Section 4.2.9).
+- `fokos_topo_range_dirty`, key `(shard_group, hash_key)`, `WITHOUT ROWID`: the promoted hash keys that need a new
+  range body.
 - `fokos_topo_bodies`, key `(shard_group, kind, hash_key, chunk)`: `bytes`. `kind` is `hash` or `range`.
 
-`fokos_topo_repartitions` has one row for each report, of every kind. `repartition_key` is the source partition ID
-for `hash_split` and `key_promotion`, and the hash key for `range_split`. `seq` increases with
-each insert, so a build finds the rows that came after the last build. No query reads the fields inside `data`: the
-build loads the rows of a shard group in full. One table for all kinds is enough for that.
+`fokos_topo_repartitions` has one row for each report, of every kind. It makes the keeper idempotent by the report
+`id`. `repartition_key` is the source partition ID for `hash_split` and `key_promotion`, and the hash key for
+`range_split`. `seq` is the `version` of the shard group after the report. No build reads this table: registration
+writes the facts into the other tables.
+
+**Versions.** `version` is a sequence number for each shard group. It increases by 1 only when a report writes a
+new fact: a new row in `fokos_topo_hash_nodes` or in `fokos_topo_range_intervals`. A report that writes no new fact
+is stored, but does not change `version` and does not start a build. Examples are a `hash_split` whose node is
+already known as the ancestor of another split, and a `key_promotion` whose range root a `range_split` already
+inserted.
+
+- `hash_version` is the `version` of the last new hash node or new range root. These are the facts of the hash
+  body: the nodes give the bitmap, and the range roots give the promoted keys of the Bloom filter.
+- `built_version` is the `hash_version` of the stored hash body. The hash body is built again only when
+  `hash_version > built_version`. A `range_split` of a known promoted key does not change the hash body.
+- A hash key is in `fokos_topo_range_dirty` only when a report wrote a new interval of that key. Only those keys
+  get a new range body. A `hash_split` makes no key dirty.
 
 `registerRepartition(event)` runs in one `transactionSync`:
 
 1. When `(shardGroup, id)` is in `fokos_topo_repartitions`, return. The report is a repeat.
 2. When `event.completedAt < reset_at`, return. The report comes from a table that `destroy` removed. The check
    compares two clocks, so it is best effort (Section 6).
-3. Insert the row, increment `version`, and set `build_due_at` to `now + buildDelayMs` when it is NULL. A later
-   report does not move `build_due_at`, so one build takes all the reports of the delay.
+3. For a `hash_split`, insert the node of the source and the node of each ancestor with `INSERT OR IGNORE`. The
+   walk goes from the source to the root and stops at the first node that is known, because a known node has all
+   its ancestors.
 4. For a `range_split` or a `key_promotion`, insert the range root, the source interval, and each target interval
-   into `fokos_topo_range_intervals` with `INSERT OR IGNORE` (Section 4.2.9).
-5. Call the host hook `scheduleBuild(build_due_at)`.
+   into `fokos_topo_range_intervals` with `INSERT OR IGNORE` (Section 4.2.9). When an interval is new, insert the
+   hash key into `fokos_topo_range_dirty`.
+5. Insert the report row. When step 3 or 4 wrote a new row, increment `version`, set `hash_version` to `version`
+   when a hash node or a range root is new, and set `build_due_at` to `now + buildDelayMs` when it is NULL. A later
+   report does not move `build_due_at`, so one build takes all the reports of the delay.
+6. When `build_due_at` is set, call the host hook `scheduleBuild(build_due_at)`.
 
-The build derives the facts from the rows, so the order of arrival does not matter:
+Registration derives the facts, so the order of arrival does not matter:
 
 - `hash_split`: the source partition and each hash ancestor of it have split. A hash partition ID holds the root
   index and the whole child path (`PartitionIdHelper`), so each prefix of the path is an ancestor. A split is the
-  only way that a child exists, so each ancestor has split.
+  only way that a child exists, so each ancestor has split. The `node` key is `[depth, rootHi, rootLo, ...path]`.
+  The byte order of this key is the level order of the bitmap (Section 4.2.4), so the primary key gives the order
+  of the build and SQLite does no sort.
 - `key_promotion`: the hash key of each `promoted_key` target slice is promoted.
 - `range_split`: the interval of the source and the interval of each target exist. The report carries no depth: a
   range `FokosSlice` holds only `hashKey`, `start`, and `end`. The build computes a rank for each interval from the
   nesting of the known intervals (Section 4.2.9), so a child that arrives before its parent is correct.
+
+`promoted_n` and `hash_nodes_n` count the range roots and the hash nodes, so a build can size the Bloom filter and
+the bitmap before it reads the rows.
 
 The first event of a shard group also inserts its `fokos_topo_groups` row. The keeper reads `rootTreesN` and
 `hashSplitN` from the decoded source ID and the target count. When an event has other values than the stored row,
 the keeper refuses it with a validation error, because these values never change (AGENTS.md).
 
 `resetShardGroup(shardGroup)` deletes the rows and the bodies of the shard group, increments `epoch`, sets
-`version`, `built_version`, and `built_seq` to 0, and sets `reset_at` to now.
+`version`, `hash_version`, `built_version`, `promoted_n`, and `hash_nodes_n` to 0, and sets `reset_at` to now.
 
 The admin DO receives the report over Durable Object RPC, not over the cached entrypoint. Workers Cache caches only
 `GET` and `HEAD`, so a `POST` through the entrypoint gains nothing and adds one hop.
 
 **The default class.** `FokosShardingAutoAdminDO` extends `DurableObject`, embeds one keeper, and exposes the
-keeper methods as RPC methods. Its `scheduleBuild` sets the alarm when the alarm is later or absent, and its
-`alarm()` calls `keeper.runDueBuilds()` and sets the next alarm from `keeper.nextBuildAt()`. A host that has its own
-admin DO embeds `FokosTopologyKeeper` instead, and calls the same two methods from its own alarm.
+keeper methods as RPC methods. Its constructor calls `keeper.runMigrations()` in `ctx.blockConcurrencyWhile()`. Its
+`scheduleBuild` sets the alarm when the alarm is later or absent. Its `alarm()` calls `keeper.runDueBuilds(now)`
+and sets the next alarm to `max(keeper.nextBuildAt(), now + 1)`, so a build that is not complete continues in the
+next alarm. A host that has its own admin DO embeds `FokosTopologyKeeper` instead. It calls `runMigrations()` once
+before any other method, and calls `runDueBuilds()` and `nextBuildAt()` from its own alarm.
 
 **One admin DO for each shard group.** The library gives `topologyAdminName(shardGroup)`, which returns
 `fokos.topo.<shardGroup>`. The report hook, the entrypoint, and `destroy` know the shard group, so they get the name
@@ -408,9 +440,16 @@ does not do that. The range reads of many hot promoted keys of one shard group a
 This is LOUDS for a tree whose nodes have 0 or `K` children. LOUDS stores the degree of each node, but the degree
 here is always 0 or `K`, so one bit is enough: `N` bits for `N` partitions, against `2N + 1` bits for LOUDS.
 
-When the cache stores a new topology, it builds a rank index: one `Uint32Array` with one count for each 512-bit
-block. `rank1(i)` is the block count plus a popcount of at most 16 words. This is the only allocation that grows
-with the topology. The bitmap and the Bloom bits stay views over the body.
+The keeper writes a rank index into the body, in the section `rank`: one `u32` for each 512-bit block, with the
+count of 1 bits before the block, and one more `u32` with the total count. `rank1(i)` is the block count plus a
+popcount of at most 16 words. The rank index adds 1/16 to the bitmap bytes. The caller makes views over the
+bitmap, the rank index, and the Bloom bits, and makes no allocation that grows with the topology.
+
+The build encodes the bitmap from `fokos_topo_hash_nodes` in primary-key order. In level order, `rank1` of a split
+partition is its index in that order, and the parents come in the order of their children. So the encoder reads two
+cursors over the same rows at the same time: one for the nodes, and one that moves forward to the parent of each
+node. The position of a node is `R + K * (index of its parent) + c`. The encoder holds no node after it moves past
+it, and only the bitmap grows with the topology.
 
 ```ts
 // Returns the bitmap position and the absolute depth of the deepest known hash partition of hashKey.
@@ -473,27 +512,41 @@ magic (4 bytes) | u32 headerLen | header JSON (UTF-8, headerLen bytes) | padding
 { "schema": 1, "epoch": 3, "version": "1842", "rootTreesN": 16, "hashSplitN": 4,
   "sections": {
     "bitmap": { "offset": 256, "bitCount": 80 },
-    "bloom": { "offset": 272, "length": 25540, "errorRate": 0.005, "k": 8, "m": 204320,
+    "rank": { "offset": 272, "count": 2 },
+    "bloom": { "offset": 280, "length": 25540, "errorRate": 0.005, "k": 8, "m": 204320,
                "capacity": 16384, "count": 0 } } }
 ```
 
-The bitmap is padded to a multiple of 8 bytes. The caller makes a `Uint32Array` over the bitmap and a view over the
-Bloom bits. The caller drops a body whose `rootTreesN` or `hashSplitN` differs from its own `FokosTopology`, and
-logs one warning.
+The bitmap is padded to a multiple of 8 bytes. The caller makes a `Uint32Array` over the bitmap, a `Uint32Array`
+over the rank index, and a view over the Bloom bits. The reader refuses a `rank` section whose `count` is not
+`ceil(words / 16) + 1`, and a body whose `bitCount` is not `rootTreesN + hashSplitN * total`. The caller drops a body
+whose `rootTreesN` or `hashSplitN` differs from its own `FokosTopology`, and logs one warning.
 
-Size at 1,000,000 partitions and 1,000,000 promoted keys: 125,000 bytes of bitmap, 1,634,527 bytes of Bloom filter,
-about 1.76 MB in total. The rank index adds about 7.8 KB in memory. At 1,000 partitions and no promotions the body
+Size at 1,000,000 partitions and 1,000,000 promoted keys: 125,000 bytes of bitmap, about 7.8 KB of rank index,
+1,634,527 bytes of Bloom filter, about 1.77 MB in total. At 1,000 partitions and no promotions the body
 is about 25.6 KB, almost all of it the empty Bloom filter.
 
-**The build.** A read never encodes. `runDueBuilds()` builds each shard group whose `build_due_at` is due:
+**The build.** A read never encodes. `runDueBuilds(now)` does one bounded step of each shard group whose
+`build_due_at` is due, in `build_due_at` order, until it read `buildStepRows` rows (an option, default 100,000). One
+step of a shard group:
 
-1. It loads the `hash_split` and `key_promotion` rows of the shard group, and encodes the hash body.
-2. It finds the hash keys of the `range_split` and `key_promotion` rows with `seq > built_seq`, and encodes the
-   range body of each one (Section 4.2.9).
-3. In one `transactionSync`, it replaces the stored bodies, and sets `built_version` to `version`, `built_seq` to
-   the highest `seq` it read, and `build_due_at` to NULL. A report that arrived during the build has a higher
-   `version` and sets `build_due_at` again.
+1. When `hash_version > built_version`, it encodes the hash body from `fokos_topo_hash_nodes` and the range roots.
+   In one `transactionSync`, it replaces the stored hash body and sets `built_version` to `hash_version`.
+2. It builds the range body of each key in `fokos_topo_range_dirty` (Section 4.2.9). Each key has its own
+   `transactionSync`: it reads the intervals, encodes the body, replaces the stored body, and deletes the dirty
+   row. Before each key, when the step read `buildStepRows` rows, it sets `build_due_at` to `now` and stops.
+3. When no key is dirty, it sets `build_due_at` to NULL.
 4. It keeps the hash body of each shard group in memory, so a read answers with no SQL.
+
+The two kinds of body do not wait for each other. The smallest unit of a step is one hash body or one range body,
+so a step always does some work. The bound is in rows and not in time, because the clock of a Worker does not move
+while the code runs with no I/O. A step does not yield, so no report arrives during a step. A report between two
+steps writes its facts, and the next step builds what the report changed. A stop between two transactions leaves
+the dirty rows or `build_due_at`, and the next alarm continues the build.
+
+While the range bodies build, a new promoted key can be in the Bloom filter of the hash body before its range body
+exists. The caller then gets the empty range answer (Section 4.2.9) and enters at the range root. The cost is extra
+hops for some seconds.
 
 A body is stored in chunks of `TOPOLOGY_BODY_CHUNK_BYTES` (1 MiB), because the documented limit of a `BLOB` or a
 row is 2 MB ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). Newer
@@ -503,14 +556,15 @@ the write of chunks stay the same. After an eviction, the first read loads the c
 does not encode. Before the first build, a read answers an empty topology of version 0.
 
 `buildDelayMs` is an option of the keeper, default 2,000. A shorter delay gives fresher bodies; a longer delay
-puts more reports in one build. The build reads every hash split and every promoted key once. Cost at 1,000,000
-partitions: `TODO: measure`. A build that needs more CPU than one alarm can use is `TODO: measure`.
+puts more reports in one build. A hash body build reads each hash node twice and each promoted key once, and it is
+one unit of a step: `buildStepRows` does not divide it. Cost at 1,000,000 partitions: `TODO: measure`.
 
 #### 4.2.5 The read path (M2)
 
 **The admin DO** exposes `getTopology(shardGroup, ifNoneMatch?)`. It answers the last built body:
 `{ status: 200, etag, body }`, or `{ status: 304, etag }` when `ifNoneMatch` equals the current ETag. The ETag is
-`"<epoch>.<built_version>"`, and the body carries the same pair. A shard
+`"<epoch>.<built_version>"`, and the body carries the same pair. A report that does not change the hash body does
+not change this ETag, so the callers do not fetch the body again. A shard
 group that the keeper does not know answers 200 with version 0 and no splits.
 
 **The topology entrypoint.** The library gives `fokosTopologyEntrypointFetch(request, opts)`. The host calls it
@@ -607,6 +661,7 @@ type TopologyEntry = {
 	epoch: number;
 	version: bigint;
 	bitmap: Uint32Array;
+	/** A view over the `rank` section of the body. */
 	rank: Uint32Array;
 	bloom: BloomFilter;
 	fetchedAt: number;
@@ -618,8 +673,8 @@ type TopologyEntry = {
 **The size limit.** The cache counts bytes, not entries. `TOPOLOGY_CACHE_BUDGET_BYTES` is 16 MiB for the isolate.
 A Worker isolate has 128 MB ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/)).
 
-- The size of an entry is the `byteLength` of the fetched body plus the `byteLength` of the rank index, plus
-  8 bytes for each position in `cut`.
+- The size of an entry is the `byteLength` of the fetched body, plus 8 bytes for each position in `cut`. The rank
+  index is a view over the body, so it adds nothing.
 - `LRUCache` gets an optional weight: `new LRUCache(capacity, { maxWeight, weightOf })`. `set` puts the new entry
   last, and then removes the least recently used entries until the total weight is at most `maxWeight`. It never
   removes the new entry. A `get` makes an entry the most recent.
@@ -728,9 +783,12 @@ the topology also for keys that its own forwards never showed.
 
 #### 4.2.9 The range topology (M5)
 
-`getRangeTopology(shardGroup, hashKey)` answers the stored range body of the key. The ETag is the topology version
-of the build. A key that is not promoted answers an empty body, with no boundaries and no segments. An empty answer
-is also cached: when it is old, the cost is extra hops.
+`getRangeTopology(shardGroup, hashKey)` answers the stored range body of the key. The ETag and the body carry the
+`version` of the shard group when the step built the body. A key gets a new body only after a new interval, so the
+version of its bodies always increases. A key with no stored body (a key that is not promoted, or a promoted key
+whose first body is not built yet) answers an empty body of version 0, with no boundaries and no segments. Thus
+the first stored body of a key always has another ETag, and a revalidation of the empty answer does not get a 304.
+An empty answer is also cached: when it is old, the cost is extra hops.
 
 **The model.** One object for each promoted hash key:
 
@@ -913,10 +971,11 @@ interval.
   ([SQLite storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)). `batch-scan.ts`
   already reads rows one at a time in this way.
 - A cursor has no snapshot across an `await`. So the build of one hash key runs in one `transactionSync` with no
-  `await`: it reads the rows, encodes the body, and writes the chunks. The alarm can yield between two hash keys.
+  `await`: it reads the rows, encodes the body, and writes the chunks. A step stops between two hash keys after
+  `buildStepRows` rows, and the next alarm continues (Section 4.2.4).
 - For each row the build does one index step, a few byte compares, and some appends. The stack removes at most one
   entry for each row. Cost for 10,000 intervals: `TODO: measure`.
-- The build reads only the hash keys with a row of `seq > built_seq` (Section 4.2.4).
+- The build reads only the hash keys in `fokos_topo_range_dirty`: the keys with a new interval (Section 4.2.3).
 
 **The size cap.** `maxRangeBodyBytes` is an option of the keeper, default 1 MiB.
 
@@ -951,7 +1010,9 @@ path.
 #### 4.2.10 Performance
 
 - **Report.** One outbox insert in the `completed` transaction, one RPC for each repartition, and one row insert
-  in the admin DO. The build runs at most once in each `buildDelayMs` for each shard group. A table with
+  in the admin DO. A build starts at most once in each `buildDelayMs` for each shard group, and each alarm does one
+step of at most `buildStepRows` rows. Only a new hash node or a new range root builds the hash body again, and only
+a hash key with a new interval gets a new range body. A table with
   1,000,000 partitions and `hashSplitN` 4 has about 250,000 hash split reports over its life.
 - **Read at the admin DO.** About one read for each upper tier in each `maxAgeS` for each cache key, and each data
   center whose lower tier misses at the same time goes to its upper tier. The number of upper tiers is
@@ -988,10 +1049,14 @@ path.
 - **Codec.** A property test builds a random hash forest, encodes it, and checks that `findLeaf` matches a walk of
   the reference tree for random keys, with and without cuts.
 - **Keeper.** Repeated events, events in any order (a child before its parent), a refused change of
-  `hashSplitN`, a reset, and an event older than `reset_at`.
-- **Build.** Many reports in one `buildDelayMs` give one build. A read before the build answers the older body. A
-  report during a build sets `build_due_at` again. A body above 1 MiB is stored in chunks, and a new keeper over
-  the same storage answers it with no build. `buildDelayMs` is an option, so the test needs no mock clock.
+  `hashSplitN`, a reset, an event older than `reset_at`, and a report of a known fact, which changes no version.
+- **Build.** Many reports in one `buildDelayMs` give one build. A read before the build answers the older body. With
+  `buildStepRows` 1, each step builds one body, and a report between two steps makes the next steps build its key.
+  A `range_split` does not change the hash body, and a `hash_split` does not change a range body. A body above
+  1 MiB is stored in chunks, and a new keeper over the same storage answers it with no build. `buildDelayMs` is an
+  option, so the test needs no mock clock.
+- **Codec.** The encoder refuses hash nodes with no parent and a node count that does not agree. The reader refuses
+  a rank section that does not agree with the bitmap.
 - **Outbox job.** A crash between `completed` and the RPC, a hook that throws and then succeeds, a host that
   removes the hook, and a partition that is `destroying`.
 - **Topology cache.** No promise is stored; `waitUntil` receives each fetch; an older version is refused; a body
@@ -1076,10 +1141,9 @@ the rest.
 not have. A caller sends once to a partition that does not exist, gets `hash_partition_not_initialized`, and cuts
 that position (Section 4.2.6). The cost is one extra hop and one empty object, until the next topology version.
 
-**Why one table for the repartitions of all kinds?** The build loads the rows of a shard group in full, and no
-query filters on a field of one kind. The range build reads `fokos_topo_range_intervals`, which holds the
-intervals in the order of the build. The derived facts (the ancestors of a split, the promoted keys) exist only in the
-built bodies.
+**Why one table for the repartitions of all kinds?** The table only makes the keeper idempotent, and no query
+reads a field of one kind. Registration writes the facts into `fokos_topo_hash_nodes` and
+`fokos_topo_range_intervals`, which hold them in the order of the build.
 
 **Why is `FokosDBAutoAdminDO` not the generic class?** Its `fokos.admin.<tableName>` instance also owns the GSI
 catalog and other FokosDB state. The

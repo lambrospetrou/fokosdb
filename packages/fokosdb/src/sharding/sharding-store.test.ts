@@ -29,12 +29,18 @@ async function withStore(
 describe("FokosShardingStore - migrations", () => {
 	it("tracks its schema version under its own key and owns every fokos_ table", async () => {
 		await withStore((_store, state) => {
-			expect(state.storage.kv.get(FOKOS_KV_KEYS.SCHEMA_VERSION)).toBe(1);
+			expect(state.storage.kv.get(FOKOS_KV_KEYS.SCHEMA_VERSION)).toBe(2);
 			const tables = state.storage.sql
 				.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fokos_%' ORDER BY name`)
 				.toArray()
 				.map((r) => r.name);
-			expect(tables).toEqual(["fokos_range_hierarchy", "fokos_repartition_targets", "fokos_repartitions", "fokos_route_overrides"]);
+			expect(tables).toEqual([
+				"fokos_admin_outbox",
+				"fokos_range_hierarchy",
+				"fokos_repartition_targets",
+				"fokos_repartitions",
+				"fokos_route_overrides",
+			]);
 		});
 	});
 });

@@ -21,6 +21,8 @@ export const SHARDING_VALIDATION_CODES = defineCodes("FokosValidationError", "ca
 	key_not_well_formed_utf16: "4767pp",
 	key_encode_empty: "58sjts",
 	partition_context_options_invalid: "nr8nsg",
+	/** A topology report is not valid, or it disagrees with the stored topology of its shard group. */
+	topology_event_invalid: "zs77yh",
 });
 
 export const SHARDING_ROUTING_CODES = defineCodes("FokosRoutingError", "internal", 500, {
