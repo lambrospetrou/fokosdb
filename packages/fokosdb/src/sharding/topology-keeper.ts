@@ -19,12 +19,13 @@ import { SHARDING_VALIDATION_CODES } from "./errors.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { validateTopology } from "./route-context.js";
-import { RANGE_BODY_MAGIC, readBodyVersion, type FokosTopologyEvent } from "./topology-codec.js";
+import { parseHashBody, RANGE_BODY_MAGIC, readBodyVersion, type FokosTopologyEvent, type HashTopologyView } from "./topology-codec.js";
 import {
 	encodeHashBitmap,
 	encodeHashBody,
 	hashNodeKey,
 	encodeRangeBody,
+	mergeHashBitmap,
 	promotedKeysBloom,
 	topologyEventFromWire,
 	topologyEventToJson,
@@ -93,6 +94,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - One row for each split hash partition, and for each of its ancestors, also when the report
 		//   of an ancestor is missing. `node` is `[depth, rootHi, rootLo, ...path]`, so the primary key
 		//   gives the level order of the bitmap.
+		// - `seq` is the `version` of the report that inserted the row. The rows with
+		//   `seq > built_version` are the splits that the stored hash body does not have yet, and
+		//   idx_fokos_topo_hash_nodes_seq finds them.
 		//
 		// fokos_topo_range_dirty:
 		// - The promoted hash keys that need a new range body. A report that writes a new interval of a
@@ -102,8 +106,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - The known intervals of each promoted hash key. `start` x'' is ~min, and `end_is_max` 1 is ~max.
 		// - The primary key gives the order of the range build: `start` ascending, then `end`
 		//   descending, so a parent comes before its children.
+		// - `seq` is the `version` of the report that inserted the row.
 		// - idx_fokos_topo_range_roots holds the range root of each promoted hash key only, so the
-		//   build reads the promoted keys and no other interval.
+		//   build reads the promoted keys and no other interval. It is in `seq` order, so a build that
+		//   extends the stored hash body reads only the roots with `seq > built_version`.
 		//
 		// fokos_topo_bodies:
 		// - The built bodies in chunks. `kind` is `hash` or `range`. A hash body has the hash key x''.
@@ -137,9 +143,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
             CREATE TABLE IF NOT EXISTS fokos_topo_hash_nodes (
                 shard_group TEXT NOT NULL,
-                node        BLOB NOT NULL,
+                node        BLOB    NOT NULL,
+                seq         INTEGER NOT NULL,
                 PRIMARY KEY (shard_group, node)
             ) WITHOUT ROWID, STRICT;
+            CREATE INDEX IF NOT EXISTS idx_fokos_topo_hash_nodes_seq ON fokos_topo_hash_nodes (shard_group, seq);
 
             CREATE TABLE IF NOT EXISTS fokos_topo_range_dirty (
                 shard_group TEXT NOT NULL,
@@ -153,10 +161,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 start       BLOB    NOT NULL,
                 end_is_max  INTEGER NOT NULL,
                 end         BLOB    NOT NULL,
+                seq         INTEGER NOT NULL,
                 PRIMARY KEY (shard_group, hash_key, start, end_is_max DESC, end DESC)
             ) WITHOUT ROWID, STRICT;
             CREATE INDEX IF NOT EXISTS idx_fokos_topo_range_roots
-                ON fokos_topo_range_intervals (shard_group, hash_key) WHERE start = x'' AND end_is_max = 1;
+                ON fokos_topo_range_intervals (shard_group, seq) WHERE start = x'' AND end_is_max = 1;
 
             CREATE TABLE IF NOT EXISTS fokos_topo_bodies (
                 shard_group TEXT    NOT NULL,
@@ -267,12 +276,13 @@ export class FokosTopologyKeeper {
 			if (tryOne(sql.exec(`SELECT 1 FROM fokos_topo_repartitions WHERE shard_group = ?1 AND id = ?2`, event.shardGroup, event.id))) {
 				return null;
 			}
-			const hashNodes = event.kind === "hash_split" ? this.#insertHashNodes(event.shardGroup, source.bytes) : 0;
-			const range = this.#insertRangeIntervals(event, source);
+			// Each new fact gets the version that this report gives the shard group when it writes a new fact.
+			const previous = group?.version ?? 0;
+			const hashNodes = event.kind === "hash_split" ? this.#insertHashNodes(event.shardGroup, source.bytes, previous + 1) : 0;
+			const range = this.#insertRangeIntervals(event, source, previous + 1);
 			// Only a new fact moves `version`. A new hash node or a new range root changes the hash body.
 			const hashChanged = hashNodes > 0 || range.roots > 0;
 			const changed = hashChanged || range.intervals > 0;
-			const previous = group?.version ?? 0;
 			const version = changed ? previous + 1 : previous;
 			sql.exec(
 				`INSERT INTO fokos_topo_repartitions
@@ -449,16 +459,18 @@ export class FokosTopologyKeeper {
 	 * also when the report of the promotion is missing. A new interval marks the hash key dirty. Returns
 	 * the number of new range roots and of new intervals, roots included.
 	 */
-	#insertRangeIntervals(event: FokosTopologyEvent, source: DecodedId): { roots: number; intervals: number } {
+	#insertRangeIntervals(event: FokosTopologyEvent, source: DecodedId, seq: number): { roots: number; intervals: number } {
 		const sql = this.#storage.sql;
 		const insert = (hashKey: Uint8Array, start: Uint8Array | null, end: Uint8Array | null): number =>
 			sql.exec(
-				`INSERT OR IGNORE INTO fokos_topo_range_intervals (shard_group, hash_key, start, end_is_max, end) VALUES (?1, ?2, ?3, ?4, ?5)`,
+				`INSERT OR IGNORE INTO fokos_topo_range_intervals (shard_group, hash_key, start, end_is_max, end, seq)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
 				event.shardGroup,
 				hashKey,
 				start ?? NO_KEY,
 				end === null ? 1 : 0,
 				end ?? NO_KEY,
+				seq,
 			).rowsWritten;
 		if (event.kind === "hash_split") {
 			return { roots: 0, intervals: 0 };
@@ -493,16 +505,17 @@ export class FokosTopologyKeeper {
 	 * returns the number of new nodes. A known node has all its ancestors, so the walk stops at the
 	 * first known node.
 	 */
-	#insertHashNodes(shardGroup: string, partitionIdBytes: Uint8Array): number {
+	#insertHashNodes(shardGroup: string, partitionIdBytes: Uint8Array, seq: number): number {
 		const node = hashNodeKey(partitionIdBytes);
 		let inserted = 0;
 		for (let depth = node[0]; depth >= 0; depth--) {
 			const ancestor = node.slice(0, 3 + depth);
 			ancestor[0] = depth;
 			const written = this.#storage.sql.exec(
-				`INSERT OR IGNORE INTO fokos_topo_hash_nodes (shard_group, node) VALUES (?1, ?2)`,
+				`INSERT OR IGNORE INTO fokos_topo_hash_nodes (shard_group, node, seq) VALUES (?1, ?2, ?3)`,
 				shardGroup,
 				ancestor,
+				seq,
 			).rowsWritten;
 			if (written === 0) {
 				break;
@@ -564,41 +577,77 @@ export class FokosTopologyKeeper {
 		return rows;
 	}
 
-	/** Builds and stores the hash body of `hash_version`. Returns the rows that it read. */
+	/**
+	 * Builds and stores the hash body of `hash_version`. Returns the rows that it read.
+	 *
+	 * With a stored hash body, the build reads only the hash nodes and the range roots with
+	 * `seq > built_version`, which the stored body does not have. It merges the new nodes into the
+	 * stored bitmap (`mergeHashBitmap`), and adds the new roots to a copy of the stored Bloom filter.
+	 * The first build of an epoch reads all the rows.
+	 */
 	#buildHashBody(group: GroupRow, rootTreesN: number, hashSplitN: number): number {
 		const sql = this.#storage.sql;
 		const shardGroup = group.shard_group;
-		const nodes = function* () {
+		const builtVersion = group.built_version;
+		let rows = 0;
+		const nodes = function* (afterSeq: number) {
+			for (const row of sql.exec<{ node: ArrayBuffer }>(
+				`SELECT node FROM fokos_topo_hash_nodes INDEXED BY idx_fokos_topo_hash_nodes_seq
+				  WHERE shard_group = ?1 AND seq > ?2 ORDER BY node`,
+				shardGroup,
+				afterSeq,
+			)) {
+				rows += 1;
+				yield new Uint8Array(row.node);
+			}
+		};
+		const allNodes = function* () {
 			for (const row of sql.exec<{ node: ArrayBuffer }>(
 				`SELECT node FROM fokos_topo_hash_nodes WHERE shard_group = ?1 ORDER BY node`,
 				shardGroup,
 			)) {
+				rows += 1;
 				yield new Uint8Array(row.node);
 			}
 		};
-		const promoted = function* () {
+		const promoted = function* (afterSeq: number) {
 			for (const row of sql.exec<{ hash_key: ArrayBuffer }>(
 				`SELECT hash_key FROM fokos_topo_range_intervals INDEXED BY idx_fokos_topo_range_roots
-				  WHERE shard_group = ?1 AND start = x'' AND end_is_max = 1`,
+				  WHERE shard_group = ?1 AND seq > ?2 AND start = x'' AND end_is_max = 1`,
 				shardGroup,
+				afterSeq,
 			)) {
+				rows += 1;
 				yield new Uint8Array(row.hash_key);
 			}
 		};
+		let old: HashTopologyView | undefined;
+		if (builtVersion > 0) {
+			const stored = this.#hashBodies.get(shardGroup);
+			const body = stored?.etag === etagOf(group.epoch, builtVersion) ? stored.body : this.#readBody(shardGroup, "hash", NO_KEY);
+			invariant(body !== undefined, "fokos/topology-keeper: a built hash body is not stored");
+			old = parseHashBody(body);
+		}
 		const hashBody = encodeHashBody({
 			epoch: group.epoch,
 			version: group.hash_version,
 			rootTreesN,
 			hashSplitN,
-			bitmap: encodeHashBitmap(rootTreesN, hashSplitN, group.hash_nodes_n, nodes),
-			bloom: promotedKeysBloom(promoted(), group.promoted_n),
+			bitmap: old
+				? mergeHashBitmap(old, group.hash_nodes_n, nodes(builtVersion))
+				: encodeHashBitmap(rootTreesN, hashSplitN, group.hash_nodes_n, allNodes),
+			bloom: promotedKeysBloom(
+				group.promoted_n,
+				() => promoted(0),
+				old?.bloom ? { base: old.bloom, added: () => promoted(builtVersion) } : undefined,
+			),
 		});
 		this.#storage.transactionSync(() => {
 			this.#writeBody(shardGroup, "hash", NO_KEY, hashBody);
 			sql.exec(`UPDATE fokos_topo_groups SET built_version = ?2 WHERE shard_group = ?1`, shardGroup, group.hash_version);
 		});
 		this.#hashBodies.set(shardGroup, { etag: etagOf(group.epoch, group.hash_version), body: hashBody });
-		return 2 * group.hash_nodes_n + group.promoted_n;
+		return rows;
 	}
 
 	/**

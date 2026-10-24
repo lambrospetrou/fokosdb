@@ -119,6 +119,52 @@ describe("topology keeper — reports", () => {
 		});
 	});
 
+	it("builds the same hash body after each batch of reports as one full build of all of them", async () => {
+		const T3 = { rootTreesN: 3, hashSplitN: 2 };
+		const arb = fc.record({
+			picks: fc.array(fc.tuple(fc.nat(), fc.boolean(), fc.nat()), { maxLength: 40 }),
+			promoted: fc.array(fc.tuple(fc.nat({ max: 30 }), fc.nat()), { maxLength: 8 }),
+			builds: fc.array(fc.nat(), { maxLength: 5 }),
+		});
+		await withKeeper(async (_keeper, { newKeeper }) => {
+			await fc.assert(
+				fc.asyncProperty(arb, async ({ picks, promoted, builds }) => {
+					// Grow a forest, and keep the report of each split with `keep`, in the order of `rank`.
+					const leaves: Array<{ root: number; path: number[] }> = [0, 1, 2].map((root) => ({ root, path: [] }));
+					const reports: Array<{ rank: number; report: (sg: string) => unknown }> = [];
+					for (const [pick, keep, rank] of picks) {
+						const [leaf] = leaves.splice(pick % leaves.length, 1);
+						leaves.push(...[0, 1].map((c) => ({ root: leaf.root, path: [...leaf.path, c] })));
+						if (keep) {
+							reports.push({ rank, report: (sg) => hashSplitReport(sg, T3, leaf.root, leaf.path, 0) });
+						}
+					}
+					for (const [key, rank] of promoted) {
+						reports.push({ rank, report: (sg) => promotionReport(sg, k(`p${key}`), 0, 3, 2) });
+					}
+					reports.sort((a, b) => a.rank - b.rank);
+					const keeper = newKeeper();
+					const stepwise = `sg_${crypto.randomUUID()}`;
+					const once = `sg_${crypto.randomUUID()}`;
+					const buildAt = new Set(builds.map((b) => b % (reports.length + 1)));
+					for (const [i, { report }] of reports.entries()) {
+						if (buildAt.has(i)) {
+							keeper.runDueBuilds(LATER);
+						}
+						await keeper.registerRepartition(report(stepwise), 0);
+					}
+					// The other shard group gets the same reports in the same order, and one build.
+					for (const { report } of reports) {
+						await keeper.registerRepartition(report(once), 0);
+					}
+					keeper.runDueBuilds(LATER);
+					expect(keeper.getTopology(stepwise)).toEqual(keeper.getTopology(once));
+				}),
+				{ numRuns: 40 },
+			);
+		});
+	});
+
 	it("puts the promoted keys in the Bloom filter of the hash body", async () => {
 		await withKeeper(async (keeper, { sg }) => {
 			await keeper.registerRepartition(promotionReport(sg, KeyCodec.encode("u42"), 0, 2, 2));

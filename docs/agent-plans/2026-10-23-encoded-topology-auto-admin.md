@@ -340,9 +340,11 @@ them apart from the tables of the host.
   `reset_at`, `built_version`, `build_due_at`, `promoted_n`, `hash_nodes_n`.
 - `fokos_topo_repartitions`, key `(shard_group, id)`: `kind`, `repartition_key`, `data` (`jsonb()` of the event),
   `actor_id`, `completed_at`, `received_at`, `seq`.
-- `fokos_topo_hash_nodes`, key `(shard_group, node)`, `WITHOUT ROWID`: one row for each hash partition that split.
+- `fokos_topo_hash_nodes`, key `(shard_group, node)`, `WITHOUT ROWID`: one row for each hash partition that split,
+  and `seq`. The index `idx_fokos_topo_hash_nodes_seq` is on `(shard_group, seq)`.
 - `fokos_topo_range_intervals`, key `(shard_group, hash_key, start, end_is_max DESC, end DESC)`: the known range
-  intervals of each promoted hash key, in the order of the range build (Section 4.2.9).
+  intervals of each promoted hash key, in the order of the range build (Section 4.2.9), and `seq`. The partial index
+  `idx_fokos_topo_range_roots` is on `(shard_group, seq)`, for the range roots only.
 - `fokos_topo_range_dirty`, key `(shard_group, hash_key)`, `WITHOUT ROWID`: the promoted hash keys that need a new
   range body.
 - `fokos_topo_bodies`, key `(shard_group, kind, hash_key, chunk)`: `bytes`. `kind` is `hash` or `range`.
@@ -362,6 +364,8 @@ inserted.
   body: the nodes give the bitmap, and the range roots give the promoted keys of the Bloom filter.
 - `built_version` is the `hash_version` of the stored hash body. The hash body is built again only when
   `hash_version > built_version`. A `range_split` of a known promoted key does not change the hash body.
+- The `seq` of a row in `fokos_topo_hash_nodes` or in `fokos_topo_range_intervals` is the `version` of the report
+  that inserted the row. A row with `seq > built_version` is a fact that the stored hash body does not have.
 - A hash key is in `fokos_topo_range_dirty` only when a report wrote a new interval of that key. Only those keys
   get a new range body. A `hash_split` makes no key dirty.
 
@@ -449,7 +453,33 @@ The build encodes the bitmap from `fokos_topo_hash_nodes` in primary-key order. 
 partition is its index in that order, and the parents come in the order of their children. So the encoder reads two
 cursors over the same rows at the same time: one for the nodes, and one that moves forward to the parent of each
 node. The position of a node is `R + K * (index of its parent) + c`. The encoder holds no node after it moves past
-it, and only the bitmap grows with the topology.
+it, and only the bitmap grows with the topology. Only the first build of an epoch uses this full encoder.
+
+**The merge.** When a hash body is stored, the build does not read all the hash nodes. It reads only the rows with
+`seq > built_version` (the pending splits), in `node` order, and merges them into the stored bitmap
+(`mergeHashBitmap`):
+
+- The merge walks the new bitmap in level order with a queue. An entry of the queue is a run of old positions, or
+  one new node under a leaf of the old bitmap.
+- The old nodes keep their order, and the children of the old splits come in the order of their parents. So the
+  children of a run are the next run of old positions, and they are one entry. The merge needs no `rank1` of the
+  old bitmap for them.
+- The merge copies a run with a shifted copy of 32 bits at a time, and counts the 1 bits of the run in the same
+  loop. It visits one at a time only a pending split and each node under it.
+- A walk of the old bitmap gives the old position of the next pending split, or shows that the split is under an
+  old leaf. The merge stops a run at that position, marks the split, and queues its `K` children as new nodes.
+- The parent of each pending split is an old split or a pending split, because registration inserts the
+  ancestors. A pending split is never an old split, because its row was a new fact. The merge refuses a pending
+  split that it cannot place, and a count that does not agree with `hash_nodes_n`.
+
+The cost is about `N / 32` word operations for `N` partitions, plus a walk and `K` queue entries for each pending
+split. The memory is the new bitmap and the queue, which grows with the pending splits only. The result is the same
+bitmap as the full encoder gives.
+
+The Bloom filter of the promoted keys works in the same way. When the stored filter has the capacity of the new
+count, the build copies its bits and adds only the range roots with `seq > built_version`. A Bloom filter is the OR
+of the bits of its keys, so the bits are the same as a full build gives. When the count needs a larger capacity, the
+build reads all the range roots again. The capacity doubles each time, so this occurs rarely.
 
 ```ts
 // Returns the bitmap position and the absolute depth of the deepest known hash partition of hashKey.
@@ -530,8 +560,10 @@ is about 25.6 KB, almost all of it the empty Bloom filter.
 `build_due_at` is due, in `build_due_at` order, until it read `buildStepRows` rows (an option, default 100,000). One
 step of a shard group:
 
-1. When `hash_version > built_version`, it encodes the hash body from `fokos_topo_hash_nodes` and the range roots.
-   In one `transactionSync`, it replaces the stored hash body and sets `built_version` to `hash_version`.
+1. When `hash_version > built_version`, it encodes the hash body. With a stored hash body, it merges the pending
+   splits and the new range roots into it. Without one, it reads all of `fokos_topo_hash_nodes` and all the range
+   roots. In one `transactionSync`, it replaces the stored hash body and sets `built_version` to `hash_version`.
+   After a crash before this transaction, the next step merges the same rows again.
 2. It builds the range body of each key in `fokos_topo_range_dirty` (Section 4.2.9). Each key has its own
    `transactionSync`: it reads the intervals, encodes the body, replaces the stored body, and deletes the dirty
    row. Before each key, when the step read `buildStepRows` rows, it sets `build_due_at` to `now` and stops.
@@ -556,8 +588,25 @@ the write of chunks stay the same. After an eviction, the first read loads the c
 does not encode. Before the first build, a read answers an empty topology of version 0.
 
 `buildDelayMs` is an option of the keeper, default 2,000. A shorter delay gives fresher bodies; a longer delay
-puts more reports in one build. A hash body build reads each hash node twice and each promoted key once, and it is
-one unit of a step: `buildStepRows` does not divide it. Cost at 1,000,000 partitions: `TODO: measure`.
+puts more reports in one build. A hash body build is one unit of a step: `buildStepRows` does not divide it. The
+first build of an epoch reads each hash node twice and each promoted key once. A later build reads the pending rows
+and the stored body.
+
+Cost in workerd (`test/topology-bench/hash-build.workerd-bench.ts`): `R` 16, `K` 2, a balanced tree, one promoted key
+for each 100 partitions, and the stored body in memory. The timers of workerd advance in whole milliseconds.
+"Before" is the full build of every hash body, and "after" is the merge.
+
+| Partitions | Hash nodes | Hash body | First build | +1 split, before | +1 split, after | +100 splits, before | +100 splits, after |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 42 | 25 KiB | 2–4 ms | 1 ms | 2 ms | 2 ms | 1 ms |
+| 1,000 | 492 | 25 KiB | 2 ms | 2 ms | 1 ms | 2 ms | 2 ms |
+| 10,000 | 4,992 | 27 KiB | 19–21 ms | 25 ms | 1 ms | 22 ms | 3 ms |
+| 100,000 | 49,992 | 38 KiB | 126–135 ms | 130 ms | 1 ms | 144 ms | 2 ms |
+| 1,000,000 | 499,992 | 155 KiB | 1.1 s | 1.1 s | 2 ms | 1.5 s | 2 ms |
+| 10,000,000 | 4,999,992 | 1.5 MiB | 11.6 s | 10.6 s | 24 ms | 14.0 s | 16 ms |
+
+The first build of an epoch stays one step: about 1.1 s at 1,000,000 partitions and 11.6 s at 10,000,000. A keeper
+that registers a large topology after a reset therefore has one long step.
 
 #### 4.2.5 The read path (M2)
 
@@ -1056,7 +1105,13 @@ a hash key with a new interval gets a new range body. A table with
   1 MiB is stored in chunks, and a new keeper over the same storage answers it with no build. `buildDelayMs` is an
   option, so the test needs no mock clock.
 - **Codec.** The encoder refuses hash nodes with no parent and a node count that does not agree. The reader refuses
-  a rank section that does not agree with the bitmap.
+  a rank section that does not agree with the bitmap. The merge of any later forest into the bitmap of any earlier
+  forest gives the body of a full build (property), also for a deep chain under one old leaf and splits over many
+  words. The merge refuses a pending split that the old bitmap has, a pending split with no split parent, and a count
+  that does not agree. An extended Bloom filter has the bits of a full build, and a count above the capacity builds
+  the filter again from all the keys.
+- **Merge in the keeper.** Reports in any order, with some reports missing and builds between them, give the same
+  hash body as one full build of the same reports (property).
 - **Outbox job.** A crash between `completed` and the RPC, a hook that throws and then succeeds, a host that
   removes the hook, and a partition that is `destroying`.
 - **Topology cache.** No promise is stored; `waitUntil` receives each fetch; an older version is refused; a body
