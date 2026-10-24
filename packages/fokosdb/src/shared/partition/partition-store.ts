@@ -27,6 +27,7 @@ import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS, decodeItemKeys } from "../tra
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import { withExpressionErrors } from "../errors-operations.js";
 import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
+import { KeySizeStats } from "./key-size-stats.js";
 import type { TransactionOperationType } from "../transaction-wire-types.js";
 
 // Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
@@ -102,9 +103,10 @@ function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
 
 /**
  * PartitionStore owns ALL SQL on the partition's data tables: items, pending_transactions,
- * deletion_metadata and key_size_estimates, plus their schema migrations and the row-size
- * estimators. No other class touches these tables. The `fokos_` tables belong to
- * `FokosShardingStore`, and no statement here may name one.
+ * deletion_metadata and the materialization outbox, plus their schema migrations and the row-size
+ * estimators. No other class touches these tables. The size estimate of each hash key belongs to
+ * `keySizes`, which this store updates in the transaction of each item write. The `fokos_` tables
+ * belong to `FokosShardingStore`, and no statement here may name one.
  *
  * Design rules:
  * - Single-purpose methods named for intent; raw SQL is fine because it lives only here.
@@ -304,13 +306,6 @@ export type SqlMetrics = { rowsRead: number; rowsWritten: number };
 export type ItemImageRead = SqlMetrics & {
 	row?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number; imageBytes: number };
 };
-
-/**
- * The range split of one slice: its boundaries, or why it has none.
- * - `fewer_items`: the slice holds fewer items than children.
- * - `skewed_bytes`: the bytes are so skewed that the scan finds fewer boundaries than it needs.
- */
-export type RangeSplitPlan = { boundaries: KeyBytes[] } | { floor: "fewer_items" | "skewed_bytes" };
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -773,18 +768,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 	{
 		idMonotonicInc: 3,
-		description: "Add per-hash key size estimate and key-level size summary for efficient promotion detection",
-		// FIXME: Add also number of items per hash key.
-		sql: `
-            CREATE TABLE IF NOT EXISTS key_size_estimates (
-                hk        BLOB    NOT NULL PRIMARY KEY,
-                est_bytes INTEGER NOT NULL DEFAULT 0
-            ) WITHOUT ROWID, STRICT;
-
-            CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (est_bytes);`,
-	},
-	{
-		idMonotonicInc: 4,
 		description: "Create the materialization outbox",
 		// One row for each changed item that the export has not sent yet. It holds the key and the
 		// revision, never the data: the export reads the data from `items`. A newer change of the item
@@ -853,6 +836,8 @@ export type PartitionStoreOptions = {
 };
 
 export class PartitionStore {
+	/** The size estimate of each hash key. */
+	readonly keySizes: KeySizeStats;
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
 	#captureChanges: () => boolean;
@@ -860,6 +845,7 @@ export class PartitionStore {
 
 	constructor(storage: DurableObjectStorage, opts: PartitionStoreOptions = {}) {
 		this.#storage = storage;
+		this.keySizes = new KeySizeStats(storage);
 		this.#captureChanges = opts.captureChanges ?? (() => false);
 		this.#onChangeCaptured = opts.onChangeCaptured ?? (() => {});
 		this.#migrations = new SQLSchemaMigrations({
@@ -871,6 +857,7 @@ export class PartitionStore {
 
 	runMigrations(): void {
 		this.#migrations.runAllSync();
+		this.keySizes.runMigrations();
 	}
 
 	get databaseSize(): number {
@@ -1022,9 +1009,9 @@ export class PartitionStore {
 	 *
 	 * Do NOT replace this read with `AFTER INSERT/UPDATE/DELETE` triggers on items that maintain
 	 * key_size_estimates. A trigger fires for EVERY writer of items, including the two that do their
-	 * size accounting in bulk: insertItemIfAbsent (migration ingest, one addKeySizeEstimate per key per
+	 * size accounting in bulk: insertItemIfAbsent (migration ingest, one `keySizes.add` per key per
 	 * page) and deleteItemsBatchForHashKey (cleanup, 1000 rows per call, followed by one
-	 * deleteKeySizeEstimate). It would add one row WRITE per row on those paths to save one row READ here.
+	 * `keySizes.remove`). It would add one row WRITE per row on those paths to save one row READ here.
 	 */
 	#storedEstRowBytes(hk: KeyBytes, sk: KeyBytes): number {
 		const row = tryOne(
@@ -1177,21 +1164,10 @@ export class PartitionStore {
 			`fokos/partition-store.upsertItem: unexpected version value: ${version}`,
 		);
 		this.#captureWrite(opts.hk, opts.sk, version, oldEst === 0);
-		// Exact stored size, measured by SQLite in the statement above (drives the key_size_estimates delta).
-		const newEst = rows[0].est_row_bytes;
+		// Exact stored size, measured by SQLite in the statement above.
+		const keyEstBytes = this.keySizes.change(opts.hk, oldEst, rows[0].est_row_bytes);
 
-		const kseRow = tryOne(
-			this.#storage.sql.exec<{ est_bytes: number }>(
-				`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
-				 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
-				 RETURNING est_bytes`,
-				opts.hk,
-				newEst,
-				oldEst,
-			),
-		);
-
-		return { version, keyEstBytes: kseRow?.est_bytes ?? newEst, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
+		return { version, keyEstBytes, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
 
 	/**
@@ -1237,7 +1213,7 @@ export class PartitionStore {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
 		}
 		if (deleted || opts.bumpTxOrderTsAlways) {
-			this.#subtractKeySizeEstimate(opts.hk, delEst);
+			this.keySizes.subtract(opts.hk, delEst);
 		}
 		return { deleted, deleteVersion, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
@@ -1382,7 +1358,7 @@ export class PartitionStore {
 			}
 
 			for (const { hk, bytes } of bytesByHashKey.values()) {
-				this.#subtractKeySizeEstimate(hk, bytes);
+				this.keySizes.subtract(hk, bytes);
 			}
 			// The logical delete of an expired row happened at its expiry. The sweep records the removed
 			// rows the same as a user delete, so a later create of the key starts above their delete
@@ -1461,127 +1437,29 @@ export class PartitionStore {
 		return { first: fromSqlKey(first.hk), more: exists(sql.exec(`SELECT 1 FROM ${table} WHERE hk > ? LIMIT 1`, first.hk)) };
 	}
 
-	/** `planRangeSplit` without the reason: the boundaries, or null. */
-	computeRangeSplitBoundaries(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): KeyBytes[] | null {
-		const plan = this.planRangeSplit(hashKey, start, end, N);
-		return "boundaries" in plan ? plan.boundaries : null;
-	}
-
 	/**
-	 * Computes N-1 strictly-increasing split boundaries (byte-quantiles) within [start, end) in one
-	 * transactionSync snapshot. When the slice cannot yield N non-empty children, it returns the
-	 * reason instead: fewer than N items, or bytes so skewed that the scan finds fewer boundaries.
-	 *
-	 * Each boundary is shortened to the minimum prefix that still separates adjacent data keys (the
-	 * "shortest separator" of the predecessor and crossing key), keeping doNames and topology encoding
-	 * compact. A data query on the items table — it lives with the store; the DO passes the result into
-	 * the range split policy's prepareSplit.
-	 *
-	 * Assumes the caller (do-partition startSplit) passes this partition's own [start, end) ownership,
-	 * so the slice being split == all items this DO holds for `hashKey`. That is why the O(1) whole-key
-	 * est_bytes total is a valid byte basis: a splitting parent owns its entire slice and its children
-	 * pull sub-slices during migration, so est_bytes[hk] equals the slice's bytes. The start/end SQL
-	 * filter is retained as a defensive bound on the scan.
+	 * The rows of `hashKey` in `[start, end)` in sort-key order, each with its `est_row_bytes`. The
+	 * generator reads one row each time the caller asks for the next row. `idx_items_scan` covers the
+	 * scan, so it does not read the item data.
 	 */
-	planRangeSplit(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): RangeSplitPlan {
-		// Rather than a COUNT(*) pass plus N-1 OFFSET re-walks (~2.5·cnt row touches, all count-balanced),
-		// this reads the O(1) est_bytes total and does a single early-stopping streaming scan that emits a
-		// boundary each time the running est_row_bytes total crosses the next byte threshold, breaking after
-		// the (N-1)th boundary (~0.75·cnt at N=4). Byte-balance — not count-balance — is the right metric
-		// because the split is triggered by size; it also isolates a heavy row into its own child.
-		return this.#storage.transactionSync((): RangeSplitPlan => {
-			const lower = start ?? KeyCodec.encodeOptional(undefined); // −∞ ⇒ sk >= x'' (the empty sentinel)
-
-			// Total bytes in O(1) from the maintained per-hk estimate. No bytes ⇒ no items to split.
-			const B =
-				tryOne(this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, hashKey))
-					?.est_bytes ?? 0;
-			if (B <= 0) {
-				return { floor: "fewer_items" };
-			}
-
-			// Cheap "≥ N items" guard, O(N) not O(cnt): each child needs ≥ 1 item, so probe with a bounded
-			// count rather than a full pass. Fewer than N items ⇒ cannot split into N non-empty children.
-			const guardRow = one(
-				end === null
-					? this.#storage.sql.exec<{ n: number }>(
-							`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? LIMIT ?)`,
-							hashKey,
-							lower,
-							N,
-						)
-					: this.#storage.sql.exec<{ n: number }>(
-							`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? AND sk < ? LIMIT ?)`,
-							hashKey,
-							lower,
-							end,
-							N,
-						),
-			);
-			if (guardRow.n < N) {
-				return { floor: "fewer_items" };
-			}
-
-			// Single streaming scan, accumulating est_row_bytes and emitting a boundary at each byte threshold.
-			const step = B / N;
-			const cursor =
-				end === null
-					? this.#storage.sql.exec<{ sk: ArrayBuffer; est_row_bytes: number }>(
-							`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? ORDER BY sk`,
-							hashKey,
-							lower,
-						)
-					: this.#storage.sql.exec<{ sk: ArrayBuffer; est_row_bytes: number }>(
-							`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
-							hashKey,
-							lower,
-							end,
-						);
-
-			const boundaries: KeyBytes[] = [];
-			let acc = 0;
-			let threshold = step;
-			let prev: KeyBytes | null = null;
-			for (const row of cursor) {
-				const sk = fromSqlKey(row.sk);
-				acc += row.est_row_bytes;
-				// prev !== null: the first row can never be a boundary, so child 0 always owns ≥ 1 row.
-				if (prev !== null && acc >= threshold && boundaries.length < N - 1) {
-					// Byte-space separator: the boundary's UTF-8 position matches the SQL scans that migrate the data.
-					// The crossing row (sk) falls into the upper child; prev is its predecessor.
-					boundaries.push(KeyCodec.shortestSeparator(prev, sk));
-					// Relative bump (acc + step, not threshold += step): when one oversized row pushes acc past
-					// several thresholds at once, the scan still emits one boundary and re-anchors here, so no
-					// two boundaries land on the same adjacent-key pair. It also gives each child ≥ 1 row.
-					threshold = acc + step;
-					if (boundaries.length === N - 1) {
-						break;
-					}
-				}
-				prev = sk;
-			}
-
-			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty
-			// children). On skewed data the scan may yield fewer than N-1 boundaries; treat any shortfall or
-			// validation failure as "cannot split yet" (the split retries later). This is the safety net
-			// that makes estimate inaccuracy harmless.
-			if (boundaries.length !== N - 1) {
-				return { floor: "skewed_bytes" };
-			}
-			for (let i = 0; i < boundaries.length; i++) {
-				invariant(
-					KeyCodec.compare(boundaries[i], lower) > 0,
-					`fokos/partition-store.computeRangeSplitBoundaries: boundary is not above lower bound`,
-				);
-				if (i > 0) {
-					invariant(
-						KeyCodec.compare(boundaries[i], boundaries[i - 1]) > 0,
-						`fokos/partition-store.computeRangeSplitBoundaries: boundaries are not strictly increasing`,
+	*sortKeySizes(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Generator<{ sk: KeyBytes; bytes: number }> {
+		const lower = start ?? KeyCodec.encodeOptional(undefined);
+		const rows =
+			end === null
+				? this.#storage.sql.exec<{ sk: ArrayBuffer; est_row_bytes: number }>(
+						`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? ORDER BY sk`,
+						hashKey,
+						lower,
+					)
+				: this.#storage.sql.exec<{ sk: ArrayBuffer; est_row_bytes: number }>(
+						`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
+						hashKey,
+						lower,
+						end,
 					);
-				}
-			}
-			return { boundaries };
-		});
+		for (const row of rows) {
+			yield { sk: fromSqlKey(row.sk), bytes: row.est_row_bytes };
+		}
 	}
 
 	/** Promotion GC: deletes up to `limit` rows of a promoted key per call (bounded work per cycle). */
@@ -1906,21 +1784,11 @@ export class PartitionStore {
 			`fokos/partition-store.updateItemSingleShot: unexpected version value: ${version}`,
 		);
 		this.#captureWrite(opts.hk, opts.sk, version, oldEst === 0);
-		const newEst = rows[0].est_row_bytes;
-		const kseRow = tryOne(
-			this.#storage.sql.exec<{ est_bytes: number }>(
-				`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
-				 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
-				 RETURNING est_bytes`,
-				opts.hk,
-				newEst,
-				oldEst,
-			),
-		);
+		const keyEstBytes = this.keySizes.change(opts.hk, oldEst, rows[0].est_row_bytes);
 
 		return {
 			version,
-			keyEstBytes: kseRow?.est_bytes ?? newEst,
+			keyEstBytes,
 			rowsRead: writeRes.rowsRead,
 			rowsWritten: writeRes.rowsWritten,
 		};
@@ -2419,58 +2287,5 @@ export class PartitionStore {
 	/** Migration ingest: idempotent, merges both values with MAX. */
 	mergeDeletionMetadata(meta: { maxDeleteTxOrderTs: number; maxDeletedV: number }): void {
 		this.#raiseDeletionMetadata(meta.maxDeleteTxOrderTs, meta.maxDeletedV);
-	}
-
-	// ─── key_size_estimates ─────────────────────────────────────────────────
-
-	deleteKeySizeEstimate(hk: KeyBytes): void {
-		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hk);
-	}
-
-	/**
-	 * Removes the bytes of deleted rows from a key's estimate. When the deleted rows held all the
-	 * bytes of the key, the key has no committed item, so the estimate row and its index entry are
-	 * deleted. Without this, a partition keeps one estimate row for each key it ever stored. The
-	 * estimate is exact and every item row has more than 0 bytes, so a total at or below `bytes`
-	 * means that no item of the key remains. A key that is written again gets a new row from the
-	 * upsert.
-	 */
-	#subtractKeySizeEstimate(hk: KeyBytes, bytes: number): void {
-		// `est_bytes <= bytes` is the same test as `est_bytes - bytes <= 0`: the deleted rows were the
-		// last items of the key. We use `<=` and not `=` so that a total that is too low also goes,
-		// and does not stay as a row of 0 bytes.
-		const removed = this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ? AND est_bytes <= ?`, hk, bytes);
-		if (removed.rowsWritten === 0) {
-			this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, bytes, hk);
-		}
-	}
-
-	/**
-	 * Up to `limit` hash keys whose estimate is at least `minBytes`, largest first. One seek of
-	 * `key_size_estimates_by_bytes`, which reads at most `limit` rows.
-	 */
-	largestKeysAtLeast(minBytes: number, limit: number): KeyBytes[] {
-		return this.#storage.sql
-			.exec<{ hk: ArrayBuffer }>(`SELECT hk FROM key_size_estimates WHERE est_bytes >= ? ORDER BY est_bytes DESC LIMIT ?`, minBytes, limit)
-			.toArray()
-			.map((row) => fromSqlKey(row.hk));
-	}
-
-	/**
-	 * Adds the bytes of ingested rows to a key's running estimate. The import calls it once per page,
-	 * with the exact sizes `insertItemIfAbsent` measured, so the estimate stays correct without a
-	 * whole-table rebuild at the end. Zero bytes writes nothing, which keeps a page of already-present
-	 * rows free.
-	 */
-	addKeySizeEstimate(hk: KeyBytes, bytes: number): void {
-		if (bytes <= 0) {
-			return;
-		}
-		this.#storage.sql.exec(
-			`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
-			 ON CONFLICT(hk) DO UPDATE SET est_bytes = est_bytes + excluded.est_bytes`,
-			hk,
-			bytes,
-		);
 	}
 }

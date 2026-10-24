@@ -27,6 +27,7 @@ import {
 } from "./partition-store.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
+import { planRangeBoundaries } from "./split-planner.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
@@ -445,7 +446,7 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	// idx_items_scan is what keeps computeRangeSplitBoundaries off the wide
+	// idx_items_scan is what keeps `sortKeySizes` off the wide
 	// item rows. A generated est_row_bytes column, or a narrower index, silently loses "COVERING" and
 	// costs ~20x more page reads without failing any other test.
 	it("the est_row_bytes scans stay index-only", async () => {
@@ -461,31 +462,6 @@ describe("PartitionStore - items", () => {
 				"COVERING INDEX",
 			);
 			expect(plan(`SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk`)).toContain("COVERING INDEX");
-		});
-	});
-
-	// Every refused write on a hash leaf with two or more keys runs this query. Without its index, the
-	// query reads one row for each hash key of the partition.
-	it("largestKeysAtLeast returns the large keys, largest first, from one seek of its index", async () => {
-		await withStore((store, state) => {
-			for (let i = 1; i <= 12; i++) {
-				store.addKeySizeEstimate(kb(`k${i}`), i * 100);
-			}
-			expect(store.largestKeysAtLeast(500, 8).map(keyLabel)).toEqual(["k12", "k11", "k10", "k9", "k8", "k7", "k6", "k5"]);
-			expect(store.largestKeysAtLeast(1_100, 8).map(keyLabel)).toEqual(["k12", "k11"]);
-			expect(store.largestKeysAtLeast(1_300, 8)).toEqual([]);
-
-			const plan = state.storage.sql
-				.exec<{ detail: string }>(
-					`EXPLAIN QUERY PLAN SELECT hk FROM key_size_estimates WHERE est_bytes >= ? ORDER BY est_bytes DESC LIMIT ?`,
-					500,
-					8,
-				)
-				.toArray()
-				.map((r) => r.detail)
-				.join(" | ");
-			expect(plan).toContain("key_size_estimates_by_bytes (est_bytes>?)");
-			expect(plan).not.toContain("TEMP B-TREE");
 		});
 	});
 
@@ -1231,7 +1207,7 @@ describe("PartitionStore - deletion watermark", () => {
 
 			// The cleanup a promotion runs over the hash key it is moving.
 			store.deleteItemsBatchForHashKey(kb("alice"), 1000);
-			store.deleteKeySizeEstimate(kb("alice"));
+			store.keySizes.remove(kb("alice"));
 
 			expect(store.hasItemsForHashKey(kb("alice"))).toBe(false);
 			expect(store.getDeletionMetadata()).toEqual(before);
@@ -1722,7 +1698,19 @@ describe("PartitionStore - pending transactions", () => {
 	});
 });
 
-describe("PartitionStore - computeRangeSplitBoundaries", () => {
+describe("PartitionStore - range split boundaries", () => {
+	/** The boundaries that the split planner computes from the rows of `sortKeySizes`, or null. */
+	function computeBoundaries(
+		store: PartitionStore,
+		hk: KeyBytes,
+		start: KeyBytes | null,
+		end: KeyBytes | null,
+		N: number,
+	): KeyBytes[] | null {
+		const plan = planRangeBoundaries(store.keySizes.bytesOf(hk), N, start, store.sortKeySizes(hk, start, end));
+		return "boundaries" in plan ? plan.boundaries : null;
+	}
+
 	function put(store: PartitionStore, hk: string, ...sks: string[]) {
 		for (const sk of sks) {
 			store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
@@ -1732,13 +1720,13 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 	it("returns null when fewer than N items exist", async () => {
 		await withStore((store) => {
 			put(store, "hk", "a");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toBeNull();
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toBeNull();
 		});
 	});
 
 	it("returns null when the hash key has no items", async () => {
 		await withStore((store) => {
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toBeNull();
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toBeNull();
 		});
 	});
 
@@ -1749,7 +1737,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// "cherry" (the crossing row "cherry" falls into the upper child).
 			// shortestSeparator("apple","cherry"): 'a'!='c' at i=0 → "c".
 			put(store, "hk", "apple", "cherry", "mango", "peach");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toEqual([kb("c")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toEqual([kb("c")]);
 		});
 	});
 
@@ -1757,7 +1745,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 		await withStore((store) => {
 			// predecessor="a", boundary="b" → shortestSeparator → "b" (already minimal)
 			put(store, "hk", "a", "b");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toEqual([kb("b")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toEqual([kb("b")]);
 		});
 	});
 
@@ -1766,7 +1754,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// predecessor="prefix_aaa", boundary="prefix_bbb"
 			// shortestSeparator: first diff at i=7 ('a'!='b') → "prefix_b"
 			put(store, "hk", "prefix_aaa", "prefix_bbb");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toEqual([kb("prefix_b")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toEqual([kb("prefix_b")]);
 		});
 	});
 
@@ -1775,7 +1763,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// predecessor="app", boundary="apple" (predecessor is proper prefix)
 			// shortestSeparator: loop exhausts at minLen=3, return "apple".substring(0,4) = "appl"
 			put(store, "hk", "app", "apple");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toEqual([kb("appl")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toEqual([kb("appl")]);
 		});
 	});
 
@@ -1785,7 +1773,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// b1: "cherry" tips acc over B/3 → shortestSeparator("aardvark","cherry") → "c"
 			// b2: "strawberry" tips acc over 2·B/3 → shortestSeparator("mango","strawberry") → "s"
 			put(store, "hk", "aardvark", "cherry", "mango", "strawberry", "vanilla", "zebra");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toEqual([kb("c"), kb("s")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toEqual([kb("c"), kb("s")]);
 		});
 	});
 
@@ -1795,7 +1783,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// est_bytes[hk] is the slice's byte total. Here the DO holds "banana","cherry","mango" and splits
 			// [banana, peach). N=2: "cherry" tips acc over B/2 → shortestSeparator("banana","cherry") → "c".
 			put(store, "hk", "banana", "cherry", "mango");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), kb("banana"), kb("peach"), 2)).toEqual([kb("c")]);
+			expect(computeBoundaries(store, kb("hk"), kb("banana"), kb("peach"), 2)).toEqual([kb("c")]);
 		});
 	});
 
@@ -1803,7 +1791,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 		await withStore((store) => {
 			put(store, "hk", "apple", "banana", "cherry", "mango", "peach");
 			// Range [cherry, mango) → only "cherry" qualifies (mango excluded) — 1 item < N=2
-			expect(store.computeRangeSplitBoundaries(kb("hk"), kb("cherry"), kb("mango"), 2)).toBeNull();
+			expect(computeBoundaries(store, kb("hk"), kb("cherry"), kb("mango"), 2)).toBeNull();
 		});
 	});
 
@@ -1830,7 +1818,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			}
 			// N=2 → 1 boundary between the 3 items in byte order: uFFFF < emoji < binary
 			// Boundary should lie between uFFFF and emoji (both are sort keys).
-			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 2);
+			const boundaries = computeBoundaries(store, kb("hk"), null, null, 2);
 			expect(boundaries).not.toBeNull();
 			expect(boundaries!.length).toBe(1);
 			// Boundary must satisfy: encode(uFFFF) < boundary <= encode(emoji)
@@ -1863,7 +1851,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			for (const sk of keys) {
 				store.upsertItem({ hk: kb("hk"), sk: kb(sk), data: "payload", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 4);
+			const boundaries = computeBoundaries(store, kb("hk"), null, null, 4);
 			expect(boundaries).not.toBeNull();
 			expect(boundaries!.length).toBe(3);
 			// Strictly increasing.
@@ -1897,7 +1885,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 				ttlAt: null,
 				txOrderTs: 1,
 			});
-			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 2);
+			const boundaries = computeBoundaries(store, kb("hk"), null, null, 2);
 			expect(boundaries).not.toBeNull();
 			expect(boundaries!.length).toBe(1);
 			// Boundary sits above the last light key and at/below the heavy key: lights in child 0, heavy alone in child 1.
@@ -1914,7 +1902,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, txOrderTs: 1 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toBeNull();
+			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toBeNull();
 		});
 	});
 });

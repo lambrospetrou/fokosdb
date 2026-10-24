@@ -191,7 +191,7 @@ export class FokosMigrationHost implements MigrationHost {
 		}
 		for (const bucket of bytesByKey.values()) {
 			for (const { hk, bytes } of bucket) {
-				store.addKeySizeEstimate(hk, bytes);
+				store.keySizes.add(hk, bytes);
 			}
 		}
 	}

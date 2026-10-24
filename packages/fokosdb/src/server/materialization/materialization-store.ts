@@ -1,13 +1,15 @@
 /**
  * The SQLite storage of `MaterializationDO`: the latest image of each base item that the partition
- * accepted, the size estimate of each base hash key, the highest epoch of each producer, the change
- * positions that the targets read, the state of each target, and the failed items of each target.
+ * accepted, the highest epoch of each producer, the change positions that the targets read, the state
+ * of each target, and the failed items of each target. The size estimate of each base hash key
+ * belongs to `keySizes`, which this store updates in the transaction of each image write.
  */
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind } from "../../shared/types.js";
 import type { KeyBytes } from "../../sharding/key-codec.js";
 import { one, tryOne } from "../../shared/sql-cursor.js";
 import { EST_ROW_BYTES_K, estRowBytesExpr, JSON_KIND_CODE } from "../../shared/partition/item-size.js";
+import { KeySizeStats } from "../../shared/partition/key-size-stats.js";
 import type { FokosTargetDefinition } from "./targets.js";
 
 /** The KV key of the target list. The first valid list is stored, and the partition uses only it. */
@@ -80,11 +82,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
             CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc ON latest_items (deleted_at_ms) WHERE deleted_at_ms IS NOT NULL;
 
-            CREATE TABLE IF NOT EXISTS key_size_estimates (
-                hk        BLOB    PRIMARY KEY,
-                est_bytes INTEGER NOT NULL
-            ) WITHOUT ROWID, STRICT;
-
             CREATE TABLE IF NOT EXISTS producer_fences (
                 producer_id TEXT    PRIMARY KEY,
                 epoch       INTEGER NOT NULL
@@ -122,11 +119,14 @@ const sqlMigrations: SQLSchemaMigration[] = [
 ];
 
 export class MaterializationStore {
+	/** The size estimate of each base hash key. */
+	readonly keySizes: KeySizeStats;
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
 
 	constructor(storage: DurableObjectStorage) {
 		this.#storage = storage;
+		this.keySizes = new KeySizeStats(storage);
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
@@ -136,6 +136,7 @@ export class MaterializationStore {
 
 	runMigrations(): void {
 		this.#migrations.runAllSync();
+		this.keySizes.runMigrations();
 	}
 
 	get databaseSize(): number {
@@ -235,19 +236,11 @@ export class MaterializationStore {
 				itemId,
 			);
 		}
-		const oldEstRowBytes = current?.estRowBytes ?? 0;
-		// An update writes the estimate row even when its value does not change. A stored image always
-		// has a size above 0, so an equal size means that the row exists and needs no write.
-		if (newEst === oldEstRowBytes) {
-			return;
+		// The ingest does not use the new estimate, so an equal size needs no read.
+		const oldEst = current?.estRowBytes ?? 0;
+		if (newEst !== oldEst) {
+			this.keySizes.change(image.hashKey, oldEst, newEst);
 		}
-		sql.exec(
-			`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
-			 ON CONFLICT (hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)`,
-			image.hashKey,
-			newEst,
-			oldEstRowBytes,
-		);
 	}
 
 	/**
@@ -568,10 +561,7 @@ export class MaterializationStore {
 				tryOne(sql.exec<{ prev_seq: number | null }>(`DELETE FROM change_positions WHERE seq = ? RETURNING prev_seq`, seq))?.prev_seq ??
 				null;
 		}
-		const hk = new Uint8Array(row.base_hk);
-		if (sql.exec(`DELETE FROM key_size_estimates WHERE hk = ? AND est_bytes <= ?`, hk, row.est_row_bytes).rowsWritten === 0) {
-			sql.exec(`UPDATE key_size_estimates SET est_bytes = est_bytes - ? WHERE hk = ?`, row.est_row_bytes, hk);
-		}
+		this.keySizes.subtract(new Uint8Array(row.base_hk) as KeyBytes, row.est_row_bytes);
 		return true;
 	}
 }

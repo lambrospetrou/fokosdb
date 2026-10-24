@@ -31,6 +31,7 @@ import { PartitionStore, type PendingTxItem } from "../../src/shared/partition/p
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
+import { planRangeBoundaries } from "../../src/shared/partition/split-planner.js";
 import {
 	RepartitionSource,
 	RepartitionTarget,
@@ -233,7 +234,10 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					captureChanges: () => false,
 					selfId: () => doName,
 				}),
-				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
+				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => {
+					const plan = planRangeBoundaries(store.keySizes.bytesOf(hashKey), childCount, start, store.sortKeySizes(hashKey, start, end));
+					return "boundaries" in plan ? plan.boundaries : null;
+				},
 				onRepartitionCutover: (plan) => {
 					const calls = cutovers.get(doName) ?? [];
 					calls.push({ id: plan.id, kind: plan.kind, state: sharding.getRepartition(plan.id)?.state });
@@ -251,7 +255,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					if (store.hasItemsForHashKey(hashKey)) {
 						return false;
 					}
-					store.deleteKeySizeEstimate(hashKey);
+					store.keySizes.remove(hashKey);
 					return true;
 				},
 			},
