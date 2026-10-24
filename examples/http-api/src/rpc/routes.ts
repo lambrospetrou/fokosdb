@@ -15,6 +15,7 @@ import {
 } from "./schemas.js";
 import {
 	serializeBatchGetItemsResult,
+	serializeBatchWriteItemsResult,
 	serializeGetItemResult,
 	serializeProjectedQueryItemsResult,
 	serializeQueryItemsResult,
@@ -83,7 +84,7 @@ rpcRoutes.post("/:tableName/:rpcAction", async (c) => {
 			const { partitionOptions, ...opts } = parseBody(BatchWriteItemsBodySchema);
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).batchWriteItems(opts);
 			c.set("dbItemMeta", result.meta);
-			return c.json(result);
+			return c.json(serializeBatchWriteItemsResult(result));
 		}
 		case "queryItems": {
 			const { partitionOptions, ...opts } = parseBody(QueryItemsBodySchema);

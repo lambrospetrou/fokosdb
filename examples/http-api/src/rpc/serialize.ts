@@ -1,6 +1,8 @@
 import { HTTPException } from "hono/http-exception";
 import type {
 	BatchGetItemsResult,
+	BatchWriteItemsResult,
+	FokosConditionCheckError,
 	GetItemResult,
 	JsonValue,
 	ProjectedItem,
@@ -95,12 +97,27 @@ export function serializeBatchGetItemsResult(result: BatchGetItemsResult) {
 	};
 }
 
-// The results of a cancelled transaction. A rejected entry can carry the old item image, whose data
-// takes the same encodeData step that a read takes.
+// The reason of a failed condition. Its old item image takes the same encodeData step that a read takes.
+export function serializeConditionFailedReason(reason: FokosConditionCheckError["reason"]) {
+	if (!reason.item) return reason;
+	const { data, ...item } = reason.item;
+	return { ...reason, item: { ...item, ...encodeData(data) } };
+}
+
+// The results of a cancelled transaction. A rejected entry can carry the old item image.
 export function serializeTransactWriteResults(results: TransactWriteOperationResult[]) {
 	return results.map((result) => {
-		if (result.outcome !== "rejected" || result.reason.code !== "condition_failed" || !result.reason.item) return result;
-		const { data, ...item } = result.reason.item;
-		return { ...result, reason: { ...result.reason, item: { ...item, ...encodeData(data) } } };
+		if (result.outcome !== "rejected" || result.reason.code !== "condition_failed") return result;
+		return { ...result, reason: serializeConditionFailedReason(result.reason) };
 	});
+}
+
+// A rejected batch write can carry the old item image of its failed condition.
+export function serializeBatchWriteItemsResult(result: BatchWriteItemsResult) {
+	return {
+		...result,
+		results: result.results.map((entry) =>
+			entry.outcome === "rejected" && entry.reason ? { ...entry, reason: serializeConditionFailedReason(entry.reason) } : entry,
+		),
+	};
 }
