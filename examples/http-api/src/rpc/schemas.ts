@@ -159,7 +159,7 @@ export const BatchGetItemsBodySchema = v.object({
 	partitionOptions: PartitionOptionsSchema,
 });
 
-// Mirrors the `BatchWriteItem` union: a batch write has no condition and no update.
+// Mirrors the `BatchWriteItem` union: a batch write has no update.
 export const BatchWriteItemsBodySchema = v.object({
 	items: v.array(
 		v.variant("operation", [
@@ -169,8 +169,14 @@ export const BatchWriteItemsBodySchema = v.object({
 				sortKey: v.optional(v.string()),
 				data: v.string(),
 				ttlAt: v.optional(v.number()),
+				condition: v.optional(ConditionExpressionSchema),
 			}),
-			v.strictObject({ operation: v.literal("delete"), hashKey: v.string(), sortKey: v.optional(v.string()) }),
+			v.strictObject({
+				operation: v.literal("delete"),
+				hashKey: v.string(),
+				sortKey: v.optional(v.string()),
+				condition: v.optional(ConditionExpressionSchema),
+			}),
 		]),
 	),
 	partitionOptions: PartitionOptionsSchema,

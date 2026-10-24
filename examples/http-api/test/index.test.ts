@@ -207,11 +207,21 @@ describe("http-api example worker", () => {
 		});
 	});
 
-	it("rejects a batchWriteItems operation with a condition as 400", async () => {
-		const res = await rpc(`t-${crypto.randomUUID()}`, "batchWriteItems", {
+	it("batchWriteItems applies an operation whose condition holds and rejects one whose condition fails", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		const body = {
 			items: [{ operation: "put", hashKey: "b-1", data: "v", condition: { op: "not_exists", args: [{ ref: "hashKey" }] } }],
+		};
+		const first = await rpc(table, "batchWriteItems", body);
+		expect(first.status).toBe(200);
+		expect(await first.json()).toMatchObject({ results: [{ outcome: "ok", operation: "put", version: 1 }] });
+
+		const second = await rpc(table, "batchWriteItems", body);
+		expect(second.status).toBe(200);
+		expect(await second.json()).toMatchObject({
+			results: [{ outcome: "rejected", code: "condition_failed" }],
+			unprocessedItems: [],
 		});
-		expect(res.status).toBe(400);
 	});
 
 	it("rejects a projection on a count query as 400", async () => {

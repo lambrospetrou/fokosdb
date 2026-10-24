@@ -5,7 +5,7 @@
  * in `server/do-partition.ts`.
  */
 import type { FokosErrorCode } from "./errors-operations.js";
-import type { ProjectionExpression } from "./expression/types.js";
+import type { ConditionExpression, ProjectionExpression } from "./expression/types.js";
 import type { JsonComposite } from "./json-types.js";
 import type { FokosMeta, HashKey, ItemKey, ReadItem, SortKey } from "./types.js";
 
@@ -56,7 +56,11 @@ export type BatchGetItemsResult<Ts extends readonly unknown[] = never[]> = {
 	meta: FokosMeta;
 };
 
-/** One operation of `batchWriteItems`. It has no condition and no update expression. */
+/**
+ * One operation of `batchWriteItems`. It has no update expression. A `condition` runs in the same
+ * transaction as the write of its item, as in `putItem` and `deleteItem`, and a failed condition
+ * gives the operation `rejected` with the code `condition_failed`.
+ */
 export type BatchWriteItem =
 	| {
 			operation: "put";
@@ -65,11 +69,16 @@ export type BatchWriteItem =
 			data: string | Uint8Array | JsonComposite;
 			/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
 			ttlAt?: number;
+			condition?: ConditionExpression;
 	  }
-	| { operation: "delete"; hashKey: HashKey; sortKey?: SortKey };
+	| { operation: "delete"; hashKey: HashKey; sortKey?: SortKey; condition?: ConditionExpression };
 
 export type BatchWriteItemsOptions = {
-	/** 0 to 100 operations. An empty list sends no RPC. Two operations on one item fail the request with `batch_duplicate_key`. */
+	/**
+	 * 0 to 100 operations. An empty list sends no RPC. Two operations on one item fail the request with
+	 * `batch_duplicate_key`. Conditions above `MAX_PAYLOAD_BYTES_PER_TX` in total fail it with
+	 * `batch_conditions_too_large`.
+	 */
 	items: BatchWriteItem[];
 };
 
@@ -79,7 +88,9 @@ export type BatchWriteItemsOptions = {
  *
  * - `applied`: the operation committed.
  * - `unprocessed`: nothing of the operation applied. Send it again.
- * - `rejected`: nothing of the operation applied, and the same operation fails the same way again.
+ * - `rejected`: nothing of the operation applied, and the same operation against the same state of the
+ *   item fails the same way again. A failed condition has the code `condition_failed`. After an
+ *   `unknown` answer, a resend can fail its condition because the first try applied.
  * - `unknown`: the operation can have applied. A caller can send it again: then the item gets a new
  *   `version`, and the write replaces a write that another client made between the two.
  */

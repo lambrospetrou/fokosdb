@@ -571,15 +571,17 @@ export function validateBatchGetItems(
 
 /**
  * Validates a `batchWriteItems` request: the item count, the fields of each operation, the key rules,
- * `ttlAt`, and no two operations on one item. A put carries data. A delete carries no data and no
- * `ttlAt`. No operation carries a condition, an update, or `returnValuesOnConditionCheckFailure`.
+ * `ttlAt`, no two operations on one item, and the sum of the condition sizes. A put carries data. A
+ * delete carries no data and no `ttlAt`. No operation carries an update or
+ * `returnValuesOnConditionCheckFailure`. The caller validates each condition tree.
  * Encodes each key one time and returns the bytes in request order. The caller encodes the data of
  * each put and checks its size.
  */
 export function validateBatchWriteItems(items: readonly BatchWriteItemLike[], limits: FokosDBLimits): TransactionItemKey[] {
 	validateBatchItemCount("batchWriteItems", items.length);
 	const seen = new KeyPairMap<true>();
-	return items.map((item, opIndex) => {
+	let conditionBytes = 0;
+	const keys = items.map((item, opIndex) => {
 		const invalidFields = (message: string) =>
 			new FokosValidationError(VALIDATION_CODES.batch_operation_fields_invalid, {
 				message,
@@ -594,12 +596,22 @@ export function validateBatchWriteItems(items: readonly BatchWriteItemLike[], li
 		if (item.operation === "delete" && (item.data != null || item.ttlAt !== undefined)) {
 			throw invalidFields(`batchWriteItems "delete" operation must not carry data or ttlAt`);
 		}
-		if (item.condition !== undefined || item.update !== undefined || item.returnValuesOnConditionCheckFailure !== undefined) {
-			throw invalidFields("batchWriteItems operation must not carry a condition, an update, or returnValuesOnConditionCheckFailure");
+		if (item.update !== undefined || item.returnValuesOnConditionCheckFailure !== undefined) {
+			throw invalidFields("batchWriteItems operation must not carry an update or returnValuesOnConditionCheckFailure");
 		}
 		validateTtlAt(item.ttlAt, "batchWriteItems");
+		if (item.condition !== undefined) {
+			conditionBytes += itemDataBytes(JSON.stringify(item.condition) ?? "");
+		}
 		return encodeBatchKey("batchWriteItems", item, opIndex, limits, seen);
 	});
+	if (conditionBytes > MAX_PAYLOAD_BYTES_PER_TX) {
+		throw new FokosValidationError(VALIDATION_CODES.batch_conditions_too_large, {
+			message: `batchWriteItems conditions exceed ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MB in total`,
+			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_TX, bytes: conditionBytes },
+		});
+	}
+	return keys;
 }
 
 function validateBatchItemCount(api: string, count: number): void {
