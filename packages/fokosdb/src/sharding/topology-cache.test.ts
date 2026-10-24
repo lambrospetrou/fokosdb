@@ -26,7 +26,7 @@ function hashBody(opts: { version: number; R?: number; K?: number; splits?: Uint
 		rootTreesN: R,
 		hashSplitN: K,
 		bitmap: encodeHashBitmap(R, K, nodes.length, () => nodes),
-		bloom: promotedKeysBloom(promoted, promoted.length),
+		bloom: promotedKeysBloom(promoted.length, () => promoted),
 	});
 }
 

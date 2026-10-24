@@ -194,12 +194,13 @@ export function parseHashBody(input: Uint8Array): HashTopologyView {
 	};
 }
 
-function bit(view: HashTopologyView, pos: number): boolean {
+/** True when the hash partition at `pos` has split. */
+export function hashBit(view: HashTopologyView, pos: number): boolean {
 	return pos < view.bitCount && ((view.words[pos >>> 5] >>> (pos & 31)) & 1) === 1;
 }
 
 /** The number of 1 bits before position `pos`. */
-function rank1(view: HashTopologyView, pos: number): number {
+export function hashRank1(view: HashTopologyView, pos: number): number {
 	const word = pos >>> 5;
 	let count = view.rank[pos >>> 9];
 	for (let w = (pos >>> 9) * TOPOLOGY_RANK_BLOCK_WORDS; w < word; w++) {
@@ -223,9 +224,9 @@ export function findLeaf(
 	const root = hashRootIndex(hashKey, rootTreesN);
 	const path: number[] = [];
 	let pos = root;
-	while (bit(view, pos)) {
+	while (hashBit(view, pos)) {
 		const child = hashChildIndex(hashKey, path.length, hashSplitN);
-		const next = rootTreesN + hashSplitN * rank1(view, pos) + child;
+		const next = rootTreesN + hashSplitN * hashRank1(view, pos) + child;
 		if (cut.has(next)) {
 			break;
 		}

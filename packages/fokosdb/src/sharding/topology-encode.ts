@@ -12,10 +12,13 @@ import type { RepartitionKind } from "./sharding-store.js";
 import {
 	BODY_SCHEMA,
 	HASH_BODY_MAGIC,
+	hashBit,
+	hashRank1,
 	popcount32,
 	RANGE_BODY_MAGIC,
 	TOPOLOGY_RANK_BLOCK_WORDS,
 	type FokosTopologyEvent,
+	type HashTopologyView,
 } from "./topology-codec.js";
 import invariant from "../shared/invariant.js";
 import { FokosValidationError } from "../shared/errors.js";
@@ -245,6 +248,171 @@ export function encodeHashBitmap(
 	return { bits, bitCount };
 }
 
+/**
+ * The bitmap position of the pending split `node` in `old`, or -1 when `node` is under a leaf of `old`.
+ * A pending split is never a split of `old`.
+ */
+function oldPosition(old: HashTopologyView, node: Uint8Array): number {
+	const depth = node[0];
+	let pos = (node[1] << 8) | node[2];
+	invariant(node.length === 3 + depth && pos < old.rootTreesN, "fokos/topology-encode: a pending hash node is not valid");
+	for (let d = 0; d < depth; d++) {
+		if (!hashBit(old, pos)) {
+			return -1;
+		}
+		pos = old.rootTreesN + old.hashSplitN * hashRank1(old, pos) + node[3 + d];
+	}
+	invariant(!hashBit(old, pos), "fokos/topology-encode: a pending hash split is already in the old bitmap");
+	return pos;
+}
+
+/**
+ * Copies `len` bits from `src` at `srcPos` to `dst` at `dstPos`, 32 bits at a time, and returns the
+ * number of 1 bits. `dst` is 0 from `dstPos` on, so the copy can OR the words.
+ */
+function copyBits(src: Uint32Array, srcPos: number, dst: Uint32Array, dstPos: number, len: number): number {
+	let ones = 0;
+	while (len > 0) {
+		const n = len < 32 ? len : 32;
+		const i = srcPos >>> 5;
+		const s = srcPos & 31;
+		let v = s === 0 ? src[i] : (src[i] >>> s) | ((i + 1 < src.length ? src[i + 1] : 0) << (32 - s));
+		if (n < 32) {
+			v &= 0xffffffff >>> (32 - n);
+		}
+		if (v !== 0) {
+			ones += popcount32(v);
+			const j = dstPos >>> 5;
+			const t = dstPos & 31;
+			dst[j] |= v << t;
+			if (t !== 0 && t + n > 32) {
+				dst[j + 1] |= v >>> (32 - t);
+			}
+		}
+		srcPos += n;
+		dstPos += n;
+		len -= n;
+	}
+	return ones;
+}
+
+/** A run of old bitmap positions, or one new node by its node key. */
+type MergeEntry = { start: number; len: number; key: Uint8Array | null };
+
+/**
+ * The hash split bitmap of the splits of `old` and the `pending` splits, without the rows of the
+ * splits of `old`. `pending` gives the node keys (`hashNodeKey`) in byte order, which is the level
+ * order. The parent of each pending node is a split of `old` or a pending node, and `nodeCount` is the
+ * number of splits of the result.
+ *
+ * The merge walks the result in level order with a queue. An entry is a run of old positions or one
+ * new node under a leaf of `old`. The old nodes keep their order, and the children of the old splits
+ * come in the order of their parents, so the children of a run are the next run of old positions. A
+ * run therefore moves to the result with a shifted word copy, and its children are one entry. The
+ * merge visits one by one only a pending node and each node under it. It stops a run at the old
+ * position of the next pending node, which a walk of `old` finds.
+ */
+export function mergeHashBitmap(
+	old: HashTopologyView,
+	nodeCount: number,
+	pending: Iterable<Uint8Array>,
+): { bits: Uint8Array; bitCount: number } {
+	const R = old.rootTreesN;
+	const K = old.hashSplitN;
+	invariant(R > 0 && old.bitCount >= R, "fokos/topology-encode: the old bitmap is empty");
+	const bitCount = R + K * nodeCount;
+	const bits = new Uint8Array(align8(Math.ceil(bitCount / 8)));
+	const out = new Uint32Array(bits.buffer, 0, bits.length / 4);
+	const queue: MergeEntry[] = [{ start: 0, len: R, key: null }];
+	let front = 0;
+	let w = 0;
+	let splits = 0;
+	// The old position of the children of the next old split.
+	let oldChild = R;
+	const cursor = pending[Symbol.iterator]();
+	let head: Uint8Array | undefined;
+	let headPos = -1;
+	const nextHead = () => {
+		const next = cursor.next();
+		head = next.done ? undefined : next.value;
+		headPos = head === undefined ? -1 : oldPosition(old, head);
+	};
+	const appendOld = (start: number, len: number) => {
+		const tail = queue[queue.length - 1];
+		if (tail.key === null && tail.start + tail.len === start) {
+			tail.len += len;
+		} else {
+			queue.push({ start, len, key: null });
+		}
+	};
+	// Marks the split at `w` and queues its children, which are new nodes.
+	const splitNew = (parent: Uint8Array) => {
+		out[w >>> 5] |= 1 << (w & 31);
+		splits += 1;
+		for (let c = 0; c < K; c++) {
+			const key = new Uint8Array(parent.length + 1);
+			key.set(parent);
+			key[0] = parent[0] + 1;
+			key[parent.length] = c;
+			queue.push({ start: 0, len: 1, key });
+		}
+		nextHead();
+	};
+	nextHead();
+	while (front < queue.length) {
+		const e = queue[front];
+		if (e.key === null) {
+			const len = headPos >= e.start && headPos < e.start + e.len ? headPos - e.start : e.len;
+			invariant(w + len <= bitCount, "fokos/topology-encode: the hash nodes do not agree with nodeCount");
+			const ones = copyBits(old.words, e.start, out, w, len);
+			w += len;
+			e.start += len;
+			e.len -= len;
+			splits += ones;
+			if (ones > 0) {
+				appendOld(oldChild, K * ones);
+				oldChild += K * ones;
+			}
+			if (e.len > 0 && headPos === e.start) {
+				// An old leaf that is a pending split.
+				invariant(w < bitCount, "fokos/topology-encode: the hash nodes do not agree with nodeCount");
+				splitNew(head!);
+				w += 1;
+				e.start += 1;
+				e.len -= 1;
+			}
+		} else {
+			invariant(w < bitCount, "fokos/topology-encode: the hash nodes do not agree with nodeCount");
+			if (head !== undefined && headPos === -1 && sameBytes(head, e.key)) {
+				splitNew(e.key);
+			}
+			w += 1;
+			e.len = 0;
+		}
+		if (e.len === 0) {
+			front += 1;
+		}
+	}
+	invariant(head === undefined, "fokos/topology-encode: a pending hash split has no split parent");
+	invariant(
+		w === bitCount && splits === nodeCount && oldChild === old.bitCount,
+		"fokos/topology-encode: the hash nodes do not agree with nodeCount",
+	);
+	return { bits, bitCount };
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) {
+		return false;
+	}
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /** The count of 1 bits before each block of `TOPOLOGY_RANK_BLOCK_BITS` bits, and the total at the end. */
 function rankIndex(bits: Uint8Array, bitCount: number): Uint32Array {
 	const wordCount = Math.ceil(bitCount / 32);
@@ -288,24 +456,44 @@ export function encodeHashBody(input: {
 }
 
 /**
- * One layer with the exact set of promoted keys. The capacity is the smallest power of two of at
- * least `TOPOLOGY_BLOOM_MIN_CAPACITY` and at least the number of keys, so the filter never adds a layer.
+ * One layer with the exact set of `count` promoted keys. The capacity is the smallest power of two of
+ * at least `TOPOLOGY_BLOOM_MIN_CAPACITY` and at least `count`, so the filter never adds a layer.
+ *
+ * When `extend` is given and its base layer has the size of this capacity, the filter starts from a
+ * copy of the base bits and adds only `extend.added()`. Otherwise it adds `all()`. The bits are the
+ * same in both cases, because a Bloom filter is the OR of the bits of its keys.
  */
-export function promotedKeysBloom(keys: Iterable<Uint8Array>, count: number): TopologyBloomSection {
+export function promotedKeysBloom(
+	count: number,
+	all: () => Iterable<Uint8Array>,
+	extend?: { base: { bits: Uint8Array; k: number; m: number }; added: () => Iterable<Uint8Array> },
+): TopologyBloomSection {
 	let capacity = TOPOLOGY_BLOOM_MIN_CAPACITY;
 	while (capacity < count) {
 		capacity *= 2;
 	}
-	const filter = BloomFilter.create({
-		errorRate: TOPOLOGY_BLOOM_ERROR_RATE,
-		initialCapacityN: capacity,
-		maxSizeBytes: bloomInitialLayerBytes(TOPOLOGY_BLOOM_ERROR_RATE, capacity),
-	});
+	const maxSizeBytes = bloomInitialLayerBytes(TOPOLOGY_BLOOM_ERROR_RATE, capacity);
+	let filter: BloomFilter;
+	let keys: Iterable<Uint8Array>;
+	if (extend !== undefined && extend.base.bits.length === maxSizeBytes) {
+		const { bits, k, m } = extend.base;
+		filter = BloomFilter.fromSnapshot({
+			version: 1,
+			errorRate: TOPOLOGY_BLOOM_ERROR_RATE,
+			maxSizeBytes,
+			initialCapacityN: capacity,
+			layers: [{ bits, capacity, count: 0, k, m, layerIndex: 0 }],
+		});
+		keys = extend.added();
+	} else {
+		filter = BloomFilter.create({ errorRate: TOPOLOGY_BLOOM_ERROR_RATE, initialCapacityN: capacity, maxSizeBytes });
+		keys = all();
+	}
 	for (const key of keys) {
 		filter.add(key);
 	}
 	const [layer] = filter.toSnapshot().layers;
-	return { bits: layer.bits, k: layer.k, m: layer.m, capacity: layer.capacity, count: layer.count, errorRate: TOPOLOGY_BLOOM_ERROR_RATE };
+	return { bits: layer.bits, k: layer.k, m: layer.m, capacity, count, errorRate: TOPOLOGY_BLOOM_ERROR_RATE };
 }
 
 // ─── the range body ──────────────────────────────────────────────────────────

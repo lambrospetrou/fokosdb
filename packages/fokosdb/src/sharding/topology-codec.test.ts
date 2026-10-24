@@ -4,7 +4,15 @@ import { hashChildIndex, hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { findLeaf, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
-import { encodeHashBitmap, encodeHashBody, encodeRangeBody, hashNodeKey } from "./topology-encode.js";
+import {
+	encodeHashBitmap,
+	encodeHashBody,
+	encodeRangeBody,
+	hashNodeKey,
+	mergeHashBitmap,
+	promotedKeysBloom,
+	TOPOLOGY_BLOOM_MIN_CAPACITY,
+} from "./topology-encode.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
 
 /** A hash forest as a test builds it: each node by its path key, with its children when it split. */
@@ -149,6 +157,80 @@ describe("topology codec — hash body", () => {
 		const view = parseHashBody(body);
 		view.rank[view.rank.length - 1] += 1;
 		expect(() => parseHashBody(body)).toThrow(/rank section/);
+	});
+});
+
+describe("topology codec — merge of new hash splits", () => {
+	function merged(before: Forest, after: Forest): Uint8Array {
+		const added = sortedNodeKeys([...after.children.keys()].filter((node) => !before.children.has(node)));
+		return encodeHashBody({
+			epoch: 1,
+			version: 7,
+			rootTreesN: after.R,
+			hashSplitN: after.K,
+			bitmap: mergeHashBitmap(parseHashBody(encodeForest(before)), after.children.size, added),
+			bloom: null,
+		});
+	}
+
+	it("gives the body of a full build, from the bitmap of any earlier forest", () => {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 5 }),
+				fc.integer({ min: 2, max: 4 }),
+				fc.array(fc.nat(), { maxLength: 120 }),
+				fc.nat(),
+				(R, K, picks, at) => {
+					const before = buildForest(R, K, picks.slice(0, at % (picks.length + 1)));
+					const after = buildForest(R, K, picks);
+					expect(merged(before, after)).toEqual(encodeForest(after));
+				},
+			),
+			{ numRuns: 300 },
+		);
+	});
+
+	it("gives the body of a full build when the new splits are deep under one old leaf and spread over many words", () => {
+		// 2,000 old splits, then a chain of 200 splits under the last leaf and 300 splits spread over the leaves.
+		const picks = Array.from({ length: 2_000 }, (_, i) => (i * 7_919) % 4_001);
+		const chain = Array.from({ length: 200 }, () => 1_000_000_000);
+		const spread = Array.from({ length: 300 }, (_, i) => i * 13);
+		const before = buildForest(16, 2, picks);
+		expect(merged(before, buildForest(16, 2, [...picks, ...chain, ...spread]))).toEqual(
+			encodeForest(buildForest(16, 2, [...picks, ...chain, ...spread])),
+		);
+	});
+
+	it("refuses a pending split that the old bitmap has, that has no split parent, or a count that does not agree", () => {
+		const before = buildForest(2, 3, [0, 3]);
+		const after = buildForest(2, 3, [0, 3, 5, 6]);
+		const old = parseHashBody(encodeForest(before));
+		const added = sortedNodeKeys([...after.children.keys()].filter((node) => !before.children.has(node)));
+		expect(() => mergeHashBitmap(old, 3, sortedNodeKeys(before.children.keys()).slice(0, 1))).toThrow(
+			invariantFailure(/already in the old bitmap/),
+		);
+		const orphan = sortedNodeKeys(["1.2.0"]);
+		expect(() => mergeHashBitmap(old, 3, orphan)).toThrow(invariantFailure(/no split parent/));
+		expect(() => mergeHashBitmap(old, after.children.size + 1, added)).toThrow(invariantFailure(/nodeCount/));
+		expect(() => mergeHashBitmap(old, after.children.size - 1, added)).toThrow(invariantFailure(/nodeCount/));
+	});
+});
+
+describe("topology codec — promoted-key Bloom filter", () => {
+	const keys = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => KeyCodec.encode(`user-${from + i}`));
+
+	it("extends the old filter with the new keys only, and gives the bits of a full build", () => {
+		const base = promotedKeysBloom(100, () => keys(0, 100));
+		const extended = promotedKeysBloom(150, () => [], { base, added: () => keys(100, 150) });
+		expect(extended).toEqual(promotedKeysBloom(150, () => keys(0, 150)));
+	});
+
+	it("builds the filter again from all the keys when the count needs a larger capacity", () => {
+		const base = promotedKeysBloom(TOPOLOGY_BLOOM_MIN_CAPACITY, () => keys(0, 10));
+		const all = keys(0, TOPOLOGY_BLOOM_MIN_CAPACITY + 1);
+		const grown = promotedKeysBloom(all.length, () => all, { base, added: () => [] });
+		expect(grown.capacity).toBe(2 * TOPOLOGY_BLOOM_MIN_CAPACITY);
+		expect(grown).toEqual(promotedKeysBloom(all.length, () => all));
 	});
 });
 
