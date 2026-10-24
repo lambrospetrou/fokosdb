@@ -167,33 +167,14 @@ export class FokosMigrationHost implements MigrationHost {
 		// The exact stored sizes, added per page, are what removes the whole-table estimate rebuild that
 		// used to close an import. A row already present contributes nothing, so a retried page cannot
 		// count its rows twice.
-		// Keyed by the KeyCodec.mapKey hash so no text is built per row. The hash is not an identity:
-		// two distinct hash keys can share one value, so a bucket holds every key of one hash and the
-		// raw bytes decide which entry a row joins. A bucket has one entry except on a collision.
-		const bytesByKey = new Map<bigint, { hk: KeyBytes; bytes: number }[]>();
+		const added: Array<{ hk: KeyBytes; bytes: number }> = [];
 		for (const item of items) {
 			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);
-			if (!inserted) {
-				continue;
-			}
-			const id = KeyCodec.mapKey(item.hk);
-			const bucket = bytesByKey.get(id);
-			if (bucket === undefined) {
-				bytesByKey.set(id, [{ hk: item.hk, bytes: estRowBytes }]);
-				continue;
-			}
-			const entry = bucket.find((e) => KeyCodec.compare(e.hk, item.hk) === 0);
-			if (entry) {
-				entry.bytes += estRowBytes;
-			} else {
-				bucket.push({ hk: item.hk, bytes: estRowBytes });
+			if (inserted) {
+				added.push({ hk: item.hk, bytes: estRowBytes });
 			}
 		}
-		for (const bucket of bytesByKey.values()) {
-			for (const { hk, bytes } of bucket) {
-				store.keySizes.add(hk, bytes);
-			}
-		}
+		store.keySizes.addRows(added);
 	}
 
 	// ─── pending transactions ─────────────────────────────────────────────────
@@ -310,7 +291,7 @@ export class FokosMigrationHost implements MigrationHost {
 }
 
 /** How the host reads the rows of one stream: as one key range, or as a walk over the hash keys. */
-type StreamReader<T, C extends { hk: KeyBytes; sk: KeyBytes }> = {
+export type StreamReader<T, C extends { hk: KeyBytes; sk: KeyBytes }> = {
 	readRange: (cursor: C | null, limit: number, range: KeyRange) => Iterable<T>;
 	walk: (
 		cursor: HashKeyWalkCursor<C> | null,
@@ -328,7 +309,7 @@ type StreamReader<T, C extends { hk: KeyBytes; sk: KeyBytes }> = {
  * decides for each row of the key, and a key that the child does not own costs one seek and one
  * scanned entry.
  */
-function collectStream<T extends { hk: KeyBytes; sk: KeyBytes }, C extends { hk: KeyBytes; sk: KeyBytes }>(
+export function collectStream<T extends { hk: KeyBytes; sk: KeyBytes }, C extends { hk: KeyBytes; sk: KeyBytes }>(
 	reader: StreamReader<T, C>,
 	cursor: HashKeyWalkCursor<C> | null,
 	range: KeyRange | null,
@@ -372,7 +353,7 @@ function collectStream<T extends { hk: KeyBytes; sk: KeyBytes }, C extends { hk:
 }
 
 /** The key range that holds every row of the slice, or null when the rows of the slice are not one key range. */
-function sliceKeyRange(slice: FokosSlice): KeyRange | null {
+export function sliceKeyRange(slice: FokosSlice): KeyRange | null {
 	switch (slice.kind) {
 		case "promoted_key":
 			return { hk: slice.hashKey, start: KeyCodec.encodeOptional(undefined), end: null };
@@ -472,14 +453,14 @@ export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, next
 	);
 }
 
-type StreamPosition = NonNullable<FokosDBHostCursor["cursor"]>;
+export type StreamPosition = NonNullable<FokosDBHostCursor["cursor"]>;
 
 /**
  * Compares two positions of one stream in its read order: `(hk, sk)` for items, and
  * `(hk, sk, transaction_id)` for locks. `after_key` is after every row of its hash key. A
  * transaction id is ASCII, so the string order of JavaScript is the byte order of SQLite.
  */
-function comparePositions(a: StreamPosition, b: StreamPosition): number {
+export function comparePositions(a: StreamPosition, b: StreamPosition): number {
 	const hk = (p: StreamPosition) => (p.kind === "row" ? p.row.hk : p.hk);
 	const byHashKey = KeyCodec.compare(hk(a), hk(b));
 	if (byHashKey !== 0 || a.kind === "after_key" || b.kind === "after_key") {

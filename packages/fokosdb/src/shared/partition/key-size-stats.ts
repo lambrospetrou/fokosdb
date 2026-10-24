@@ -89,6 +89,33 @@ export class KeySizeStats {
 		);
 	}
 
+	/** Adds the bytes of many new rows, with one `add` for each hash key. */
+	addRows(rows: Iterable<{ hk: KeyBytes; bytes: number }>): void {
+		// Keyed by the KeyCodec.mapKey hash so no text is built per row. The hash is not an identity:
+		// two distinct hash keys can share one value, so a bucket holds every key of one hash and the
+		// raw bytes decide which entry a row joins. A bucket has one entry except on a collision.
+		const bytesByKey = new Map<bigint, { hk: KeyBytes; bytes: number }[]>();
+		for (const { hk, bytes } of rows) {
+			const id = KeyCodec.mapKey(hk);
+			const bucket = bytesByKey.get(id);
+			if (bucket === undefined) {
+				bytesByKey.set(id, [{ hk, bytes }]);
+				continue;
+			}
+			const entry = bucket.find((e) => KeyCodec.compare(e.hk, hk) === 0);
+			if (entry) {
+				entry.bytes += bytes;
+			} else {
+				bucket.push({ hk, bytes });
+			}
+		}
+		for (const bucket of bytesByKey.values()) {
+			for (const { hk, bytes } of bucket) {
+				this.add(hk, bytes);
+			}
+		}
+	}
+
 	/**
 	 * Removes the bytes of deleted rows of `hk`. When the deleted rows held all the bytes of the key,
 	 * no item of the key remains, so the row and its index entry are deleted. Without this, a

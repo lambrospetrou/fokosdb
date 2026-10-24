@@ -835,6 +835,56 @@ export type PartitionStoreOptions = {
 	onChangeCaptured?: () => void;
 };
 
+/**
+ * Walks a table one hash key at a time, strictly after `cursor`, for a read whose rows are not one
+ * key range (a hash child). `firstRowAfter` gives the first row of the first hash key above `after`
+ * (null = the first key of the table). `owns` decides each hash key one time, from its first row. The
+ * walk gives each row of an owned key, which `readKey` reads with a range on that key. For a key that
+ * it does not own, it gives one `skipped` entry: one seek on the key index steps past all the rows of
+ * that key, and reads no `data`.
+ *
+ * Do NOT find the next hash key with `SELECT DISTINCT hk ... LIMIT ?`. SQLite reads each index entry
+ * of each key for DISTINCT, and does not skip. The walk does one `hk > ?` seek for each key.
+ *
+ * `limit` counts the entries of both kinds, so the scan limit of a caller also stops a run of keys
+ * that it does not own. The walk gives fewer than `limit` entries only at the end of the table. The
+ * caller rules of `PartitionStore.queryItemsPage` apply.
+ */
+export function* walkByHashKey<T, C extends { hk: KeyBytes; sk: KeyBytes }>(
+	firstRowAfter: (after: KeyBytes | null) => { hk: KeyBytes; sk: KeyBytes } | undefined,
+	cursor: HashKeyWalkCursor<C> | null,
+	limit: number,
+	owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
+	readKey: (after: C | null, limit: number, range: KeyRange) => Iterable<T>,
+): Generator<HashKeyWalkEntry<T>> {
+	let given = 0;
+	if (cursor?.kind === "row") {
+		// The cursor stops on a row only inside an owned key, so the rest of that key is owned.
+		const { row: at } = cursor;
+		for (const row of readKey(at, limit, { hk: at.hk, start: at.sk, end: null })) {
+			given++;
+			yield { kind: "row", row };
+		}
+	}
+	let after = cursor === null ? null : cursor.kind === "row" ? cursor.row.hk : cursor.hk;
+	while (given < limit) {
+		const first = firstRowAfter(after);
+		if (first === undefined) {
+			return;
+		}
+		if (owns(first.hk, first.sk)) {
+			for (const row of readKey(null, limit - given, { hk: first.hk, start: first.sk, end: null })) {
+				given++;
+				yield { kind: "row", row };
+			}
+		} else {
+			given++;
+			yield { kind: "skipped", hk: first.hk };
+		}
+		after = first.hk;
+	}
+}
+
 export class PartitionStore {
 	/** The size estimate of each hash key. */
 	readonly keySizes: KeySizeStats;
@@ -1519,56 +1569,20 @@ export class PartitionStore {
 		return this.#walkByHashKey("pending_transactions", cursor, limit, owns, (after, n, range) => this.queryPendingTxPage(after, n, range));
 	}
 
-	/**
-	 * Walks `table` one hash key at a time, strictly after `cursor`, for a read whose rows are not one
-	 * key range (a hash child). `owns` decides each hash key one time, from its first row. The walk
-	 * gives each row of an owned key, which `readKey` reads with a range on that key. For a key that it
-	 * does not own, it gives one `skipped` entry: one seek on the key index steps past all the rows of
-	 * that key, and reads no `data`.
-	 *
-	 * Do NOT find the next hash key with `SELECT DISTINCT hk ... LIMIT ?`. SQLite reads each index entry
-	 * of each key for DISTINCT, and does not skip. The walk does one `hk > ?` seek for each key.
-	 *
-	 * `limit` counts the entries of both kinds, so the scan limit of a caller also stops a run of keys
-	 * that it does not own. The walk gives fewer than `limit` entries only at the end of the table. The
-	 * caller rules of `queryItemsPage` apply.
-	 */
-	*#walkByHashKey<T, C extends { hk: KeyBytes; sk: KeyBytes }>(
+	/** `walkByHashKey` over `table`, which finds the next hash key with one seek of its key index. */
+	#walkByHashKey<T, C extends { hk: KeyBytes; sk: KeyBytes }>(
 		table: HashKeyWalkTable,
 		cursor: HashKeyWalkCursor<C> | null,
 		limit: number,
 		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
 		readKey: (after: C | null, limit: number, range: KeyRange) => Iterable<T>,
 	): Generator<HashKeyWalkEntry<T>> {
-		let given = 0;
-		if (cursor?.kind === "row") {
-			// The cursor stops on a row only inside an owned key, so the rest of that key is owned.
-			const { row: at } = cursor;
-			for (const row of readKey(at, limit, { hk: at.hk, start: at.sk, end: null })) {
-				given++;
-				yield { kind: "row", row };
-			}
-		}
-		let after = cursor === null ? null : cursor.kind === "row" ? cursor.row.hk : cursor.hk;
-		while (given < limit) {
+		const firstRowAfter = (after: KeyBytes | null) => {
 			const { sql, params } = nextHashKeyStatement(table, after);
-			const first = tryOne(this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params));
-			if (first === undefined) {
-				return;
-			}
-			const hk = fromSqlKey(first.hk);
-			const firstSk = fromSqlKey(first.sk);
-			if (owns(hk, firstSk)) {
-				for (const row of readKey(null, limit - given, { hk, start: firstSk, end: null })) {
-					given++;
-					yield { kind: "row", row };
-				}
-			} else {
-				given++;
-				yield { kind: "skipped", hk };
-			}
-			after = hk;
-		}
+			const row = tryOne(this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params));
+			return row && { hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk) };
+		};
+		return walkByHashKey(firstRowAfter, cursor, limit, owns, readKey);
 	}
 
 	/**

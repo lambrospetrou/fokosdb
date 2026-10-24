@@ -68,6 +68,11 @@ export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSwe
 };
 
 export type MaterializationDOConfig = Readonly<{
+	/**
+	 * A base hash key moves into a range partition of its own when its size reaches
+	 * `hashSplitConditions.maxSizeMb` times this fraction. Valid values are in (0, 1).
+	 */
+	promotionFraction: number;
 	/** The runner that sends the changes to the targets. */
 	targetRunner: Readonly<TargetRunnerConfig>;
 	/** The cleanup of the finished change positions and of the tombstones that no target needs. */
@@ -75,6 +80,7 @@ export type MaterializationDOConfig = Readonly<{
 }>;
 
 export type MaterializationDOConfigOverrides = {
+	promotionFraction?: number;
 	targetRunner?: Partial<TargetRunnerConfig>;
 	cleanup?: Partial<MaterializationCleanupConfig>;
 };
@@ -164,6 +170,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 });
 
 export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreeze({
+	promotionFraction: 0.25,
 	targetRunner: {
 		concurrency: 2,
 		// The item limit of `batchWriteItems`.
@@ -223,6 +230,7 @@ export function resolveMaterializationConfig(overrides: MaterializationDOConfigO
 	if (c === DEFAULT_MATERIALIZATION_CONFIG) {
 		return c;
 	}
+	check(c.promotionFraction > 0 && c.promotionFraction < 1, () => `promotionFraction must be in (0, 1), got ${c.promotionFraction}`);
 	validateTargetRunnerConfig(c.targetRunner);
 	validateMaterializationCleanupConfig(c.cleanup);
 	return c;

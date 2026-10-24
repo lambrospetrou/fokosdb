@@ -1,5 +1,6 @@
 import { hashChildIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import invariant from "../shared/invariant.js";
 
 /**
  * The part of a source partition's keyspace that one repartition target owns.
@@ -54,4 +55,11 @@ export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey:
 /** Says whether one hash key belongs to the slice, ignoring the sort-key axis. */
 export function sliceIncludesHashKey(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number): boolean {
 	return hashKeyInSlice(slice, hashKey, hashSplitN);
+}
+
+/** The one key of a promotion plan: its single target carries a `promoted_key` slice. */
+export function promotedKeyOf(plan: { targets: ReadonlyArray<{ slice: FokosSlice }> }): KeyBytes {
+	const slice = plan.targets[0]?.slice;
+	invariant(slice?.kind === "promoted_key", "fokos/repartition: a promotion plan carries one promoted_key slice");
+	return slice.hashKey;
 }

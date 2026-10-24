@@ -52,7 +52,7 @@ const sent = (call: Call) => call.batch.items.map((item) => `${String(item.baseH
 const applyAll = ({ batch }: Call): PushTargetResult[] => batch.items.map(() => ({ outcome: "applied" }));
 
 async function withRunner(
-	opts: { targets?: string[]; answer?: Answer; config?: Partial<TargetRunnerConfig> },
+	opts: { targets?: string[]; answer?: Answer; config?: Partial<TargetRunnerConfig>; owns?: (hk: string) => boolean },
 	fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`runner-test.${crypto.randomUUID()}`);
@@ -77,7 +77,7 @@ async function withRunner(
 			cleanup,
 			targets: () => targets,
 			canRun: () => true,
-			ownerCheck: () => () => true,
+			ownerCheck: () => (row) => opts.owns?.(KeyCodec.decode(row.hk) as string) ?? true,
 			producerId: () => "aa".repeat(32),
 			push: async (target, batch) => {
 				const call = { targetId: target.targetId, batch };
@@ -525,6 +525,105 @@ describe("TargetRunner — cleanup", () => {
 			h.ingest("y", 2, { deleted: true });
 			await h.drain();
 			expect(h.count("latest_items")).toBe(0);
+		});
+	});
+});
+
+describe("TargetRunner — splits", () => {
+	const ANCESTOR = "bb".repeat(32);
+
+	it("sends the ancestor fences of a target until its cursor reaches them and no inherited retry row is left", async () => {
+		let failA = true;
+		const answer = ({ batch }: Call): PushTargetResult[] =>
+			batch.items.map((item) => (item.baseHashKey === "a" && failA ? { outcome: "retry" } : { outcome: "applied" }));
+		await withRunner({ answer }, async (h) => {
+			const fences = () => h.sql.exec(`SELECT ancestor_id, min_epoch, until_id FROM ancestor_fences`).toArray();
+			const addFence = () =>
+				h.sql.exec(`INSERT INTO ancestor_fences (target_id, ancestor_id, min_epoch, until_id) VALUES ('t1', ?, 3, 2)`, ANCESTOR);
+			addFence();
+			h.ingest("a", 1);
+			h.ingest("b", 1);
+			await h.drain();
+			expect(h.calls[0].batch.ancestorFences).toEqual([{ ancestorId: ANCESTOR, minEpoch: 3 }]);
+			// The cursor reached `until_id`, and the `retry` row of a is not inherited.
+			expect(h.target("t1").cursorSeq).toBe(2);
+			expect(fences()).toEqual([]);
+
+			// An inherited `retry` row keeps the fences after the cursor reached them.
+			h.sql.exec(`UPDATE target_retry SET is_inherited = 1`);
+			addFence();
+			failA = false;
+			h.advance(CONFIG.retryBackoffMaxMs);
+			h.runner.wake();
+			await h.drain();
+			expect(h.calls.map(sent)).toEqual([["a@1", "b@1"], ["a@1"]]);
+			expect(h.calls[1].batch.ancestorFences).toEqual([{ ancestorId: ANCESTOR, minEpoch: 3 }]);
+			expect(h.retryRows()).toEqual([]);
+			expect(fences()).toEqual([]);
+		});
+	});
+
+	it("keeps the ancestor fences while a promotion snapshot cursor is below them", async () => {
+		await withRunner({}, async (h) => {
+			const fences = () => h.sql.exec(`SELECT ancestor_id FROM ancestor_fences`).toArray();
+			h.sql.exec(`INSERT INTO ancestor_fences (target_id, ancestor_id, min_epoch, until_id) VALUES ('t1', ?, 3, 2)`, ANCESTOR);
+			// The promotion child starts from the snapshot cursor 0, so it needs the fence up to 2.
+			h.store.storeCursorSnapshot(kb("p"));
+			h.ingest("a", 1);
+			h.ingest("b", 1);
+			await h.drain();
+			expect(h.target("t1").cursorSeq).toBe(2);
+			expect(fences()).toEqual([{ ancestor_id: ANCESTOR }]);
+
+			h.store.deleteCursorSnapshot(kb("p"));
+			h.runner.wake();
+			await h.drain();
+			expect(fences()).toEqual([]);
+		});
+	});
+
+	it("moves the backoff of the retry row of a moved item while a promotion runs, and deletes the row after", async () => {
+		let moved = false;
+		const answer = ({ batch }: Call): PushTargetResult[] =>
+			batch.items.map((item) => (item.baseHashKey === "a" ? { outcome: "retry" } : { outcome: "applied" }));
+		await withRunner({ answer, owns: (hk) => !(moved && hk === "a") }, async (h) => {
+			h.ingest("a", 1);
+			h.ingest("b", 1);
+			await h.drain();
+			expect(h.retryRows()).toMatchObject([{ hk: "a", kind: "retry" }]);
+			const calls = h.calls.length;
+
+			moved = true;
+			h.store.storeCursorSnapshot(kb("a"));
+			h.advance(CONFIG.retryBackoffMaxMs);
+			h.runner.wake();
+			await h.drain();
+			expect(h.calls).toHaveLength(calls);
+			expect(h.retryRows()).toMatchObject([{ hk: "a", not_before: h.now() + CONFIG.retryBackoffMaxMs }]);
+
+			// After the completion, the child has the row, so the source deletes it.
+			h.store.deleteCursorSnapshot(kb("a"));
+			h.advance(CONFIG.retryBackoffMaxMs);
+			h.runner.wake();
+			await h.drain();
+			expect(h.retryRows()).toEqual([]);
+			expect(h.calls).toHaveLength(calls);
+		});
+	});
+
+	it("keeps the positions above a promotion snapshot until the promotion completes", async () => {
+		await withRunner({}, async (h) => {
+			h.store.storeCursorSnapshot(kb("p"));
+			h.ingest("a", 1);
+			h.ingest("b", 1);
+			await h.drain();
+			expect(h.target("t1").cursorSeq).toBe(2);
+			expect(h.count("change_positions")).toBe(2);
+
+			h.store.deleteCursorSnapshot(kb("p"));
+			h.runner.wake();
+			await h.drain();
+			expect(h.count("change_positions")).toBe(0);
 		});
 	});
 });

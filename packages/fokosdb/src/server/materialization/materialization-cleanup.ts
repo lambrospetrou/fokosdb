@@ -14,6 +14,9 @@
  * and a caller reports each other event with `tombstoneUnblocked()`.
  * Thus a target that is down, and that holds the lowest cursor, does not make each pass read all the
  * tombstones again.
+ *
+ * The lowest cursor is `MaterializationStore.cleanupBound()`: it also holds each cursor of each
+ * promotion snapshot, so a promotion child gets each row above its snapshot.
  */
 import invariant from "../../shared/invariant.js";
 import type { MaterializationStore, TombstoneCursor } from "./materialization-store.js";
@@ -72,7 +75,7 @@ export class MaterializationCleanup {
 				return false;
 			}
 			this.#unblocked = false;
-			this.#pass = { phase: "positions", minCursor: store.minCursor() };
+			this.#pass = { phase: "positions", minCursor: store.cleanupBound() };
 		}
 		const config = this.#deps.config();
 		const pass = this.#pass;
@@ -121,7 +124,7 @@ export class MaterializationCleanup {
 
 	/** True when a tombstone can be free now, or when the lowest cursor moved since the last pass. */
 	#hasNewWork(): boolean {
-		return this.#unblocked || this.#deps.store.minCursor() !== this.#lastMinCursor;
+		return this.#unblocked || this.#deps.store.cleanupBound() !== this.#lastMinCursor;
 	}
 }
 

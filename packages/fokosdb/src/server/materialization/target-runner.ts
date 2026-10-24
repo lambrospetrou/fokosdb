@@ -15,7 +15,8 @@
  *
  * Each call carries the epoch of its target. The runner raises the epoch when an earlier call can
  * still apply: after an answer that it does not know, and at the first claim after a restart while a
- * batch was open (`is_batch_open`).
+ * batch was open (`is_batch_open`). On a split child, each call also carries the ancestor fences of
+ * its target until the inherited work of the target is done.
  */
 import invariant from "../../shared/invariant.js";
 import { decodeItemKeys } from "../../shared/transaction-limits.js";
@@ -96,6 +97,7 @@ type ClaimedItem = { itemId: number; revision: number; deleted: boolean; hk: Key
 
 type ClaimedBatch = {
 	epoch: number;
+	ancestorFences: Array<{ ancestorId: string; minEpoch: number }>;
 	/** The cursor that the claim read. */
 	cursor: number;
 	/** The highest position that the claim read, or null when it read none. */
@@ -280,19 +282,23 @@ export class TargetRunner {
 			// A batch of the instance before the restart can still apply. A raise before the next call
 			// makes each receiver that gets the next call first reject that late call.
 			const epoch = firstClaim && row.isBatchOpen ? store.raiseTargetEpoch(targetId) : row.epoch;
-			const { refs, highestSeq } = this.#claimRefs(targetId, row.cursorSeq);
-			const items = this.#claimItems(refs);
+			const { refs, retryCount, highestSeq } = this.#claimRefs(targetId, row.cursorSeq);
+			const items = this.#claimItems(targetId, refs, retryCount);
 			if (items.length === 0) {
 				// No batch of the current epoch is in flight, so the marker can go.
 				if (highestSeq !== null || row.isBatchOpen) {
 					store.updateTarget(targetId, highestSeq ?? row.cursorSeq, false);
 				}
+				store.dropDoneTargetFences(targetId);
 				return { batch: null, readNothing: highestSeq === null };
 			}
 			if (!row.isBatchOpen) {
 				store.openTargetBatch(targetId);
 			}
-			return { batch: { epoch, cursor: row.cursorSeq, highestSeq, items }, readNothing: false };
+			// The claim can delete an inherited `retry` row, so the fences can be done.
+			store.dropDoneTargetFences(targetId);
+			const ancestorFences = store.targetFences(targetId);
+			return { batch: { epoch, ancestorFences, cursor: row.cursorSeq, highestSeq, items }, readNothing: false };
 		});
 		state.started = true;
 		if (claim.batch === null) {
@@ -308,9 +314,10 @@ export class TargetRunner {
 	 * read. The due `retry` rows come first, up to half of the items and half of the bytes of a batch.
 	 * Then the positions above the cursor fill the batch. Each part takes at least one item, so the
 	 * `retry` rows cannot stop the cursor. A position is done for the target and is skipped when its
-	 * item has a `retry` row, or is already in the batch.
+	 * item has a `retry` row, or is already in the batch. The first `retryCount` refs come from the
+	 * `retry` rows.
 	 */
-	#claimRefs(targetId: string, cursor: number): { refs: TargetItemRef[]; highestSeq: number | null } {
+	#claimRefs(targetId: string, cursor: number): { refs: TargetItemRef[]; retryCount: number; highestSeq: number | null } {
 		const { store } = this.#deps;
 		const config = this.#deps.config();
 		const refs: TargetItemRef[] = [];
@@ -342,20 +349,34 @@ export class TargetRunner {
 			}
 			highestSeq = position.seq;
 		}
-		return { refs, highestSeq };
+		return { refs, retryCount: positionStart, highestSeq };
 	}
 
 	/**
 	 * Reads the image of each claimed item, in the snapshot of the claim. An item that moved to another
 	 * partition is skipped: its position is done here, and the new owner sends it.
+	 *
+	 * The `retry` row of a moved item sends nothing here, so the claim deletes it. While a promotion of
+	 * this partition is between its cutover and its completion, the child can still need the row, so
+	 * the claim moves its backoff end instead. The row then does not fill the `retry` part of each batch.
 	 */
-	#claimItems(refs: readonly TargetItemRef[]): ClaimedItem[] {
+	#claimItems(targetId: string, refs: readonly TargetItemRef[], retryCount: number): ClaimedItem[] {
 		const { store } = this.#deps;
 		const owns = this.#deps.ownerCheck();
 		const items: ClaimedItem[] = [];
-		for (const ref of refs) {
+		for (const [i, ref] of refs.entries()) {
 			const image = store.targetImage(ref.itemId);
-			if (image === undefined || !owns(image)) {
+			if (image === undefined) {
+				continue;
+			}
+			if (!owns(image)) {
+				if (i < retryCount) {
+					if (store.hasCursorSnapshots()) {
+						store.deferTargetRetry(targetId, ref.itemId, this.#deps.now() + this.#deps.config().retryBackoffMaxMs);
+					} else {
+						store.deleteTargetRetry(targetId, ref.itemId);
+					}
+				}
 				continue;
 			}
 			items.push({
@@ -380,7 +401,7 @@ export class TargetRunner {
 		const request: PushTargetBatch = {
 			producerId: this.#deps.producerId(),
 			epoch: batch.epoch,
-			ancestorFences: [],
+			ancestorFences: batch.ancestorFences,
 			items: batch.items.map((item) => item.record),
 		};
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -442,6 +463,7 @@ export class TargetRunner {
 			if (cursor !== row.cursorSeq || !more) {
 				store.updateTarget(targetId, cursor, more);
 			}
+			store.dropDoneTargetFences(targetId);
 			return { unblocked };
 		});
 		if (outcome === "discarded") {

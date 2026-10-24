@@ -211,21 +211,22 @@ describe("MaterializationDO — applyLatestImages size and routing", () => {
 		const mat = makeMaterialization({ maxSizeMb: 0.0001, keepTombstones: true });
 		await mat.refuse("x");
 		const m = mat.at("x");
+		// The applied delete asks for a split, which can start before a later call. Thus one call holds
+		// each case. Its items apply in order, so the live image of y finds the stored revision 2: it
+		// needs no write, so it is acknowledged.
 		const res = await apply(m, {
 			epoch: 2,
 			ancestorFences: [{ ancestorId: OTHER_PRODUCER, minEpoch: 4 }],
-			items: [live(0, "x", 1), deleted(1, "y", 2)],
+			items: [live(0, "x", 1), deleted(1, "y", 2), live(2, "y", 1)],
 		});
 		expect(res).toMatchObject({
-			acknowledged: [{ opIndex: 1 }],
+			acknowledged: [{ opIndex: 1 }, { opIndex: 2 }],
 			failed: [{ outcome: "unprocessed", code: "partition_over_size", opIndexes: [0] }],
 		});
 		expect(await storedImage(m.stub, "x")).toBeUndefined();
 		// The receiver rules ran for the refused image too.
 		expect(await producerEpoch(m.stub, PRODUCER)).toBe(2);
 		expect(await producerEpoch(m.stub, OTHER_PRODUCER)).toBe(4);
-		// A live image at or below the stored revision needs no write, so it is acknowledged.
-		expect(await apply(m, { epoch: 2, items: [live(0, "y", 1)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }], failed: [] });
 	});
 
 	it("answers each item of a call by its opIndex, at the root that owns its key", async () => {

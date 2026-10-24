@@ -15,19 +15,21 @@ import type {
 	FokosShardingRpc,
 	FokosStartImportRequest,
 	FokosStatusRequest,
-	MigrationHost,
 } from "../../sharding/repartition-types.js";
+import { promotedKeyOf } from "../../sharding/repartition-slice.js";
 import { identityDepth } from "../../sharding/partition-id.js";
 import { materializationStubByName, pushTargetStub } from "../../shared/do-stubs.js";
 import { CONFLICT_CODES, FokosConflictError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../shared/errors.js";
-import invariant from "../../shared/invariant.js";
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
 import { mergeBatchParts, withOffset, type BatchFailure } from "../../shared/batch-merge.js";
 import { ADMISSION_MARGIN } from "../../shared/transaction-limits.js";
 import type { WirePartitionMeta } from "../../shared/types.js";
+import type { KeyBytes } from "../../sharding/key-codec.js";
 import { resolveMaterializationConfig, type MaterializationDOConfig, type MaterializationDOConfigOverrides } from "../host-config.js";
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
 import { MaterializationCleanup } from "./materialization-cleanup.js";
+import { MaterializationMigrationHost } from "./materialization-migration-host.js";
+import { maxSplitBytes, SplitPlanner } from "../../shared/partition/split-planner.js";
 import { TargetRunner } from "./target-runner.js";
 import { validateTargets, type FokosTargetDefinition } from "./targets.js";
 
@@ -84,26 +86,16 @@ type MaterializationRpc = FokosShardingRpc & {
 };
 
 /**
- * This class does not split: `evaluateSplit` never starts a repartition and nothing asks it for a
- * promotion, so the runtime never calls its migration host.
- */
-const NO_MIGRATION: MigrationHost = {
-	buildPage: () => noSplit(),
-	applyPage: () => noSplit(),
-	validatePage: () => noSplit(),
-};
-
-function noSplit(): never {
-	invariant(false, "fokos/mat: MaterializationDO does not split");
-}
-
-/**
  * The latest image of each changed base item of a table, in the shard group `fokos.m.<tableName>`. It
  * routes by the base key `(hashKey, sortKey)`, so a split of the base table does not change the owner
  * of an item here. Each base partition exports its changes with `applyLatestImages`.
  *
  * Each accepted image gets a change position, and the target runner sends the latest image of each
  * changed item to each target of `fokosTargets()`.
+ *
+ * It splits with the rules of `PartitionDO`: a hash split, a promotion of a large base hash key, and a
+ * range split of a promoted key. The migration moves the items with their positions and their
+ * `target_retry` rows, and the split fences of each target.
  */
 export class MaterializationDO extends DurableObject<Env> implements MaterializationRpc {
 	/** The sharding runtime: identity, routing, and the alarm. */
@@ -111,12 +103,25 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	#store: MaterializationStore;
 	#runner: TargetRunner;
 	#cleanup: MaterializationCleanup;
+	#splitPlanner: SplitPlanner;
 	/** The stored target list, read one time for each instance. */
 	#targetList: readonly FokosTargetDefinition[] | undefined;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new MaterializationStore(ctx.storage);
+		this.#splitPlanner = new SplitPlanner({
+			keySizes: this.#store.keySizes,
+			source: {
+				probeHashKeys: () => this.#store.probeHashKeys(),
+				sortKeySizes: (hashKey, start, end) => this.#store.sortKeySizes(hashKey, start, end),
+			},
+			databaseSize: () => this.#store.databaseSize,
+			promotionFraction: () => this.config().promotionFraction,
+			rangeSplitN: () => this.fokos.routeContext().rangeConfig.rangeSplitN,
+			logName: "fokos/mat",
+			logParams: () => this.logParams(),
+		});
 		this.#cleanup = new MaterializationCleanup({
 			store: this.#store,
 			config: () => this.config().cleanup,
@@ -225,8 +230,43 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 
 	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		return {
-			evaluateSplit: () => false,
-			migration: NO_MIGRATION,
+			evaluateSplit: (input) => this.#splitPlanner.evaluateSplit(input),
+			computeRangeBoundaries: ({ hashKey, start, end, childCount }) => this.#splitPlanner.rangeBoundaries(hashKey, start, end, childCount),
+			migration: new MaterializationMigrationHost({ store: this.#store, selfId: () => this.ctx.id.toString() }),
+			// Each call of a target from before the cutover then has an epoch below the epoch that the
+			// child gets with its inherited work, so each receiver rejects a late call. A promotion
+			// source keeps its other keys and its runner continues, so its cursors move past the moved
+			// items. The snapshot keeps the cursors of the cutover for the child.
+			onRepartitionCutover: (plan) => {
+				this.#store.raiseAllTargetEpochs();
+				if (plan.kind === "key_promotion") {
+					this.#store.storeCursorSnapshot(promotedKeyOf(plan));
+				}
+			},
+			// The child has each row of the promoted key now. Each new write of the key goes to the
+			// child, so the estimate is not necessary, and the cleanup can delete the rows above the
+			// snapshot.
+			beforeComplete: (plan) => {
+				if (plan.kind === "key_promotion") {
+					const hashKey = promotedKeyOf(plan);
+					this.#store.keySizes.remove(hashKey);
+					this.#store.deleteCursorSnapshot(hashKey);
+				}
+			},
+			// A split keeps its rows, as `PartitionDO` does. A promotion deletes the items of its key in
+			// steps of a limited size, because one large delete holds each request of this partition
+			// until its write is durable.
+			cleanupSourceStep: (plan) => {
+				if (plan.kind !== "key_promotion") {
+					return true;
+				}
+				const hashKey = promotedKeyOf(plan);
+				if (!this.#store.transactionSync(() => this.#store.deleteItemsOfHashKey(hashKey, this.config().cleanup.deleteRows))) {
+					return false;
+				}
+				this.#store.keySizes.remove(hashKey);
+				return true;
+			},
 			jobs: [
 				{
 					name: JOB_TARGET_PUSH,
@@ -312,10 +352,8 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 			read: Math.max(row.cursorSeq, this.#runner.readPosition(row.targetId) ?? row.cursorSeq),
 		}));
 		let accepted = false;
+		const grown: Array<{ hashKey: KeyBytes; keyEstBytes: number }> = [];
 		const overSize = req.items.some((item) => !item.deleted) ? this.sizeRefusal() : undefined;
-		if (overSize) {
-			call.signal({ evaluateSplit: true });
-		}
 		const fail = (error: unknown, opIndex: number) =>
 			out.failed.push({ ...classifyBatchFailure(error, { write: true, local: true }), opIndexes: [opIndex], partitionIndex: 0 });
 		for (const item of req.items) {
@@ -339,7 +377,10 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 					if (overSize && !item.deleted) {
 						return "over_size";
 					}
-					this.#store.putLatestImage(item, this.fokosNow(), current, targets);
+					const keyEstBytes = this.#store.putLatestImage(item, this.fokosNow(), current, targets);
+					if (keyEstBytes !== undefined && !item.deleted) {
+						grown.push({ hashKey: item.hashKey, keyEstBytes });
+					}
 					if (item.deleted && targets.length === 0) {
 						// No target reads the tombstone, so the cleanup can delete it now.
 						this.#cleanup.tombstoneUnblocked();
@@ -363,14 +404,22 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 		if (accepted) {
 			this.#runner.wake();
 		}
+		// A key that grew past its share of the size limit gets its own range tree. Promotions are
+		// signaled first, because an unfinished promotion blocks the split behind it.
+		const promotionCandidates = this.#splitPlanner.promotionCandidates(this.fokos.identity(), this.fokos.policy(), grown);
+		if (promotionCandidates.length > 0) {
+			call.signal({ promotionCandidates });
+		}
+		if (accepted || overSize) {
+			call.signal({ evaluateSplit: true });
+		}
 		return out;
 	}
 
 	/** The refusal of a live image above the admission limit of this partition, or undefined below it. */
 	private sizeRefusal(): FokosUnavailableError | undefined {
-		const policy = this.fokos.policy();
-		const maxSizeMb = (this.fokos.identity().kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
-		if (maxSizeMb && this.#store.databaseSize > maxSizeMb * ADMISSION_MARGIN * 1024 * 1024) {
+		const maxSizeBytes = maxSplitBytes(this.fokos.identity(), this.fokos.policy());
+		if (maxSizeBytes > 0 && this.#store.databaseSize > maxSizeBytes * ADMISSION_MARGIN) {
 			return new FokosUnavailableError(UNAVAILABLE_CODES.partition_over_size, {
 				message: "the materialization partition exceeded its limits, please retry later",
 				attributes: { operation: "applyLatestImages" },

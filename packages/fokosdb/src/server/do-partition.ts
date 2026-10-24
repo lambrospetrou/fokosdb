@@ -49,6 +49,7 @@ import {
 } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry } from "../shared/partition/ttl-expiry.js";
 import { SplitPlanner } from "../shared/partition/split-planner.js";
+import { promotedKeyOf } from "../sharding/repartition-slice.js";
 import { resolvePartitionConfig, type PartitionDOConfig, type PartitionDOConfigOverrides } from "./host-config.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
@@ -61,7 +62,6 @@ import type {
 	FokosLocalCall,
 	FokosOperations,
 	FokosRangeVisit,
-	FokosRepartitionPlan,
 	FokosShardingHooks,
 } from "../sharding/runtime-types.js";
 import type {
@@ -1790,13 +1790,6 @@ function mergePrepare(parts: Array<FokosGroupPart<PrepareRequest, PrepareRespons
 	}
 	applyImageCap(merged);
 	return { outcome: "rejected", results: merged, partitions };
-}
-
-/** The one key of a promotion plan: its single target carries a `promoted_key` slice. */
-function promotedKeyOf(plan: FokosRepartitionPlan): KeyBytes {
-	const slice = plan.targets[0]?.slice;
-	invariant(slice?.kind === "promoted_key", "fokos/partition: a promotion plan carries one promoted_key slice");
-	return slice.hashKey;
 }
 
 /** The migration status the partition suites read, taken from the import state. */

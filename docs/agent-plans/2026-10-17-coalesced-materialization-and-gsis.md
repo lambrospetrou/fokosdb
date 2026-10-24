@@ -44,6 +44,9 @@ global secondary indexes (GSIs) and push targets.
     - [4.3.4 Capture on a table that has data](#434-capture-on-a-table-that-has-data)
     - [4.3.5 Base version on GSI queries](#435-base-version-on-gsi-queries)
     - [4.3.6 Target changes and target versions](#436-target-changes-and-target-versions)
+    - [4.3.7 Applied map for each target](#437-applied-map-for-each-target)
+    - [4.3.8 Skip a GSI write that changes nothing](#438-skip-a-gsi-write-that-changes-nothing)
+    - [4.3.9 Time limit and status for promotion snapshots](#439-time-limit-and-status-for-promotion-snapshots)
 - [5. Alternative Options](#5-alternative-options)
   - [5.1 Base outbox, base shadow, and stateless Queue fan-out](#51-base-outbox-base-shadow-and-stateless-queue-fan-out)
   - [5.2 Separate `GsiMaintainerDO` worker tier](#52-separate-gsimaintainerdo-worker-tier)
@@ -230,7 +233,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   fence removal check to each delete of an outbox row. Delete unowned outbox copies in `cleanupSourceStep` (Sections
   4.2.3, 4.2.9, and 4.2.12).
 
-### Milestone 3: Target runner and push targets
+### Milestone 3 — DONE — Target runner and push targets
 - Add the `MaterializationDO.fokosTargets()` method override and the stored target list `__fokosdb/mat/targets`
   (Section 4.2.13).
 - Build these parts (Sections 4.2.5 to 4.2.12):
@@ -633,7 +636,8 @@ the partition. Then the ingest does one of these steps:
 4. **Otherwise,** the ingest inserts `(N, X, e)` and sets `newest_seq = N`.
 
 When no target is registered, the ingest writes no position. A cleanup step deletes the rows with
-`seq <= MIN(C_t)` in bounded chunks.
+`seq <= MIN(C_t)` in bounded chunks. While a promotion of the partition is between its cutover and its completion, the
+bound is also at or below each cursor of its snapshot (Section 4.2.12, "Promotion source").
 
 The positions must keep these invariants:
 
@@ -714,7 +718,8 @@ A step of target `t` has these parts:
    - the item is already in the batch,
    - the partition does not own the item (`!this.fokos.owns(key)`), because the item moved to another partition.
 
-   A skipped position is done for `t`.
+   A skipped position is done for `t` on this partition. A promotion child does not use the cursor of the source. It
+   gets the cursors of the source at the cutover (Section 4.2.12, "Promotion source").
 3. **Build.** The step builds the entries from the latest image of each item: GSI entries (Section 4.2.7) or a push
    record (Section 4.2.8). It sets `R_t` to the highest position that the claim read.
 4. **Send.** The step sends the call with `producerId`, `epoch`, and the ancestor fences (Section 4.2.9).
@@ -1015,7 +1020,8 @@ target hop). The parent is the source of the split, and the child is each target
 1. **The parent raises its epoch.** The parent raises its epoch by 1 in the cutover transaction of the split, in the
    runtime hook `onRepartitionCutover`. The base partition raises `materialization_export_state.epoch`.
    `MaterializationDO` raises the epoch of each target. The last page of the export state gives each child the
-   current epoch `E` of the parent. The parent stores nothing for the split.
+   current epoch `E` of the parent. A base partition stores nothing for the split. A `MaterializationDO` promotion
+   source also stores the cursor of each target at the cutover (Section 4.2.12, "Promotion source").
    - After the cutover, the claims of the parent skip the rows of the moved slice (step 2). Thus only the calls that
      the parent claimed before the cutover can carry those rows, and the raise gives each of them an epoch below
      `E`.
@@ -1149,6 +1155,9 @@ These rules apply:
    position of the item (rule 1), so the `retry` row must send the new image.
 3. **A `violation` row does not own its item.** When the item changes, the cursor sends the new image. When the new
    image applies, the completion deletes the `violation` row.
+4. **A due `retry` row of an item that the partition does not own sends nothing.** The claim deletes it. While a
+   promotion of the partition is between its cutover and its completion, the child can still need the row, so the
+   claim sets `not_before = now + retryBackoffMaxMs` instead (Section 4.2.12, "Promotion source").
 
 The `retry` backoff starts at 1 s, doubles after each failure, and stops at 10 s.
 
@@ -1221,7 +1230,8 @@ handles a violation in these steps:
 
 - The ingest of a delete writes the tombstone (Section 4.2.4, ingest step 2) and gives it a position.
 - A background sweep on `idx_latest_items_deleted_gc` deletes a tombstone row when each condition is true:
-  1. `newest_seq <= MIN(C_t)`: each target read the tombstone.
+  1. `newest_seq <= MIN(C_t)`: each target read the tombstone. While a promotion is between its cutover and its
+     completion, `newest_seq` must also be at or below each cursor of its snapshot (Section 4.2.12).
   2. No `target_retry` row exists for `item_id`.
   3. No `target_index_keys` row exists for `item_id`: each GSI deleted its entries.
 - In the same `transactionSync`, the sweep subtracts the key bytes from `key_size_estimates` and deletes the positions
@@ -1243,10 +1253,12 @@ a split.
 A `MaterializationDO` split or promotion migrates these rows for the items of the slice:
 
 1. `latest_items` with `item_id` and `newest_seq` unchanged.
-2. `change_positions` with `seq` unchanged. The child gives each new image a position above each copied position.
+2. `change_positions` with `seq` unchanged, only the positions above the lowest cursor that the child gets. A position
+   at or below it is done for each target. The child gives each new image a position above each copied position.
 3. `target_index_keys`.
 4. `target_retry`, with `is_inherited = 1`.
-5. `materialization_targets`, with `cursor_seq` unchanged. The child starts each `epoch` at 1.
+5. `materialization_targets`. A split copies `cursor_seq` unchanged. A promotion copies the cursor of its snapshot
+   ("Promotion source" below). The child starts each `epoch` at 1.
 6. `ancestor_fences`: the rows of the parent, plus `(parent DO ID, E, until_id)` for each target. `until_id` is the
    highest copied position.
 7. `producer_fences`: the whole table, with `MAX(epoch)`. A child must reject each late call that its parent rejects.
@@ -1259,9 +1271,74 @@ the slice has no outbox row, no work of the slice is in flight, and the child st
 
 A GSI `PartitionDO` split migrates the whole `producer_fences` table to each child with `MAX(epoch)`.
 
+A split source keeps its rows, as a base `PartitionDO` split does: it is a router after the cutover. On a promotion,
 `cleanupSourceStep` deletes the moved rows of `latest_items`, `change_positions`, `target_index_keys`, and
-`target_retry` on the source, with the link-ID delete rule. A target step on the source skips an unowned item, and its
+`target_retry` on the source in bounded steps, with the link-ID delete rule. A target step on the source skips an unowned item, and its
 position is then done (Section 4.2.6, target step 2).
+
+##### Promotion source
+
+A split source becomes a router at the cutover, so its target runner stops, and its cursors and positions stay as they
+were at the cutover. A promotion source keeps its other keys, so its runner continues after the cutover:
+
+- Its claims skip the moved items, because it does not own them now (Section 4.2.6, target step 2). The cursor moves
+  past their positions.
+- Its cleanup can then delete those positions, and its claims can delete the `retry` rows of the moved items.
+
+The child pulls the pages later. With the current cursors, it would treat the moved items that the source skipped as
+done, and no partition would send them. Example with one target:
+
+1. `C_t = 90`. The moved item X has position 100, and the target did not get X yet.
+2. The cutover occurs.
+3. A claim on the source skips X, and `C_t` moves to 110. The cleanup deletes position 100.
+4. The child gets `C_t = 110` and no position for X. No partition sends X to the target.
+
+Thus a promotion source keeps a snapshot of its cursors:
+
+1. **`onRepartitionCutover` stores the snapshot.** In the cutover transaction, the source stores the cursor of each
+   target under the plan ID, in one KV entry. This is 1 row for each promotion.
+2. **The pages send the snapshot.** The last page of the migration gives the child the cursors of the snapshot, not the
+   current cursors. The source copies the positions of the moved items above the lowest cursor of the snapshot.
+3. **The cleanup keeps the positions above the snapshot.** The bound of the position cleanup and of the tombstone GC is
+   the lowest of `MIN(C_t)` and each cursor of each snapshot. A stored position of a moved item above the snapshot
+   thus stays until the child has it.
+4. **The claim keeps the `retry` rows of the moved items.** While a snapshot exists, the claim sets
+   `not_before = now + retryBackoffMaxMs` on a due `retry` row of an item that the partition does not own, so the row
+   does not fill the `retry` part of each batch. After the completion, the claim deletes such a row.
+5. **`beforeComplete` deletes the snapshot.** After the completion, the child has each row, so the source cleanup and
+   `cleanupSourceStep` can delete the rows of the moved items.
+
+The child does not send all moved items again. For each target `t`, it sends only:
+
+- each moved item with a position above the cursor of `t` in the snapshot: the work that the source did not finish at
+  the cutover,
+- each copied `retry` row of `t`,
+- each new image that it gets after the import.
+
+For example, the snapshot holds `C_gsi = 500` and `C_lake = 300`, and of the 10,000 items of the promoted key only X
+(position 450) and Y (position 520) have positions above 300. The child sends Y to `gsi`, and X and Y to `lake`. The
+other 9,998 items go to no target.
+
+**Dangers and failure scenarios.** These are not solved in the first version:
+
+1. **A stalled promotion holds the cleanup of the source.** While the promotion does not complete, the cleanup keeps
+   each position above the lowest snapshot cursor, for each item and not only for the moved items, and the tombstones
+   whose newest position is above it. Each new write adds rows. This is the same growth as a target that is down.
+2. **A stalled promotion can stop all export to the source.** When the growth reaches the size limit, the source
+   refuses each newer live image with `partition_over_size`. A hash split waits for each unfinished promotion, so the
+   split cannot free space. The base exporters back off, and each target of the source lags for each key until the
+   promotion completes.
+3. **One stalled promotion holds the cleanup for the others.** A source can run up to 5 promotions at the same time.
+   The bound uses the lowest cursor of all snapshots, so the oldest unfinished promotion decides it.
+4. **A promotion that never completes keeps its snapshot.** Only `beforeComplete` deletes it. Nothing alerts an
+   operator. If the runtime adds a cancel of a repartition, the cancel must also delete the snapshot.
+5. **The batch in flight at the cutover is sent two times.** The cutover raises the epoch, so the source discards the
+   answer of that batch, and the cursor in the snapshot is the cursor before that batch. The child sends its items
+   again. This is at most one batch for each target. The target gets the same revision again and ignores it.
+6. **Each `retry` row of a moved item costs writes while the promotion runs.** The claim writes the row one time for
+   each `retryBackoffMaxMs` period, until the completion.
+
+A later version can address scenarios 1 to 4 with a time limit on the snapshot and a status that an operator can see.
 
 The split fences need the final export state of the slice. `RepartitionSource.servePage`
 (`packages/fokosdb/src/sharding/repartition-flow.ts`) rejects each page request before the cutover, for each stream of
@@ -1815,6 +1892,17 @@ a GSI write occurs at that time anyway.
 The two options do not combine at full value. When a GSI entry holds the base revision for Section 4.3.5, each base
 change must write the entry to update the revision, and the hash then skips only the duplicates. Choose Option B to
 write fewer GSI rows, or Option A to keep the base revision on each entry.
+
+#### 4.3.9 Time limit and status for promotion snapshots
+
+A `MaterializationDO` promotion source keeps a snapshot of its cursors from the cutover to the completion
+(Section 4.2.12, "Promotion source"). While the snapshot exists, the source keeps positions, tombstones, and the
+`retry` rows of the moved items. Section 4.2.12 lists the failure scenarios of a promotion that stalls or never
+completes. A later version can:
+
+- show the age of each snapshot in `fokosStatus`, and log an error when a snapshot is older than a limit,
+- stop the hold of the cleanup after a time limit, and give the child a cursor that makes it send each moved item
+  again: a full send of the promoted key instead of an unbounded growth of the source.
 
 ## 5. Alternative Options
 

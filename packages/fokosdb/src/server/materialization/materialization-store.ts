@@ -6,14 +6,33 @@
  */
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind } from "../../shared/types.js";
-import type { KeyBytes } from "../../sharding/key-codec.js";
-import { one, tryOne } from "../../shared/sql-cursor.js";
-import { EST_ROW_BYTES_K, estRowBytesExpr, JSON_KIND_CODE } from "../../shared/partition/item-size.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
+import { exists, one, tryOne } from "../../shared/sql-cursor.js";
+import { JSON_KIND_CODE } from "../../shared/partition/item-size.js";
 import { KeySizeStats } from "../../shared/partition/key-size-stats.js";
+import {
+	walkByHashKey,
+	type HashKeyWalkCursor,
+	type HashKeyWalkEntry,
+	type KeyRange,
+	type ScanCursor,
+} from "../../shared/partition/partition-store.js";
 import type { FokosTargetDefinition } from "./targets.js";
 
 /** The KV key of the target list. The first valid list is stored, and the partition uses only it. */
 const TARGETS_KV_KEY = "__fokosdb/mat/targets";
+
+/**
+ * The KV key of the cursor snapshots of the promotions of this partition that are between their
+ * cutover and their completion: the cursor of each target at the cutover, by the promoted hash key.
+ */
+const CURSOR_SNAPSHOTS_KV_KEY = "__fokosdb/mat/cursor_snapshots";
+
+/**
+ * A Map, not an object: a `targetId` such as `__proto__` is valid, and an object would not keep it
+ * as an own key.
+ */
+type CursorSnapshots = Map<string, Map<string, number>>;
 
 /**
  * One image that a producer exports. A live image carries the stored representation of the base item
@@ -32,10 +51,22 @@ export type LatestImage =
 	  }
 	| { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; revision: number; deleted: true };
 
+/** The fixed part of the `est_row_bytes` of a `latest_items` row. The migration tells what it covers. */
+const LATEST_ROW_BYTES_K = 60;
+
+/**
+ * The SQL of the `est_row_bytes` of a `latest_items` row, with the base hash key in `?1` and the base
+ * sort key in `?2`. `dataParam` holds the stored `data` value, or is null for a tombstone.
+ */
+function latestRowBytesExpr(dataParam: string | null): string {
+	const fixed = `2 * (octet_length(?1) + octet_length(?2)) + ${LATEST_ROW_BYTES_K}`;
+	return dataParam === null ? fixed : `octet_length(${dataParam}) + ${fixed}`;
+}
+
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 1,
-		description: "Create the latest images, the key size estimates, the producer fences, the change positions, and the target state",
+		description: "Create the latest images, the producer fences, the change positions, the target state, and the ancestor fences",
 		// latest_items:
 		// - One row for each base item: its newest live image, or a tombstone (`deleted_at_ms` is not
 		//   NULL, `data` is NULL). `revision` is the base revision of the image.
@@ -46,6 +77,12 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   time. Each statement that deletes a row must delete its linked rows in the same transaction,
 		//   because SQLite can give the id to a new row again.
 		// - No rule reads the value of `deleted_at_ms`. It orders the garbage collection of tombstones.
+		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The keys count
+		//   two times, because the UNIQUE index holds a second copy of them. LATEST_ROW_BYTES_K gives the
+		//   fixed part: the integer columns, the record header, the rowid, and the fixed part of the
+		//   index entry. It is an approximate value for size accounting (promotion, split, batch and page
+		//   budgets). A change of the formula needs no data migration, because each change of a key
+		//   size estimate uses the value that the row stores.
 		//
 		// producer_fences:
 		// - The highest epoch of each producer, by its DurableObjectId in hex. A call with a lower epoch
@@ -65,6 +102,12 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - The failed items of each target. A 'retry' row owns its item for its target: the cursor skips
 		//   the item, and the row sends the latest image after its backoff. A 'violation' row records a
 		//   permanent failure, and does not own its item. `is_inherited` is 1 on a row that a split copied.
+		//
+		// ancestor_fences:
+		// - The ancestors of a split child whose late calls each receiver of a target must reject. Each
+		//   call of the target carries all rows of the target. `until_id` is the highest copied position:
+		//   the rows of a target go when its cursor reaches it and no inherited `retry` row of the target
+		//   is left.
 		sql: `
             CREATE TABLE IF NOT EXISTS latest_items (
                 item_id       INTEGER PRIMARY KEY,
@@ -114,7 +157,15 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
             CREATE INDEX IF NOT EXISTS idx_target_retry_due ON target_retry (target_id, not_before) WHERE kind = 'retry';
 
-            CREATE INDEX IF NOT EXISTS idx_target_retry_inherited ON target_retry (target_id) WHERE is_inherited = 1 AND kind = 'retry';`,
+            CREATE INDEX IF NOT EXISTS idx_target_retry_inherited ON target_retry (target_id) WHERE is_inherited = 1 AND kind = 'retry';
+
+            CREATE TABLE IF NOT EXISTS ancestor_fences (
+                target_id   TEXT    NOT NULL,
+                ancestor_id TEXT    NOT NULL,
+                min_epoch   INTEGER NOT NULL,
+                until_id    INTEGER NOT NULL,
+                PRIMARY KEY (target_id, ancestor_id)
+            ) WITHOUT ROWID, STRICT;`,
 	},
 ];
 
@@ -188,15 +239,22 @@ export class MaterializationStore {
 	 *
 	 * When targets exist, the image gets a change position (see `#planPosition`), and the `retry` rows
 	 * of the item become due, because the cursor skips the item while it has a `retry` row.
+	 *
+	 * Returns the new size estimate of the base hash key when the size of the row changed, or undefined.
 	 */
-	putLatestImage(image: LatestImage, nowMs: number, current: StoredImage | undefined, targets: readonly TargetPositions[]): void {
+	putLatestImage(
+		image: LatestImage,
+		nowMs: number,
+		current: StoredImage | undefined,
+		targets: readonly TargetPositions[],
+	): number | undefined {
 		const sql = this.#storage.sql;
 		const position = this.#planPosition(current?.newestSeq ?? null, targets);
 		const newestSeq = position === null ? (current?.newestSeq ?? null) : position.seq;
 		const row = image.deleted
 			? sql.exec<{ item_id: number; est_row_bytes: number }>(
 					`INSERT INTO latest_items (base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, octet_length(?1) + octet_length(?2) + ${EST_ROW_BYTES_K}, NULL)
+					 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ${latestRowBytesExpr(null)}, NULL)
 					 ON CONFLICT (base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = excluded.deleted_at_ms, newest_seq = excluded.newest_seq,
 					   data_kind = NULL, ttl_at = NULL, est_row_bytes = excluded.est_row_bytes, data = NULL
@@ -209,7 +267,7 @@ export class MaterializationStore {
 				)
 			: sql.exec<{ item_id: number; est_row_bytes: number }>(
 					`INSERT INTO latest_items (base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?1, ?2, ?3, NULL, ?7, ?4, ?5, ${estRowBytesExpr("?6", "?1", "?2")}, ?6)
+					 VALUES (?1, ?2, ?3, NULL, ?7, ?4, ?5, ${latestRowBytesExpr("?6")}, ?6)
 					 ON CONFLICT (base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = NULL, newest_seq = excluded.newest_seq,
 					   data_kind = excluded.data_kind, ttl_at = excluded.ttl_at, est_row_bytes = excluded.est_row_bytes, data = excluded.data
@@ -236,11 +294,9 @@ export class MaterializationStore {
 				itemId,
 			);
 		}
-		// The ingest does not use the new estimate, so an equal size needs no read.
+		// The ingest reads the new estimate only when the key grew, so an equal size needs no read.
 		const oldEst = current?.estRowBytes ?? 0;
-		if (newEst !== oldEst) {
-			this.keySizes.change(image.hashKey, oldEst, newEst);
-		}
+		return newEst === oldEst ? undefined : this.keySizes.change(image.hashKey, oldEst, newEst);
 	}
 
 	/**
@@ -359,6 +415,85 @@ export class MaterializationStore {
 			cursorSeq,
 			isBatchOpen ? 1 : 0,
 			targetId,
+		);
+	}
+
+	/** Raises the epoch of each target by 1. A split source calls it in its cutover transaction. */
+	raiseAllTargetEpochs(): void {
+		this.#storage.sql.exec(`UPDATE materialization_targets SET epoch = epoch + 1`);
+	}
+
+	// ─── cursor snapshots ─────────────────────────────────────────────────────
+
+	/** Stores the cursor of each target as the snapshot of the promotion of `hk`. */
+	storeCursorSnapshot(hk: KeyBytes): void {
+		const snapshots = this.#cursorSnapshots();
+		snapshots.set(snapshotKey(hk), new Map(this.targetRows().map((row) => [row.targetId, row.cursorSeq])));
+		this.#storage.kv.put(CURSOR_SNAPSHOTS_KV_KEY, snapshots);
+	}
+
+	/** The cursor of each target in the snapshot of the promotion of `hk`, or undefined when it has none. */
+	cursorSnapshot(hk: KeyBytes): ReadonlyMap<string, number> | undefined {
+		return this.#cursorSnapshots().get(snapshotKey(hk));
+	}
+
+	deleteCursorSnapshot(hk: KeyBytes): void {
+		const snapshots = this.#cursorSnapshots();
+		snapshots.delete(snapshotKey(hk));
+		if (snapshots.size === 0) {
+			this.#storage.kv.delete(CURSOR_SNAPSHOTS_KV_KEY);
+		} else {
+			this.#storage.kv.put(CURSOR_SNAPSHOTS_KV_KEY, snapshots);
+		}
+	}
+
+	/** True while a promotion of this partition is between its cutover and its completion. */
+	hasCursorSnapshots(): boolean {
+		return this.#storage.kv.get(CURSOR_SNAPSHOTS_KV_KEY) !== undefined;
+	}
+
+	#cursorSnapshots(): CursorSnapshots {
+		return this.#storage.kv.get<CursorSnapshots>(CURSOR_SNAPSHOTS_KV_KEY) ?? new Map();
+	}
+
+	// ─── ancestor fences ──────────────────────────────────────────────────────
+
+	/** The ancestor fences that each call of a target carries. Empty in normal operation. */
+	targetFences(targetId: string): Array<{ ancestorId: string; minEpoch: number }> {
+		const fences: Array<{ ancestorId: string; minEpoch: number }> = [];
+		for (const row of this.#storage.sql.exec<{ ancestor_id: string; min_epoch: number }>(
+			`SELECT ancestor_id, min_epoch FROM ancestor_fences WHERE target_id = ?1`,
+			targetId,
+		)) {
+			fences.push({ ancestorId: row.ancestor_id, minEpoch: row.min_epoch });
+		}
+		return fences;
+	}
+
+	/**
+	 * Deletes the ancestor fences of a target when no inherited work of the target is left: its cursor
+	 * and its cursor in each promotion snapshot are at or above `until_id`, and it has no inherited
+	 * `retry` row. Each transaction that moves the cursor or deletes a `retry` row runs it. With no
+	 * fence row, it reads the snapshot key and an empty range.
+	 *
+	 * A promotion child starts from the snapshot cursor and copies the fences of this partition when
+	 * its state page is built. The cursor of this partition moves past the moved positions after the
+	 * cutover, so the cursor alone can drop a fence that the child still needs.
+	 */
+	dropDoneTargetFences(targetId: string): void {
+		let snapshotBound: number | null = null;
+		for (const cursors of this.#cursorSnapshots().values()) {
+			const cursor = cursors.get(targetId) ?? 0;
+			snapshotBound = snapshotBound === null ? cursor : Math.min(snapshotBound, cursor);
+		}
+		this.#storage.sql.exec(
+			`DELETE FROM ancestor_fences
+			  WHERE target_id = ?1
+			    AND until_id <= (SELECT cursor_seq FROM materialization_targets WHERE target_id = ?1)
+			    AND (?2 IS NULL OR until_id <= ?2)
+			    AND NOT EXISTS (SELECT 1 FROM target_retry WHERE target_id = ?1 AND is_inherited = 1 AND kind = 'retry')`,
+			targetId,
+			snapshotBound,
 		);
 	}
 
@@ -485,6 +620,11 @@ export class MaterializationStore {
 		);
 	}
 
+	/** Moves the backoff end of the `retry` row of an item for a target to `notBefore`. */
+	deferTargetRetry(targetId: string, itemId: number, notBefore: number): void {
+		this.#storage.sql.exec(`UPDATE target_retry SET not_before = ?3 WHERE target_id = ?1 AND item_id = ?2`, targetId, itemId, notBefore);
+	}
+
 	/** Records a permanent failure of an item for a target. The row does not own the item. */
 	recordTargetViolation(targetId: string, itemId: number, code: string): void {
 		this.#storage.sql.exec(
@@ -501,6 +641,22 @@ export class MaterializationStore {
 	/** The lowest cursor of all targets, or null when the partition has no target. */
 	minCursor(): number | null {
 		return one(this.#storage.sql.exec<{ m: number | null }>(`SELECT MIN(cursor_seq) AS m FROM materialization_targets`)).m;
+	}
+
+	/**
+	 * The position at or below which each target is done on each partition that can still need the
+	 * rows: the lowest cursor, and each cursor of each promotion snapshot. A promotion child gets the
+	 * cursors of its snapshot, so the positions above them stay until the promotion completes. Null
+	 * when the partition has no target.
+	 */
+	cleanupBound(): number | null {
+		let bound = this.minCursor();
+		for (const cursors of this.#cursorSnapshots().values()) {
+			for (const cursor of cursors.values()) {
+				bound = bound === null ? cursor : Math.min(bound, cursor);
+			}
+		}
+		return bound;
 	}
 
 	/** Deletes up to `limit` positions at or below `seq`, the lowest first. Returns the count. */
@@ -554,15 +710,301 @@ export class MaterializationStore {
 		if (row === undefined) {
 			return false;
 		}
-		// The positions of an item link from the newest to the oldest. The cleanup can have deleted the
-		// older part of the chain already.
-		for (let seq = row.newest_seq; seq !== null; ) {
-			seq =
-				tryOne(sql.exec<{ prev_seq: number | null }>(`DELETE FROM change_positions WHERE seq = ? RETURNING prev_seq`, seq))?.prev_seq ??
-				null;
-		}
+		this.#deletePositions(row.newest_seq);
 		this.keySizes.subtract(new Uint8Array(row.base_hk) as KeyBytes, row.est_row_bytes);
 		return true;
+	}
+
+	/**
+	 * Deletes up to `limit` items of the base hash key `hk`, with their positions and their
+	 * `target_retry` rows. Returns true when no item of the key is left. The size estimate of the key
+	 * is not changed: the caller deletes it.
+	 */
+	deleteItemsOfHashKey(hk: KeyBytes, limit: number): boolean {
+		const sql = this.#storage.sql;
+		// The rows are read before the deletes, because the loop deletes from the table that it reads.
+		// `limit` bounds the array.
+		const rows = sql
+			.exec<{
+				item_id: number;
+				newest_seq: number | null;
+			}>(`SELECT item_id, newest_seq FROM latest_items WHERE base_hk = ?1 LIMIT ?2`, hk, limit)
+			.toArray();
+		for (const row of rows) {
+			this.#deletePositions(row.newest_seq);
+			sql.exec(`DELETE FROM target_retry WHERE target_id IN (SELECT target_id FROM materialization_targets) AND item_id = ?1`, row.item_id);
+			sql.exec(`DELETE FROM latest_items WHERE item_id = ?1`, row.item_id);
+		}
+		return !exists(sql.exec(`SELECT 1 FROM latest_items WHERE base_hk = ?1 LIMIT 1`, hk));
+	}
+
+	/**
+	 * Deletes the positions of an item from its newest position `seq`. The positions of an item link
+	 * from the newest to the oldest. The cleanup can have deleted the older part of the chain already.
+	 */
+	#deletePositions(seq: number | null): void {
+		while (seq !== null) {
+			seq =
+				tryOne(this.#storage.sql.exec<{ prev_seq: number | null }>(`DELETE FROM change_positions WHERE seq = ?1 RETURNING prev_seq`, seq))
+					?.prev_seq ?? null;
+		}
+	}
+
+	// ─── split decisions ──────────────────────────────────────────────────────
+
+	/** The first base hash key, and whether another one follows it. Two seeks of the unique key index. */
+	probeHashKeys(): { first: KeyBytes; more: boolean } | null {
+		const sql = this.#storage.sql;
+		const first = tryOne(sql.exec<{ base_hk: ArrayBuffer }>(`SELECT base_hk FROM latest_items ORDER BY base_hk LIMIT 1`));
+		if (!first) {
+			return null;
+		}
+		return { first: asKey(first.base_hk), more: exists(sql.exec(`SELECT 1 FROM latest_items WHERE base_hk > ?1 LIMIT 1`, first.base_hk)) };
+	}
+
+	/** The items of `hk` in `[start, end)` in sort-key order, each with its `est_row_bytes`. It reads one row at a time. */
+	*sortKeySizes(hk: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Generator<{ sk: KeyBytes; bytes: number }> {
+		const lower = start ?? KeyCodec.encodeOptional(undefined);
+		const rows =
+			end === null
+				? this.#storage.sql.exec<{ base_sk: ArrayBuffer; est_row_bytes: number }>(
+						`SELECT base_sk, est_row_bytes FROM latest_items WHERE base_hk = ?1 AND base_sk >= ?2 ORDER BY base_sk`,
+						hk,
+						lower,
+					)
+				: this.#storage.sql.exec<{ base_sk: ArrayBuffer; est_row_bytes: number }>(
+						`SELECT base_sk, est_row_bytes FROM latest_items WHERE base_hk = ?1 AND base_sk >= ?2 AND base_sk < ?3 ORDER BY base_sk`,
+						hk,
+						lower,
+						end,
+					);
+		for (const row of rows) {
+			yield { sk: asKey(row.base_sk), bytes: row.est_row_bytes };
+		}
+	}
+
+	// ─── migration ────────────────────────────────────────────────────────────
+
+	/**
+	 * Pages `latest_items` in `(base_hk, base_sk)` order, strictly after `cursor`, each item with its
+	 * positions above `minSeq` and its `target_retry` rows. A position at or below `minSeq` is done for
+	 * each target, so the target needs no copy. `range` limits the read to one hash key and one
+	 * sort-key interval, with the cursor rules of `itemsPageStatement`. The generator reads one item
+	 * each time the caller asks for the next one.
+	 */
+	*queryMigrationItems(cursor: ScanCursor | null, limit: number, range: KeyRange | null, minSeq: number): Generator<MigratedLatestItem> {
+		const conds: string[] = [];
+		const params: unknown[] = [];
+		if (range === null) {
+			if (cursor) {
+				conds.push("(base_hk, base_sk) > (?, ?)");
+				params.push(cursor.hk, cursor.sk);
+			}
+		} else {
+			conds.push("base_hk = ?", cursor ? "base_sk > ?" : "base_sk >= ?");
+			params.push(range.hk, cursor ? cursor.sk : range.start);
+			if (range.end !== null) {
+				conds.push("base_sk < ?");
+				params.push(range.end);
+			}
+		}
+		const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")} ` : "";
+		const rows = this.#storage.sql.exec<{
+			item_id: number;
+			base_hk: ArrayBuffer;
+			base_sk: ArrayBuffer;
+			revision: number;
+			deleted_at_ms: number | null;
+			newest_seq: number | null;
+			data_kind: number | null;
+			ttl_at: number | null;
+			est_row_bytes: number;
+			data: string | ArrayBuffer | null;
+		}>(
+			`SELECT item_id, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data
+			 FROM latest_items ${where}ORDER BY base_hk, base_sk LIMIT ?`,
+			...params,
+			limit,
+		);
+		for (const { base_hk, base_sk, data, ...row } of rows) {
+			yield {
+				...row,
+				hk: asKey(base_hk),
+				sk: asKey(base_sk),
+				data: data === null || typeof data === "string" ? data : new Uint8Array(data),
+				positions: this.#positionsAbove(row.newest_seq, minSeq),
+				retries: this.#retryRows(row.item_id),
+			};
+		}
+	}
+
+	/** The hash-key walk of `latest_items` for a hash child, with the rules of `walkByHashKey`. */
+	walkMigrationItems(
+		cursor: HashKeyWalkCursor<ScanCursor> | null,
+		limit: number,
+		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
+		minSeq: number,
+	): Generator<HashKeyWalkEntry<MigratedLatestItem>> {
+		const firstRowAfter = (after: KeyBytes | null) => {
+			const row = tryOne(
+				after === null
+					? this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer }>(
+							`SELECT base_hk, base_sk FROM latest_items ORDER BY base_hk, base_sk LIMIT 1`,
+						)
+					: this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer }>(
+							`SELECT base_hk, base_sk FROM latest_items WHERE base_hk > ?1 ORDER BY base_hk, base_sk LIMIT 1`,
+							after,
+						),
+			);
+			return row && { hk: asKey(row.base_hk), sk: asKey(row.base_sk) };
+		};
+		return walkByHashKey(firstRowAfter, cursor, limit, owns, (after, n, range) => this.queryMigrationItems(after, n, range, minSeq));
+	}
+
+	/** The positions of an item from its newest position `seq`, while they are above `minSeq`. */
+	#positionsAbove(seq: number | null, minSeq: number): Array<{ seq: number; prev_seq: number | null }> {
+		const positions: Array<{ seq: number; prev_seq: number | null }> = [];
+		while (seq !== null && seq > minSeq) {
+			const row = tryOne(this.#storage.sql.exec<{ prev_seq: number | null }>(`SELECT prev_seq FROM change_positions WHERE seq = ?1`, seq));
+			if (row === undefined) {
+				break;
+			}
+			positions.push({ seq, prev_seq: row.prev_seq });
+			seq = row.prev_seq;
+		}
+		return positions;
+	}
+
+	/** The `target_retry` rows of an item. One seek of the primary key for each target. */
+	#retryRows(itemId: number): MigratedRetryRow[] {
+		const rows: MigratedRetryRow[] = [];
+		for (const row of this.#storage.sql.exec<MigratedRetryRow>(
+			`SELECT target_id, kind, not_before, attempts, last_error FROM target_retry
+			 WHERE target_id IN (SELECT target_id FROM materialization_targets) AND item_id = ?1`,
+			itemId,
+		)) {
+			rows.push(row);
+		}
+		return rows;
+	}
+
+	/**
+	 * Inserts a migrated item with its positions and its `target_retry` rows, which it marks as
+	 * inherited. A target takes no write while it imports, so an item that is present came from an
+	 * earlier try of the same page, and the insert keeps it. The conflict target stays `(base_hk,
+	 * base_sk)`, for the reason of `PartitionStore.insertItemIfAbsent`. Returns true when it inserted
+	 * the item.
+	 */
+	insertMigratedItem(item: MigratedLatestItem): boolean {
+		const sql = this.#storage.sql;
+		const inserted = tryOne(
+			sql.exec(
+				`INSERT INTO latest_items (item_id, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+				 ON CONFLICT (base_hk, base_sk) DO NOTHING
+				 RETURNING item_id`,
+				item.item_id,
+				item.hk,
+				item.sk,
+				item.revision,
+				item.deleted_at_ms,
+				item.newest_seq,
+				item.data_kind,
+				item.ttl_at,
+				item.est_row_bytes,
+				item.data,
+			),
+		);
+		if (inserted === undefined) {
+			return false;
+		}
+		for (const position of item.positions) {
+			sql.exec(`INSERT INTO change_positions (seq, item_id, prev_seq) VALUES (?1, ?2, ?3)`, position.seq, item.item_id, position.prev_seq);
+		}
+		for (const retry of item.retries) {
+			sql.exec(
+				`INSERT INTO target_retry (target_id, item_id, kind, not_before, attempts, is_inherited, last_error) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)`,
+				retry.target_id,
+				item.item_id,
+				retry.kind,
+				retry.not_before,
+				retry.attempts,
+				retry.last_error,
+			);
+		}
+		return true;
+	}
+
+	/** Up to `limit` producer fences after `after`, in `producer_id` order. */
+	producerFencesAfter(after: string | null, limit: number): Array<{ producerId: string; epoch: number }> {
+		const fences: Array<{ producerId: string; epoch: number }> = [];
+		for (const row of this.#storage.sql.exec<{ producer_id: string; epoch: number }>(
+			`SELECT producer_id, epoch FROM producer_fences WHERE producer_id > ?1 ORDER BY producer_id LIMIT ?2`,
+			after ?? "",
+			limit,
+		)) {
+			fences.push({ producerId: row.producer_id, epoch: row.epoch });
+		}
+		return fences;
+	}
+
+	/** Each ancestor fence of each target. */
+	allTargetFences(): MigratedFence[] {
+		const fences: MigratedFence[] = [];
+		for (const row of this.#storage.sql.exec<{ target_id: string; ancestor_id: string; min_epoch: number }>(
+			`SELECT target_id, ancestor_id, min_epoch FROM ancestor_fences`,
+		)) {
+			fences.push({ targetId: row.target_id, ancestorId: row.ancestor_id, minEpoch: row.min_epoch });
+		}
+		return fences;
+	}
+
+	/**
+	 * Stores the target state of a split child at the end of its migration: the target list, a state
+	 * row for each target with the cursor of the source and the epoch 1, and the ancestor fences.
+	 *
+	 * The inherited work of a target is each copied position above its cursor and each copied `retry`
+	 * row of the target. A target with inherited work gets the fences of the source and the source
+	 * itself at its epoch in `epochs`, with `until_id` at the highest copied position. A target with no
+	 * inherited work gets no fence. The child takes no write while it imports, so the copied positions
+	 * are all positions of the child.
+	 */
+	importMigrationState(state: MigratedState): void {
+		const sql = this.#storage.sql;
+		if (state.targetList === undefined) {
+			return;
+		}
+		this.#storage.kv.put(TARGETS_KV_KEY, state.targetList);
+		const maxSeq = one(sql.exec<{ m: number | null }>(`SELECT MAX(seq) AS m FROM change_positions`)).m;
+		for (const target of state.targetList) {
+			const cursor = state.cursors.get(target.targetId) ?? 0;
+			sql.exec(
+				`INSERT INTO materialization_targets (target_id, kind, cursor_seq) VALUES (?1, ?2, ?3) ON CONFLICT (target_id) DO NOTHING`,
+				target.targetId,
+				target.kind,
+				cursor,
+			);
+			const inherited =
+				(maxSeq !== null && maxSeq > cursor) ||
+				exists(
+					sql.exec(`SELECT 1 FROM target_retry WHERE target_id = ?1 AND is_inherited = 1 AND kind = 'retry' LIMIT 1`, target.targetId),
+				);
+			if (!inherited) {
+				continue;
+			}
+			const untilId = Math.max(maxSeq ?? 0, cursor);
+			const fences = state.fences.filter((fence) => fence.targetId === target.targetId);
+			for (const fence of [...fences, { ancestorId: state.sourceId, minEpoch: state.epochs.get(target.targetId) ?? 1 }]) {
+				sql.exec(
+					`INSERT INTO ancestor_fences (target_id, ancestor_id, min_epoch, until_id) VALUES (?1, ?2, ?3, ?4)
+					 ON CONFLICT (target_id, ancestor_id) DO UPDATE SET min_epoch = MAX(min_epoch, excluded.min_epoch), until_id = excluded.until_id`,
+					target.targetId,
+					fence.ancestorId,
+					fence.minEpoch,
+					untilId,
+				);
+			}
+		}
 	}
 }
 
@@ -588,6 +1030,54 @@ export type TargetImage = { hk: KeyBytes; sk: KeyBytes; revision: number } & (
 );
 
 export type TombstoneCursor = { deletedAtMs: number; itemId: number };
+
+/** One `target_retry` row as a migration page carries it. The target marks it as inherited. */
+export type MigratedRetryRow = { target_id: string; kind: string; not_before: number; attempts: number; last_error: string | null };
+
+/**
+ * One `latest_items` row as a migration page carries it, with its stored data (a json item as its
+ * JSONB blob), its positions from the newest, and its `target_retry` rows. `item_id` and each `seq`
+ * stay unchanged.
+ */
+export type MigratedLatestItem = {
+	item_id: number;
+	hk: KeyBytes;
+	sk: KeyBytes;
+	revision: number;
+	deleted_at_ms: number | null;
+	newest_seq: number | null;
+	data_kind: number | null;
+	ttl_at: number | null;
+	est_row_bytes: number;
+	data: string | Uint8Array | null;
+	positions: Array<{ seq: number; prev_seq: number | null }>;
+	retries: MigratedRetryRow[];
+};
+
+export type MigratedFence = { targetId: string; ancestorId: string; minEpoch: number };
+
+/** The target state that the last migration page gives a split child. */
+export type MigratedState = {
+	/** The `DurableObjectId` of the source, in hex. */
+	sourceId: string;
+	/** The stored target list of the source, or undefined when it has none. */
+	targetList: FokosTargetDefinition[] | undefined;
+	/** The cursor of each target that the child starts from, by `targetId`. */
+	cursors: ReadonlyMap<string, number>;
+	/** The epoch of each target of the source after its cutover raise, by `targetId`. */
+	epochs: ReadonlyMap<string, number>;
+	/** The ancestor fences of the source. */
+	fences: MigratedFence[];
+};
+
+/** The KV field name of the snapshot of a promoted hash key. */
+function snapshotKey(hk: KeyBytes): string {
+	return hk.toBase64({ alphabet: "base64url" });
+}
+
+function asKey(value: ArrayBuffer): KeyBytes {
+	return KeyCodec.asKeyBytes(new Uint8Array(value));
+}
 
 function toTargetRow(row: { target_id: string; cursor_seq: number; epoch: number; is_batch_open: number }): TargetRow {
 	return { targetId: row.target_id, cursorSeq: row.cursor_seq, epoch: row.epoch, isBatchOpen: row.is_batch_open === 1 };

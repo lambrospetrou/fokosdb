@@ -114,3 +114,17 @@ describe("MaterializationStore — change positions", () => {
 		});
 	});
 });
+
+describe("MaterializationStore — row size estimate", () => {
+	it("counts the data, the keys two times, and the fixed part, for a live image and for a tombstone", async () => {
+		await withStore((h) => {
+			const keys = kb("x").byteLength + NO_SK.byteLength;
+			h.ingest("x", 1, []);
+			expect(h.store.storedImage(kb("x"), NO_SK)!.estRowBytes).toBe("v1".length + 2 * keys + 60);
+			expect(h.store.keySizes.bytesOf(kb("x"))).toBe("v1".length + 2 * keys + 60);
+			h.ingest("x", 2, [], true);
+			expect(h.store.storedImage(kb("x"), NO_SK)!.estRowBytes).toBe(2 * keys + 60);
+			expect(h.store.keySizes.bytesOf(kb("x"))).toBe(2 * keys + 60);
+		});
+	});
+});
