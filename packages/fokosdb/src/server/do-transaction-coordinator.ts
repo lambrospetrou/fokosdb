@@ -51,7 +51,7 @@ import {
 	type TransactionPartitionsAnswer,
 } from "../shared/transaction-wire-types.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
-import { adminOutboxFor, TopologyCacheMemo } from "../shared/topology-hooks.js";
+import { adminOutboxFor, TopologyCacheMemo, topologyCacheFor } from "../shared/topology-hooks.js";
 import {
 	FokosError,
 	FokosExpressionError,
@@ -700,12 +700,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// The low three decimal digits stay zero; a later change can allocate them to tie-breaking.
 		const transactionTs = txOrderTimestampNow();
 
-		// Group the operations by the root partition of each key. The same grouping feeds the tc_items and
+		// Group the operations by the deepest known partition of each key. The same grouping feeds the tc_items and
 		// tc_participants rows below and the prepare fan-out, so the happy path never reads the rows it has
 		// just written back from SQLite. The client validates the topology and the range config of the
 		// table before anything is written.
 		const partitions = this.partitionClient(request.table);
-		const participants: PrepareParticipant[] = partitions.resolveAll(request.items).map(({ ctx, indexes }) => ({
+		// The coordinator stores each address, and later sends to it from another client, after a restart
+		// too. Only the client that resolved an address can fall back after a miss, so each address must
+		// name a partition that exists: no speculative range root of a Bloom hit.
+		const participants: PrepareParticipant[] = partitions.resolveAll(request.items, { speculative: false }).map(({ ctx, indexes }) => ({
 			doName: ctx.doName,
 			context: ctx,
 			items: indexes.map((i) => request.items[i]),
@@ -1192,17 +1195,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
 	private partitionClient(ctx: FokosDBTableConfig): FokosShardingClient<FokosDBPolicy, PartitionOps> {
 		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
-		// This client has no topology cache. The coordinator stores the address of each participant, and
-		// later sends to it from another client, after a restart too. Only the client that resolved an
-		// address from the topology can fall back after a miss, so a stored address from the topology could
-		// cancel a valid transaction. A root address is always correct, and the root forwards with its own
-		// topology cache.
+		const topologyCache = topologyCacheFor(ctx, (promise) => this.ctx.waitUntil(promise), this.topologyRefreshSettings());
 		return new FokosShardingClient<FokosDBPolicy, PartitionOps>({
 			topology: ctx.topology,
 			rangeConfig: ctx.rangeConfig,
 			policy: ctx.policy,
 			policyVersion: ctx.policyVersion,
 			stub: (c, doName) => partitionStubByName(this.env, c, doName),
+			...(topologyCache === undefined ? {} : { topologyCache }),
 		});
 	}
 

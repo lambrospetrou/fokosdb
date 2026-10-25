@@ -96,6 +96,11 @@ type LinkedEntry = FokosStatusEntry & { target: NonNullable<FokosStatusEntry["ta
 /** The range lookup of one request: a point lookup of a sort key, or a lookup of a whole interval. */
 type RangeLookup = (view: RangeTopologyView, cut: ReadonlySet<number>) => RangeTarget | null;
 
+export type FokosResolveOptions = {
+	/** False: give only a partition that exists. Default: true. */
+	speculative?: boolean;
+};
+
 /** The entry to send to after a miss at an entry that came from the topology, or null when the error is not that miss. */
 type MissFallback<TPolicy> = (e: unknown) => FokosRouteContext<TPolicy> | null;
 
@@ -146,23 +151,32 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 
 	// ─── resolve: no I/O, local only ──────────────────────────────────────────────────
 
-	/** The deepest known partition of the key. It reads the topology cache, and does no I/O. */
-	resolve(key: RouteKey): FokosRouteContext<TPolicy> {
-		return this.#resolveKey(key.hashKey, (view, cut) => rangePointLookup(view, key.sortKey, cut), true);
+	/**
+	 * The deepest known partition of the key. It reads the topology cache, and does no I/O.
+	 *
+	 * `speculative` false gives only a partition that exists: it does not send a key with a Bloom hit
+	 * and no cached range entry to the range root of the key. Use it for an address that another
+	 * client instance sends to later, because only this instance can fall back after a miss.
+	 */
+	resolve(key: RouteKey, opts?: FokosResolveOptions): FokosRouteContext<TPolicy> {
+		return this.#resolveKey(key.hashKey, (view, cut) => rangePointLookup(view, key.sortKey, cut), true, opts?.speculative ?? true);
 	}
 
 	/** The deepest known partition that holds the whole interval. That partition plans the range frontier. */
 	resolveRange(input: FokosRangeInput): FokosRouteContext<TPolicy> {
-		return this.#resolveKey(input.hashKey, (view, cut) => rangeIntervalLookup(view, input.interval, cut), true);
+		return this.#resolveKey(input.hashKey, (view, cut) => rangeIntervalLookup(view, input.interval, cut), true, true);
 	}
 
 	/**
 	 * A key with a Bloom hit enters its range tree: at the deepest known range partition, or at the
 	 * range root when the range entry is not cached yet. Every other key enters at the deepest known
 	 * hash partition. `bloom` false skips the range tree, after the range root answered that it does
-	 * not exist or has no data yet.
+	 * not exist or has no data yet. `speculative` false skips the range root of a key with no range
+	 * entry, which can be a Bloom false positive. Every other entry names a partition that exists,
+	 * because the keeper records only completed repartitions. The hash leaf of a promoted key forwards
+	 * to its range tree.
 	 */
-	#resolveKey(hashKey: KeyBytes, rangeLookup: RangeLookup, bloom: boolean): FokosRouteContext<TPolicy> {
+	#resolveKey(hashKey: KeyBytes, rangeLookup: RangeLookup, bloom: boolean, speculative: boolean): FokosRouteContext<TPolicy> {
 		const root = this.#router.rootContext(hashKey);
 		const opts = this.#topologyCache;
 		if (!opts) {
@@ -176,7 +190,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		if (bloom && maybePromoted(hash.view, hashKey)) {
 			const range = cachedRangeTopology(opts, topology.shardGroup, hashKey);
 			// A range entry with no segment says that the Bloom hit is a false positive.
-			if (!range || range.view.depths.length > 0) {
+			if (range ? range.view.depths.length > 0 : speculative) {
 				const target = range ? rangeLookup(range.view, range.cut) : { start: 0, end: 1, rank: 0 };
 				if (target) {
 					const start = range ? rangeBoundaryAt(range.view, target.start) : null;
@@ -185,13 +199,13 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 					this.#fallbacks.set(ctx, (e) => {
 						const missing = notInitializedAt(e, SHARDING_ROUTING_CODES.range_partition_not_initialized, ctx.doName);
 						if (target.rank === 0 && (missing || awaitingData(e))) {
-							return this.#resolveKey(hashKey, rangeLookup, false);
+							return this.#resolveKey(hashKey, rangeLookup, false, speculative);
 						}
 						if (!missing || !range) {
 							return null;
 						}
 						cutTopologyHint(range, rangeCutKey(range.view, target));
-						return this.#resolveKey(hashKey, rangeLookup, bloom);
+						return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
 					});
 					return ctx;
 				}
@@ -207,7 +221,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 				return null;
 			}
 			cutTopologyHint(hash, leaf.pos);
-			return this.#resolveKey(hashKey, rangeLookup, bloom);
+			return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
 		});
 		return ctx;
 	}
@@ -217,10 +231,10 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * The keys of one group keep their input order. A group can hold keys of different owners, so the
 	 * operation must fan out below the entry.
 	 */
-	resolveAll(keys: readonly RouteKey[]): FokosResolvedGroup<TPolicy>[] {
+	resolveAll(keys: readonly RouteKey[], opts?: FokosResolveOptions): FokosResolvedGroup<TPolicy>[] {
 		const groups = new Map<string, FokosResolvedGroup<TPolicy>>();
 		keys.forEach((key, index) => {
-			const ctx = this.resolve(key);
+			const ctx = this.resolve(key, opts);
 			const group = groups.get(ctx.doName);
 			if (group) {
 				group.indexes.push(index);

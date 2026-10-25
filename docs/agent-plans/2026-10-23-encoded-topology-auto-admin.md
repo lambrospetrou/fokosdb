@@ -850,13 +850,16 @@ has no fallback after a hash miss.
   `exports[topologyEntrypoint]({ props: { nsAdmin, jurisdiction } }).fetch(...)`. The caller does not give an
   `ExecutionContext`. It sends the cache to both of its `FokosShardingClient` instances. `PartitionDO` and
   `TransactionCoordinatorDO` give it to their runtimes, with `this.ctx.waitUntil`.
-- The partition client of the coordinator has no topology cache. The coordinator stores the address of each
-  participant in `tc_participants`, and prepare, commit, cancel, and recovery send to it from other client
-  instances, also after a restart. Only the client that resolved an address from the topology has its fallback, so
-  a stored address from an old hint could cancel a valid transaction. A root address is always correct, and the
-  root forwards with its own topology cache (M3). A later change can use the topology here when the fallback works
-  across client instances and stored addresses, and when the groups that fall back to one owner join again, so
-  that each owner gets its keys in one `txCommit`. In the vitest pool, the imported `exports` (with props) and the imported `waitUntil` work
+- The partition client of the coordinator has the topology cache, so the roots do not get the participant traffic.
+  The coordinator stores the address of each participant in `tc_participants`, and prepare, commit, cancel, and
+  recovery send to it from other client instances, also after a restart. Only the client that resolved an address
+  has its fallback. Thus `initiateWrite` calls `resolveAll(items, { speculative: false })`, which gives only a
+  partition that exists. A key with a Bloom hit and no cached range entry goes to its deepest known hash partition,
+  not to its range root, because the hit can be a false positive and that range root then does not exist. The hash
+  leaf of a promoted key holds its route override and forwards to the range tree. Every other entry names a
+  partition that exists, because the keeper records only completed repartitions. Known limit: a hint from before a
+  `destroy` that the `reset_at` check did not drop can name a hash partition that does not exist, and a transaction
+  with a participant there is cancelled. In the vitest pool, the imported `exports` (with props) and the imported `waitUntil` work
   in a Worker and in a Durable Object. `ctx.exports` needs the `enable_ctx_exports` compatibility flag, which is the default from the compatibility date 2025-11-17.
 - `destroy` calls `resetShardGroup` on the admin DO of each shard group of the table after the sharding destroy
   ends.

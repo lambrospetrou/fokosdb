@@ -12,6 +12,7 @@ export type {
 	FokosCallResult,
 	FokosResolvedGroup,
 	FokosRetryPolicy,
+	FokosResolveOptions,
 	FokosShardingClientOptions,
 	FokosWalkNode,
 } from "./client.js";
