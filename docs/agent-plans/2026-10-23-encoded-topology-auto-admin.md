@@ -191,6 +191,13 @@ deepest known hash partition, also for keys that its own traffic never showed.
 The `topology.GetForRange` read and the range part of the topology cache. A caller with a Bloom hit then enters at
 the deepest known range partition of the promoted key, or at its range root when it has no range entry yet.
 
+### M6 — The runtime forwards with the range topology (optional)
+
+A partition reads the range part of the topology cache and the promoted-key Bloom filter of the hash body when it
+forwards a promoted key. A hash partition and a range router then forward to the deepest known range partition of
+the key, also for keys and intervals that their own forwards never showed, and the range root receives less
+traffic. Section 4.2.9 gives the details. The range frontier (`rangeVisits`) is not in this milestone.
+
 ## 4. Proposed solution
 
 ### 4.1 High-level overview
@@ -1064,6 +1071,38 @@ The hash key goes in the query as base64url. The maximum length of the URL of a 
 `TODO: measure`, and it limits the length of the hash key that this read supports. A longer key uses the hash
 path.
 
+**The runtime (M6, optional).** M3 gives the runtime the hash topology only. A promoted key still goes to the
+deepest learned slice of `fokos_range_hierarchy`, or to the range root. The learned slices come only from the
+responses to the forwards of the partition, and `rangeHierarchyMaxRows` bounds them. So the range root receives
+the traffic of each caller with a cold cache, of each hash partition with no learned slice for the key, and of each
+interval that no learned slice covers. M6 uses the cached range topology in the same way as M3 uses the hash
+topology:
+
+1. **The range owner.** `#rangeOwner` and the range router branch of `#resolve` also read
+   `cachedRangeTopology(shardGroup, hashKey)`, and call `rangePointLookup` with the cut set of the entry. The
+   target is the deeper of the learned slice and the topology target. On a range router, the topology target must
+   be inside the interval of the router. A topology target outside it gives no hint.
+2. **The miss.** A `range_partition_not_initialized` miss at a topology target goes to `#missLadder`. It adds
+   `rangeCutKey` of the target to the cut set of the range entry, and the retry resolves again without that hint.
+   The client does the same (Section 4.2.6).
+3. **The Bloom step.** Where `#resolve` reads the Bloom filter of the partition, it also reads the promoted-key
+   Bloom filter of the cached hash body (`maybePromoted`). A router then sends a promoted key directly into its
+   range tree, and not first to the hash leaf that holds the route override. A false positive takes the existing
+   retry with no Bloom step.
+4. **The range frontier.** `#planRange` keeps the learned slices only. A planned visit has no fallback after a
+   miss, so a topology hint there needs a fallback first. This is a follow-up.
+
+For a partition, the Bloom filter and the range bodies are more useful than the hash bitmap. The hash arena learns
+each split from the responses, stores it in SQLite, and keeps it, because a split never goes away. The Bloom filter
+of a partition knows only the promotions that its own traffic showed, and its learned slices are bounded. The hash
+body stays one body: at 1,000,000 partitions the bitmap is about 125 KB of 1.77 MB, so a separate Bloom body saves
+little.
+
+Tests for M6: a hash router forwards a promoted key to a range leaf that its own forwards never showed; a range
+router forwards to a deeper range partition inside its interval and ignores a target outside it; a miss at a range
+topology hint cuts the hint and the request completes; a Bloom hit of the topology on a router enters the range tree,
+and a false positive completes through the hash path.
+
 #### 4.2.10 Performance
 
 - **Report.** One outbox insert in the `completed` transaction, one RPC for each repartition, and one row insert
@@ -1128,6 +1167,7 @@ a hash key with a new interval gets a new range body. A table with
   parent.
 - **No cache.** With `useTopologyCache: false`, `FokosDB` sends no topology fetch and every request enters at
   the root.
+- **Runtime range topology (M6, optional).** Section 4.2.9 lists the tests.
 - **End to end.** In the vitest pool, a table splits to depth 2, the keeper receives the reports, and a new client
   enters at the leaf with `forwardCount` 0. The tests call the entrypoint helper and the keeper directly.
 - **Range lookup (M5).** A property test makes random range trees with `rangeSplitN` 2 to 4, also trees of
