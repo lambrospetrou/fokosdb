@@ -18,6 +18,9 @@ import {
 	type ScanCursor,
 } from "../../shared/partition/partition-store.js";
 import type { FokosTargetDefinition } from "./targets.js";
+import { materializedPlanBindings } from "../../shared/expression/bindings.js";
+import type { CompiledProjectionPlan } from "../../shared/expression/plan.js";
+import { decodeProjectedRow, type ProjectedWireRow } from "../../shared/expression/projection.js";
 
 /** The KV key of the target list. The first valid list is stored, and the partition uses only it. */
 const TARGETS_KV_KEY = "__fokosdb/mat/targets";
@@ -166,6 +169,27 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 until_id    INTEGER NOT NULL,
                 PRIMARY KEY (target_id, ancestor_id)
             ) WITHOUT ROWID, STRICT;`,
+	},
+	{
+		idMonotonicInc: 2,
+		description: "Create the GSI key sets",
+		// target_index_keys:
+		// - One row for each GSI key `(index_hk, index_sk)` of a GSI target that can have an entry of the
+		//   item. `index_sk` is empty when the GSI has no sort key. No row means that the GSI has no entry
+		//   of the item. An item has 1 key, 2 keys while a key moves, and more only after deletes that did
+		//   not apply.
+		// - A rowid table with an index on `(item_id, target_id)` only, because the keys can be multiple
+		//   kilobytes, and an index on the keys would store them two times. The code keeps each key unique.
+		sql: `
+            CREATE TABLE IF NOT EXISTS target_index_keys (
+                key_id    INTEGER PRIMARY KEY,
+                item_id   INTEGER NOT NULL,
+                target_id TEXT    NOT NULL,
+                index_hk  BLOB    NOT NULL,
+                index_sk  BLOB    NOT NULL
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS idx_target_index_keys_item ON target_index_keys (item_id, target_id);`,
 	},
 ];
 
@@ -636,6 +660,76 @@ export class MaterializationStore {
 		);
 	}
 
+	// ─── GSI key sets ─────────────────────────────────────────────────────────
+
+	/** The GSI keys of an item for a GSI target, in insert order. */
+	indexKeys(targetId: string, itemId: number): GsiKey[] {
+		const keys: GsiKey[] = [];
+		for (const row of this.#storage.sql.exec<{ index_hk: ArrayBuffer; index_sk: ArrayBuffer }>(
+			`SELECT index_hk, index_sk FROM target_index_keys WHERE item_id = ? AND target_id = ? ORDER BY key_id`,
+			itemId,
+			targetId,
+		)) {
+			keys.push({ hk: asKey(row.index_hk), sk: asKey(row.index_sk) });
+		}
+		return keys;
+	}
+
+	/** Adds a GSI key of an item for a GSI target. The caller checks that the item does not have the key. */
+	addIndexKey(targetId: string, itemId: number, key: GsiKey): void {
+		this.#storage.sql.exec(
+			`INSERT INTO target_index_keys (item_id, target_id, index_hk, index_sk) VALUES (?, ?, ?, ?)`,
+			itemId,
+			targetId,
+			key.hk,
+			key.sk,
+		);
+	}
+
+	/** Removes GSI keys of an item for a GSI target. Returns true when the item has no key left. */
+	removeIndexKeys(targetId: string, itemId: number, keys: readonly GsiKey[]): boolean {
+		for (const key of keys) {
+			this.#storage.sql.exec(
+				`DELETE FROM target_index_keys WHERE item_id = ? AND target_id = ? AND index_hk = ? AND index_sk = ?`,
+				itemId,
+				targetId,
+				key.hk,
+				key.sk,
+			);
+		}
+		return !exists(this.#storage.sql.exec(`SELECT 1 FROM target_index_keys WHERE item_id = ? AND target_id = ? LIMIT 1`, itemId, targetId));
+	}
+
+	#hasIndexKeys(itemId: number): boolean {
+		return exists(
+			this.#storage.sql.exec(
+				`SELECT 1 FROM target_index_keys WHERE item_id = ? AND target_id IN (SELECT target_id FROM materialization_targets) LIMIT 1`,
+				itemId,
+			),
+		);
+	}
+
+	/**
+	 * Evaluates a compiled projection against the latest image of one item. The subquery gives the
+	 * columns of `latest_items` the names of the items table, so the compiled SQL reads the columns
+	 * that it expects. Undefined when the item has no row.
+	 */
+	evaluateProjection(plan: CompiledProjectionPlan, hk: KeyBytes, sk: KeyBytes): ProjectedWireRow | undefined {
+		const columns = plan.valueSql.flatMap((valueSql, index) => [`${valueSql} AS p${index}`, `${plan.typeSql[index]} AS t${index}`]);
+		const row = tryOne(
+			this.#storage.sql.exec<Record<string, SqlStorageValue>>(
+				`SELECT ${columns.join(", ")}
+				 FROM (SELECT base_hk AS hk, base_sk AS sk, revision AS v, ttl_at AS ttl_epoch_utc_seconds, data_kind, data
+				       FROM latest_items WHERE base_hk = ?2 AND base_sk = ?3) AS i
+				 LIMIT 1`,
+				...materializedPlanBindings(plan, "pool"),
+				hk,
+				sk,
+			),
+		);
+		return row === undefined ? undefined : decodeProjectedRow(row, plan.names.length);
+	}
+
 	// ─── cleanup ──────────────────────────────────────────────────────────────
 
 	/** The lowest cursor of all targets, or null when the partition has no target. */
@@ -698,7 +792,7 @@ export class MaterializationStore {
 				itemId,
 			),
 		);
-		if (hasRetry !== undefined) {
+		if (hasRetry !== undefined || this.#hasIndexKeys(itemId)) {
 			return false;
 		}
 		const row = tryOne(
@@ -733,6 +827,7 @@ export class MaterializationStore {
 		for (const row of rows) {
 			this.#deletePositions(row.newest_seq);
 			sql.exec(`DELETE FROM target_retry WHERE target_id IN (SELECT target_id FROM materialization_targets) AND item_id = ?1`, row.item_id);
+			sql.exec(`DELETE FROM target_index_keys WHERE item_id = ?1`, row.item_id);
 			sql.exec(`DELETE FROM latest_items WHERE item_id = ?1`, row.item_id);
 		}
 		return !exists(sql.exec(`SELECT 1 FROM latest_items WHERE base_hk = ?1 LIMIT 1`, hk));
@@ -834,6 +929,7 @@ export class MaterializationStore {
 				data: data === null || typeof data === "string" ? data : new Uint8Array(data),
 				positions: this.#positionsAbove(row.newest_seq, minSeq),
 				retries: this.#retryRows(row.item_id),
+				indexKeys: this.#indexKeyRows(row.item_id),
 			};
 		}
 	}
@@ -888,6 +984,19 @@ export class MaterializationStore {
 		return rows;
 	}
 
+	/** The GSI keys of an item, in insert order. */
+	#indexKeyRows(itemId: number): MigratedIndexKey[] {
+		const rows: MigratedIndexKey[] = [];
+		for (const row of this.#storage.sql.exec<{ target_id: string; index_hk: ArrayBuffer; index_sk: ArrayBuffer }>(
+			`SELECT target_id, index_hk, index_sk FROM target_index_keys
+			 WHERE item_id = ?1 AND target_id IN (SELECT target_id FROM materialization_targets) ORDER BY key_id`,
+			itemId,
+		)) {
+			rows.push({ target_id: row.target_id, index_hk: asKey(row.index_hk), index_sk: asKey(row.index_sk) });
+		}
+		return rows;
+	}
+
 	/**
 	 * Inserts a migrated item with its positions and its `target_retry` rows, which it marks as
 	 * inherited. A target takes no write while it imports, so an item that is present came from an
@@ -930,6 +1039,16 @@ export class MaterializationStore {
 				retry.not_before,
 				retry.attempts,
 				retry.last_error,
+			);
+		}
+		// A page of an older version has no GSI keys.
+		for (const key of item.indexKeys ?? []) {
+			sql.exec(
+				`INSERT INTO target_index_keys (item_id, target_id, index_hk, index_sk) VALUES (?1, ?2, ?3, ?4)`,
+				item.item_id,
+				key.target_id,
+				key.index_hk,
+				key.index_sk,
 			);
 		}
 		return true;
@@ -1052,7 +1171,14 @@ export type MigratedLatestItem = {
 	data: string | Uint8Array | null;
 	positions: Array<{ seq: number; prev_seq: number | null }>;
 	retries: MigratedRetryRow[];
+	indexKeys?: MigratedIndexKey[];
 };
+
+/** One `target_index_keys` row as a migration page carries it. */
+export type MigratedIndexKey = { target_id: string; index_hk: KeyBytes; index_sk: KeyBytes };
+
+/** One GSI key: the GSI hash key and the GSI sort key (empty when the GSI has no sort key). */
+export type GsiKey = { hk: KeyBytes; sk: KeyBytes };
 
 export type MigratedFence = { targetId: string; ancestorId: string; minEpoch: number };
 

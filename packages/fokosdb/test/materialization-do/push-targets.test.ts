@@ -72,8 +72,12 @@ describe("validateTargets", () => {
 		expect(failure([push("a"), push("a")])).toMatch(/not unique/);
 	});
 
-	it("rejects a GSI target and a push projection, which are not supported yet", () => {
-		expect(failure([{ kind: "gsi", targetId: "g", hashKey: { ref: "hashKey" } }])).toMatch(/not supported yet/);
+	it("accepts a GSI target with valid expressions, and rejects one with an expression that is not valid", () => {
+		expect(() => validateTargets([{ kind: "gsi", targetId: "g", hashKey: { ref: "data", path: "$.a" } }])).not.toThrow();
+		expect(() => validateTargets([{ kind: "gsi", targetId: "g", hashKey: { ref: "nope" } as never }])).toThrow();
+	});
+
+	it("rejects a push projection, which is not supported yet", () => {
 		const projected = { ...push("p"), projection: [] } as FokosTargetDefinition;
 		expect(failure([projected])).toMatch(/projection/);
 	});

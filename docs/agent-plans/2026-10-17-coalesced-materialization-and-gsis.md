@@ -141,7 +141,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
 | Change position | A row of `change_positions` that points to one changed item. All targets share the positions. |
 | Cursor (`C_t`) | `materialization_targets.cursor_seq` of target `t`. Each position at or below `C_t` is done for `t`. |
 | Read position (`R_t`) | In memory: the highest position that the batch in flight of target `t` read, or `C_t`. |
-| Key set | The `target_index_keys` row of one item and one GSI: each GSI key that can have an entry of the item. |
+| Key set | The `target_index_keys` rows of one item and one GSI: each GSI key that can have an entry of the item. |
 | Producer | The sender on a hop: a base `PartitionDO` for the export, or a `MaterializationDO` for a target. |
 | Receiver | The partition that applies a call: a `MaterializationDO`, a GSI `PartitionDO`, or a push target. |
 | Producer epoch | An integer that a producer stores for each hop and sends with each call. It only goes up. |
@@ -771,19 +771,23 @@ For each item in a batch, the step evaluates the desired GSI key `D` from the la
 
 ```sql
 CREATE TABLE IF NOT EXISTS target_index_keys (
-    key_set_id INTEGER PRIMARY KEY,
-    item_id    INTEGER NOT NULL,
-    target_id  TEXT    NOT NULL,
-    index_keys BLOB    NOT NULL,  -- encoded list of (index_hk, gsiSK) pairs
-    UNIQUE (item_id, target_id)
+    key_id    INTEGER PRIMARY KEY,
+    item_id   INTEGER NOT NULL,
+    target_id TEXT    NOT NULL,
+    index_hk  BLOB    NOT NULL,
+    index_sk  BLOB    NOT NULL  -- the encoded gsiSK, empty when the GSI has no sort key
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_target_index_keys_item ON target_index_keys (item_id, target_id);
 ```
 
-The key set of `(item_id, target_id)` holds each GSI key that can have an entry of the item in that GSI. When no row
-exists, the GSI has no entry of the item. The set normally holds 1 key. It holds 2 keys while a key moves. It holds
-more keys only after failed deletes. It is a rowid table, because the keys can be multiple kilobytes (Section 1.3).
+The key set of `(item_id, target_id)` is its rows: each GSI key that can have an entry of the item in that GSI. When
+no row exists, the GSI has no entry of the item. The set normally holds 1 key. It holds 2 keys while a key moves. It
+holds more keys only after failed deletes. It is a rowid table with an index on `(item_id, target_id)` only, because
+the keys can be multiple kilobytes (Section 1.3), and an index on the keys would store them two times. The code keeps
+each key unique in its set.
 
-`index_keys` stores the encoded `gsiSK`, not `physicalSk` (Section 4.2.14). With 1.5 KB base keys and 10 GSIs, this
+`index_sk` stores the encoded `gsiSK`, not `physicalSk` (Section 4.2.14). With 1.5 KB base keys and 10 GSIs, this
 saves about 15 KB for each item at rest and 30 KB while a key moves. Before `MaterializationDO` sends a GSI call, it
 reads `base_hk` and `base_sk` from `latest_items` by `item_id`. Both columns come before the trailing `data` column, so
 SQLite reads no overflow page. Then it builds `physicalSk = encodeGsiSortKey(index_sk, base_hk, base_sk)`.
@@ -814,9 +818,14 @@ The key set prevents an orphan GSI entry in two cases:
 The two calls of one step run in sequence and carry different GSI keys of the item. Thus they keep the same-epoch
 rule of Section 4.2.9.
 
-`MaterializationDO` validates each item before it calls `gsiWriteEntries`. When `gsiWriteEntries` still throws a
-validation error for the whole call before I/O, `MaterializationDO` sends each item of that batch again alone. Thus
-only the item that is not valid becomes a violation.
+`MaterializationDO` validates each item before it calls `gsiWriteEntries`. A violation keeps the item out of the GSI
+until the next write of the base item, so only a failure that the data of the item causes parks the item (Section
+4.2.10). `gsiWriteEntries` answers each entry, and only two failures reject a whole call:
+
+- **`batch_request_too_large`.** Nothing applied. The step sends the two halves of the call again, down to one entry.
+- **A rejection before the partition answers for each entry,** for example a route context that is not valid. The
+  data of the items does not cause it, so each item retries, no row is written, and the circuit breaker counts one
+  failure.
 
 #### 4.2.8 Push targets
 
@@ -1177,7 +1186,9 @@ item gets its own `retry` row.
 | `applied`, and the item changed during the call | For a `retry` item, keep the row with `not_before = 0`. For a cursor item, write nothing: the change has a position above the cursor (Section 4.2.5, invariant 1). |
 | `unprocessed`, or push `retry` | Insert or update the `retry` row: `attempts + 1`, and an exponential backoff from 1 s to 10 s. |
 | `rejected` (`batch_request_too_large`) | The RPC is above 32 MiB, and nothing applied. Split the batch and send again. No row. |
-| `rejected` (any other code) | A permanent item failure. Run the violation cleanup, then set `kind = 'violation'`. |
+| `rejected` of the whole call | Keep the cursor. Write no row. Back off and count a circuit breaker failure. |
+| `rejected` with a violation code | A permanent item failure. Run the violation cleanup, then set `kind = 'violation'`. The violation codes are `gsi_key_type_invalid`, `update_value_is_bytes`, `key_contains_nul`, `key_not_well_formed_utf16`, `hash_key_too_large`, `sort_key_too_large`, and `item_data_too_large`. |
+| `rejected` (any other code) | Insert or update the `retry` row, and log an error. |
 | The whole call fails with a definite outcome | Keep the cursor. Write no `retry` row. Back off and count a circuit breaker failure. |
 | `unknown` | Raise the epoch, keep the cursor, and send again at once (Section 4.2.9). |
 
@@ -1212,7 +1223,7 @@ possible:
    - **Row size.** The GSI entry row (projected data + GSI hash key + `physicalSk` + fixed overhead) is larger than
      `MAX_ITEM_BYTES` (400 KB). `MaterializationDO` measures it with `estRowBytesExpr`, `itemDataExpr`, and
      `validateItemDataSize`.
-   - **Target rejection.** The GSI returns `rejected` with a code other than `batch_request_too_large`, or a push
+   - **Target rejection.** The GSI returns `rejected` for one entry with a violation code, or a push
      target returns `{ outcome: "rejected", code }`.
 
 A permanent failure of one item on a target must not fail the other items of the batch, block base outbox

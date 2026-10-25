@@ -66,7 +66,10 @@ export class MaterializationMigrationHost implements MigrationHost {
 					readRange: (c, limit, range) => store.queryMigrationItems(c, limit, range, minSeq),
 					walk: (c, limit, owns) => store.walkMigrationItems(c, limit, owns, minSeq),
 					cursorOf: (row) => ({ hk: row.hk, sk: row.sk }),
-					estimateBytes: (row) => row.est_row_bytes + (row.positions.length + row.retries.length) * LINKED_ROW_BYTES,
+					estimateBytes: (row) =>
+						row.est_row_bytes +
+						(row.positions.length + row.retries.length) * LINKED_ROW_BYTES +
+						(row.indexKeys ?? []).reduce((n, key) => n + LINKED_ROW_BYTES + key.index_hk.length + key.index_sk.length, 0),
 				};
 				const { rows, nextCursor } = collectStream(reader, from.cursor, sliceKeyRange(slice), belongsToTarget, budget);
 				const next: MaterializationHostCursor = nextCursor

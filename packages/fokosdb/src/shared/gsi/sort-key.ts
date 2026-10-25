@@ -40,10 +40,14 @@ export function escapeKey(key: Uint8Array): Uint8Array {
 	return out;
 }
 
-/** The physical sort key of a GSI entry, without the binary tag that `KeyCodec.encode` adds. */
+/**
+ * The physical sort key of a GSI entry, without the binary tag that `KeyCodec.encode` adds. For example,
+ * the text keys `gsiSK = "2026"`, `baseHK = "u1"`, and `baseSK = "o9"` give
+ * `"2026" 00 00 "u1" 00 00 "o9" "4" ":" "1"`. `decodeGsiSortKey` describes the full layout.
+ */
 export function encodeGsiSortKey(gsiSK: KeyBytes, baseHK: KeyBytes, baseSK: KeyBytes): Uint8Array {
 	const hasNul = gsiSK.includes(NUL);
-	const length = new TextEncoder().encode(String(gsiSK.length));
+	const length = digitBytes(gsiSK.length);
 	invariant(length.length <= 9, "fokos/gsi: the GSI sort key is too long");
 	const parts = [escapeKey(gsiSK), SEPARATOR, escapeKey(baseHK), SEPARATOR, escapeKey(baseSK)];
 	if (hasNul) {
@@ -64,21 +68,39 @@ export function gsiItemSortKey(gsiSK: KeyBytes, baseHK: KeyBytes, baseSK: KeyByt
 	return KeyCodec.encode(encodeGsiSortKey(gsiSK, baseHK, baseSK));
 }
 
-/** The inverse of `encodeGsiSortKey`. Throws when the bytes are not a physical GSI sort key. */
+/**
+ * The inverse of `encodeGsiSortKey`. Throws when the bytes are not a physical GSI sort key.
+ *
+ * The layout, with `n` bytes in total:
+ *
+ *   escape(gsiSK) 00 00 escape(baseHK) 00 00 escape(baseSK) [gsiSK] <L> <flag> <D>
+ *   └───────────────────── body ──────────────────────────┘ └──────── trailer ─────┘
+ *
+ * 1. The last byte is `<D>`, the digit count of `<L>`, and the byte before it is `<flag>`.
+ * 2. The `<D>` bytes before `<flag>` are `<L>`, the byte length of `gsiSK` in decimal ASCII.
+ * 3. With the `'!'` flag, the `<L>` bytes before `<L>` are a raw copy of `gsiSK`. The body ends
+ *    before them. With the `':'` flag, the body ends at `<L>`.
+ * 4. The body is read from the start. `00 FF` is an escaped `0x00` byte of a component, and `00 00`
+ *    ends a component. The body has three components: `gsiSK`, `baseHK`, and `baseSK`.
+ */
 export function decodeGsiSortKey(physicalSk: Uint8Array): GsiSortKeyParts {
 	const n = physicalSk.length;
+	// Step 1: the last two bytes are <D> and <flag>.
 	invariant(n >= 3, "fokos/gsi: the physical sort key has no trailer");
 	const d = physicalSk[n - 1] - DIGIT_0;
 	const flag = physicalSk[n - 2];
 	invariant(d >= 1 && d <= 9 && (flag === FLAG_PLAIN || flag === FLAG_RAW) && n >= 2 + d, "fokos/gsi: the trailer is not valid");
+	// Step 2: <L> is the <D> digits before <flag>.
 	let length = 0;
 	for (let i = n - 2 - d; i < n - 2; i++) {
 		const digit = physicalSk[i] - DIGIT_0;
 		invariant(digit >= 0 && digit <= 9, "fokos/gsi: the trailer length is not a number");
 		length = length * 10 + digit;
 	}
+	// Step 3: the body ends before <L>, or before the raw copy of gsiSK with the '!' flag.
 	const bodyEnd = n - 2 - d - (flag === FLAG_RAW ? length : 0);
 	invariant(bodyEnd >= 0, "fokos/gsi: the trailer length is too large");
+	// Step 4: split the body at each 00 00, and turn each 00 FF back into 00.
 	const components: KeyBytes[] = [];
 	let current: number[] = [];
 	for (let i = 0; i < bodyEnd; i++) {
@@ -104,3 +126,15 @@ export function decodeGsiSortKey(physicalSk: Uint8Array): GsiSortKeyParts {
 }
 
 const SEPARATOR = Uint8Array.of(NUL, NUL);
+
+/**
+ * The decimal ASCII digits of a non-negative integer, most significant first, with no string in between.
+ * For example, 0 gives `[0x30]` ("0"), 7 gives `[0x37]` ("7"), and 512 gives `[0x35, 0x31, 0x32]` ("512").
+ */
+function digitBytes(n: number): Uint8Array {
+	const out = new Uint8Array(n === 0 ? 1 : Math.floor(Math.log10(n)) + 1);
+	for (let i = out.length - 1; i >= 0; i--, n = Math.floor(n / 10)) {
+		out[i] = DIGIT_0 + (n % 10);
+	}
+	return out;
+}

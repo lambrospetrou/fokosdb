@@ -20,12 +20,33 @@
  */
 import invariant from "../../shared/invariant.js";
 import { decodeItemKeys } from "../../shared/transaction-limits.js";
-import type { HashKey, ReadItemValue, SortKey } from "../../shared/types.js";
+import type { DataKind, HashKey, ReadItemValue, SortKey } from "../../shared/types.js";
 import type { JsonValue } from "../../shared/json-types.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import type { MaterializationCleanup } from "./materialization-cleanup.js";
-import type { MaterializationStore, TargetImage, TargetItemRef } from "./materialization-store.js";
-import type { FokosTargetDefinition, PushSinkTargetDefinition, PushTargetBatch, PushTargetItem, PushTargetResult } from "./targets.js";
+import type { GsiKey, MaterializationStore, TargetImage, TargetItemRef } from "./materialization-store.js";
+import type {
+	FokosTargetDefinition,
+	GsiTargetDefinition,
+	PushSinkTargetDefinition,
+	PushTargetBatch,
+	PushTargetItem,
+	PushTargetResult,
+} from "./targets.js";
+import type { GsiWriteEntriesRequest, GsiWriteEntry } from "../do-partition.js";
+import { gsiItemSortKey } from "../../shared/gsi/sort-key.js";
+import { GSI_VIOLATION_CODES, sameGsiKey, type GsiDesiredEntry } from "./gsi-target.js";
+
+/** One GSI entry with no `opIndex`: the call gives each entry its index. */
+type GsiEntryBody = GsiWriteEntry extends infer E ? (E extends unknown ? Omit<E, "opIndex"> : never) : never;
+
+/** The outcome of one entry of a GSI write. */
+export type GsiEntryOutcome =
+	| { outcome: "applied" }
+	/** `wholeCall` is true when the call to the partition failed before it answered for each entry. */
+	| { outcome: "rejected" | "unprocessed" | "unknown"; code: string; wholeCall?: boolean };
+
+const BATCH_REQUEST_TOO_LARGE = "batch_request_too_large";
 
 export type TargetRunnerConfig = {
 	/** The workers that run at the same time. */
@@ -68,6 +89,10 @@ export type TargetRunnerDeps = {
 	producerId: () => string;
 	/** Sends one batch to a push target, and returns the answer of the target as it is. */
 	push: (target: PushSinkTargetDefinition, batch: PushTargetBatch) => Promise<unknown>;
+	/** Sends one `gsiWriteEntries` call to a GSI table, and returns one outcome for each entry, in order. */
+	writeGsi: (target: GsiTargetDefinition, request: GsiWriteEntriesRequest) => Promise<GsiEntryOutcome[]>;
+	/** The GSI entry that the latest image of an item gives. It runs in the claim transaction. */
+	desiredGsi: (target: GsiTargetDefinition, image: TargetImage) => GsiDesiredEntry;
 	config: () => TargetRunnerConfig;
 	/** Sets the alarm to start a worker again at `runAt`. It does not throw. */
 	scheduleRetry: (runAt: number) => void;
@@ -93,7 +118,25 @@ type TargetState = {
 	probeAt: number;
 };
 
-type ClaimedItem = { itemId: number; revision: number; deleted: boolean; hk: KeyBytes; sk: KeyBytes; record: PushTargetItem };
+type ClaimedItem = {
+	itemId: number;
+	revision: number;
+	deleted: boolean;
+	hk: KeyBytes;
+	sk: KeyBytes;
+	record: PushTargetItem;
+	/** The writes of a GSI target, and the keys whose delete applied in this batch. */
+	gsi?: ClaimedGsiWrites;
+};
+
+type ClaimedGsiWrites = {
+	put?: { key: GsiKey; data: string | Uint8Array; kind: DataKind; ttlAt: number | null };
+	/** The keys of the set other than the key of `put`. */
+	deletes: GsiKey[];
+	/** The code of a permanent violation. The step then deletes each key of the set. */
+	violation?: string;
+	removed: GsiKey[];
+};
 
 type ClaimedBatch = {
 	epoch: number;
@@ -220,7 +263,7 @@ export class TargetRunner {
 	}
 
 	/** The next target in turn that has no step in flight, that can have work, and whose breaker allows a call. */
-	#nextTarget(): PushSinkTargetDefinition | undefined {
+	#nextTarget(): FokosTargetDefinition | undefined {
 		const targets = this.#deps.targets();
 		const now = this.#deps.now();
 		for (let i = 0; i < targets.length; i++) {
@@ -230,7 +273,6 @@ export class TargetRunner {
 			if (state.inFlight || state.idle || state.probeAt > now) {
 				continue;
 			}
-			invariant(target.kind === "push_sink", () => `fokos/mat: the runner cannot send to the ${target.kind} target ${target.targetId}`);
 			this.#next = (index + 1) % targets.length;
 			return target;
 		}
@@ -253,15 +295,15 @@ export class TargetRunner {
 		return state;
 	}
 
-	async #step(target: PushSinkTargetDefinition): Promise<void> {
+	async #step(target: FokosTargetDefinition): Promise<void> {
 		const state = this.#state(target.targetId);
 		state.inFlight = true;
 		try {
-			const batch = this.#claim(target.targetId, state);
+			const batch = this.#claim(target, state);
 			if (batch === null) {
 				return;
 			}
-			const results = await this.#send(target, batch);
+			const results = target.kind === "gsi" ? await this.#sendGsi(target, batch) : await this.#send(target, batch);
 			this.#complete(target.targetId, state, batch, results);
 		} finally {
 			state.inFlight = false;
@@ -274,8 +316,9 @@ export class TargetRunner {
 	 * item to send. A claim that read positions and found no item to send moves the cursor past them, so
 	 * a long run of skipped positions moves the cursor in bounded steps.
 	 */
-	#claim(targetId: string, state: TargetState): ClaimedBatch | null {
+	#claim(target: FokosTargetDefinition, state: TargetState): ClaimedBatch | null {
 		const { store } = this.#deps;
+		const targetId = target.targetId;
 		const firstClaim = !state.started;
 		const claim = store.transactionSync(() => {
 			const row = store.targetRow(targetId);
@@ -283,7 +326,7 @@ export class TargetRunner {
 			// makes each receiver that gets the next call first reject that late call.
 			const epoch = firstClaim && row.isBatchOpen ? store.raiseTargetEpoch(targetId) : row.epoch;
 			const { refs, retryCount, highestSeq } = this.#claimRefs(targetId, row.cursorSeq);
-			const items = this.#claimItems(targetId, refs, retryCount);
+			const items = this.#claimItems(target, refs, retryCount);
 			if (items.length === 0) {
 				// No batch of the current epoch is in flight, so the marker can go.
 				if (highestSeq !== null || row.isBatchOpen) {
@@ -360,8 +403,9 @@ export class TargetRunner {
 	 * this partition is between its cutover and its completion, the child can still need the row, so
 	 * the claim moves its backoff end instead. The row then does not fill the `retry` part of each batch.
 	 */
-	#claimItems(targetId: string, refs: readonly TargetItemRef[], retryCount: number): ClaimedItem[] {
+	#claimItems(target: FokosTargetDefinition, refs: readonly TargetItemRef[], retryCount: number): ClaimedItem[] {
 		const { store } = this.#deps;
+		const targetId = target.targetId;
 		const owns = this.#deps.ownerCheck();
 		const items: ClaimedItem[] = [];
 		for (const [i, ref] of refs.entries()) {
@@ -386,9 +430,191 @@ export class TargetRunner {
 				hk: image.hk,
 				sk: image.sk,
 				record: toPushItem(image),
+				...(target.kind === "gsi" ? { gsi: this.#claimGsi(target, ref.itemId, image) } : {}),
 			});
 		}
 		return items;
+	}
+
+	/**
+	 * The GSI writes of one item. A desired key that is not in the key set goes into the set before the
+	 * call, so that a later step can delete an entry that the call wrote.
+	 */
+	#claimGsi(target: GsiTargetDefinition, itemId: number, image: TargetImage): ClaimedGsiWrites {
+		const { store } = this.#deps;
+		const desired = this.#deps.desiredGsi(target, image);
+		const keys = store.indexKeys(target.targetId, itemId);
+		if (desired.kind !== "present") {
+			return { deletes: keys, removed: [], ...(desired.kind === "violation" ? { violation: desired.code } : {}) };
+		}
+		if (!keys.some((key) => sameGsiKey(key, desired.key))) {
+			keys.push(desired.key);
+			store.addIndexKey(target.targetId, itemId, desired.key);
+		}
+		return {
+			put: { key: desired.key, data: desired.data, kind: desired.dataKind, ttlAt: desired.ttlAt },
+			deletes: keys.filter((key) => !sameGsiKey(key, desired.key)),
+			removed: [],
+		};
+	}
+
+	/**
+	 * Sends the GSI writes of one batch in two calls in sequence. The first call puts each desired
+	 * entry, and deletes each key of an item with no desired entry. The second call deletes the other
+	 * keys of each item whose put applied, so that a key move writes the new entry before it deletes
+	 * the old one. After a put that the GSI rejected, the second call deletes each key of the item. The
+	 * two calls carry different keys of an item, so they keep the same-epoch rule. Returns null when the
+	 * outcome of an entry is unknown.
+	 */
+	async #sendGsi(target: GsiTargetDefinition, batch: ClaimedBatch): Promise<PushTargetResult[] | null> {
+		const results: PushTargetResult[] = batch.items.map(() => ({ outcome: "applied" }));
+		type Pending = { index: number; entry: GsiEntryBody; key: GsiKey; isPut: boolean };
+		const entryOf = (item: ClaimedItem, key: GsiKey): GsiEntryBody => ({
+			op: "delete",
+			hashKey: key.hk,
+			sortKey: gsiItemSortKey(key.sk, item.hk, item.sk),
+		});
+		/** The code of a permanent failure, by item index: the item gets `rejected` when its deletes apply. */
+		const violations = new Map<number, string>();
+		const first: Pending[] = [];
+		const second: Pending[] = [];
+		for (const [index, item] of batch.items.entries()) {
+			const gsi = item.gsi;
+			invariant(gsi !== undefined, "fokos/mat: a GSI batch item has no GSI writes");
+			if (gsi.violation !== undefined) {
+				violations.set(index, gsi.violation);
+			}
+			if (gsi.put !== undefined) {
+				const { key, data, kind, ttlAt } = gsi.put;
+				first.push({
+					index,
+					key,
+					isPut: true,
+					entry: {
+						op: "put",
+						hashKey: key.hk,
+						sortKey: gsiItemSortKey(key.sk, item.hk, item.sk),
+						data,
+						kind,
+						baseRevision: item.revision,
+						...(ttlAt === null ? {} : { ttlAt }),
+					},
+				});
+			} else {
+				first.push(...gsi.deletes.map((key) => ({ index, key, isPut: false, entry: entryOf(item, key) })));
+			}
+		}
+		const failed = new Set<number>();
+		const apply = (pending: Pending[], outcomes: GsiEntryOutcome[]) => {
+			for (const [k, { index, key, isPut }] of pending.entries()) {
+				const outcome = outcomes[k];
+				const item = batch.items[index];
+				const gsi = item.gsi as ClaimedGsiWrites;
+				if (outcome.outcome === "applied") {
+					if (!isPut) {
+						gsi.removed.push(key);
+					} else {
+						second.push(...gsi.deletes.map((other) => ({ index, key: other, isPut: false, entry: entryOf(item, other) })));
+					}
+					continue;
+				}
+				if (isPut && outcome.outcome === "rejected" && GSI_VIOLATION_CODES.has(outcome.code)) {
+					violations.set(index, outcome.code);
+					second.push(...[key, ...gsi.deletes].map((other) => ({ index, key: other, isPut: false, entry: entryOf(item, other) })));
+					continue;
+				}
+				if (outcome.outcome === "rejected") {
+					this.#logError("fokos/mat: a GSI rejected an entry with a code that the item data does not cause", {
+						targetId: target.targetId,
+						key: KeyCodec.pairForLog(item.hk, item.sk),
+						code: outcome.code,
+					});
+				}
+				failed.add(index);
+				results[index] = { outcome: "retry", code: outcome.code };
+			}
+		};
+		for (const pending of [first, second]) {
+			if (pending.length === 0) {
+				continue;
+			}
+			const outcomes = await this.#callGsi(
+				target,
+				batch,
+				pending.map((p) => p.entry),
+			);
+			if (outcomes === null) {
+				return null;
+			}
+			// A rejection of the whole call is not a failure of its items: each item retries, and the
+			// circuit breaker counts one failure.
+			const whole = outcomes.find((outcome) => outcome.outcome === "rejected" && outcome.wholeCall === true);
+			if (whole !== undefined && whole.outcome !== "applied") {
+				this.#logError("fokos/mat: a GSI rejected a whole call", { targetId: target.targetId, code: whole.code });
+				return batch.items.map(() => ({ outcome: "retry", code: whole.code }));
+			}
+			apply(pending, outcomes);
+		}
+		for (const [index, code] of violations) {
+			if (!failed.has(index)) {
+				results[index] = { outcome: "rejected", code };
+			}
+		}
+		return results;
+	}
+
+	/**
+	 * One GSI call. A call above the RPC limit applied nothing, so its two halves go again, down to one
+	 * entry. Returns null when the outcome of an entry is unknown.
+	 */
+	async #callGsi(target: GsiTargetDefinition, batch: ClaimedBatch, entries: Array<GsiEntryBody>): Promise<GsiEntryOutcome[] | null> {
+		const outcomes = await this.#callGsiOnce(target, batch, entries);
+		if (
+			outcomes === null ||
+			entries.length < 2 ||
+			!outcomes.some((outcome) => outcome.outcome === "rejected" && outcome.code === BATCH_REQUEST_TOO_LARGE)
+		) {
+			return outcomes;
+		}
+		const half = Math.ceil(entries.length / 2);
+		const first = await this.#callGsi(target, batch, entries.slice(0, half));
+		const second = first === null ? null : await this.#callGsi(target, batch, entries.slice(half));
+		return first === null || second === null ? null : [...first, ...second];
+	}
+
+	async #callGsiOnce(target: GsiTargetDefinition, batch: ClaimedBatch, entries: Array<GsiEntryBody>): Promise<GsiEntryOutcome[] | null> {
+		const request: GsiWriteEntriesRequest = {
+			producerId: this.#deps.producerId(),
+			epoch: batch.epoch,
+			ancestorFences: batch.ancestorFences,
+			items: entries.map((entry, opIndex) => ({ ...entry, opIndex }) as GsiWriteEntry),
+		};
+		try {
+			const outcomes = await this.#withTimeout(this.#deps.writeGsi(target, request));
+			invariant(outcomes.length === entries.length, "fokos/mat: the GSI writer answered a wrong number of outcomes");
+			const unknown = outcomes.find((outcome) => outcome.outcome === "unknown");
+			if (unknown !== undefined) {
+				throw new Error(`an entry has the outcome unknown (${(unknown as { code: string }).code})`);
+			}
+			return outcomes;
+		} catch (error) {
+			this.#logError("fokos/mat: a GSI call has no answer", { targetId: target.targetId, epoch: batch.epoch, error: String(error) });
+			return null;
+		}
+	}
+
+	/** Waits for `call` up to `callTimeoutMs`. The timer is cleared when the call answers. */
+	async #withTimeout<T>(call: Promise<T>): Promise<T> {
+		const timeoutMs = this.#deps.config().callTimeoutMs;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new Error(`the call had no answer after ${timeoutMs} ms`)), timeoutMs);
+		});
+		try {
+			return await Promise.race([call, timeout]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/**
@@ -397,19 +623,14 @@ export class TargetRunner {
 	 * the Durable Object from hibernation, and it is billed for that time.
 	 */
 	async #send(target: PushSinkTargetDefinition, batch: ClaimedBatch): Promise<PushTargetResult[] | null> {
-		const timeoutMs = this.#deps.config().callTimeoutMs;
 		const request: PushTargetBatch = {
 			producerId: this.#deps.producerId(),
 			epoch: batch.epoch,
 			ancestorFences: batch.ancestorFences,
 			items: batch.items.map((item) => item.record),
 		};
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new Error(`the push call had no answer after ${timeoutMs} ms`)), timeoutMs);
-		});
 		try {
-			const answer = await Promise.race([this.#deps.push(target, request), timeout]);
+			const answer = await this.#withTimeout(this.#deps.push(target, request));
 			if (!Array.isArray(answer) || answer.length !== batch.items.length || !answer.every(isPushTargetResult)) {
 				throw new Error(`the push target answered ${Array.isArray(answer) ? `${answer.length} results` : typeof answer}`);
 			}
@@ -417,8 +638,6 @@ export class TargetRunner {
 		} catch (error) {
 			this.#logError("fokos/mat: a push call has no answer", { targetId: target.targetId, epoch: batch.epoch, error: String(error) });
 			return null;
-		} finally {
-			clearTimeout(timer);
 		}
 	}
 
@@ -451,6 +670,14 @@ export class TargetRunner {
 			}
 			const owns = this.#deps.ownerCheck();
 			let unblocked = false;
+			// A key whose delete applied has no entry now. Only this batch changes the key sets of the target.
+			for (const item of batch.items) {
+				if (item.gsi !== undefined && item.gsi.removed.length > 0) {
+					if (store.removeIndexKeys(targetId, item.itemId, item.gsi.removed) && item.deleted) {
+						unblocked = true;
+					}
+				}
+			}
 			for (const [i, result] of results.entries()) {
 				const item = batch.items[i];
 				if (owns(item) && this.#applyResult(targetId, item, result)) {

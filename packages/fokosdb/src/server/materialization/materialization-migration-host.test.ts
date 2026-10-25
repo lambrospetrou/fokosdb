@@ -203,4 +203,38 @@ describe("MaterializationMigrationHost", () => {
 		expect(child.targets).toEqual([{ target_id: "__proto__", cursor_seq: 0, epoch: 1 }]);
 		expect(child.fences).toEqual([{ target_id: "__proto__", ancestor_id: SOURCE_ID, min_epoch: 2, until_id: 1 }]);
 	});
+
+	it("moves the GSI key sets of each item with the item", async () => {
+		const slice: FokosSlice = { kind: "promoted_key", hashKey: kb("hot") };
+		const inSlice = (key: RouteKey) => KeyCodec.compare(key.hashKey, kb("hot")) === 0;
+		const keys = [
+			{ hk: kb("A"), sk: KeyCodec.encodeOptional(undefined) },
+			{ hk: kb("B"), sk: kb("b") },
+		];
+		const pages = await inPartition("mat-keys-source", (store) => {
+			store.storeTargets(targets);
+			store.putLatestImage(image("hot", "s"), 1_000, undefined, []);
+			for (const key of keys) {
+				store.addIndexKey("t1", store.storedImage(kb("hot"), kb("s"))!.itemId, key);
+			}
+			store.storeCursorSnapshot(kb("hot"));
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID });
+			const out: MaterializationHostPage[] = [];
+			let cursor: unknown = null;
+			do {
+				const { page, nextCursor } = host.buildPage(cursor, slice, inSlice, BUDGET);
+				out.push(page);
+				cursor = nextCursor;
+			} while (cursor !== null);
+			return out;
+		});
+		const copied = await inPartition("mat-keys-target", (store) => {
+			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32) });
+			for (const page of pages) {
+				host.applyPage(page, slice);
+			}
+			return store.indexKeys("t1", store.storedImage(kb("hot"), kb("s"))!.itemId);
+		});
+		expect(copied).toEqual(keys);
+	});
 });

@@ -19,6 +19,7 @@
 				"TransactionCoordinatorDO",
 				"MaterializationDO",
 				"PushMaterializationDO",
+				"GsiMaterializationDO",
 				"PushSinkDO",
 				"CustomPartitionDO",
 				"ControlledPartitionDO",
@@ -46,6 +47,10 @@
 			{
 				"class_name": "PushMaterializationDO",
 				"name": "PUSH_MATERIALIZATION_DO",
+			},
+			{
+				"class_name": "GsiMaterializationDO",
+				"name": "GSI_MATERIALIZATION_DO",
 			},
 			{
 				"class_name": "PushSinkDO",

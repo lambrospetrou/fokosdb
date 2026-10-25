@@ -18,7 +18,10 @@ import type {
 } from "../../sharding/repartition-types.js";
 import { promotedKeyOf } from "../../sharding/repartition-slice.js";
 import { identityDepth } from "../../sharding/partition-id.js";
-import { materializationStubByName, pushTargetStub } from "../../shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName, pushTargetStub } from "../../shared/do-stubs.js";
+import { resolveLimits } from "../../shared/transaction-limits.js";
+import { GsiWriter } from "./gsi-writer.js";
+import { compileGsiPlans, desiredGsiEntry, type GsiPlans } from "./gsi-target.js";
 import { CONFLICT_CODES, FokosConflictError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../shared/errors.js";
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
 import { mergeBatchParts, withOffset, type BatchFailure } from "../../shared/batch-merge.js";
@@ -104,6 +107,9 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	#runner: TargetRunner;
 	#cleanup: MaterializationCleanup;
 	#splitPlanner: SplitPlanner;
+	#gsiWriter: GsiWriter;
+	/** The compiled expressions of each GSI target, by `targetId`. */
+	readonly #gsiPlans = new Map<string, GsiPlans>();
 	/** The stored target list, read one time for each instance. */
 	#targetList: readonly FokosTargetDefinition[] | undefined;
 
@@ -126,6 +132,13 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 			store: this.#store,
 			config: () => this.config().cleanup,
 		});
+		this.#gsiWriter = new GsiWriter({
+			table: () => {
+				const { topology, rangeConfig, policy, policyVersion } = this.fokos.routeContext();
+				return { topology, rangeConfig, policy, policyVersion };
+			},
+			stub: (routeCtx, doName) => partitionStubByName(env, routeCtx, doName),
+		});
 		this.#runner = new TargetRunner({
 			store: this.#store,
 			cleanup: this.#cleanup,
@@ -145,6 +158,15 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 				this.fokos.scheduleJob(JOB_TARGET_PUSH, runAt).catch((error: unknown) => {
 					console.error({ ...this.logParams(), message: "fokos/mat: failed to schedule the target runner", error: String(error) });
 				});
+			},
+			writeGsi: (target, request) => this.#gsiWriter.write(target, request),
+			desiredGsi: (target, image) => {
+				let plans = this.#gsiPlans.get(target.targetId);
+				if (plans === undefined) {
+					plans = compileGsiPlans(target);
+					this.#gsiPlans.set(target.targetId, plans);
+				}
+				return desiredGsiEntry(this.#store, plans, image, resolveLimits(this.fokos.policy().limits));
 			},
 			now: () => this.fokosNow(),
 			logParams: () => this.logParams(),

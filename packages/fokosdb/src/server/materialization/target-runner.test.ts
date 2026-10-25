@@ -5,7 +5,12 @@ import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { MaterializationCleanup } from "./materialization-cleanup.js";
 import { MaterializationStore, type LatestImage, type TargetRow } from "./materialization-store.js";
 import { TargetRunner, type TargetRunnerConfig } from "./target-runner.js";
-import type { PushSinkTargetDefinition, PushTargetBatch, PushTargetResult } from "./targets.js";
+import type { FokosTargetDefinition, PushTargetBatch, PushTargetResult } from "./targets.js";
+import type { GsiWriteEntriesRequest } from "../do-partition.js";
+import type { GsiDesiredEntry } from "./gsi-target.js";
+import type { GsiEntryOutcome } from "./target-runner.js";
+import type { TargetImage } from "./materialization-store.js";
+import invariant from "../../shared/invariant.js";
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);
@@ -44,6 +49,7 @@ type Harness = {
 	/** The times that the runner gave to `scheduleRetry`. */
 	scheduled: number[];
 	sql: SqlStorage;
+	gsiCalls: GsiWriteEntriesRequest[];
 };
 
 /** The items of a call as `hashKey@revision`, with a `-` for a tombstone. */
@@ -52,24 +58,29 @@ const sent = (call: Call) => call.batch.items.map((item) => `${String(item.baseH
 const applyAll = ({ batch }: Call): PushTargetResult[] => batch.items.map(() => ({ outcome: "applied" }));
 
 async function withRunner(
-	opts: { targets?: string[]; answer?: Answer; config?: Partial<TargetRunnerConfig>; owns?: (hk: string) => boolean },
+	opts: {
+		targets?: string[];
+		answer?: Answer;
+		config?: Partial<TargetRunnerConfig>;
+		owns?: (hk: string) => boolean;
+		/** Makes each target a GSI target. `answer` gives the outcomes of each GSI call, or throws. */
+		gsi?: { answer: (request: GsiWriteEntriesRequest) => GsiEntryOutcome[]; desired: (image: TargetImage) => GsiDesiredEntry };
+	},
 	fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`runner-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: MaterializationDO, state: DurableObjectState) => {
 		const store = new MaterializationStore(state.storage);
-		const targets: PushSinkTargetDefinition[] = (opts.targets ?? ["t1"]).map((targetId) => ({
-			kind: "push_sink",
-			targetId,
-			binding: "SINK",
-			method: "push",
-		}));
+		const targets: FokosTargetDefinition[] = (opts.targets ?? ["t1"]).map((targetId) =>
+			opts.gsi ? { kind: "gsi", targetId, hashKey: { ref: "data" } } : { kind: "push_sink", targetId, binding: "SINK", method: "push" },
+		);
 		store.storeTargets(targets);
 		const cleanup = new MaterializationCleanup({
 			store,
 			config: () => ({ deleteRows: 100, scanRows: 100 }),
 		});
 		const calls: Call[] = [];
+		const gsiCalls: GsiWriteEntriesRequest[] = [];
 		const scheduled: number[] = [];
 		let now = 1_000;
 		const runner = new TargetRunner({
@@ -84,6 +95,12 @@ async function withRunner(
 				calls.push(call);
 				return await (opts.answer ?? applyAll)(call);
 			},
+			writeGsi: async (_target, request) => {
+				gsiCalls.push(request);
+				invariant(opts.gsi, "this harness has no GSI target");
+				return opts.gsi.answer(request);
+			},
+			desiredGsi: (_target, image) => opts.gsi?.desired(image) ?? { kind: "absent" },
 			config: () => ({ ...CONFIG, ...opts.config }),
 			scheduleRetry: (runAt) => scheduled.push(runAt),
 			now: () => now,
@@ -133,6 +150,7 @@ async function withRunner(
 			now: () => now,
 			scheduled,
 			sql: state.storage.sql,
+			gsiCalls,
 		});
 	});
 }
@@ -624,6 +642,132 @@ describe("TargetRunner — splits", () => {
 			h.runner.wake();
 			await h.drain();
 			expect(h.count("change_positions")).toBe(0);
+		});
+	});
+});
+
+describe("TargetRunner — GSI targets", () => {
+	/** The data of an image is its GSI hash key, and "none" gives no entry. */
+	const desired = (image: TargetImage): GsiDesiredEntry =>
+		image.deleted || image.data === "none"
+			? { kind: "absent" }
+			: { kind: "present", key: { hk: kb(image.data as string), sk: NO_SK }, data: "d", dataKind: "text", ttlAt: null };
+	const applied = (request: GsiWriteEntriesRequest): GsiEntryOutcome[] => request.items.map(() => ({ outcome: "applied" }));
+	/** Each call as its entries, `put:<gsiHK>` or `delete:<gsiHK>`. */
+	const entries = (calls: GsiWriteEntriesRequest[]) =>
+		calls.map((call) => call.items.map((item) => `${item.op}:${String(KeyCodec.decode(item.hashKey))}`));
+	const keySet = (h: Harness, hk: string) => {
+		const itemId = h.store.storedImage(kb(hk), NO_SK)?.itemId;
+		return itemId === undefined ? [] : h.store.indexKeys("t1", itemId).map((key) => String(KeyCodec.decode(key.hk)));
+	};
+
+	it("a key move puts the new entry in one call, and deletes the old entry in a second call", async () => {
+		await withRunner({ gsi: { answer: applied, desired } }, async (h) => {
+			h.ingest("x", 1, { data: "A" });
+			await h.drain();
+			expect(entries(h.gsiCalls)).toEqual([["put:A"]]);
+			expect(keySet(h, "x")).toEqual(["A"]);
+
+			h.ingest("x", 2, { data: "C" });
+			await h.drain();
+			expect(entries(h.gsiCalls)).toEqual([["put:A"], ["put:C"], ["delete:A"]]);
+			expect(keySet(h, "x")).toEqual(["C"]);
+			expect(h.gsiCalls[2].epoch).toBe(h.gsiCalls[1].epoch);
+		});
+	});
+
+	it("an item with no entry and no key set sends no call", async () => {
+		await withRunner({ gsi: { answer: applied, desired } }, async (h) => {
+			h.ingest("x", 1, { data: "none" });
+			await h.drain();
+			expect(h.gsiCalls).toEqual([]);
+			expect(h.target("t1").cursorSeq).toBeGreaterThan(0);
+		});
+	});
+
+	it("a delete with an unknown outcome keeps its key, raises the epoch, and is sent again", async () => {
+		let unknown = true;
+		const answer = (request: GsiWriteEntriesRequest): GsiEntryOutcome[] => {
+			if (unknown && request.items.some((item) => item.op === "delete")) {
+				unknown = false;
+				return request.items.map(() => ({ outcome: "unknown", code: "internal" }));
+			}
+			return applied(request);
+		};
+		await withRunner({ gsi: { answer, desired } }, async (h) => {
+			h.ingest("x", 1, { data: "A" });
+			await h.drain();
+			h.ingest("x", 2, { deleted: true });
+			await h.drain();
+			expect(entries(h.gsiCalls)).toEqual([["put:A"], ["delete:A"], ["delete:A"]]);
+			expect(h.gsiCalls[2].epoch).toBe(h.gsiCalls[1].epoch + 1);
+			expect(keySet(h, "x")).toEqual([]);
+		});
+	});
+
+	it("a put that the GSI rejects deletes each key of the item, and parks the item as a violation", async () => {
+		const answer = (request: GsiWriteEntriesRequest): GsiEntryOutcome[] =>
+			request.items.map((item) =>
+				item.op === "put" && String(KeyCodec.decode(item.hashKey)) === "BAD"
+					? { outcome: "rejected", code: "item_data_too_large" }
+					: { outcome: "applied" },
+			);
+		await withRunner({ gsi: { answer, desired } }, async (h) => {
+			h.ingest("x", 1, { data: "A" });
+			await h.drain();
+			h.ingest("x", 2, { data: "BAD" });
+			await h.drain();
+			expect(entries(h.gsiCalls)).toEqual([["put:A"], ["put:BAD"], ["delete:BAD", "delete:A"]]);
+			expect(keySet(h, "x")).toEqual([]);
+			expect(h.retryRows()).toMatchObject([{ target_id: "t1", hk: "x", kind: "violation", last_error: "item_data_too_large" }]);
+		});
+	});
+
+	it("a call above the RPC limit goes again in two halves, and writes no row", async () => {
+		const answer = (request: GsiWriteEntriesRequest): GsiEntryOutcome[] =>
+			request.items.length > 1 ? request.items.map(() => ({ outcome: "rejected", code: "batch_request_too_large" })) : applied(request);
+		await withRunner({ gsi: { answer, desired } }, async (h) => {
+			h.ingest("x", 1, { data: "A" });
+			h.ingest("y", 1, { data: "B" });
+			h.ingest("z", 1, { data: "C" });
+			await h.drain();
+			expect(entries(h.gsiCalls)).toEqual([["put:A", "put:B", "put:C"], ["put:A", "put:B"], ["put:A"], ["put:B"], ["put:C"]]);
+			expect(h.retryRows()).toEqual([]);
+			expect(["x", "y", "z"].map((hk) => keySet(h, hk))).toEqual([["A"], ["B"], ["C"]]);
+		});
+	});
+
+	it("a rejection of the whole call writes no row and keeps the cursor", async () => {
+		let reject = true;
+		const answer = (request: GsiWriteEntriesRequest): GsiEntryOutcome[] =>
+			reject
+				? request.items.map(() => ({ outcome: "rejected", code: "partition_context_options_invalid", wholeCall: true }))
+				: applied(request);
+		await withRunner({ gsi: { answer, desired }, config: { breakerFailures: 1 } }, async (h) => {
+			h.ingest("x", 1, { data: "A" });
+			await h.drain();
+			expect(h.retryRows()).toEqual([]);
+			expect(h.target("t1").cursorSeq).toBe(0);
+			reject = false;
+			h.advance(CONFIG.probeIntervalMs);
+			h.runner.wake();
+			await h.drain();
+			expect(entries(h.gsiCalls).at(-1)).toEqual(["put:A"]);
+			expect(h.target("t1").cursorSeq).toBeGreaterThan(0);
+		});
+	});
+
+	it("a put that the GSI rejects with a code that the item data does not cause gets a retry row", async () => {
+		const answer = (request: GsiWriteEntriesRequest): GsiEntryOutcome[] =>
+			request.items.map((item) =>
+				String(KeyCodec.decode(item.hashKey)) === "B" ? { outcome: "rejected", code: "compiled_plan_refused" } : { outcome: "applied" },
+			);
+		await withRunner({ gsi: { answer, desired } }, async (h) => {
+			h.ingest("x", 1, { data: "A" });
+			h.ingest("y", 1, { data: "B" });
+			await h.drain();
+			expect(h.retryRows()).toMatchObject([{ target_id: "t1", hk: "y", kind: "retry", last_error: "compiled_plan_refused" }]);
+			expect(keySet(h, "y")).toEqual(["B"]);
 		});
 	});
 });

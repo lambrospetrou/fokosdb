@@ -19,6 +19,8 @@ export { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinat
 export { MaterializationDO } from "../src/server/materialization/do-materialization.js";
 // A materialization class with a push target, and the push target that it sends to.
 export { PushMaterializationDO, PushSinkDO } from "./materialization-do/push-target-host.js";
+// A materialization class with GSI targets.
+export { GsiMaterializationDO } from "./materialization-do/gsi-target-host.js";
 
 // db.test.ts runs its whole suite over CUSTOM_PARTITION_DO as well, so that a
 // subclassed PartitionDO stays covered.

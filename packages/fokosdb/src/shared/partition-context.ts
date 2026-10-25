@@ -17,7 +17,7 @@ import { validatePolicyVersion, validateRangeConfig, validateTopology } from "..
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
-import { resolveLimits, type FokosDBLimitOverrides } from "./transaction-limits.js";
+import { resolveLimits, type FokosDBLimitOverrides, type FokosDBLimits } from "./transaction-limits.js";
 
 export type SplitConditions = {
 	/** The size in megabytes that makes the partition split. */
@@ -75,6 +75,7 @@ export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
 export const RESERVED_SHARD_GROUP_PREFIX = "fokos.";
 
 const PARTITION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}p.`;
+const MATERIALIZATION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}m.`;
 
 /** The coordinator group of a table, `fokos.tc.<tableName>`, from the partition group of the table. */
 export function coordinatorShardGroup(topology: FokosTopology): string {
@@ -83,7 +84,7 @@ export function coordinatorShardGroup(topology: FokosTopology): string {
 
 /** The materialization group of a table, `fokos.m.<tableName>`, from the partition group of the table. */
 export function materializationShardGroup(topology: FokosTopology): string {
-	return `${RESERVED_SHARD_GROUP_PREFIX}m.${tableNameOf(topology)}`;
+	return `${MATERIALIZATION_SHARD_GROUP_PREFIX}${tableNameOf(topology)}`;
 }
 
 /**
@@ -92,6 +93,48 @@ export function materializationShardGroup(topology: FokosTopology): string {
  */
 export function materializationTableConfig(table: FokosDBTableConfig): FokosDBTableConfig {
 	return { ...table, topology: { ...table.topology, shardGroup: materializationShardGroup(table.topology) } };
+}
+
+/**
+ * The shard group of a GSI, `fokos.gsiv1.<n>.<tableName>.<indexName>`, from the partition group or the
+ * materialization group of the table. `<n>` is the length of the table name, so each pair of names
+ * gives one shard group. The name is the address of the GSI data, so it must never change.
+ */
+export function gsiShardGroup(topology: FokosTopology, indexName: string): string {
+	const tableName = topology.shardGroup.startsWith(MATERIALIZATION_SHARD_GROUP_PREFIX)
+		? topology.shardGroup.slice(MATERIALIZATION_SHARD_GROUP_PREFIX.length)
+		: tableNameOf(topology);
+	return `${RESERVED_SHARD_GROUP_PREFIX}gsiv1.${tableName.length}.${tableName}.${indexName}`;
+}
+
+/** True for the shard group of a GSI. */
+export function isGsiShardGroup(shardGroup: string): boolean {
+	return shardGroup.startsWith(`${RESERVED_SHARD_GROUP_PREFIX}gsiv1.`);
+}
+
+/**
+ * The key limits of a GSI table. `h` and `s` are the limits of the base table. The physical sort key
+ * holds the tag byte, the escaped GSI sort key, base hash key, and base sort key (each 0x00 can double),
+ * two separators, and the longest trailer: a raw copy of the GSI sort key, its length, and two bytes.
+ */
+export function gsiLimits(base: FokosDBLimits): FokosDBLimits {
+	const h = base.maxHashKeyBytes;
+	const s = base.maxSortKeyBytes;
+	return { maxHashKeyBytes: h, maxSortKeyBytes: 1 + 2 * (2 * s + h) + 4 + s + String(s).length + 2 };
+}
+
+/**
+ * The configuration of the GSI table `indexName`. It has the topology, the range configuration, and
+ * the policy of the base table, with its own shard group, the GSI key limits, no change capture, and
+ * no materialization group.
+ */
+export function gsiTableConfig(table: FokosDBTableConfig, indexName: string): FokosDBTableConfig {
+	const { captureChanges: _capture, nsMat: _nsMat, ...policy } = table.policy;
+	return {
+		...table,
+		topology: { ...table.topology, shardGroup: gsiShardGroup(table.topology, indexName) },
+		policy: { ...policy, limits: gsiLimits(resolveLimits(table.policy.limits)) },
+	};
 }
 
 function tableNameOf(topology: FokosTopology): string {

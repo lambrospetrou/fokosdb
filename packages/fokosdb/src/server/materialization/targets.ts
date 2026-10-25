@@ -3,6 +3,7 @@
  */
 import type { ExpressionValue, ProjectionExpression } from "../../shared/expression/types.js";
 import invariant from "../../shared/invariant.js";
+import { analyzeExpressionValue, validateProjectionExpression } from "../../shared/expression/semantic.js";
 import type { HashKey, ReadItemValue, SortKey } from "../../shared/types.js";
 
 export type GsiTargetDefinition = {
@@ -54,7 +55,7 @@ const MAX_GSI_TARGETS = 10;
 
 /**
  * Throws when the target list is not valid. A `targetId` is not empty, has no `~`, and is unique.
- * GSI targets and push projections are not supported yet.
+ * The expressions of a GSI target are valid. Push projections are not supported yet.
  */
 export function validateTargets(targets: readonly FokosTargetDefinition[]): void {
 	const ids = new Set<string>();
@@ -70,7 +71,13 @@ export function validateTargets(targets: readonly FokosTargetDefinition[]): void
 			case "gsi":
 				gsiCount += 1;
 				invariant(gsiCount <= MAX_GSI_TARGETS, () => `fokos/mat: a table has at most ${MAX_GSI_TARGETS} GSI targets`);
-				invariant(false, () => `fokos/mat: the GSI target ${target.targetId} is not supported yet`);
+				analyzeExpressionValue(target.hashKey, "projection");
+				if (target.sortKey !== undefined) {
+					analyzeExpressionValue(target.sortKey, "projection");
+				}
+				if (target.projection !== undefined) {
+					validateProjectionExpression(target.projection);
+				}
 				break;
 			case "push_sink":
 				invariant(
