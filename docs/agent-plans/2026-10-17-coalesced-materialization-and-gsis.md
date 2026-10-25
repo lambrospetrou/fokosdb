@@ -3,8 +3,8 @@
 **State:** Draft
 **Date:** 2026-10-17
 **Author:** Lambros Petrou
-**Status:** The delete revision `v + 1` (Section 4.2.2), Milestone 1, and Milestone 2 are built. Nothing else is built. This document specifies
-global secondary indexes (GSIs) and push targets.
+**Status:** Milestones 1 to 4 are built. Milestone 5 is deferred.
+Push projections are future work (Section 4.3.10).
 
 ## Table of Contents
 
@@ -47,6 +47,7 @@ global secondary indexes (GSIs) and push targets.
     - [4.3.7 Applied map for each target](#437-applied-map-for-each-target)
     - [4.3.8 Skip a GSI write that changes nothing](#438-skip-a-gsi-write-that-changes-nothing)
     - [4.3.9 Time limit and status for promotion snapshots](#439-time-limit-and-status-for-promotion-snapshots)
+    - [4.3.10 Push target projections](#4310-push-target-projections)
 - [5. Alternative Options](#5-alternative-options)
   - [5.1 Base outbox, base shadow, and stateless Queue fan-out](#51-base-outbox-base-shadow-and-stateless-queue-fan-out)
   - [5.2 Separate `GsiMaintainerDO` worker tier](#52-separate-gsimaintainerdo-worker-tier)
@@ -169,7 +170,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   `MaterializationDO` round-robins the targets with 2 parallel workers. The Durable Object alarm is only for recovery
   after a crash or an eviction.
 - Keep a full mirror of live items in `MaterializationDO` (`latest_items.data`). The mirror supports target
-  projections, retries, and future online target backfills (Section 4.3.1).
+  retries, GSI projections, and future online target backfills (Section 4.3.1).
 - Isolate failures between targets. One unavailable GSI or push target must not stop healthy targets or base writes.
 - Write a `MaterializationDO` row for each item and each target only when a GSI key changes or when an item fails.
 
@@ -183,6 +184,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   before it deletes the old entry, as in the eventually consistent GSIs of DynamoDB.
 - Uniqueness constraints on a GSI key. A caller that needs a unique secondary key must use `transactWriteItems` on the
   base table.
+- Projections for push targets. Push targets receive complete live items. Section 4.3.10 tracks push projections.
 - Online backfill of targets that are added after data exists, cluster-wide activation tracking through
   `FokosDBAutoAdminDO`, per-GSI topology overrides, capture on a table that has data, a base version on GSI
   queries, and changes to the target list. Section 4.3 tracks them.
@@ -256,7 +258,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   limits, `db.gsi(indexName).queryItems`, and `FokosDB.destroy()` across all shard groups of the table (Sections
   4.2.13 and 4.2.14).
 
-### Milestone 5: Circuit breaker tuning
+### Milestone 5 — DEFERRED — Circuit breaker tuning
 - Tune the circuit breaker values (the failure count that opens a breaker, and `probeIntervalMs`) with measurements.
 
 ## 4. Proposed Solution
@@ -473,7 +475,7 @@ Each export call has these steps:
 
 1. **Claim.** In the claim `transactionSync`, the exporter:
    - selects up to `maxExportItems` (100) rows with `next_attempt_at <= now` from `idx_materialization_outbox_due`,
-     bounded by `maxExportBytes` (1 MiB),
+     bounded by `maxExportBytes` (10 MiB),
    - skips each row whose key is in a call in flight (the same-epoch rule, Section 4.2.9),
    - skips each unowned copy of a promoted key (`!this.fokos.owns(key)`) and sets its
      `next_attempt_at = now + exportRetryMs` (default 30 s). Thus unowned copies never block the owned keys behind
@@ -701,6 +703,8 @@ drives its targets with one in-memory background promise (`#pushPromise`), as `T
 
 A step of target `t` has these parts:
 
+0. **Evaluator.** A GSI step first gets the evaluator of `t` (Section 4.2.10, "Retry rows"). When `t` cannot evaluate
+   any item, the step stops here: it claims nothing, and counts one circuit breaker failure.
 1. **Claim.** In one `transactionSync`, the step:
    - takes the due `retry` rows of `t`, up to half of `maxItemsPerStep` and half of `maxBytesPerStep`
      (Section 4.2.10),
@@ -746,7 +750,8 @@ sent. The skipped positions are done for `t`.
   new pass every `fastPathDelayMs` (default 50 ms).
 - While the in-memory loop is idle, `deadline()` returns the earliest due time in SQLite, and `runStep()` starts the
   in-memory loop. In `PartitionDO`, the due time is the earliest `next_attempt_at`, or the end of a backoff when it is later. In `MaterializationDO`, it is
-  `now` when a position above a cursor exists, or else the earliest `not_before` of a `retry` row.
+  the next probe of a target with an open circuit breaker, `now` when a position above a cursor exists, or else the
+  earliest `not_before` of a `retry` row.
 
 #### 4.2.7 GSI targets and key sets
 
@@ -766,6 +771,10 @@ For each item in a batch, the step evaluates the desired GSI key `D` from the la
   ttl_epoch_utc_seconds`, so that the compiled expression SQL reads the column names it expects.
 - When the evaluation fails with a permanent violation (Section 4.2.10), the step runs the violation cleanup instead of
   `put(D)`.
+- When the evaluation of the item fails with any other error, the item gets a `retry` row (Section 4.2.10, "Retry
+  rows"), and the step sends nothing for it.
+- When the target cannot evaluate any item, for example when its plans do not compile, the step claims nothing and
+  counts one circuit breaker failure (Section 4.2.10, "Retry rows").
 
 ##### Key sets
 
@@ -832,8 +841,9 @@ until the next write of the base item, so only a failure that the data of the it
 A `push_sink` target calls a `WorkerEntrypoint` or a `DurableObject` over Workers RPC in one call. A push target keys
 records by `(baseHashKey, baseSortKey)`, so it has no old secondary key to delete, and it needs no key set.
 
-For each item, the step sends one `PushTargetItem` with the latest image or the tombstone. It applies the optional
-target projection to live items. The batch carries the producer fields of Section 4.2.9:
+For each item, the step sends one `PushTargetItem` with the complete live item or the tombstone.
+Push targets do not support projections. Section 4.3.10 tracks this future work.
+The batch carries the producer fields of Section 4.2.9:
 
 ```ts
 export type PushTargetItem = {
@@ -842,7 +852,7 @@ export type PushTargetItem = {
 	baseSortKey?: SortKey;
 	revision: number;
 	deleted: boolean;
-	/** The complete item or projected record. Absent when `deleted` is true. */
+	/** The complete item. Absent when `deleted` is true. */
 	value?: ReadItemValue;
 	/** Epoch UTC seconds. Absent when the item has no TTL or when `deleted` is true. */
 	ttlAt?: number;
@@ -926,7 +936,7 @@ For each item of a call, in the `transactionSync` of that item, the receiver doe
 4. It applies the item. `MaterializationDO` also applies the revision rules of Section 4.2.4.
 
 The receiver writes a `producer_fences` row only when an epoch goes up. In normal operation, the epoch stays the same,
-and the check adds no row write. The receiver keeps the row of each producer in memory after the first read.
+and the check adds no row write. The receiver reads the stored epoch from SQLite for each fence check.
 
 The receiver must not delete a `producer_fences` row. A deleted row has the epoch `0`, and a late call of that
 producer then applies. The number of rows is the number of producers that ever sent to the receiver. A row with a
@@ -1162,6 +1172,18 @@ batch. When no `retry` row is due, the cursor fills the whole batch. Thus the `r
 the cursor cannot stop the `retry` rows. Each item gets its latest image. A failed item has its own backoff and no
 position order, so a due index fits it better than a second cursor.
 
+Before a GSI step claims items, it gets the evaluator of the target: the compiled plans, which SQLite prepared on no
+row, and the limits of the table. An instance keeps the plans of a target after their first check passes. When the
+evaluator fails, the target cannot evaluate any item, so the failure is not a failure of an item. The step claims
+nothing, keeps the cursor, writes no `retry` row, and counts one circuit breaker failure. The next probe gets the
+evaluator again. Thus a target that cannot evaluate costs one check for each probe, and it does not depend on the
+count of items.
+
+An unexpected error during the GSI evaluation of one item writes a `retry` row with
+`last_error = 'gsi_evaluation_failed'`. The claim keeps the earlier GSI key set and continues with the other items.
+The failed item gets its own backoff, and its position does not stop the cursor.
+These errors do not count as whole-call failures, even when each item of a claim fails.
+
 These rules apply:
 
 1. **A `retry` row owns its item for its target.** The cursor skips an item that has a `retry` row. Thus only one path
@@ -1191,7 +1213,7 @@ item gets its own `retry` row.
 | `unprocessed`, or push `retry` | Insert or update the `retry` row: `attempts + 1`, and an exponential backoff from 1 s to 10 s. |
 | `rejected` (`batch_request_too_large`) | The RPC is above 32 MiB, and nothing applied. Split the batch and send again. No row. |
 | `rejected` of the whole call | Keep the cursor. Write no row. Back off and count a circuit breaker failure. |
-| `rejected` with a violation code | A permanent item failure. Run the violation cleanup, then set `kind = 'violation'`. The violation codes are `gsi_key_type_invalid`, `update_value_is_bytes`, `key_contains_nul`, `key_not_well_formed_utf16`, `hash_key_too_large`, `sort_key_too_large`, and `item_data_too_large`. |
+| `rejected` with a violation code | A permanent item failure. Run the violation cleanup, then set `kind = 'violation'`. The violation codes are `gsi_key_type_invalid`, `update_value_is_bytes`, `gsi_sqlite_unrecoverable_error`, `key_contains_nul`, `key_not_well_formed_utf16`, `hash_key_too_large`, `sort_key_too_large`, and `item_data_too_large`. |
 | `rejected` (any other code) | Insert or update the `retry` row, and log an error. |
 | The whole call fails with a definite outcome | Keep the cursor. Write no `retry` row. Back off and count a circuit breaker failure. |
 | `unknown` | Raise the epoch, keep the cursor, and send again at once (Section 4.2.9). |
@@ -1220,6 +1242,13 @@ possible:
    - **Size violation.** The encoded GSI hash key is larger than the `maxHashKeyBytes` of the base table, or the
      encoded GSI sort key is larger than its `maxSortKeyBytes` (Section 4.2.14).
 3. **Entry that cannot be written (a violation):**
+   - **SQLite error that the data causes.** For the data of an item, SQLite can stop a key or projection expression
+     with one of these errors:
+     - `integer overflow: SQLITE_ERROR`, for example `abs(-9223372036854775808)`,
+     - `string or blob too big: SQLITE_TOOBIG`, for example `hex(hex(data))` on a large item.
+
+     The item gets the violation code `gsi_sqlite_unrecoverable_error`. The match is exact. Thus
+     `statement too long: SQLITE_TOOBIG`, which the expression causes for each item, is not a violation.
    - **Projected `'bytes'` attribute in a GSI `projection`.** A GSI `projection` builds a JSONB document
      (`kind = "json"`), which cannot store raw binary values (`Uint8Array`). Each projected cell that evaluates to
      `'bytes'` at run time is a violation, as `update_value_is_bytes` is in `UpdateExpression`. The validation of
@@ -1313,8 +1342,9 @@ done, and no partition would send them. Example with one target:
 
 Thus a promotion source keeps a snapshot of its cursors:
 
-1. **`onRepartitionCutover` stores the snapshot.** In the cutover transaction, the source stores the cursor of each
-   target under the plan ID, in one KV entry. This is 1 row for each promotion.
+1. **`onRepartitionCutover` stores the snapshot.** In the cutover transaction, the source updates
+   `__fokosdb/mat/cursor_snapshots`. This KV item holds a map from each promoted hash key to its target cursors.
+   Each hash key uses its base64url encoding. All active promotion snapshots share this KV item.
 2. **The pages send the snapshot.** The last page of the migration gives the child the cursors of the snapshot, not the
    current cursors. The source copies the positions of the moved items above the lowest cursor of the snapshot.
 3. **The cleanup keeps the positions above the snapshot.** The bound of the position cleanup and of the tombstone GC is
@@ -1385,16 +1415,28 @@ export type PushSinkTargetDefinition = {
 	method: string;
 	/** Target DO name when `binding` is a `DurableObjectNamespace`. */
 	objectName?: string;
-	projection?: readonly ProjectionExpression[];
 };
 
 export type FokosTargetDefinition = GsiTargetDefinition | PushSinkTargetDefinition;
 ```
 
-- At startup, each `MaterializationDO` leaf validates `this.fokosTargets()`:
+- Before a root `MaterializationDO` stores its first list, at its first `applyLatestImages` call, it validates
+  `this.fokosTargets()`:
   - at most 10 GSIs,
   - unique, non-empty `targetId` values with no `~`,
-  - valid `hashKey`, `sortKey`, and `projection` expressions.
+  - valid GSI `hashKey`, `sortKey`, and `projection` expressions,
+  - no `projection` on a push target,
+  - GSI expressions that compile, and statements that SQLite prepares. The check runs each statement on no row, so
+    the data of an item cannot make it fail.
+
+  A failed validation stores nothing, and the root answers each item of the call `unprocessed`. The base exporter
+  backs off and sends the items again, and the root validates the list again. A split or promotion child gets the
+  list of its parent and does not validate it before it stores it.
+- Each new instance of a partition validates its stored list one time, with the same rules, after its storage
+  migrations. A failure logs one error for each target that is not valid, with the partition and the `targetId`, or
+  one error for a rule of the whole list. The check never refuses a stored list and changes nothing. The target
+  runner also checks the plans of each GSI target before its steps (Section 4.2.10, "Retry rows"), and a failed check
+  stops only that target.
 - **The target list is fixed in the first version.** A partition stores the first valid `this.fokosTargets()` result in
   the KV item `__fokosdb/mat/targets`, and then uses only the stored list:
   - A root stores the list from its first request. A split or promotion child gets the stored list of its parent
@@ -1614,6 +1656,8 @@ destination GSI partition:
 - When calls to a target fail as a whole (each item fails with a code that can be retried), `MaterializationDO` opens
   the circuit breaker of that target. It stops claiming batches for the target, and sends one probe batch every
   `probeIntervalMs` (default 5 s) until a probe succeeds.
+- When a GSI target cannot evaluate any item, for example when its plans do not compile, each step counts one failure
+  of the target in the same way (Section 4.2.10, "Retry rows"). Each probe checks the plans again.
 - When only some items of a call fail, for example the items of one GSI partition that migrates, the breaker stays
   closed. Each failed item retries on its own (Section 4.2.10), and the healthy items continue. Thus the per-item retry
   keeps a bad GSI partition apart from the healthy partitions, and `MaterializationDO` tracks no GSI partition.
@@ -1957,6 +2001,14 @@ completes. A later version can:
 - stop the hold of the cleanup after a time limit, and give the child a cursor that makes it send each moved item
   again: a full send of the promoted key instead of an unbounded growth of the source.
 
+#### 4.3.10 Push target projections
+
+A later version can add `projection?: readonly ProjectionExpression[]` to `PushSinkTargetDefinition`.
+The target declaration must validate the projection expression.
+The runner then applies the projection to each live item and sends the projected record in `PushTargetItem.value`.
+Without a projection, the target continues to receive the complete live item.
+Tombstones still carry no `value` (Section 4.2.8).
+
 ## 5. Alternative Options
 
 ### 5.1 Base outbox, base shadow, and stateless Queue fan-out
@@ -2186,8 +2238,9 @@ items (Sections 4.2.5 to 4.2.10). A GSI also keeps a key set, and its step sends
 
 ### 6.2 Why does `MaterializationDO` keep a full mirror of live items?
 
-With `latest_items.data` for live items, `MaterializationDO` can evaluate projections again on a retry. Future online
-targets (Section 4.3.1) can also backfill from local SQLite with zero reads from the base `PartitionDO` shard group.
+With `latest_items.data` for live items, `MaterializationDO` can evaluate GSI projections again on a retry.
+Future online targets (Section 4.3.1) can also backfill from local SQLite.
+This needs no reads from the base `PartitionDO` shard group.
 
 ### 6.3 What happens when an item is created, updated, and deleted while `MaterializationDO` is unreachable?
 

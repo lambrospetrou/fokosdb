@@ -15,7 +15,7 @@ import {
 	type FokosDBLimits,
 } from "../../shared/transaction-limits.js";
 import type { DataKind } from "../../shared/types.js";
-import { KeyCodec } from "../../sharding/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import type { GsiKey, MaterializationStore, TargetImage } from "./materialization-store.js";
 import type { GsiTargetDefinition } from "./targets.js";
 
@@ -23,6 +23,20 @@ import type { GsiTargetDefinition } from "./targets.js";
 export const GSI_KEY_TYPE_INVALID = "gsi_key_type_invalid";
 /** The violation code of a projected `Uint8Array` value, which a json entry cannot store. */
 export const GSI_PROJECTION_BYTES = "update_value_is_bytes";
+/**
+ * The violation code of a key or projection expression that SQLite stops with an error that the data of
+ * the item causes, so that each evaluation fails again.
+ */
+export const GSI_SQLITE_UNRECOVERABLE_ERROR = "gsi_sqlite_unrecoverable_error";
+/**
+ * The messages of the SQLite errors that give `GSI_SQLITE_UNRECOVERABLE_ERROR`: an integer overflow, for
+ * example `abs(-9223372036854775808)`, and a value above the string or `BLOB` limit of SQLite. The match
+ * is exact, so `statement too long: SQLITE_TOOBIG`, which the expression causes for each item, is not in it.
+ */
+const SQLITE_UNRECOVERABLE_MESSAGES: ReadonlySet<string> = new Set([
+	"integer overflow: SQLITE_ERROR",
+	"string or blob too big: SQLITE_TOOBIG",
+]);
 
 /**
  * The codes of a failure that the data of the item causes, so that each resend fails again. Only these
@@ -32,6 +46,7 @@ export const GSI_PROJECTION_BYTES = "update_value_is_bytes";
 export const GSI_VIOLATION_CODES: ReadonlySet<string> = new Set([
 	GSI_KEY_TYPE_INVALID,
 	GSI_PROJECTION_BYTES,
+	GSI_SQLITE_UNRECOVERABLE_ERROR,
 	"key_contains_nul",
 	"key_not_well_formed_utf16",
 	"hash_key_too_large",
@@ -56,10 +71,29 @@ export function compileGsiPlans(target: GsiTargetDefinition): GsiPlans {
 	};
 }
 
+/** An empty base hash key. `KeyCodec.encode` never returns an empty key, so no item has it. */
+const NO_ITEM_KEY: KeyBytes = KeyCodec.encodeOptional(undefined);
+
+/**
+ * Compiles the plans of a GSI target, and runs each statement on no row, so that SQLite prepares it.
+ * Throws when the target cannot evaluate any item. The check reads no item data, so the data of an
+ * item cannot make it fail.
+ */
+export function checkGsiPlans(store: MaterializationStore, target: GsiTargetDefinition): GsiPlans {
+	const plans = compileGsiPlans(target);
+	for (const plan of [plans.keys, plans.projection]) {
+		if (plan !== undefined) {
+			store.evaluateProjection(plan, NO_ITEM_KEY, NO_ITEM_KEY);
+		}
+	}
+	return plans;
+}
+
 /**
  * The desired entry of an item. A tombstone, a missing or `null` key attribute, and a GSI with a sort
  * key whose attribute is missing or `null` give no entry. A key that is not valid, a projected
- * `Uint8Array`, and entry data above the item limit are violations.
+ * `Uint8Array`, an SQLite error that the data causes, and entry data above the item limit are
+ * violations. Any other error throws.
  */
 export function desiredGsiEntry(store: MaterializationStore, plans: GsiPlans, image: TargetImage, limits: FokosDBLimits): GsiDesiredEntry {
 	if (image.deleted) {
@@ -94,6 +128,9 @@ export function desiredGsiEntry(store: MaterializationStore, plans: GsiPlans, im
 		validateItemDataSize(data, "gsiWriteEntries");
 		return { kind: "present", key, data, dataKind, ttlAt: image.ttlAt };
 	} catch (error) {
+		if (error instanceof Error && SQLITE_UNRECOVERABLE_MESSAGES.has(error.message)) {
+			return { kind: "violation", code: GSI_SQLITE_UNRECOVERABLE_ERROR };
+		}
 		if ((error instanceof FokosError || error instanceof ExpressionError) && GSI_VIOLATION_CODES.has(String(error.code))) {
 			return { kind: "violation", code: String(error.code) };
 		}

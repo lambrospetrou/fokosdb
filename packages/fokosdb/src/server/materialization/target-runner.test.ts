@@ -7,10 +7,12 @@ import { MaterializationStore, type LatestImage, type TargetRow } from "./materi
 import { TargetRunner, type TargetRunnerConfig } from "./target-runner.js";
 import type { FokosTargetDefinition, PushTargetBatch, PushTargetResult } from "./targets.js";
 import type { GsiWriteEntriesRequest } from "../do-partition.js";
-import type { GsiDesiredEntry } from "./gsi-target.js";
+import { compileGsiPlans, desiredGsiEntry, type GsiDesiredEntry } from "./gsi-target.js";
 import type { GsiEntryOutcome } from "./target-runner.js";
 import type { TargetImage } from "./materialization-store.js";
 import invariant from "../../shared/invariant.js";
+import type { ExpressionValue } from "../../shared/expression/types.js";
+import { resolveLimits } from "../../shared/transaction-limits.js";
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);
@@ -63,8 +65,15 @@ async function withRunner(
 		answer?: Answer;
 		config?: Partial<TargetRunnerConfig>;
 		owns?: (hk: string) => boolean;
-		/** Makes each target a GSI target. `answer` gives the outcomes of each GSI call, or throws. */
-		gsi?: { answer: (request: GsiWriteEntriesRequest) => GsiEntryOutcome[]; desired: (image: TargetImage) => GsiDesiredEntry };
+		/**
+		 * Makes each target a GSI target. `answer` gives the outcomes of each GSI call, or throws. `plans`
+		 * runs when a step gets the evaluator of a target, and throws when the target cannot evaluate.
+		 */
+		gsi?: {
+			answer: (request: GsiWriteEntriesRequest) => GsiEntryOutcome[];
+			desired: (image: TargetImage) => GsiDesiredEntry;
+			plans?: () => void;
+		};
 	},
 	fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
@@ -100,7 +109,11 @@ async function withRunner(
 				invariant(opts.gsi, "this harness has no GSI target");
 				return opts.gsi.answer(request);
 			},
-			desiredGsi: (_target, image) => opts.gsi?.desired(image) ?? { kind: "absent" },
+			gsiEvaluator: () => {
+				invariant(opts.gsi, "this harness has no GSI target");
+				opts.gsi.plans?.();
+				return opts.gsi.desired;
+			},
 			config: () => ({ ...CONFIG, ...opts.config }),
 			scheduleRetry: (runAt) => scheduled.push(runAt),
 			now: () => now,
@@ -660,6 +673,190 @@ describe("TargetRunner — GSI targets", () => {
 		const itemId = h.store.storedImage(kb(hk), NO_SK)?.itemId;
 		return itemId === undefined ? [] : h.store.indexKeys("t1", itemId).map((key) => String(KeyCodec.decode(key.hk)));
 	};
+
+	const sqliteFailures: Array<{ name: string; expr: ExpressionValue; good: object; bad: object }> = [
+		{
+			name: "integer overflow",
+			expr: { fn: "sqlite.abs", args: [{ fn: "*", args: [{ ref: "data", path: "$.n" }, { val: 4_294_967_296 }] }] },
+			good: { n: 1 },
+			bad: { n: -2_147_483_648 },
+		},
+		{
+			// Four hex encodings make the value 16 times longer (9.6 MB). That is above the string limit of
+			// SQLite, which is 2 MB on Cloudflare and between 4 MB and 8 MB in the local runtime.
+			name: "string or blob too big",
+			expr: [1, 2, 3, 4].reduce<ExpressionValue>((value) => ({ fn: "sqlite.hex", args: [value] }), { ref: "data", path: "$.s" }),
+			good: { s: "a" },
+			bad: { s: "a".repeat(600_000) },
+		},
+	];
+	for (const field of ["hashKey", "projection"] as const) {
+		it.each(sqliteFailures)(
+			`a ${field} evaluation with $name parks only that item, cleans up its old entry, and recovers on a newer image`,
+			async ({ expr, good, bad }) => {
+				const plans = compileGsiPlans({
+					kind: "gsi",
+					targetId: "t1",
+					hashKey: field === "hashKey" ? { fn: "sqlite.concat", args: [{ val: "key" }, expr] } : { ref: "hashKey" },
+					...(field === "projection" ? { projection: [{ expr, as: "value" }] } : {}),
+				});
+				let store!: MaterializationStore;
+				await withRunner(
+					{
+						config: { breakerFailures: 1 },
+						gsi: { answer: applied, desired: (image) => desiredGsiEntry(store, plans, image, resolveLimits(undefined)) },
+					},
+					async (h) => {
+						store = h.store;
+						const ingest = (hk: string, revision: number, data: object) => {
+							const jsonb = new Uint8Array(h.sql.exec<{ b: ArrayBuffer }>(`SELECT jsonb(?) AS b`, JSON.stringify(data)).one().b);
+							const positions = store.targetRows().map((row) => ({
+								cursor: row.cursorSeq,
+								read: Math.max(row.cursorSeq, h.runner.readPosition(row.targetId) ?? row.cursorSeq),
+							}));
+							store.putLatestImage(
+								{ opIndex: 0, hashKey: kb(hk), sortKey: NO_SK, revision, deleted: false, data: jsonb, kind: "json", ttlAt: null },
+								h.now(),
+								store.storedImage(kb(hk), NO_SK),
+								positions,
+							);
+							h.runner.wake();
+						};
+						ingest("bad", 1, good);
+						await h.drain();
+						expect(keySet(h, "bad")).toHaveLength(1);
+						ingest("bad", 2, bad);
+						ingest("healthy", 1, good);
+						await h.drain();
+						expect(h.target("t1")).toMatchObject({ cursorSeq: 3, epoch: 1, isBatchOpen: false });
+						expect(h.retryRows()).toMatchObject([{ hk: "bad", kind: "violation", last_error: "gsi_sqlite_unrecoverable_error" }]);
+						expect(keySet(h, "bad")).toEqual([]);
+						expect(keySet(h, "healthy")).toHaveLength(1);
+						expect(h.gsiCalls.slice(1).some((call) => call.items.some((item) => item.op === "put"))).toBe(true);
+						ingest("bad", 3, good);
+						await h.drain();
+						expect(h.retryRows()).toEqual([]);
+						expect(keySet(h, "bad")).toHaveLength(1);
+					},
+				);
+			},
+		);
+	}
+
+	it.each(["unexpected evaluator failure", "database or disk is full: SQLITE_FULL"])(
+		"an evaluation error that is not a violation (%s) retries only that item and keeps its old entry",
+		async (message) => {
+			let fail = false;
+			await withRunner(
+				{
+					config: { breakerFailures: 1 },
+					gsi: {
+						answer: applied,
+						desired: (image) => {
+							if (fail && KeyCodec.decode(image.hk) === "bad") {
+								throw new Error(message);
+							}
+							return desired(image);
+						},
+					},
+				},
+				async (h) => {
+					h.ingest("bad", 1, { data: "A" });
+					await h.drain();
+					fail = true;
+					h.ingest("bad", 2, { data: "B" });
+					h.ingest("healthy", 1, { data: "C" });
+					await h.drain();
+					expect(h.target("t1")).toMatchObject({ cursorSeq: 3, epoch: 1, isBatchOpen: false });
+					expect(h.retryRows()).toMatchObject([{ hk: "bad", kind: "retry", attempts: 1, last_error: "gsi_evaluation_failed" }]);
+					expect(keySet(h, "bad")).toEqual(["A"]);
+					expect(keySet(h, "healthy")).toEqual(["C"]);
+					h.advance(CONFIG.retryBackoffMinMs);
+					h.runner.wake();
+					await h.drain();
+					expect(h.retryRows()).toMatchObject([{ hk: "bad", kind: "retry", attempts: 2 }]);
+					expect(keySet(h, "bad")).toEqual(["A"]);
+					fail = false;
+					h.advance(CONFIG.retryBackoffMaxMs);
+					h.runner.wake();
+					await h.drain();
+					expect(h.retryRows()).toEqual([]);
+					expect(keySet(h, "bad")).toEqual(["B"]);
+				},
+			);
+		},
+	);
+
+	it("a full batch of evaluation failures cannot stop a healthy item in a later batch", async () => {
+		await withRunner(
+			{
+				config: { maxItemsPerStep: 1, breakerFailures: 1 },
+				gsi: {
+					answer: applied,
+					desired: (image) => {
+						if (KeyCodec.decode(image.hk) !== "healthy") {
+							throw new Error("unexpected evaluator failure");
+						}
+						return desired(image);
+					},
+				},
+			},
+			async (h) => {
+				h.ingest("bad1", 1);
+				h.ingest("bad2", 1);
+				h.ingest("healthy", 1, { data: "C" });
+				await h.drain();
+				expect(h.target("t1")).toMatchObject({ cursorSeq: 3, epoch: 1, isBatchOpen: false });
+				expect(h.retryRows()).toMatchObject([
+					{ hk: "bad1", kind: "retry" },
+					{ hk: "bad2", kind: "retry" },
+				]);
+				expect(entries(h.gsiCalls)).toEqual([["put:C"]]);
+			},
+		);
+	});
+
+	it("a target that cannot evaluate keeps its cursor, writes no retry row, opens its circuit breaker, and continues when it can", async () => {
+		let checks = 0;
+		let broken = true;
+		await withRunner(
+			{
+				gsi: {
+					answer: applied,
+					desired,
+					plans: () => {
+						checks += 1;
+						if (broken) {
+							throw new Error("compiled SQL exceeds the SQL limit");
+						}
+					},
+				},
+			},
+			async (h) => {
+				h.ingest("a", 1, { data: "A" });
+				h.ingest("b", 1, { data: "B" });
+				await h.drain();
+				expect(checks).toBe(CONFIG.breakerFailures);
+				expect(h.gsiCalls).toEqual([]);
+				expect(h.retryRows()).toEqual([]);
+				expect(h.target("t1")).toMatchObject({ cursorSeq: 0, isBatchOpen: false });
+				expect(h.runner.deadline()).toBe(h.now() + CONFIG.probeIntervalMs);
+
+				// A wake before the probe does not check the target again.
+				h.runner.wake();
+				await h.drain();
+				expect(checks).toBe(CONFIG.breakerFailures);
+
+				broken = false;
+				h.advance(CONFIG.probeIntervalMs);
+				h.runner.wake();
+				await h.drain();
+				expect(entries(h.gsiCalls)).toEqual([["put:A", "put:B"]]);
+				expect(h.target("t1")).toMatchObject({ cursorSeq: 2, isBatchOpen: false });
+				expect(h.retryRows()).toEqual([]);
+			},
+		);
+	});
 
 	it("a key move puts the new entry in one call, and deletes the old entry in a second call", async () => {
 		await withRunner({ gsi: { answer: applied, desired } }, async (h) => {

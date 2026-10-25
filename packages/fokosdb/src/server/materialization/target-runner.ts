@@ -48,6 +48,12 @@ export type GsiEntryOutcome =
 
 const BATCH_REQUEST_TOO_LARGE = "batch_request_too_large";
 
+/**
+ * The GSI entry that the latest image of an item gives. It runs in the claim transaction. When it
+ * throws, the item gets a `retry` row, and the claim continues with the other items.
+ */
+export type GsiEvaluator = (image: TargetImage) => GsiDesiredEntry;
+
 export type TargetRunnerConfig = {
 	/** The workers that run at the same time. */
 	concurrency: number;
@@ -91,8 +97,12 @@ export type TargetRunnerDeps = {
 	push: (target: PushSinkTargetDefinition, batch: PushTargetBatch) => Promise<unknown>;
 	/** Sends one `gsiWriteEntries` call to a GSI table, and returns one outcome for each entry, in order. */
 	writeGsi: (target: GsiTargetDefinition, request: GsiWriteEntriesRequest) => Promise<GsiEntryOutcome[]>;
-	/** The GSI entry that the latest image of an item gives. It runs in the claim transaction. */
-	desiredGsi: (target: GsiTargetDefinition, image: TargetImage) => GsiDesiredEntry;
+	/**
+	 * The evaluator of a GSI target for one step. It throws when the target cannot evaluate any item, for
+	 * example when its plans do not compile: the step then claims nothing, and counts one failure of the
+	 * target.
+	 */
+	gsiEvaluator: (target: GsiTargetDefinition) => GsiEvaluator;
 	config: () => TargetRunnerConfig;
 	/** Sets the alarm to start a worker again at `runAt`. It does not throw. */
 	scheduleRetry: (runAt: number) => void;
@@ -299,7 +309,12 @@ export class TargetRunner {
 		const state = this.#state(target.targetId);
 		state.inFlight = true;
 		try {
-			const batch = this.#claim(target, state);
+			const evaluator = target.kind === "gsi" ? this.#gsiEvaluator(target) : undefined;
+			if (evaluator === null) {
+				this.#recordFailure(target.targetId, state);
+				return;
+			}
+			const batch = this.#claim(target, state, evaluator);
 			if (batch === null) {
 				return;
 			}
@@ -312,11 +327,25 @@ export class TargetRunner {
 	}
 
 	/**
+	 * The evaluator of a GSI target for one step, or null when the target cannot evaluate any item. The
+	 * failure is not a failure of an item, so the step keeps the cursor and writes no `retry` row.
+	 */
+	#gsiEvaluator(target: GsiTargetDefinition): GsiEvaluator | null {
+		try {
+			return this.#deps.gsiEvaluator(target);
+		} catch (error) {
+			this.#logError("fokos/mat: a GSI target cannot evaluate its entries", { targetId: target.targetId, error: String(error) });
+			return null;
+		}
+	}
+
+	/**
 	 * Claims the next batch of a target in one storage transaction. Returns null when the claim found no
 	 * item to send. A claim that read positions and found no item to send moves the cursor past them, so
-	 * a long run of skipped positions moves the cursor in bounded steps.
+	 * a long run of skipped positions moves the cursor in bounded steps. `evaluator` is set for a GSI
+	 * target only.
 	 */
-	#claim(target: FokosTargetDefinition, state: TargetState): ClaimedBatch | null {
+	#claim(target: FokosTargetDefinition, state: TargetState, evaluator: GsiEvaluator | undefined): ClaimedBatch | null {
 		const { store } = this.#deps;
 		const targetId = target.targetId;
 		const firstClaim = !state.started;
@@ -326,7 +355,7 @@ export class TargetRunner {
 			// makes each receiver that gets the next call first reject that late call.
 			const epoch = firstClaim && row.isBatchOpen ? store.raiseTargetEpoch(targetId) : row.epoch;
 			const { refs, retryCount, highestSeq } = this.#claimRefs(targetId, row.cursorSeq);
-			const items = this.#claimItems(target, refs, retryCount);
+			const items = this.#claimItems(targetId, refs, retryCount, evaluator);
 			if (items.length === 0) {
 				// No batch of the current epoch is in flight, so the marker can go.
 				if (highestSeq !== null || row.isBatchOpen) {
@@ -403,9 +432,8 @@ export class TargetRunner {
 	 * this partition is between its cutover and its completion, the child can still need the row, so
 	 * the claim moves its backoff end instead. The row then does not fill the `retry` part of each batch.
 	 */
-	#claimItems(target: FokosTargetDefinition, refs: readonly TargetItemRef[], retryCount: number): ClaimedItem[] {
+	#claimItems(targetId: string, refs: readonly TargetItemRef[], retryCount: number, evaluator: GsiEvaluator | undefined): ClaimedItem[] {
 		const { store } = this.#deps;
-		const targetId = target.targetId;
 		const owns = this.#deps.ownerCheck();
 		const items: ClaimedItem[] = [];
 		for (const [i, ref] of refs.entries()) {
@@ -423,6 +451,10 @@ export class TargetRunner {
 				}
 				continue;
 			}
+			const gsi = evaluator === undefined ? undefined : this.#claimGsi(targetId, ref.itemId, image, evaluator);
+			if (gsi === null) {
+				continue;
+			}
 			items.push({
 				itemId: ref.itemId,
 				revision: image.revision,
@@ -430,7 +462,7 @@ export class TargetRunner {
 				hk: image.hk,
 				sk: image.sk,
 				record: toPushItem(image),
-				...(target.kind === "gsi" ? { gsi: this.#claimGsi(target, ref.itemId, image) } : {}),
+				...(gsi === undefined ? {} : { gsi }),
 			});
 		}
 		return items;
@@ -438,18 +470,39 @@ export class TargetRunner {
 
 	/**
 	 * The GSI writes of one item. A desired key that is not in the key set goes into the set before the
-	 * call, so that a later step can delete an entry that the call wrote.
+	 * call, so that a later step can delete an entry that the call wrote. Returns null when the
+	 * evaluation throws: the item then gets a `retry` row, and its key set does not change.
 	 */
-	#claimGsi(target: GsiTargetDefinition, itemId: number, image: TargetImage): ClaimedGsiWrites {
+	#claimGsi(targetId: string, itemId: number, image: TargetImage, evaluator: GsiEvaluator): ClaimedGsiWrites | null {
 		const { store } = this.#deps;
-		const desired = this.#deps.desiredGsi(target, image);
-		const keys = store.indexKeys(target.targetId, itemId);
+		let desired: GsiDesiredEntry;
+		try {
+			desired = evaluator(image);
+		} catch (error) {
+			const config = this.#deps.config();
+			store.recordTargetRetry(
+				targetId,
+				itemId,
+				this.#deps.now(),
+				config.retryBackoffMinMs,
+				config.retryBackoffMaxMs,
+				"gsi_evaluation_failed",
+			);
+			this.#logError("fokos/mat: a GSI evaluation failed", {
+				targetId,
+				key: KeyCodec.pairForLog(image.hk, image.sk),
+				revision: image.revision,
+				error: String(error),
+			});
+			return null;
+		}
+		const keys = store.indexKeys(targetId, itemId);
 		if (desired.kind !== "present") {
 			return { deletes: keys, removed: [], ...(desired.kind === "violation" ? { violation: desired.code } : {}) };
 		}
 		if (!keys.some((key) => sameGsiKey(key, desired.key))) {
 			keys.push(desired.key);
-			store.addIndexKey(target.targetId, itemId, desired.key);
+			store.addIndexKey(targetId, itemId, desired.key);
 		}
 		return {
 			put: { key: desired.key, data: desired.data, kind: desired.dataKind, ttlAt: desired.ttlAt },

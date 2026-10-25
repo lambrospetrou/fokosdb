@@ -21,8 +21,8 @@ import { identityDepth } from "../../sharding/partition-id.js";
 import { materializationStubByName, partitionStubByName, pushTargetStub } from "../../shared/do-stubs.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
 import { GsiWriter } from "./gsi-writer.js";
-import { compileGsiPlans, desiredGsiEntry, type GsiPlans } from "./gsi-target.js";
-import { CONFLICT_CODES, FokosConflictError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../shared/errors.js";
+import { checkGsiPlans, desiredGsiEntry, type GsiPlans } from "./gsi-target.js";
+import { CONFLICT_CODES, FokosConflictError, FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../shared/errors.js";
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
 import { mergeBatchParts, withOffset, type BatchFailure } from "../../shared/batch-merge.js";
 import { ADMISSION_MARGIN } from "../../shared/transaction-limits.js";
@@ -108,7 +108,10 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	#cleanup: MaterializationCleanup;
 	#splitPlanner: SplitPlanner;
 	#gsiWriter: GsiWriter;
-	/** The compiled expressions of each GSI target, by `targetId`. */
+	/**
+	 * The checked plans of each GSI target, by `targetId`. A target whose check failed has no entry, so
+	 * the next step checks it again.
+	 */
 	readonly #gsiPlans = new Map<string, GsiPlans>();
 	/** The stored target list, read one time for each instance. */
 	#targetList: readonly FokosTargetDefinition[] | undefined;
@@ -160,13 +163,11 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 				});
 			},
 			writeGsi: (target, request) => this.#gsiWriter.write(target, request),
-			desiredGsi: (target, image) => {
-				let plans = this.#gsiPlans.get(target.targetId);
-				if (plans === undefined) {
-					plans = compileGsiPlans(target);
-					this.#gsiPlans.set(target.targetId, plans);
-				}
-				return desiredGsiEntry(this.#store, plans, image, resolveLimits(this.fokos.policy().limits));
+			gsiEvaluator: (target) => {
+				const plans = this.#gsiPlans.get(target.targetId) ?? checkGsiPlans(this.#store, target);
+				this.#gsiPlans.set(target.targetId, plans);
+				const limits = resolveLimits(this.fokos.policy().limits);
+				return (image) => desiredGsiEntry(this.#store, plans, image, limits);
 			},
 			now: () => this.fokosNow(),
 			logParams: () => this.logParams(),
@@ -179,7 +180,45 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
 		});
-		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
+		void ctx.blockConcurrencyWhile(async () => {
+			this.#store.runMigrations();
+			this.#checkStoredTargets();
+		});
+	}
+
+	/**
+	 * Validates the stored target list one time for each instance, and checks the plans of each GSI
+	 * target. A failure logs one error for each target, and changes nothing: the partition keeps the
+	 * stored list, and the target runner stops only a GSI target whose plans fail. It never throws,
+	 * because a throw in `blockConcurrencyWhile` resets the Durable Object.
+	 */
+	#checkStoredTargets(): void {
+		try {
+			const stored = this.#store.storedTargets() ?? [];
+			let valid = true;
+			for (const target of stored) {
+				try {
+					validateTargets([target]);
+					if (target.kind === "gsi") {
+						this.#gsiPlans.set(target.targetId, checkGsiPlans(this.#store, target));
+					}
+				} catch (error) {
+					valid = false;
+					console.error({
+						...this.logParams(),
+						message: "fokos/mat: a stored target is not valid",
+						targetId: target.targetId,
+						kind: target.kind,
+						...errorFields(error),
+					});
+				}
+			}
+			if (valid) {
+				validateTargets(stored);
+			}
+		} catch (error) {
+			console.error({ ...this.logParams(), message: "fokos/mat: the stored target list is not valid", ...errorFields(error) });
+		}
 	}
 
 	// ═══ the RPC surface: one dispatch per method ════════════════════════════
@@ -324,9 +363,10 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 
 	/**
 	 * The stored target list. The first call of a partition with no stored list validates
-	 * `this.fokosTargets()`, and stores it with a state row for each target. Each later call uses only the
-	 * stored list. When `this.fokosTargets()` is different from it, the partition logs one error for each
-	 * instance and continues with the stored list.
+	 * `this.fokosTargets()`, checks the plans of each GSI target, and stores the list with a state row for
+	 * each target. A failed check stores nothing, so the next call checks the list again. Each later call
+	 * uses only the stored list, and never refuses it. When `this.fokosTargets()` is different from it,
+	 * the partition logs one error for each instance and continues with the stored list.
 	 */
 	#targets(): readonly FokosTargetDefinition[] {
 		if (this.#targetList !== undefined) {
@@ -336,6 +376,11 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 		const stored = this.#store.storedTargets();
 		if (stored === undefined) {
 			validateTargets(declared);
+			for (const target of declared) {
+				if (target.kind === "gsi") {
+					checkGsiPlans(this.#store, target);
+				}
+			}
 			const list = structuredClone(declared);
 			this.#store.storeTargets(list);
 			this.#targetList = list;
@@ -510,6 +555,11 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	fokosNow(): number {
 		return Date.now();
 	}
+}
+
+/** The log fields of an error. The detail of an `invariant` failure is in the attributes, not in the message. */
+function errorFields(error: unknown): { error: string; attributes?: Record<string, unknown> } {
+	return { error: String(error), ...(FokosError.is(error) ? { attributes: error.attributes } : {}) };
 }
 
 function producerEpochFenced(epoch: number): FokosConflictError {
