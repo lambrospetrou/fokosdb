@@ -295,13 +295,18 @@ string.
 **The hook.** `FokosRuntimeOptions` gets one optional field:
 
 ```ts
-adminOutbox?: {
+/** Host code. The outbox, or undefined when it is off. The runtime calls it at each use. */
+adminOutbox?(this: void): FokosAdminOutbox | undefined;
+
+type FokosAdminOutbox = {
 	/** Host code. Sends one entry to an admin DO, chosen from `eventType`. A throw means "retry later". */
 	send(this: void, entry: { eventType: string; id: string; event: unknown }): Promise<void>;
 };
 ```
 
-Absent: the runtime writes no outbox row and runs no outbox job.
+The runtime calls the function only after the partition has its identity, so the answer can depend on the policy
+of the partition. FokosDB uses this: the `nsAdmin` table option travels in the policy (Section 4.2.8). Absent, or
+an answer of undefined: the runtime writes no outbox row, and the outbox job deletes the rows that remain.
 
 **The outbox.** A new table for all the actions that a partition sends to the admin DO. This RFC adds one event
 type. Later features, for example the GSIs, add their own types to the same table and the same job.
@@ -627,11 +632,12 @@ group that the keeper does not know answers 200 with version 0 and no splits.
 from the `fetch()` of its own named `WorkerEntrypoint`:
 
 ```ts
-export class FokosTopologyCache extends WorkerEntrypoint<Env> {
+export class FokosTopologyCache extends WorkerEntrypoint<Env, TopologyAdminAddress> {
 	fetch(request: Request): Promise<Response> {
 		return fokosTopologyEntrypointFetch(request, {
-			// Host code: the stub of `topologyAdminName(shardGroup)`.
-			admin: (shardGroup) => adminStubFor(this.env, shardGroup),
+			// Host code: the stub of `topologyAdminName(shardGroup)`. The props of the caller select the
+			// admin binding and the jurisdiction of the table.
+			admin: (shardGroup) => topologyAdminStub(this.env, this.ctx.props, shardGroup),
 			maxAgeS: 10,
 			staleWhileRevalidateS: 600,
 		});
@@ -666,7 +672,8 @@ key. So:
 
 - The path carries the shard group, which is unique for each table and each kind (`fokos.p.<table>`,
   `fokos.tc.<table>`). The `v1` segment is the schema of the body. A change of the body format changes the path.
-- Each caller passes the same `ctx.props`, or none.
+- Each caller of one table passes the same `ctx.props`. FokosDB passes the admin address of the table,
+  `{ nsAdmin, jurisdiction }`, so all the callers of one table share one entry for each path.
 - The consumer sets `cache.cross_version_cache: true`. The Worker version then leaves the key, and a deploy keeps
   the warm cache. The `v1` path segment still separates two formats. `cross_version_cache` needs Wrangler 4.107.0
   or later, and applies to every entrypoint whose cache is on.
@@ -686,7 +693,10 @@ key. So:
 
 #### 4.2.6 The topology cache (M2)
 
-**The options.** `FokosShardingClientOptions` and `FokosRuntimeOptions` get one optional field:
+**The options.** `FokosShardingClientOptions` gets one optional field. `FokosRuntimeOptions` gets the same
+options as a function, `topologyCache?(this: void): FokosTopologyCacheOptions | undefined`, which the runtime calls
+at each forward of a hash key, after the partition has its identity. The host returns the same object while the
+options do not change.
 
 ```ts
 topologyCache?: {
@@ -828,20 +838,32 @@ has no fallback after a hash miss.
     host sets `topologyCache`.
 - `FokosDBOptions` gets `topologyRefreshMs?` and `topologyRefreshTimeoutMs?`, which go to `refreshMs` and
   `refreshTimeoutMs` of its `topologyCache`. `PartitionDO.fokosConfig()` and the configuration of
-  `TransactionCoordinatorDO` get the same two settings for the runtime.
+  `TransactionCoordinatorDO` get the same two settings for the runtime (`topologyRefreshMs` and
+  `topologyRefreshTimeoutMs`, defaults 10,000 and 30,000).
+- `createTableConfig` refuses a `topologyEntrypoint` without `nsAdmin`.
 - `FokosDBOptions` gets `useTopologyCache?: boolean`, default `true`. When it is `false`, the clients of that
   `FokosDB` get no `topologyCache`: they send no topology fetch, do not read the isolate cache, and enter at the
   root, as today. Tests use it, and so does a consumer that prefers no extra requests to fewer hops. It does not
   change the partitions and coordinators, which follow `topologyEntrypoint`.
-- `FokosDB` builds `topologyCache` itself, from `exports[topologyEntrypoint].fetch` and `waitUntil`, both imported
-  from `cloudflare:workers`. The caller does not give an `ExecutionContext`. It sends the cache to both of its
-  `FokosShardingClient` instances. The coordinator does the same for its partition client, with `this.ctx`.
-  `worker-configuration.d.ts` declares both imports. M4 starts with a check that the imported `waitUntil` works
-  in the context of a request.
+- `FokosDB` builds `topologyCache` itself (`shared/topology-hooks.ts`), from `exports[topologyEntrypoint]` and
+  `waitUntil`, both imported from `cloudflare:workers`. The fetch calls
+  `exports[topologyEntrypoint]({ props: { nsAdmin, jurisdiction } }).fetch(...)`. The caller does not give an
+  `ExecutionContext`. It sends the cache to both of its `FokosShardingClient` instances. `PartitionDO` and
+  `TransactionCoordinatorDO` give it to their runtimes, with `this.ctx.waitUntil`.
+- The partition client of the coordinator has no topology cache. The coordinator stores the address of each
+  participant in `tc_participants`, and prepare, commit, cancel, and recovery send to it from other client
+  instances, also after a restart. Only the client that resolved an address from the topology has its fallback, so
+  a stored address from an old hint could cancel a valid transaction. A root address is always correct, and the
+  root forwards with its own topology cache (M3). A later change can use the topology here when the fallback works
+  across client instances and stored addresses, and when the groups that fall back to one owner join again, so
+  that each owner gets its keys in one `txCommit`. In the vitest pool, the imported `exports` (with props) and the imported `waitUntil` work
+  in a Worker and in a Durable Object. `ctx.exports` needs the `enable_ctx_exports` compatibility flag, which is the default from the compatibility date 2025-11-17.
 - `destroy` calls `resetShardGroup` on the admin DO of each shard group of the table after the sharding destroy
   ends.
-- `fokosdb/server` exports `FokosTopologyCache` (a `WorkerEntrypoint`). The consumer re-exports it from its main
-  module, and enables its cache.
+- `fokosdb/server` exports `FokosDBAutoAdminDO` and `FokosTopologyCache` (a `WorkerEntrypoint`). The consumer
+  binds the first, and re-exports the second from its main module and enables its cache in the `exports` map.
+  `FokosDBAutoAdminDO` is `FokosShardingAutoAdminDO` with no change. The `fokos.admin.<tableName>` role adds its
+  own state later.
 - The admin DOs use the jurisdiction of the table, through a helper in `shared/do-stubs.ts`, as the other classes
   do.
 

@@ -90,6 +90,7 @@ import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
+import { adminOutboxFor, TopologyCacheMemo } from "../shared/topology-hooks.js";
 import {
 	ADMISSION_MARGIN,
 	applyImageCap,
@@ -383,6 +384,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			logParams: () => this.logParams(),
 			config: () => this.config().ttlSweep,
 		});
+		const topologyCache = new TopologyCacheMemo((promise) => ctx.waitUntil(promise));
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
 			ctx,
@@ -391,6 +393,13 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
+			// The table options select both. The runtime asks only after this partition has its identity.
+			adminOutbox: () => adminOutboxFor(env, this.fokos.routeContext()),
+			topologyCache: () =>
+				topologyCache.get(this.fokos.routeContext(), {
+					refreshMs: this.config().topologyRefreshMs,
+					refreshTimeoutMs: this.config().topologyRefreshTimeoutMs,
+				}),
 		});
 		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
 		this.#ttl.arm(this.config().ttlSweep.ttlSweepDelayMs);

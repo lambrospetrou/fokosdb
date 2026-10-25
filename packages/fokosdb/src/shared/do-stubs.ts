@@ -12,7 +12,9 @@
  */
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { FokosDBStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
+import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
+import { topologyAdminName } from "../sharding/topology-codec.js";
+import type { AdminNamespaceKey, FokosDBStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
 
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.
@@ -67,4 +69,28 @@ export function txCoordinatorStubForParticipant(
 ): DurableObjectStub<TransactionCoordinatorDO> {
 	const ns: DurableObjectNamespace<TransactionCoordinatorDO> = env[address.nsTx];
 	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(doName);
+}
+
+/**
+ * The fields that select the admin Durable Objects of a table: the `nsAdmin` binding and the
+ * jurisdiction of the table. The `FokosTopologyCache` entrypoint receives them as its `ctx.props`.
+ */
+export type TopologyAdminAddress = {
+	nsAdmin: AdminNamespaceKey;
+	jurisdiction?: DurableObjectJurisdiction;
+};
+
+/** The admin address of the table of `ctx`, or undefined when the table has no `nsAdmin`. */
+export function topologyAdminAddress(ctx: FokosDBStubContext): TopologyAdminAddress | undefined {
+	const { nsAdmin } = ctx.policy;
+	if (nsAdmin === undefined) {
+		return undefined;
+	}
+	return ctx.topology.jurisdiction === undefined ? { nsAdmin } : { nsAdmin, jurisdiction: ctx.topology.jurisdiction };
+}
+
+/** The stub of the admin Durable Object that holds the topology of `shardGroup`, `topologyAdminName(shardGroup)`. */
+export function topologyAdminStub(env: Env, address: TopologyAdminAddress, shardGroup: string): DurableObjectStub<FokosDBAutoAdminDO> {
+	const ns: DurableObjectNamespace<FokosDBAutoAdminDO> = env[address.nsAdmin];
+	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(topologyAdminName(shardGroup));
 }

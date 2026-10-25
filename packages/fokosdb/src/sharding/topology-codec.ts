@@ -18,6 +18,11 @@ import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
 import type { SkInterval } from "./sk-interval.js";
 
+/** The name of the admin Durable Object that holds the topology of `shardGroup`. */
+export function topologyAdminName(shardGroup: string): string {
+	return `fokos.topo.${shardGroup}`;
+}
+
 // ─── the report event ────────────────────────────────────────────────────────
 
 /** The event type of a completed repartition in the admin outbox. */

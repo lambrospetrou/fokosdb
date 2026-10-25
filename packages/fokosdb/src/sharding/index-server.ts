@@ -61,7 +61,6 @@ export {
 	FokosTopologyKeeper,
 	TOPOLOGY_BODY_CHUNK_BYTES,
 	fokosTopologyEntrypointFetch,
-	topologyAdminName,
 } from "./topology-keeper.js";
 export { topologyEventFromWire, topologyEventToJson } from "./topology-encode.js";
 export type {

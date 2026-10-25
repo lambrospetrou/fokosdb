@@ -51,6 +51,7 @@ import {
 	type TransactionPartitionsAnswer,
 } from "../shared/transaction-wire-types.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import { adminOutboxFor, TopologyCacheMemo } from "../shared/topology-hooks.js";
 import {
 	FokosError,
 	FokosExpressionError,
@@ -397,6 +398,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			doStorage: ctx.storage,
 			keyNameTrackingLastMigrationID: "__fokosdb/tc/sql_schema_version",
 		});
+		const topologyCache = new TopologyCacheMemo((promise) => ctx.waitUntil(promise));
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
 			ctx,
@@ -404,6 +406,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
+			// The table options select both. The runtime asks only after this coordinator has its identity.
+			adminOutbox: () => adminOutboxFor(env, this.fokos.routeContext()),
+			topologyCache: () => topologyCache.get(this.fokos.routeContext(), this.topologyRefreshSettings()),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
 			this.#migrations.runAllSync();
@@ -1187,7 +1192,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
 	private partitionClient(ctx: FokosDBTableConfig): FokosShardingClient<FokosDBPolicy, PartitionOps> {
 		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
-		// TODO: The client should exploit cache of topology hierarchy to leapfrog partitions.
+		// This client has no topology cache. The coordinator stores the address of each participant, and
+		// later sends to it from another client, after a restart too. Only the client that resolved an
+		// address from the topology can fall back after a miss, so a stored address from the topology could
+		// cancel a valid transaction. A root address is always correct, and the root forwards with its own
+		// topology cache.
 		return new FokosShardingClient<FokosDBPolicy, PartitionOps>({
 			topology: ctx.topology,
 			rangeConfig: ctx.rangeConfig,
@@ -1195,6 +1204,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			policyVersion: ctx.policyVersion,
 			stub: (c, doName) => partitionStubByName(this.env, c, doName),
 		});
+	}
+
+	private topologyRefreshSettings() {
+		const config = this.config();
+		return { refreshMs: config.topologyRefreshMs, refreshTimeoutMs: config.topologyRefreshTimeoutMs };
 	}
 
 	/**

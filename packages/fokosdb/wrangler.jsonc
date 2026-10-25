@@ -29,6 +29,10 @@
 			"new_sqlite_classes": ["TestTopologyAdminDO"],
 			"tag": "v2",
 		},
+		{
+			"new_sqlite_classes": ["FokosDBAutoAdminDO"],
+			"tag": "v3",
+		},
 	],
 	"durable_objects": {
 		"bindings": [
@@ -63,6 +67,10 @@
 			{
 				"class_name": "TestTopologyAdminDO",
 				"name": "TOPOLOGY_ADMIN_DO",
+			},
+			{
+				"class_name": "FokosDBAutoAdminDO",
+				"name": "FOKOS_ADMIN_DO",
 			},
 		],
 	},

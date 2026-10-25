@@ -12,7 +12,7 @@ import type { AppEnv } from "./shared.js";
 
 // Wrangler resolves Durable Object bindings against this module, so the classes must be re-exported
 // from the worker entry even though the implementations live in the library.
-export { PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
+export { FokosDBAutoAdminDO, FokosTopologyCache, PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
 export { CounterPartitionDO, SearchPartitionDO } from "./demo2/index.js";
 
 const api = new Hono<AppEnv>().basePath("/api");

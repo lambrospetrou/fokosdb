@@ -21,6 +21,10 @@
 			"new_sqlite_classes": ["CounterPartitionDO", "SearchPartitionDO"],
 			"tag": "v2",
 		},
+		{
+			"new_sqlite_classes": ["FokosDBAutoAdminDO"],
+			"tag": "v3",
+		},
 	],
 	"durable_objects": {
 		"bindings": [
@@ -44,7 +48,18 @@
 				"class_name": "SearchPartitionDO",
 				"name": "SEARCH_PARTITION_DO",
 			},
+			{
+				"class_name": "FokosDBAutoAdminDO",
+				"name": "FOKOS_ADMIN_DO",
+			},
 		],
+	},
+	// The cached entrypoint of the encoded topology. Only `ctx.exports` reaches it: no route names it.
+	"exports": {
+		"FokosTopologyCache": {
+			"type": "worker",
+			"cache": { "enabled": true },
+		},
 	},
 	"observability": {
 		"enabled": true,
