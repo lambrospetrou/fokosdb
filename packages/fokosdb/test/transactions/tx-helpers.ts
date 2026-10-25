@@ -257,13 +257,16 @@ export async function holdPendingLock(
 	const { rpc, pCtx } = owningPartition(db, key);
 	const transactionId = crypto.randomUUID();
 	const keys = { hashKey: KeyCodec.encode(key.hashKey), sortKey: KeyCodec.encode(key.sortKey) };
+	// A write in the same millisecond stamps the item with the same timestamp, and the prepare then gets
+	// `timestamp_conflict`. The timer moves the clock past that millisecond.
+	await new Promise((resolve) => setTimeout(resolve, 2));
 	const res = await rpc.txPrepare(pCtx, {
 		transactionId,
 		coordinator: testCoordinatorRef(),
 		transactionTimestamp: txOrderTimestampNow(),
 		items: [{ opIndex: 0, ...keys, ...item }],
 	});
-	expect(res.outcome).toBe("accepted");
+	expect(res).toMatchObject({ outcome: "accepted" });
 	return () => rpc.txCancel(pCtx, { transactionId, items: [keys] });
 }
 
