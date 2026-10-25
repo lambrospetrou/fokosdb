@@ -177,6 +177,13 @@ export function materializationOf(base: FokosDBRouteContext, hashKey: string): D
 	return materializationStubByName(env, ctx, ctx.doName);
 }
 
+/**
+ * The `vi.waitFor` options for a base change to reach a materialization partition or a target. The
+ * change goes through two or three Durable Objects, and while the full suite runs, that can take more
+ * than the default 1 s.
+ */
+export const TARGET_WAIT = { timeout: 5_000, interval: 10 };
+
 /** The latest image of one base item in a materialization partition, or undefined when it has none. */
 export async function latestImage(
 	stub: DurableObjectStub<MaterializationDO>,

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
-import { conditionTree, kb, latestImage, makeStub, materializationOf, withOpIndex } from "./helpers.js";
+import { conditionTree, kb, latestImage, makeStub, materializationOf, TARGET_WAIT, withOpIndex } from "./helpers.js";
 
 async function outboxSize(stub: DurableObjectStub<PartitionDO>): Promise<number> {
 	return await runInDurableObject(
@@ -21,7 +21,7 @@ describe("PartitionDO — materialization export", () => {
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "one", kind: "text" });
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "two", kind: "text" });
 		await rpc.apiPutItem(ctx, { hashKey: kb("b"), sortKey: kb("s"), data: JSON.stringify({ n: 1 }), kind: "json" });
-		await vi.waitFor(async () => expect(await outboxSize(stub)).toBe(0));
+		await vi.waitFor(async () => expect(await outboxSize(stub)).toBe(0), TARGET_WAIT);
 
 		const mat = materializationOf(ctx, "a");
 		expect(await latestImage(mat, "a")).toEqual({ revision: 2, deleted: false, data: "two" });
@@ -30,8 +30,8 @@ describe("PartitionDO — materialization export", () => {
 
 		// The export of the delete is a tombstone at the delete revision.
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("a"), sortKey: kb("s") });
-		await vi.waitFor(async () => expect(await latestImage(mat, "a")).toEqual({ revision: 3, deleted: true, data: null }));
-		await vi.waitFor(async () => expect(await outboxSize(stub)).toBe(0));
+		await vi.waitFor(async () => expect(await latestImage(mat, "a")).toEqual({ revision: 3, deleted: true, data: null }), TARGET_WAIT);
+		await vi.waitFor(async () => expect(await outboxSize(stub)).toBe(0), TARGET_WAIT);
 
 		// The receiver stored the export epoch of the base partition.
 		const producerId = stub.id.toString();
@@ -70,7 +70,7 @@ describe("PartitionDO — materialization export", () => {
 		});
 		expect(rejected).toMatchObject({ outcome: "rejected" });
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("a"), sortKey: kb("s") });
-		await vi.waitFor(async () => expect(await outboxSize(stub)).toBe(0));
+		await vi.waitFor(async () => expect(await outboxSize(stub)).toBe(0), TARGET_WAIT);
 
 		expect(await latestImage(materializationOf(ctx, "b"), "b")).toMatchObject({ revision: 1, deleted: false });
 		// The delete of a at v = 1 has the revision 2. A delete before the first export of a sends
@@ -101,8 +101,9 @@ describe("PartitionDO — materialization export", () => {
 		const transactionTimestamp = Date.now() + 1;
 		expect(await prepare(committed, transactionTimestamp, "committed")).toMatchObject({ outcome: "accepted" });
 		await rpc.txCommit(ctx, { transactionId: committed, transactionTimestamp, items: keys });
-		await vi.waitFor(async () =>
-			expect(await latestImage(materializationOf(ctx, "a"), "a")).toEqual({ revision: 1, deleted: false, data: "committed" }),
+		await vi.waitFor(
+			async () => expect(await latestImage(materializationOf(ctx, "a"), "a")).toEqual({ revision: 1, deleted: false, data: "committed" }),
+			TARGET_WAIT,
 		);
 	});
 

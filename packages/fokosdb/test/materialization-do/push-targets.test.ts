@@ -2,7 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { validateTargets, type FokosTargetDefinition } from "../../src/server/materialization/targets.js";
-import { kb, makeStub, materializationOf } from "../partition-do/helpers.js";
+import { kb, makeStub, materializationOf, TARGET_WAIT } from "../partition-do/helpers.js";
 import type { ReceivedPush } from "./push-target-host.js";
 
 /** The latest record of each key that the push target received from one producer. */
@@ -31,17 +31,20 @@ describe("MaterializationDO — push targets", () => {
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "one", kind: "text" });
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: JSON.stringify({ n: 2 }), kind: "json" });
-		await vi.waitFor(async () =>
-			expect((await latestPushes(producerId)).a).toEqual({ hashKey: "a", revision: 2, deleted: false, data: `{"n":2}`, epoch: 1 }),
+		await vi.waitFor(
+			async () =>
+				expect((await latestPushes(producerId)).a).toEqual({ hashKey: "a", revision: 2, deleted: false, data: `{"n":2}`, epoch: 1 }),
+			TARGET_WAIT,
 		);
 
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("a"), sortKey: kb("s") });
-		await vi.waitFor(async () =>
-			expect((await latestPushes(producerId)).a).toEqual({ hashKey: "a", revision: 3, deleted: true, data: null, epoch: 1 }),
+		await vi.waitFor(
+			async () => expect((await latestPushes(producerId)).a).toEqual({ hashKey: "a", revision: 3, deleted: true, data: null, epoch: 1 }),
+			TARGET_WAIT,
 		);
 
 		// The target read the tombstone, so the cleanup deletes it and each position.
-		await vi.waitFor(async () => expect(await materializationState(mat)).toMatchObject({ items: 0, positions: 0 }));
+		await vi.waitFor(async () => expect(await materializationState(mat)).toMatchObject({ items: 0, positions: 0 }), TARGET_WAIT);
 		expect(await materializationState(mat)).toMatchObject({
 			targets: [{ target_id: "sink", kind: "push_sink", epoch: 1, is_batch_open: 0 }],
 			storedTargets: [{ kind: "push_sink", targetId: "sink", binding: "PUSH_SINK_DO", method: "push", objectName: "sink" }],

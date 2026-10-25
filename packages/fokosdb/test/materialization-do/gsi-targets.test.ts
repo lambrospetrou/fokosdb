@@ -7,7 +7,7 @@ import { decodeGsiSortKey } from "../../src/shared/gsi/sort-key.js";
 import { gsiTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { kb, makeStub, materializationOf } from "../partition-do/helpers.js";
+import { kb, makeStub, materializationOf, TARGET_WAIT } from "../partition-do/helpers.js";
 
 type Entry = { sortKey?: string; baseHashKey: string; baseSortKey?: string; data: unknown };
 
@@ -70,14 +70,14 @@ describe("MaterializationDO — GSI targets", () => {
 				{ sortKey: "t1", baseHashKey: "o1", baseSortKey: "s", data: { status: "OPEN", at: "t1", owner: "u1" } },
 			]);
 			expect(await gsiEntries(t.ctx, "byOwner", "u1")).toEqual([{ baseHashKey: "o1", baseSortKey: "s", data: { status: "OPEN" } }]);
-		});
+		}, TARGET_WAIT);
 
 		await t.put("o1", { status: "CLOSED", at: "t2", owner: "u1" });
 		await vi.waitFor(async () => {
 			expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toEqual([]);
 			expect(await gsiEntries(t.ctx, "byStatus", "CLOSED")).toMatchObject([{ sortKey: "t2", baseHashKey: "o1" }]);
 			expect(await gsiEntries(t.ctx, "byOwner", "u1")).toMatchObject([{ data: { status: "CLOSED" } }]);
-		});
+		}, TARGET_WAIT);
 		expect(await materializationRows(mat)).toMatchObject({ keySets: 2 });
 
 		await t.remove("o1");
@@ -86,20 +86,20 @@ describe("MaterializationDO — GSI targets", () => {
 			expect(await gsiEntries(t.ctx, "byOwner", "u1")).toEqual([]);
 			// No key set is left, so the cleanup deletes the tombstone.
 			expect(await materializationRows(mat)).toEqual({ items: 0, keySets: 0, retries: [] });
-		});
+		}, TARGET_WAIT);
 	});
 
 	it("an item with a missing GSI key attribute has no entry in that GSI", async () => {
 		const t = gsiTable();
 		const mat = materializationOf(t.ctx, "o2");
 		await t.put("o2", { status: "OPEN", at: "t1", owner: "u2" });
-		await vi.waitFor(async () => expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toHaveLength(1));
+		await vi.waitFor(async () => expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toHaveLength(1), TARGET_WAIT);
 		// The sort key attribute goes, so the entry goes too.
 		await t.put("o2", { status: "OPEN", owner: "u2" });
 		await vi.waitFor(async () => {
 			expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toEqual([]);
 			expect(await gsiEntries(t.ctx, "byOwner", "u2")).toHaveLength(1);
-		});
+		}, TARGET_WAIT);
 		expect(await materializationRows(mat)).toMatchObject({ keySets: 1, retries: [] });
 	});
 
@@ -107,7 +107,7 @@ describe("MaterializationDO — GSI targets", () => {
 		const t = gsiTable();
 		const mat = materializationOf(t.ctx, "o3");
 		await t.put("o3", { status: "OPEN", at: "t1", owner: "u3" });
-		await vi.waitFor(async () => expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toHaveLength(1));
+		await vi.waitFor(async () => expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toHaveLength(1), TARGET_WAIT);
 		await t.put("o3", { status: 7, at: "t1", owner: "u3" });
 		await vi.waitFor(async () => {
 			expect(await gsiEntries(t.ctx, "byStatus", "OPEN")).toEqual([]);
@@ -115,12 +115,12 @@ describe("MaterializationDO — GSI targets", () => {
 				keySets: 1,
 				retries: [{ target_id: "byStatus", kind: "violation", last_error: "gsi_key_type_invalid" }],
 			});
-		});
+		}, TARGET_WAIT);
 		// A newer valid image applies, and its application deletes the violation row.
 		await t.put("o3", { status: "DONE", at: "t3", owner: "u3" });
 		await vi.waitFor(async () => {
 			expect(await gsiEntries(t.ctx, "byStatus", "DONE")).toHaveLength(1);
 			expect(await materializationRows(mat)).toMatchObject({ retries: [] });
-		});
+		}, TARGET_WAIT);
 	});
 });

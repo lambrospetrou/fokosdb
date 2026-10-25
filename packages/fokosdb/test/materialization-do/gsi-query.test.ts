@@ -7,6 +7,7 @@ import { createTableConfig, gsiTableConfig, materializationTableConfig } from ".
 import { FokosShardingClient } from "../../src/sharding/client.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { TARGET_WAIT } from "../partition-do/helpers.js";
 
 function makeDB() {
 	return new FokosDB({
@@ -39,7 +40,7 @@ describe("db.gsi(indexName).queryItems", () => {
 		}
 		const query = (sortKeyCondition?: Parameters<FokosDB["queryItems"]>[0]["queries"][number]["sortKeyCondition"]) =>
 			db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN", sortKeyCondition }] });
-		await vi.waitFor(async () => expect((await query()).items).toHaveLength(4));
+		await vi.waitFor(async () => expect((await query()).items).toHaveLength(4), TARGET_WAIT);
 
 		const all = await query();
 		expect(all.items[0]).toMatchObject({ hashKey: "OPEN", sortKey: "t1", baseHashKey: "o1", baseSortKey: "s", data: { at: "t1" } });
@@ -69,7 +70,10 @@ describe("db.gsi(indexName).queryItems", () => {
 		const db = makeDB();
 		await db.putItem({ hashKey: "o1", sortKey: "s", data: { status: "OPEN", at: "t1", owner: "u" } });
 		await db.putItem({ hashKey: "o2", sortKey: "s", data: { status: "OPEN", at: "t2", owner: "u" } });
-		await vi.waitFor(async () => expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toHaveLength(2));
+		await vi.waitFor(
+			async () => expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toHaveLength(2),
+			TARGET_WAIT,
+		);
 		const page = await db.gsi("byStatus").queryItems({
 			queries: [{ hashKey: "OPEN" }],
 			filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "t2" }] },
@@ -80,7 +84,10 @@ describe("db.gsi(indexName).queryItems", () => {
 		});
 		expect(page.items).toEqual([{ at: "t2", owner: "u" }]);
 		// A GSI with no sort key has no sortKey value.
-		await vi.waitFor(async () => expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(2));
+		await vi.waitFor(
+			async () => expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(2),
+			TARGET_WAIT,
+		);
 		const missing = await db
 			.gsi("byOwner")
 			.queryItems({ queries: [{ hashKey: "u" }], filter: { op: "not_exists", args: [{ ref: "sortKey" }] } });
@@ -90,7 +97,10 @@ describe("db.gsi(indexName).queryItems", () => {
 	it("destroy() deletes the base, the materialization, and each GSI table", async () => {
 		const db = makeDB();
 		await db.putItem({ hashKey: "o1", sortKey: "s", data: { status: "OPEN", at: "t1", owner: "u" } });
-		await vi.waitFor(async () => expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(1));
+		await vi.waitFor(
+			async () => expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(1),
+			TARGET_WAIT,
+		);
 		await expect(db.destroy()).resolves.toEqual({ ok: true });
 		expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toEqual([]);
 		expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toEqual([]);
@@ -104,7 +114,7 @@ describe("db.gsi(indexName).queryItems", () => {
 		await vi.waitFor(async () => {
 			expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toHaveLength(1);
 			expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(1);
-		});
+		}, TARGET_WAIT);
 		// The state of a destroy that stopped after the first GSI table: the base partitions are gone, the
 		// materialization partitions are fenced, and only the byStatus GSI table is gone.
 		const { topology, rangeConfig, policy, policyVersion } = createTableConfig({ table: db.options().table });
