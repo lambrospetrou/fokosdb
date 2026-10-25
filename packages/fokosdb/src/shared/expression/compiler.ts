@@ -98,6 +98,8 @@ type CompileContext = {
 	preImage: PreImage;
 	/** The callbacks that an operation renders its arguments through. Made at the first function node. */
 	renderers: OperationRenderers | undefined;
+	/** True on a GSI table: `i.sk` is the physical GSI sort key, and `{ ref: "sortKey" }` reads the GSI sort key in it. */
+	gsiSortKey: boolean;
 };
 
 /**
@@ -306,10 +308,13 @@ export function compileProjectionExpression(projection: readonly ProjectionExpre
 	};
 }
 
-export function compileQueryExpression(input: {
-	filter?: ConditionExpression;
-	projection?: readonly ProjectionExpression[];
-}): CompiledQueryPlan {
+export function compileQueryExpression(
+	input: {
+		filter?: ConditionExpression;
+		projection?: readonly ProjectionExpression[];
+	},
+	opts: { gsiSortKey?: boolean } = {},
+): CompiledQueryPlan {
 	const { filter, projection } = input;
 	if (filter === undefined && projection === undefined) {
 		throw new ExpressionError("invalid_ast", "a query plan needs a filter or a projection");
@@ -319,6 +324,7 @@ export function compileQueryExpression(input: {
 	// The filter and the projection share one compile context. A path or a literal that both halves
 	// use binds one time only.
 	const context = createContext("filter", STORED_PRE_IMAGE, "pool");
+	context.gsiSortKey = opts.gsiSortKey ?? false;
 	const rawFilterSql = filter === undefined ? null : compileCondition(filter, context);
 	context.expressionContext = "projection";
 	const rawValueSql = projection?.map((entry) => renderProjectionValue(entry.expr, context)) ?? [];
@@ -375,6 +381,7 @@ function createContext(
 		expressionContext,
 		preImage,
 		renderers: undefined,
+		gsiSortKey: false,
 	};
 }
 
@@ -989,7 +996,7 @@ function referencePresent(reference: ExpressionReference, context: CompileContex
 		case "v":
 			return "(i.hk IS NOT NULL)";
 		case "sortKey":
-			return `(i.hk IS NOT NULL AND length(i.sk) > 0)`;
+			return context.gsiSortKey ? GSI_SORT_KEY_PRESENT : `(i.hk IS NOT NULL AND length(i.sk) > 0)`;
 		case "ttlAt":
 			return `(i.hk IS NOT NULL AND i.ttl_epoch_utc_seconds IS NOT NULL)`;
 	}
@@ -1000,7 +1007,9 @@ function referenceType(reference: ExpressionReference, context: CompileContext):
 		case "hashKey":
 			return keyType("i.hk", "i.hk IS NOT NULL");
 		case "sortKey":
-			return keyType("i.sk", "i.hk IS NOT NULL AND length(i.sk) > 0");
+			return context.gsiSortKey
+				? keyType(GSI_SORT_KEY_VALUE, GSI_SORT_KEY_PRESENT)
+				: keyType("i.sk", "i.hk IS NOT NULL AND length(i.sk) > 0");
 		case "v":
 			return `CASE WHEN i.hk IS NOT NULL THEN 'number' ELSE 'missing' END`;
 		case "ttlAt":
@@ -1020,8 +1029,10 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 	switch (reference.ref) {
 		case "hashKey":
 			return mode === "key" ? "i.hk" : logicalKeyValue("i.hk");
-		case "sortKey":
-			return mode === "key" ? "i.sk" : logicalKeyValue("i.sk");
+		case "sortKey": {
+			const column = context.gsiSortKey ? GSI_SORT_KEY_VALUE : "i.sk";
+			return mode === "key" ? column : logicalKeyValue(column);
+		}
 		case "v":
 			return "i.v";
 		case "ttlAt":
@@ -1046,6 +1057,16 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 		}
 	}
 }
+
+// The physical GSI sort key is `0xFF body <L> <flag> <D>` (see `shared/gsi/sort-key.ts`). `<D>` is the
+// last byte, `<flag>` the byte before it, and `<L>` the `<D>` digits before `<flag>`: the byte length of
+// the encoded GSI sort key. With the ':' flag, the GSI sort key holds no 0x00 byte, so it is the `<L>`
+// bytes after the tag. With the '!' flag, it is the raw copy of `<L>` bytes before `<L>`. A GSI with no
+// sort key gives the empty key, whose body starts with the separator 0x00 0x00.
+const GSI_D = "CAST(substr(i.sk, -1, 1) AS INTEGER)";
+const GSI_L = `CAST(substr(i.sk, -2 - ${GSI_D}, ${GSI_D}) AS INTEGER)`;
+const GSI_SORT_KEY_VALUE = `(CASE WHEN substr(i.sk, -2, 1) = x'21' THEN substr(i.sk, -2 - ${GSI_D} - ${GSI_L}, ${GSI_L}) ELSE substr(i.sk, 2, ${GSI_L}) END)`;
+const GSI_SORT_KEY_PRESENT = `(i.hk IS NOT NULL AND substr(i.sk, 2, 2) != x'0000')`;
 
 function keyType(column: string, present: string): string {
 	return `CASE WHEN ${present} THEN CASE WHEN substr(${column}, 1, 1) = x'ff' THEN 'bytes' ELSE 'text' END ELSE 'missing' END`;

@@ -33,9 +33,10 @@ export function projectionPlanOf(projection: readonly ProjectionExpression[]): C
 	return plan;
 }
 
-export function queryPlanOf(query: QueryExpressions): CompiledQueryPlan {
+/** `gsiSortKey` is true on a GSI table, where `{ ref: "sortKey" }` reads the GSI sort key of the physical key. */
+export function queryPlanOf(query: QueryExpressions, gsiSortKey = false): CompiledQueryPlan {
 	refuseCompiledPlan(query);
-	return compileQueryExpression(query);
+	return compileQueryExpression(query, { gsiSortKey });
 }
 
 const updatePlans = new WeakMap<UpdateExpression, CompiledUpdatePlan>();

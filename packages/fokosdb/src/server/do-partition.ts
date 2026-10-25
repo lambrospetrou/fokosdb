@@ -26,7 +26,7 @@ import type {
 	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
-import { materializationTableConfig, type FokosDBPolicy, type FokosDBRouteContext } from "../shared/partition-context.js";
+import { isGsiShardGroup, materializationTableConfig, type FokosDBPolicy, type FokosDBRouteContext } from "../shared/partition-context.js";
 import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { SplitType } from "../sharding/types.js";
@@ -407,6 +407,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		this.#store = new PartitionStore(ctx.storage, {
 			captureChanges: () => this.#captureEnabled(),
 			onChangeCaptured: () => this.#exporter.wake(),
+			gsiSortKey: () => isGsiShardGroup(this.fokos.routeContext().topology.shardGroup),
 		});
 		// A hash leaf probes `pending_transactions` when `items` is empty, because a pending payload
 		// moves with its key.

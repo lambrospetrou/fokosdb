@@ -19,11 +19,16 @@ import {
 	QueryItemsProjectedOptions,
 	QueryItemsProjectedResult,
 	QueryItemsResult,
+	FokosGsi,
+	GsiQueryItemsResult,
 	QuerySelect,
 	SinglePartitionMeta,
 	SortKey,
 } from "../shared/types.js";
-import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
+import { gsiSkInterval } from "../shared/gsi/query.js";
+import type { MaterializationOps } from "../server/materialization/do-materialization.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
@@ -114,7 +119,7 @@ import {
 } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
-import { KeyCodec, KeyPairMap } from "../sharding/key-codec.js";
+import { KeyCodec, KeyPairMap, type KeyBytes } from "../sharding/key-codec.js";
 import { attachRouting, routedError } from "../sharding/envelope.js";
 import type { FokosPublicRouting } from "../sharding/runtime-types.js";
 import type { WirePartitionMeta } from "../shared/types.js";
@@ -138,6 +143,8 @@ import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expre
 import {
 	coordinatorShardGroup,
 	createTableConfig,
+	gsiTableConfig,
+	materializationTableConfig,
 	type FokosDBPolicy,
 	type FokosDBTableConfig,
 	type FokosTableIdentity,
@@ -611,6 +618,8 @@ export class FokosDB {
 	#partitions: FokosShardingClient<FokosDBPolicy, PartitionOps>;
 	/** The coordinator group of the table, `fokos.tc.<tableName>`. */
 	#coordinators: FokosShardingClient<FokosDBPolicy, CoordinatorOps>;
+	/** The client of each GSI table, by index name. */
+	#gsis = new Map<string, FokosShardingClient<FokosDBPolicy, PartitionOps>>();
 
 	constructor(options: FokosDBOptions) {
 		this.#table = createTableConfig(options);
@@ -665,6 +674,30 @@ export class FokosDB {
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
 		});
+	}
+
+	/**
+	 * The read view of the GSI `indexName`, a `targetId` of a GSI target of the `MaterializationDO` of the
+	 * table. A `sortKeyCondition` applies to the GSI sort key. An entry has the GSI keys and the keys of
+	 * its base item.
+	 */
+	gsi(indexName: string): FokosGsi {
+		return {
+			queryItems: (async (opts: QueryItemsOptions) =>
+				await withFokosErrors(async () => await this.#queryItems(opts, this.#gsiClient(indexName)))) as FokosGsi["queryItems"],
+		};
+	}
+
+	#gsiClient(indexName: string): FokosShardingClient<FokosDBPolicy, PartitionOps> {
+		let client = this.#gsis.get(indexName);
+		if (client === undefined) {
+			client = new FokosShardingClient({
+				...gsiTableConfig(this.#table, indexName),
+				stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+			});
+			this.#gsis.set(indexName, client);
+		}
+		return client;
 	}
 
 	/** The options of this client, with the defaults applied. */
@@ -1178,7 +1211,12 @@ export class FokosDB {
 		return { outcome: "committed", items, meta: meta() };
 	}
 
-	async #queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult | QueryItemsProjectedResult> {
+	/** `gsi` is the client of a GSI table, or undefined for the base table. */
+	async #queryItems(
+		opts: QueryItemsOptions,
+		gsi?: FokosShardingClient<FokosDBPolicy, PartitionOps>,
+	): Promise<QueryItemsResult | GsiQueryItemsResult | QueryItemsProjectedResult> {
+		const partitions = gsi ?? this.#partitions;
 		if (opts.queries.length === 0) {
 			throw new FokosValidationError(VALIDATION_CODES.query_queries_empty, { message: "queries must not be empty" });
 		}
@@ -1230,7 +1268,7 @@ export class FokosDB {
 			validateItemKeys(q.hashKey);
 			return {
 				hashKey: encodeHashKey(q.hashKey, this.#limits),
-				interval: normalizeSkInterval(q.sortKeyCondition, (k) => encodeSortBound(k, this.#limits)),
+				interval: (gsi ? gsiSkInterval : normalizeSkInterval)(q.sortKeyCondition, (k) => encodeSortBound(k, this.#limits)),
 				direction,
 				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
 			};
@@ -1272,7 +1310,7 @@ export class FokosDB {
 		const items: Array<QueryItemsResult["items"][number] | ProjectedItem> = [];
 		// Each leaf writes its own entry, so the cap of the route list cannot drop a leaf. Only a name can
 		// be absent. The entries of the sub-queries follow in order, so the items stay in entry order.
-		const partitions: QueryItemsResult["meta"]["partitions"] = [];
+		const pageMeta: QueryItemsResult["meta"]["partitions"] = [];
 		let count = 0;
 		let scannedCount = 0;
 		let rowsReturned = 0;
@@ -1292,7 +1330,7 @@ export class FokosDB {
 
 			let answer: FokosCallResult<PartitionOps["apiQueryItems"]["res"]>;
 			try {
-				answer = await this.#partitions.range(
+				answer = await partitions.range(
 					"apiQueryItems",
 					{ hashKey: query.hashKey, interval: query.interval, descending: query.direction === "desc" },
 					{
@@ -1310,17 +1348,17 @@ export class FokosDB {
 					},
 				);
 			} catch (e) {
-				throw withMetaSoFar(e, { forwardCount, partitions });
+				throw withMetaSoFar(e, { forwardCount, partitions: pageMeta });
 			}
 			const { value: rpcResult, routing } = answer;
-			partitions.push(...answerMeta(rpcResult.partitions, routing).partitions);
+			pageMeta.push(...answerMeta(rpcResult.partitions, routing).partitions);
 			forwardCount += routing.forwardCount;
 
 			count += rpcResult.count;
 			scannedCount += rpcResult.scannedCount;
 			rowsReturned += rpcResult.rowsReturned;
 			if (select === "projection") {
-				withAnswerMeta({ forwardCount, partitions }, () => {
+				withAnswerMeta({ forwardCount, partitions: pageMeta }, () => {
 					if (projectionNames) {
 						for (const item of rpcResult.items) {
 							items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
@@ -1330,7 +1368,7 @@ export class FokosDB {
 							const stored = item as StoredItem;
 							items.push({
 								hashKey: KeyCodec.decode(stored.hk),
-								sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
+								...(gsi ? gsiKeys(stored.sk) : { sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk) }),
 								// json data arrives as JSON text and is parsed once here to the public JsonValue.
 								...decodeItemData(stored.kind, stored.data),
 								...(stored.ttl_epoch_utc_seconds === null ? {} : { ttlAt: stored.ttl_epoch_utc_seconds }),
@@ -1381,9 +1419,25 @@ export class FokosDB {
 			}
 		}
 
-		const meta: QueryItemsResult["meta"] = { forwardCount, partitions, rowsReturned };
+		const meta: QueryItemsResult["meta"] = { forwardCount, partitions: pageMeta, rowsReturned };
 
 		return { items, count, scannedCount, cursor, meta } as QueryItemsResult | QueryItemsProjectedResult;
+	}
+
+	/**
+	 * Fences each materialization partition, which stops its target runner, and returns the GSI
+	 * targets of the table: the union of the stored target lists.
+	 */
+	async #fenceMaterializations(materializations: FokosShardingClient<FokosDBPolicy, MaterializationOps>): Promise<string[]> {
+		const ids = new Set<string>();
+		for await (const node of materializations.walk()) {
+			const stub = materializationStubByName(env, node.ctx, node.ctx.doName);
+			await stub.fokosPrepareDestroy({ rootContext: node.parent === null ? node.ctx : undefined });
+			for (const id of (await stub.fokosGsiTargetIds()) ?? []) {
+				ids.add(id);
+			}
+		}
+		return [...ids];
 	}
 
 	// The positional types of the public method are erased here, as in `#transactGetItems`.
@@ -1557,7 +1611,33 @@ export class FokosDB {
 		await this.#partitions.destroy({
 			onDestroyed: (ref) => console.warn(`Destroyed partition DO ${ref.doName} (partitionId=${ref.partitionId})`),
 		});
+		// Each writer goes before its receiver: the base partitions export to the materialization
+		// partitions, and these write the GSI tables.
+		// The materialization partitions are fenced first, so that no GSI write follows the destroy of a
+		// GSI table, and they are deleted last, so that a destroy that stops halfway can read the GSI
+		// targets again.
+		if (this.#table.policy.nsMat !== undefined) {
+			const materializations = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
+				...materializationTableConfig(this.#table),
+				stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
+			});
+			const indexNames = await this.#fenceMaterializations(materializations);
+			for (const indexName of indexNames) {
+				await this.#gsiClient(indexName).destroy({ onDestroyed: (ref) => console.warn(`Destroyed GSI partition DO ${ref.doName}`) });
+			}
+			await materializations.destroy({ onDestroyed: (ref) => console.warn(`Destroyed materialization DO ${ref.doName}`) });
+		}
 
 		return { ok: true };
 	}
+}
+
+/** The GSI keys and the base keys of a GSI entry, from its physical sort key. */
+function gsiKeys(physicalSk: KeyBytes): { sortKey?: SortKey; baseHashKey: HashKey; baseSortKey?: SortKey } {
+	const { gsiSK, baseHK, baseSK } = decodeGsiSortKey(KeyCodec.decode(physicalSk) as Uint8Array);
+	return {
+		...(gsiSK.length === 0 ? {} : { sortKey: KeyCodec.decode(gsiSK) }),
+		baseHashKey: KeyCodec.decode(baseHK),
+		...(baseSK.length === 0 ? {} : { baseSortKey: KeyCodec.decode(baseSK) }),
+	};
 }

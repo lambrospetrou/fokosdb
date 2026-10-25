@@ -246,7 +246,7 @@ Each row in `items` has a version `v`. Each partition has one `deletion_metadata
   - the tombstone GC,
   - the `MaterializationDO` split and promotion migration with the split fences.
 
-### Milestone 4: Static GSIs and `db.gsi(indexName)`
+### Milestone 4 — DONE — Static GSIs and `db.gsi(indexName)`
 - Add the internal `PartitionDO` operation `gsiWriteEntries` with `producerId`, `epoch`, `ancestorFences`, and the
   outcome `producer_epoch_fenced`. Add `producer_fences` to the GSI `PartitionDO` and to its split migration
   (Sections 4.2.9 and 4.2.14). The public `batchWriteItems` does not change.
@@ -1411,9 +1411,10 @@ export type FokosTargetDefinition = GsiTargetDefinition | PushSinkTargetDefiniti
 1. `fokos.tc.<tableName>`.
 2. `fokos.p.<tableName>`. `fokosPrepareDestroy` fences each base partition, stops its in-memory export workers, and
    waits for them.
-3. `fokos.m.<tableName>`, when `nsMat` is configured. `fokosPrepareDestroy` fences each `MaterializationDO`, stops its
-   in-memory `#pushPromise`, and waits for it. It collects the union of the GSI `targetId` values from
-   `materialization_targets`.
+3. `fokos.m.<tableName>`, when `nsMat` is configured, in two parts. First, `fokosPrepareDestroy` fences each
+   `MaterializationDO`, stops its target runner, and waits for it, and the walk collects the union of the GSI
+   `targetId` values of the stored target lists. Then step 4 runs, and then each `MaterializationDO` is deleted. Thus no
+   GSI write follows the destroy of a GSI table, and a destroy that stops halfway can read the GSI targets again.
 4. `fokos.gsiv1.<n>.<tableName>.<indexName>` for each collected GSI `targetId`.
 
 Each step is idempotent. A caller must not use `<tableName>` again until `destroy()` returns `{ ok: true }`.

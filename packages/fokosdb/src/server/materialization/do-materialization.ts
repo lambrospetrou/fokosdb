@@ -220,6 +220,10 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	fokosDestroy(): Promise<void> {
 		return this.fokos.fokosDestroy();
 	}
+	/** The `targetId` of each GSI target of the stored target list, or null when this partition has no list. */
+	fokosGsiTargetIds(): string[] | null {
+		return this.#store.storedTargets()?.flatMap((target) => (target.kind === "gsi" ? [target.targetId] : [])) ?? null;
+	}
 
 	async alarm(info: AlarmInvocationInfo): Promise<void> {
 		await this.fokos.alarm(info);

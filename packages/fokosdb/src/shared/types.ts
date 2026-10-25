@@ -334,3 +334,18 @@ export type QueryItemsPage<Item> = {
 // db.ts has parsed json text into a JsonValue. The DO's counterpart is QueryItemsRpcResponse, which
 // carries raw key bytes and the stored data representation.
 export type QueryItemsResult<T = never> = QueryItemsPage<ReadItem<T>>;
+
+/**
+ * One GSI entry of `db.gsi(indexName).queryItems`. `hashKey` and `sortKey` are the GSI keys, and
+ * `baseHashKey` and `baseSortKey` are the keys of the base item. `version` is the version of the GSI
+ * entry, not of the base item.
+ */
+export type GsiReadItem<T = never> = ReadItem<T> & { baseHashKey: HashKey; baseSortKey?: SortKey };
+
+export type GsiQueryItemsResult<T = never> = QueryItemsPage<GsiReadItem<T>>;
+
+/** The read view of one GSI of a table. */
+export interface FokosGsi {
+	queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
+	queryItems<T = never>(opts: QueryItemsOptions): Promise<GsiQueryItemsResult<T>>;
+}

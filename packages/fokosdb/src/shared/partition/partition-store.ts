@@ -848,6 +848,8 @@ export type PartitionStoreOptions = {
 	captureChanges?: () => boolean;
 	/** Called after a write adds or changes an outbox row that the export must send. The write is not committed yet. */
 	onChangeCaptured?: () => void;
+	/** True on a GSI table, so that a query compiles `{ ref: "sortKey" }` against the physical GSI sort key. Default: false. */
+	gsiSortKey?: () => boolean;
 };
 
 /**
@@ -906,12 +908,14 @@ export class PartitionStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
 	#captureChanges: () => boolean;
+	#gsiSortKey: () => boolean;
 	#onChangeCaptured: () => void;
 
 	constructor(storage: DurableObjectStorage, opts: PartitionStoreOptions = {}) {
 		this.#storage = storage;
 		this.keySizes = new KeySizeStats(storage);
 		this.#captureChanges = opts.captureChanges ?? (() => false);
+		this.#gsiSortKey = opts.gsiSortKey ?? (() => false);
 		this.#onChangeCaptured = opts.onChangeCaptured ?? (() => {});
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
@@ -1612,7 +1616,7 @@ export class PartitionStore {
 		consumer: QueryCandidateConsumer,
 	): SqlMetrics {
 		const query = opts.plan;
-		const plan = query === null ? null : withExpressionErrors(() => queryPlanOf(query));
+		const plan = query === null ? null : withExpressionErrors(() => queryPlanOf(query, this.#gsiSortKey()));
 		const { sql, params } = queryScanStatement({ ...opts, plan });
 		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
 		const entryCount = plan?.projection?.names.length ?? 0;
