@@ -60,12 +60,13 @@ export type {
 	FokosRouting,
 	FokosServedRole,
 } from "./runtime-types.js";
+export type { FokosAdminOutbox } from "./runtime-types.js";
 export type { FokosImportState, RouteKey } from "./repartition-types.js";
 export type { RepartitionKind } from "./sharding-store.js";
 
 // ─── Encoded topology ─────────────────────────────────────────────────────────
 
-export { TOPOLOGY_EVENT_TYPE } from "./topology-codec.js";
+export { TOPOLOGY_EVENT_TYPE, topologyAdminName } from "./topology-codec.js";
 export type { FokosTopologyEvent } from "./topology-codec.js";
 export { TOPOLOGY_CACHE_BUDGET_BYTES, topologyGetForRangePath, topologyGetPath } from "./topology-cache.js";
 export type { FokosTopologyCacheOptions } from "./topology-cache.js";

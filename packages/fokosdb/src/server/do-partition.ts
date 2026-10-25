@@ -95,6 +95,7 @@ import { materializationStubByName, partitionStubByName, txCoordinatorStubForPar
 import { FokosShardingClient } from "../sharding/client.js";
 import { MaterializationExporter, type ExportCall, type ExportItemOutcome } from "../shared/partition/materialization-export.js";
 import type { MaterializationOps } from "./materialization/do-materialization.js";
+import { adminOutboxFor, TopologyCacheMemo } from "../shared/topology-hooks.js";
 import {
 	ADMISSION_MARGIN,
 	applyBatchImageCap,
@@ -455,6 +456,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			now: () => this.fokosNow(),
 			logParams: () => this.logParams(),
 		});
+		const topologyCache = new TopologyCacheMemo((promise) => ctx.waitUntil(promise));
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
 			ctx,
@@ -463,6 +465,13 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
+			// The table options select both. The runtime asks only after this partition has its identity.
+			adminOutbox: () => adminOutboxFor(env, this.fokos.routeContext()),
+			topologyCache: () =>
+				topologyCache.get(this.fokos.routeContext(), {
+					refreshMs: this.config().topologyRefreshMs,
+					refreshTimeoutMs: this.config().topologyRefreshTimeoutMs,
+				}),
 		});
 		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
 		this.#ttl.arm(this.config().ttlSweep.ttlSweepDelayMs);

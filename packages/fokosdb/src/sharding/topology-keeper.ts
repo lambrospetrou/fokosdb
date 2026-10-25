@@ -31,11 +31,6 @@ import {
 	topologyEventToJson,
 } from "./topology-encode.js";
 
-/** The name of the admin Durable Object that holds the topology of `shardGroup`. */
-export function topologyAdminName(shardGroup: string): string {
-	return `fokos.topo.${shardGroup}`;
-}
-
 /** The size of one stored chunk of a body. The documented limit of a row is 2 MB. */
 export const TOPOLOGY_BODY_CHUNK_BYTES = 1024 * 1024;
 

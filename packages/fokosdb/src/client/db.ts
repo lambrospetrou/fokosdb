@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env, waitUntil } from "cloudflare:workers";
 import {
 	AnsweredPartitionMeta,
 	DataKind,
@@ -25,10 +25,11 @@ import {
 	SinglePartitionMeta,
 	SortKey,
 } from "../shared/types.js";
-import { materializationStubByName, partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName, topologyAdminAddress, topologyAdminStub, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
 import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
+import { topologyCacheFor } from "../shared/topology-hooks.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
@@ -563,6 +564,18 @@ export type FokosDBOptions = FokosTableOptions & {
 	 * it. The client cannot read that setting. Default: 15,000 ms.
 	 */
 	partitionMigratingRetryDeadlineMs?: number;
+
+	/**
+	 * Reads the topology of the table when the table has a `topologyEntrypoint`, so each request enters
+	 * at the deepest known partition. False: the client sends no topology fetch, reads no topology, and
+	 * each request enters at a root. The partitions and the coordinators do not read this option.
+	 * Default: true.
+	 */
+	useTopologyCache?: boolean;
+	/** The age of a cached topology that starts a refresh, in milliseconds. Default: 10,000. */
+	topologyRefreshMs?: number;
+	/** The time after which a topology refresh that did not end can start again, in milliseconds. Default: 30,000. */
+	topologyRefreshTimeoutMs?: number;
 };
 
 /** `FokosDBOptions` with the defaults of the client applied. */
@@ -653,6 +666,23 @@ export class FokosDB {
 				attributes: { coordinatorRootsN },
 			});
 		}
+		for (const option of ["topologyRefreshMs", "topologyRefreshTimeoutMs"] as const) {
+			const value = options[option];
+			const min = option === "topologyRefreshMs" ? 0 : 1;
+			if (value !== undefined && (!Number.isSafeInteger(value) || value < min)) {
+				throw invalidOption(option, value, `${option} must be an integer of at least ${min}`);
+			}
+		}
+		// The imported `waitUntil` extends the request that runs the refresh, in a Worker and in a
+		// Durable Object.
+		const topologyCache =
+			options.useTopologyCache === false
+				? undefined
+				: topologyCacheFor(this.#table, waitUntil, {
+						refreshMs: options.topologyRefreshMs,
+						refreshTimeoutMs: options.topologyRefreshTimeoutMs,
+					});
+		const withTopologyCache = topologyCache === undefined ? {} : { topologyCache };
 		// The coordinators take the topology of the table except its shard group and its number of roots:
 		// the same hash split fan-out, and the same jurisdiction. The range config is not used, because
 		// a coordinator has no range tree.
@@ -662,6 +692,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+			...withTopologyCache,
 		});
 		this.#coordinators = new FokosShardingClient({
 			topology: {
@@ -673,6 +704,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
+			...withTopologyCache,
 		});
 	}
 
@@ -1626,6 +1658,15 @@ export class FokosDB {
 				await this.#gsiClient(indexName).destroy({ onDestroyed: (ref) => console.warn(`Destroyed GSI partition DO ${ref.doName}`) });
 			}
 			await materializations.destroy({ onDestroyed: (ref) => console.warn(`Destroyed materialization DO ${ref.doName}`) });
+		}
+		// The topology goes last: a partition that the traversal has not reached can still report a split.
+		// A report that completed before the reset is ignored.
+		const admin = topologyAdminAddress(this.#table);
+		if (admin !== undefined) {
+			const { topology } = this.#table;
+			for (const shardGroup of [topology.shardGroup, coordinatorShardGroup(topology)]) {
+				await topologyAdminStub(env, admin, shardGroup).resetShardGroup(shardGroup);
+			}
 		}
 
 		return { ok: true };

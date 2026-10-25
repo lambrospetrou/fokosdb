@@ -39,20 +39,27 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 */
 	config?(this: void): FokosRuntimeConfigOverrides;
 	/**
-	 * The admin outbox. With it, the transaction that completes a repartition also writes one outbox
-	 * row, and the `admin_outbox` job sends each row through `send` until `send` resolves. Absent: the
-	 * runtime writes no outbox row, and the job deletes the rows that remain.
+	 * Host code. The admin outbox, or undefined when it is off. The runtime calls this at each use, after
+	 * the partition has its identity, so the answer can depend on the policy. With an outbox, the
+	 * transaction that completes a repartition also writes one outbox row, and the `admin_outbox` job
+	 * sends each row through `send` until `send` resolves. Without one, the runtime writes no outbox row,
+	 * and the job deletes the rows that remain.
 	 */
-	adminOutbox?: {
-		/** Host code. Sends one entry to an admin DO, chosen from `eventType`. A throw means "retry later". */
-		send(this: void, entry: { eventType: string; id: string; event: unknown }): Promise<void>;
-	};
+	adminOutbox?(this: void): FokosAdminOutbox | undefined;
 	/**
-	 * The topology cache of the isolate. With it, a router forwards a hash key to the deepest known hash
-	 * partition of the topology, also for a key that its own forwards never showed. The host gives the
-	 * `waitUntil` of its `DurableObjectState`. Absent: a router uses its hash arena only.
+	 * Host code. The topology cache options, or undefined when the cache is off. The runtime calls this
+	 * at each forward of a hash key, after the partition has its identity, so the answer can depend on
+	 * the policy. Return the same object while the options do not change. With a cache, a router
+	 * forwards a hash key to the deepest known hash partition of the topology, also for a key that its
+	 * own forwards never showed. The host gives the `waitUntil` of its `DurableObjectState`. Without
+	 * one, a router uses its hash arena only.
 	 */
-	topologyCache?: FokosTopologyCacheOptions;
+	topologyCache?(this: void): FokosTopologyCacheOptions | undefined;
+};
+
+export type FokosAdminOutbox = {
+	/** Host code. Sends one entry to an admin DO, chosen from `eventType`. A throw means "retry later". */
+	send(this: void, entry: { eventType: string; id: string; event: unknown }): Promise<void>;
 };
 
 // ─── the primitive API ───────────────────────────────────────────────────────

@@ -21,6 +21,8 @@ export { MaterializationDO } from "../src/server/materialization/do-materializat
 export { PushMaterializationDO, PushSinkDO } from "./materialization-do/push-target-host.js";
 // A materialization class with GSI targets.
 export { GsiMaterializationDO } from "./materialization-do/gsi-target-host.js";
+export { FokosDBAutoAdminDO } from "../src/server/do-auto-admin.js";
+export { FokosTopologyCache } from "../src/server/topology-entrypoint.js";
 
 // db.test.ts runs its whole suite over CUSTOM_PARTITION_DO as well, so that a
 // subclassed PartitionDO stays covered.

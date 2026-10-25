@@ -90,8 +90,8 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 			hooks: this.hooks(),
 			operations: this.operations(),
 			// The constructor reads the test control, so a restart can remove the hook.
-			...(this.readMeta("outboxDisabled") === 1 ? {} : { adminOutbox: { send: (entry) => this.sendToAdmin(entry) } }),
-			...(this.readMeta("topologyCacheEnabled") === 1 ? { topologyCache: this.topologyCache() } : {}),
+			...(this.readMeta("outboxDisabled") === 1 ? {} : { adminOutbox: () => ({ send: (entry) => this.sendToAdmin(entry) }) }),
+			...(this.readMeta("topologyCacheEnabled") === 1 ? { topologyCache: () => this.topologyCacheOptions } : {}),
 		});
 	}
 
@@ -111,18 +111,16 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 	}
 
 	/** The topology cache through the entrypoint helper. A short refresh, so a test waits little for a new topology. */
-	private topologyCache() {
-		return {
-			fetch: (path: string, signal: AbortSignal) =>
-				fokosTopologyEntrypointFetch(new Request(`http://topology${path}`, { signal }), {
-					admin: (shardGroup) => this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)),
-					maxAgeS: 0,
-					staleWhileRevalidateS: 0,
-				}),
-			waitUntil: (promise: Promise<unknown>) => this.ctx.waitUntil(promise),
-			refreshMs: 50,
-		};
-	}
+	private readonly topologyCacheOptions = {
+		fetch: (path: string, signal: AbortSignal) =>
+			fokosTopologyEntrypointFetch(new Request(`http://topology${path}`, { signal }), {
+				admin: (shardGroup) => this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)),
+				maxAgeS: 0,
+				staleWhileRevalidateS: 0,
+			}),
+		waitUntil: (promise: Promise<unknown>) => this.ctx.waitUntil(promise),
+		refreshMs: 50,
+	};
 
 	async increment(
 		ctx: FokosRouteContext<CounterPolicy>,

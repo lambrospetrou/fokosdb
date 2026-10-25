@@ -12,6 +12,7 @@
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import type { MaterializationDO } from "../server/materialization/do-materialization.js";
+import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
@@ -34,6 +35,10 @@ export type TransactionCoordinatorNamespaceKey = {
 
 export type MaterializationNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<MaterializationDO> ? K : never;
+}[keyof Env];
+
+export type AdminNamespaceKey = {
+	[K in keyof Env]: Env[K] extends DurableObjectNamespace<FokosDBAutoAdminDO> ? K : never;
 }[keyof Env];
 
 /**
@@ -64,6 +69,10 @@ export type FokosDBPolicy = {
 	 * without capture sends no extra bytes.
 	 */
 	captureChanges?: true;
+	/** The binding of the `FokosDBAutoAdminDO` namespace. Absent: no partition or coordinator reports its repartitions. */
+	nsAdmin?: AdminNamespaceKey;
+	/** The export name of the `FokosTopologyCache` entrypoint. Absent: no caller reads the topology. Needs `nsAdmin`. */
+	topologyEntrypoint?: string;
 };
 
 export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
@@ -215,7 +224,8 @@ export type FokosTableOptions = {
 	 * The ancestors that a new range child keeps, part of responses too for ancestors to learn about splits.
 	 * Default: `{ fromRoot: 0, fromLeaf: 3 }`.
 	 **/
-	rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number }; /**
+	rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
+	/**
 	 * The key size limits of the table. Every client of the table must use the same values. Never
 	 * decrease a key size limit after items with larger keys exist.
 	 */
@@ -228,6 +238,20 @@ export type FokosTableOptions = {
 	 * the value, so a table that turns it on when it has data never exports its older items.
 	 */
 	captureChanges?: boolean;
+	/**
+	 * The binding of the `FokosDBAutoAdminDO` namespace, for example `"FOKOS_ADMIN_DO"`. With it, each
+	 * partition and coordinator reports its completed repartitions to the admin Durable Object of its
+	 * shard group, `topologyAdminName(shardGroup)`, and `destroy` resets the topology. Keep the same
+	 * value for the life of the table.
+	 */
+	nsAdmin?: AdminNamespaceKey;
+	/**
+	 * The export name of the `FokosTopologyCache` entrypoint, for example `"FokosTopologyCache"`. The
+	 * Worker must re-export the entrypoint from its main module, and use a compatibility date of
+	 * 2025-11-17 or later (or the `enable_ctx_exports` compatibility flag). With it, the clients, the partitions and the coordinators read the encoded
+	 * topology of the table, and send each request to the deepest known partition. It needs `nsAdmin`.
+	 */
+	topologyEntrypoint?: string;
 	/**
 	 * The version of the options above, a non-negative integer. Default: 0.
 	 *
@@ -299,6 +323,9 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 	if (limits !== undefined) {
 		resolveLimits(limits);
 	}
+	if (opts.topologyEntrypoint !== undefined && opts.nsAdmin === undefined) {
+		throw invalid("topologyEntrypoint", opts.topologyEntrypoint, "topologyEntrypoint needs nsAdmin");
+	}
 
 	const policy: FokosDBPolicy = {
 		ns: table.ns,
@@ -309,6 +336,8 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 		...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
 		...(limits === undefined ? {} : { limits }),
 		...(opts.captureChanges === true ? { captureChanges: true as const } : {}),
+		...(opts.nsAdmin === undefined ? {} : { nsAdmin: opts.nsAdmin }),
+		...(opts.topologyEntrypoint === undefined ? {} : { topologyEntrypoint: opts.topologyEntrypoint }),
 	};
 	const policyVersion = opts.policyVersion ?? 0;
 	validatePolicyVersion(policyVersion);

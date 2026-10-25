@@ -22,3 +22,7 @@ export type {
 	PushTargetItem,
 	PushTargetResult,
 } from "./materialization/do-materialization.js";
+/** The admin Durable Object of the topology. Bind it, and name the binding in the `nsAdmin` table option. */
+export { FokosDBAutoAdminDO } from "./do-auto-admin.js";
+/** The cached topology entrypoint. Re-export it, enable its cache, and name it in the `topologyEntrypoint` table option. */
+export { FokosTopologyCache } from "./topology-entrypoint.js";

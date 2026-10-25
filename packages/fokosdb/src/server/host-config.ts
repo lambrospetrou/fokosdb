@@ -60,6 +60,13 @@ export type PartitionDOConfig = Readonly<{
 	cleanupTxLockCopyRows: number;
 	/** The export of the item changes of a table with `captureChanges` to `MaterializationDO`. */
 	materializationExport: Readonly<MaterializationExportConfig>;
+	/**
+	 * The age of a topology cache entry that starts a refresh, in milliseconds. It applies when the
+	 * table has a `topologyEntrypoint`.
+	 */
+	topologyRefreshMs: number;
+	/** The time after which a topology refresh that did not end can start again, in milliseconds. */
+	topologyRefreshTimeoutMs: number;
 }>;
 
 export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSweep" | "materializationExport">> & {
@@ -132,6 +139,13 @@ export type TransactionCoordinatorDOConfig = Readonly<{
 	recoveryConcurrentDrives: number;
 	/** The size at which a coordinator splits when the table has no smaller split size. At most the storage limit. */
 	maxDatabaseBytes: number;
+	/**
+	 * The age of a topology cache entry that starts a refresh, in milliseconds. It applies when the
+	 * table has a `topologyEntrypoint`.
+	 */
+	topologyRefreshMs: number;
+	/** The time after which a topology refresh that did not end can start again, in milliseconds. */
+	topologyRefreshTimeoutMs: number;
 }>;
 
 export type TransactionCoordinatorDOConfigOverrides = Partial<Omit<TransactionCoordinatorDOConfig, "participantRetry">> & {
@@ -167,6 +181,8 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 		callTimeoutMs: 30_000,
 		fallbackAlarmMs: 60_000,
 	},
+	topologyRefreshMs: 10_000,
+	topologyRefreshTimeoutMs: 30_000,
 });
 
 export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreeze({
@@ -200,6 +216,8 @@ export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFr
 	recoveryScanRows: 100,
 	recoveryConcurrentDrives: 6,
 	maxDatabaseBytes: 5 * 1024 * 1024 * 1024,
+	topologyRefreshMs: 10_000,
+	topologyRefreshTimeoutMs: 30_000,
 });
 
 /** Merges `overrides` with the defaults of `PartitionDO` and validates the result. */
@@ -219,6 +237,8 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 	checkInteger(c, "staleLockScanRows", 1);
 	checkInteger(c, "cleanupPromotedKeyRows", 1);
 	checkInteger(c, "cleanupTxLockCopyRows", 1);
+	checkInteger(c, "topologyRefreshMs", 0);
+	checkInteger(c, "topologyRefreshTimeoutMs", 1);
 	validateTtlSweepConfig(c.ttlSweep);
 	validateMaterializationExportConfig(c.materializationExport);
 	return c;
@@ -268,6 +288,8 @@ export function resolveCoordinatorConfig(overrides: TransactionCoordinatorDOConf
 	checkInteger(c, "recoveryScanRows", 1);
 	checkInteger(c, "recoveryConcurrentDrives", 1);
 	checkInteger(c, "maxDatabaseBytes", 1);
+	checkInteger(c, "topologyRefreshMs", 0);
+	checkInteger(c, "topologyRefreshTimeoutMs", 1);
 	check(
 		c.maxDatabaseBytes <= DO_STORAGE_MAX_BYTES,
 		() => `maxDatabaseBytes must be at most ${DO_STORAGE_MAX_BYTES}, got ${c.maxDatabaseBytes}`,

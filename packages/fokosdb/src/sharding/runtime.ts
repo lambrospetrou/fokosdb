@@ -1708,7 +1708,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		let relDepth = Math.max(1, this.#arena()?.findLeaf(hashKey) ?? 0);
 		let topologyHint: RemoteResolution["topologyHint"];
-		const entry = this.#topologyCache && cachedHashTopology(this.#topologyCache, this.identity().topology);
+		const cacheOptions = this.#topologyCache?.();
+		const entry = cacheOptions && cachedHashTopology(cacheOptions, this.identity().topology);
 		if (entry) {
 			const { rootTreesN, hashSplitN } = this.identity().topology;
 			const leaf = findLeaf(entry.view, rootTreesN, hashSplitN, hashKey, entry.cut);
@@ -2296,7 +2297,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * own copy of the event, because the cleanup deletes the plan before it writes `cleaned`.
 	 */
 	#recordCompletion(plan: FokosRepartitionPlan, completedAt: number): void {
-		if (!this.#adminOutbox) {
+		if (!this.#adminOutbox?.()) {
 			return;
 		}
 		const ctx = this.routeContext();
@@ -2328,7 +2329,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (this.#store.isDestroying()) {
 			return;
 		}
-		const outbox = this.#adminOutbox;
+		const outbox = this.#adminOutbox?.();
 		if (!outbox) {
 			this.#store.transactionSync(() => this.#store.deleteAllAdminOutbox());
 			return;
