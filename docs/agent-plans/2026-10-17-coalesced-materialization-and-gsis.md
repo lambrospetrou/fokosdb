@@ -929,8 +929,9 @@ The receiver writes a `producer_fences` row only when an epoch goes up. In norma
 and the check adds no row write. The receiver keeps the row of each producer in memory after the first read.
 
 The receiver must not delete a `producer_fences` row. A deleted row has the epoch `0`, and a late call of that
-producer then applies. The number of rows is the number of producers that ever sent to the receiver. A row is about
-80 bytes, so 10,000 producers use about 800 KB in each receiver. TODO: measure the row size.
+producer then applies. The number of rows is the number of producers that ever sent to the receiver. A row with a
+64-character producer ID uses 84 bytes (measured in workerd, `test/gsi-cost-bench`), so 10,000 producers use about
+840 KB in each receiver.
 
 A receiver split copies the whole table to each child with `MAX(epoch)` (Section 4.2.12). The partition that applies
 a forwarded call checks it.
@@ -1004,8 +1005,11 @@ After an `unknown` outcome, the producer sends again at once:
 
 A producer can stop its wait for a slow call after `callTimeoutMs`. The outcome is then `unknown`, and the rules above
 apply. The value of `callTimeoutMs` changes cost and latency, not correctness. Each timeout costs 1 row at the
-producer and 1 row at each receiver that gets the new epoch first. The default of `callTimeoutMs` is 30 s. TODO:
-measure the normal call duration and tune the default.
+producer and 1 row at each receiver that gets the new epoch first. The default of `callTimeoutMs` is 30 s. In local
+workerd, a `gsiWriteEntries` call has a median duration of 2 ms with 1 or 10 entries and 5 ms with 100 entries, and the
+longest of 30 calls is 9 ms (`test/gsi-cost-bench`). The default is more than 3,000 times the normal duration, so a
+timeout occurs only when a call is stuck. A timeout costs few rows, so a shorter default gives a small gain. Keep 30 s
+until production measurements show a different normal duration.
 
 ##### Response rules
 
@@ -1641,54 +1645,61 @@ in total: 72,000 new items and 648,000 mutations across 50,000 existing items.
 - An item that is created and deleted during the outage has no key set for the down GSI. Its tombstone then converges
   with 0 RPCs to that GSI.
 - 122,000 items change. Each changed item has at most 2 positions, so `change_positions` holds at most 244,000 rows.
-  TODO: measure the size of a `change_positions` row.
+  A row uses 13 bytes (measured in workerd), so the rows use about 3.2 MB.
 - When the GSI recovers, the in-memory runner drains the 122,000 to 172,000 `gsiWriteEntries` operations in 1.5 to 2.5
   minutes, at 1,000 to 2,000 items/s across 4 `MaterializationDO` partitions. The healthy targets continue to share
   the round-robin workers.
 
 ##### Cost of one base write
 
-SQLite table rows written for each base write, with no coalescing, for a table with `T` GSIs (the worst case: 1 export
-for each write):
+Rows written for each base write, as the `rowsWritten` of each SQL statement counts them in workerd
+(`test/gsi-cost-bench`). The count includes the index entries: an insert into `items` with its `UNIQUE (hk, sk)` index
+is 3 rows, and an update of the same row is 2 rows. Cloudflare bills these rows. The table is for a table with `T`
+GSIs, with 1 export call and 1 target batch for each write, and without the costs of each batch below:
 
 | Base write | Today | Base partition | `MaterializationDO` | GSI partitions | Total | `T = 10` |
 | --- | --- | --- | --- | --- | --- | --- |
-| Put, new item | 2 | 2 + 3 | 4 + T | 2T | 9 + 3T | 39 |
-| Put, every GSI key stays | 2 | 2 + 2 | 4 | 2T | 8 + 2T | 28 |
-| Put, every GSI key moves | 2 | 2 + 2 | 4 + 2T | 5T | 8 + 7T | 78 |
-| Delete | 3 | 3 + 2 | 6 + T | 3T | 11 + 4T | 51 |
+| Put, new item | 5 | 5 + 5 | 6 + 2T | 5T | 16 + 7T | 86 |
+| Put, every GSI key stays | 2 to 4 | 4 + 4 | 5 | 2T to 4T | 13 + 2T to 13 + 4T | 33 to 53 |
+| Put, every GSI key moves | 2 to 4 | 4 + 4 | 5 + 3T | 8T | 13 + 11T | 123 |
+| Delete | 3 | 3 + 4 | 8 + T | 3T | 15 + 4T | 55 |
 
-- **Base partition.** A put writes `items` and `key_size_estimates` (2). A delete also writes `deletion_metadata` (3).
-  Capture adds 3 outbox writes for a new item: the upsert, the `is_local_only = 0` claim, and the delete on the
-  acknowledgement. It adds 2 for an update or a delete, because their rows have `is_local_only = 0` and the claim
-  writes no row.
-- **`MaterializationDO` ingest.** `latest_items` and `key_size_estimates` (2), and the position insert and its cleanup
-  delete (2). Step 2 of Section 4.2.5 writes no position when no target read the newest position.
-- **GSI key sets.** A new key costs 1 row. A key move costs 2 rows: the add and the removal. A delete costs 1 row: the
-  delete of the key set. A key that stays costs 0 rows.
-- **Delete.** The tombstone GC deletes `latest_items` and updates `key_size_estimates` (2).
-- **GSI partitions.** A put writes `items` and `key_size_estimates` (2). A delete writes 3 rows.
+- **Base partition.** A new item writes `items` (3) and `key_size_estimates` (2). An update writes `items` (2) and
+  `key_size_estimates` (0 or 2: 0 when the size estimate does not change). A delete writes `items`,
+  `deletion_metadata`, and `key_size_estimates` (1 each). Capture adds the outbox insert (3), the `is_local_only = 0`
+  claim of a new item (1), and the delete on the acknowledgement (1).
+- **`MaterializationDO` ingest.** `latest_items` (2 for a new row or a tombstone, 1 for an update),
+  `key_size_estimates` (2), and the position insert and its cleanup delete (2). Step 2 of Section 4.2.5 writes no
+  position when no target read the newest position.
+- **GSI key sets.** A new key costs 2 rows: the row and its index entry. A key move costs 3 rows: the add (2) and the
+  removal (1). A delete costs 1 row: the delete of the key. A key that stays costs 0 rows.
+- **Delete.** The tombstone GC deletes `latest_items` and its `key_size_estimates` row (2).
+- **GSI partitions.** A new entry writes `items` (3) and `key_size_estimates` (2). An overwrite writes 2 to 4 rows, as
+  in the base partition. A delete writes 3 rows.
+- **Measured example.** With `T = 2` and a key move on 1 of the 2 GSIs, a put writes 34 rows: 10 in the base
+  partition, 12 in `MaterializationDO`, 8 in the GSI of the move, and 4 in the other GSI. These counts include the
+  costs of each batch.
 - **Push target or sparse GSI.** A push target costs 0 rows for each item in `MaterializationDO` and 0 rows in FokosDB.
   A sparse GSI with an absent key and no key set costs 0 rows.
 - **Left out of the table:**
-  - The cursor update costs 1 row for each batch of up to 100 items: about 0.01 rows for each item and each target.
-    `is_batch_open` costs at most 1 more row for each period of target work.
+  - Each target batch of up to 100 items costs 2 rows: `is_batch_open` and the cursor update. This is about 0.02 rows
+    for each item and each target when the batches are full, and 2 rows when each batch has 1 item.
   - A `producer_fences` row costs 1 row the first time that a producer calls a receiver, and 1 row when its epoch goes
     up.
   - An epoch raise costs 1 row at the producer.
-  - `is_call_open` costs at most 2 rows in the base partition for each period of export work.
+  - `is_call_open` costs 2 rows in the base partition for each export call.
+  - The first ingest of a `MaterializationDO` partition writes 1 `materialization_targets` row for each target.
   - A failed item costs about 2 rows: the insert of its `retry` row and its delete.
   - A `retry` row that a split copies adds 1 entry to `idx_target_retry_inherited` at the import, and removes 1 entry
     when the row is deleted or becomes a `violation` row.
   - The ingest of an item with `retry` rows costs 1 row for each such row.
 
 When `N` base writes of one item coalesce before the export, the cost is `3N` base rows and one downstream export and
-push cycle. Secondary index updates can add billed row writes. TODO: measure the billed `rowsWritten` in the Workers
-runtime.
+push cycle. The table above counts the index entries, so it is the billed `rowsWritten`.
 
 One live item with full-item projections across `T` GSIs stores `2 + T` payload copies: base `items`, `latest_items`,
-and `T` GSI rows. Each `target_index_keys` row adds the bytes of its GSI keys. TODO: measure the size of a
-`target_index_keys` row.
+and `T` GSI rows. Each `target_index_keys` row uses about 40 bytes plus the bytes of its two GSI keys, with
+its index entry. A row with a 5-byte GSI hash key and a 28-byte GSI sort key uses 74 bytes (measured in workerd).
 
 ##### Trade-offs
 
@@ -2135,11 +2146,12 @@ Cons:
    bound, and that check depends on `maxClockSkewMs`.
 2. **More rows written.** A GSI delete writes the tombstone row and `key_size_estimates` (2), and the sweep later
    deletes them (2 to 3). A plain delete writes 3 rows. This is about 1 to 2 more rows for each GSI delete or key
-   move. With `T = 10`, a key move costs about 89 to 99 rows instead of 79, and a delete about 62 to 72 instead of
-   52 (Section 4.2.15). TODO: measure.
+   move. With `T = 10`, a key move costs about 133 to 143 rows instead of 123, and a delete about 65 to 75 instead
+   of 55 (the measured counts of Section 4.2.15).
 3. **Storage for the TTL.** A tombstone holds the GSI hash key and `physicalSk`, which holds the base keys. For
-   example, 100 deletes or key moves each second with a 1-hour TTL keep 360,000 tombstones in each GSI. TODO: measure
-   the size of a tombstone.
+   example, 100 deletes or key moves each second with a 1-hour TTL keep 360,000 tombstones in each GSI. A GSI
+   `items` row with no data, a 5-byte GSI hash key, and a physical sort key of about 45 bytes uses 220 bytes (measured
+   in workerd), so the tombstones use about 79 MB in each GSI.
 4. **Permanent splits.** Tombstones count in the partition size, and partitions never merge (`RepartitionKind`). A
    burst of deletes can split GSI partitions, and the partitions stay split after the tombstones expire.
 5. **Query cost.** Each GSI query reads the tombstones in its range and skips them. A page with a `limit` can hold

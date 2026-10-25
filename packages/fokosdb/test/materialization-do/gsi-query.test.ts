@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { FokosDB } from "../../src/client/db.js";
-import { partitionStubByName } from "../../src/shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName } from "../../src/shared/do-stubs.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";
-import { createTableConfig, gsiTableConfig } from "../../src/shared/partition-context.js";
+import { createTableConfig, gsiTableConfig, materializationTableConfig } from "../../src/shared/partition-context.js";
+import { FokosShardingClient } from "../../src/sharding/client.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 
@@ -95,6 +96,39 @@ describe("db.gsi(indexName).queryItems", () => {
 		expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toEqual([]);
 		expect((await db.getItem({ hashKey: "o1", sortKey: "s" })).found).toBe(false);
 		await db.destroy();
+	});
+
+	it("a destroy that stops after the first GSI table deletes the other GSI table when it runs again", async () => {
+		const db = makeDB();
+		await db.putItem({ hashKey: "o1", sortKey: "s", data: { status: "OPEN", at: "t1", owner: "u" } });
+		await vi.waitFor(async () => {
+			expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toHaveLength(1);
+			expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(1);
+		});
+		// The state of a destroy that stopped after the first GSI table: the base partitions are gone, the
+		// materialization partitions are fenced, and only the byStatus GSI table is gone.
+		const { topology, rangeConfig, policy, policyVersion } = createTableConfig({ table: db.options().table });
+		const table = { topology, rangeConfig, policy, policyVersion };
+		await new FokosShardingClient({ ...table, stub: (ctx, doName) => partitionStubByName(env, ctx, doName) }).destroy();
+		const materializations = new FokosShardingClient({
+			...materializationTableConfig(table),
+			stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
+		});
+		for await (const node of materializations.walk()) {
+			await materializationStubByName(env, node.ctx, node.ctx.doName).fokosPrepareDestroy({
+				rootContext: node.parent === null ? node.ctx : undefined,
+			});
+		}
+		await new FokosShardingClient({
+			...gsiTableConfig(table, "byStatus"),
+			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+		}).destroy();
+		expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toEqual([]);
+		expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(1);
+
+		await expect(db.destroy()).resolves.toEqual({ ok: true });
+		expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toEqual([]);
+		expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toEqual([]);
 	});
 });
 
