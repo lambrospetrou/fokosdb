@@ -25,7 +25,13 @@ import {
 	SinglePartitionMeta,
 	SortKey,
 } from "../shared/types.js";
-import { materializationStubByName, partitionStubByName, topologyAdminAddress, topologyAdminStub, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import {
+	materializationStubByName,
+	partitionStubByName,
+	topologyAdminAddress,
+	topologyAdminStub,
+	txCoordinatorStubByName,
+} from "../shared/do-stubs.js";
 import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
 import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
