@@ -4,7 +4,7 @@
 **Date:** 2026-10-23
 **Author:** Lambros Petrou
 
-**Status:** Nothing is built. Section 3 lists the milestones.
+**Status:** M1–M5 are built. M6 is not built. Section 3 lists the milestones.
 
 ## Table of contents
 
@@ -275,6 +275,8 @@ export type FokosTopologyEvent = {
 	id: string;
 	kind: RepartitionKind; // "hash_split" | "range_split" | "key_promotion"
 	shardGroup: string;
+	rootTreesN: number;
+	hashSplitN: number;
 	/** `source.doName` is the name of the source object. */
 	source: FokosPartitionRef;
 	/** `ctx.id.toString()` of the source. */
@@ -289,6 +291,9 @@ export type FokosTopologyEvent = {
 The runtime builds the event from the repartition row and its targets, which `FokosRepartitionPlan` already holds.
 The event has no `actorName`, because `source.doName` already holds it. In JSON, each key byte array is a base64url
 string.
+
+The runtime sets `id` to `${source.doName}/${plan.id}`. The local repartition ID alone is not unique across partitions.
+The event carries the immutable `rootTreesN` and `hashSplitN` values of its shard group.
 
 #### 4.2.3 The report path (M1)
 
@@ -335,18 +340,28 @@ it runs before the state is `completed`.
 `BUILTIN_JOBS`:
 
 1. The `deadline()` of the job is the lowest `next_at` of the outbox.
-2. The step takes the due rows in `next_at` order, at most 16 in each step, and calls `send` for each one.
-3. When `send` resolves, the step deletes the row.
-4. When `send` throws, the step increments `attempt` and sets `next_at` to now plus an exponential backoff from
-   1 s to 5 min.
-5. When the partition is `destroying`, the job does nothing.
-6. When the host removes the outbox hook, the next step deletes all outbox rows.
+2. The step takes the due rows in `next_at` order, at most 16, and sends them one at a time.
+   One 5 s timeout covers the whole step, not each row.
+3. The runtime passes each delivery task to `ctx.waitUntil` and races it with the shared timeout.
+   The task awaits `send`, then deletes the row if its event type, ID, and payload still match.
+   The task checks the destroy fence before it deletes the row.
+4. On failure or timeout, the step increments `attempt` and sets `next_at` to now plus the backoff.
+   The exponential backoff increases from 1 s to 5 min.
+   The update applies only to the same payload and the current attempt.
+5. After the timeout, the step starts no more sends and returns.
+   The delivery task continues. A late success can delete the matching row, even while another retry is in flight.
+   The runtime handles a late rejection without another row update; the timeout already set the retry.
+   A retry can overlap the original send, so the keeper remains idempotent.
+6. When the partition is `destroying`, the job and its delivery tasks make no outbox changes.
+7. When the host removes the outbox hook, the next step deletes all outbox rows.
 
-The job does not block cleanup, the next repartition, or any request. A report that fails makes the topology
-older, and Requirement 2.3.1 makes that safe.
+The timeout bounds the wait for admin sends to 5 s in each step.
+Other jobs and `fokosPrepareDestroy` do not await a send after that timeout.
+Ordinary requests do not await the admin send.
+A report that fails makes the topology older, and Requirement 2.3.1 makes that safe.
 
-**The keeper.** `FokosTopologyKeeper` takes `SqlStorage` and owns these tables. The prefix `fokos_topo_` keeps
-them apart from the tables of the host.
+**The keeper.** `FokosTopologyKeeper` takes `DurableObjectStorage` and owns these tables.
+The prefix `fokos_topo_` keeps them apart from the tables of the host.
 
 - `fokos_topo_groups`, key `shard_group`: `root_trees_n`, `hash_split_n`, `epoch`, `version`, `hash_version`,
   `reset_at`, `built_version`, `build_due_at`, `promoted_n`, `hash_nodes_n`.
@@ -381,11 +396,12 @@ inserted.
 - A hash key is in `fokos_topo_range_dirty` only when a report wrote a new interval of that key. Only those keys
   get a new range body. A `hash_split` makes no key dirty.
 
-`registerRepartition(event)` runs in one `transactionSync`:
+Steps 1–5 of `registerRepartition(event)` run in one `transactionSync`:
 
-1. When `(shardGroup, id)` is in `fokos_topo_repartitions`, return. The report is a repeat.
-2. When `event.completedAt < reset_at`, return. The report comes from a table that `destroy` removed. The check
+1. When `event.completedAt < reset_at`, return. The report comes from a table that `destroy` removed. The check
    compares two clocks, so it is best effort (Section 6).
+2. When `(shardGroup, id)` is in `fokos_topo_repartitions`, return the pending `build_due_at`.
+   The report is a repeat, so the facts and their versions stay unchanged.
 3. For a `hash_split`, insert the node of the source and the node of each ancestor with `INSERT OR IGNORE`. The
    walk goes from the source to the root and stops at the first node that is known, because a known node has all
    its ancestors.
@@ -395,7 +411,9 @@ inserted.
 5. Insert the report row. When step 3 or 4 wrote a new row, increment `version`, set `hash_version` to `version`
    when a hash node or a range root is new, and set `build_due_at` to `now + buildDelayMs` when it is NULL. A later
    report does not move `build_due_at`, so one build takes all the reports of the delay.
-6. When `build_due_at` is set, call the host hook `scheduleBuild(build_due_at)`.
+6. After the transaction commits, call `scheduleBuild(build_due_at)` when a build is pending.
+   This also applies to a repeated report or a report of a known fact.
+   A failure of the hook leaves the report and deadline stored. A retry calls the hook with that deadline again.
 
 Registration derives the facts, so the order of arrival does not matter:
 
@@ -412,9 +430,11 @@ Registration derives the facts, so the order of arrival does not matter:
 `promoted_n` and `hash_nodes_n` count the range roots and the hash nodes, so a build can size the Bloom filter and
 the bitmap before it reads the rows.
 
-The first event of a shard group also inserts its `fokos_topo_groups` row. The keeper reads `rootTreesN` and
-`hashSplitN` from the decoded source ID and the target count. When an event has other values than the stored row,
-the keeper refuses it with a validation error, because these values never change (AGENTS.md).
+The first event of a shard group also inserts its `fokos_topo_groups` row.
+The keeper reads `rootTreesN` and `hashSplitN` from the event.
+For an event not older than `reset_at`, the keeper compares these values before the repeat check.
+When either value differs from the stored row, the keeper refuses the event with a validation error.
+These values never change (AGENTS.md).
 
 `resetShardGroup(shardGroup)` deletes the rows and the bodies of the shard group, increments `epoch`, sets
 `version`, `hash_version`, `built_version`, `promoted_n`, and `hash_nodes_n` to 0, and sets `reset_at` to now.
@@ -761,8 +781,9 @@ entry is about 26 KB.
    (Section 4.2.4). When the signal fires, `refresh` stops waiting also when the host fetch does not read the
    signal. Thus the promise in `waitUntil` settles in at most `fetchTimeoutMs`, and a fetch that does not end does
    not keep a Durable Object in memory for the 15 minutes that `waitUntil` allows.
-4. When the result is valid and its topology version is equal to or higher than the cached one, `refresh` stores a
-   new entry. A new entry has an empty `cut` set.
+4. When a valid response has a newer topology version, `refresh` stores a new entry with an empty `cut` set.
+   The same rule applies when no entry is cached.
+   An equal or older version updates `fetchedAt` and keeps the cached body and `cut` set.
 5. In all cases, `refresh` clears `refreshStartedAt`. A failure logs one warning and keeps the old entry.
 
 Defaults: `refreshMs` 10,000, `refreshTimeoutMs` 30,000. A test sets them low, and does not need a mock clock. A
@@ -789,6 +810,9 @@ hash split moves the overrides to the child, so the leaf forwards to the range t
 - The client adds the bitmap position of the entry to `entry.cut`. This removes one hint and keeps the rest of the
   topology.
 - The client sends again to the parent of the entry. The parent is the result of `findLeaf` with the new cut.
+- When the next resolution names the same partition, the client sends again to the hash root.
+  After 16 fallbacks through cached hints, the client also uses the hash root.
+  An error from that root follows the retry policy of the caller.
 - The `cut` set lives until the next topology version replaces the entry. A cut that a later version also has
   returns at most one miss for each isolate in each version.
 
@@ -1186,10 +1210,18 @@ a hash key with a new interval gets a new range body. A table with
   hash body as one full build of the same reports (property).
 - **Outbox job.** A crash between `completed` and the RPC, a hook that throws and then succeeds, a host that
   removes the hook, and a partition that is `destroying`.
+  A send that stays pending releases the next job and the destroy wait after 5 s.
+  Late success deletes the matching row, also while a retry is in flight. Late rejection keeps the retry state.
+  Delivery tasks preserve the destroy fence, replacement payloads, and newer retry metadata.
+  Sequential sends share the same 5 s timeout.
+- **Build scheduling.** A hook that fails after registration, then a retry after keeper recreation.
+  Both a repeated report and a report of the same fact restore the pending deadline without a new version.
 - **Topology cache.** No promise is stored; `waitUntil` receives each fetch; an older version is refused; a body
   larger than the budget is dropped; the LRU evicts by bytes, oldest first, and never the new entry; a miss adds one
   cut and the next request goes to the
   parent.
+  A full cut set and a path beyond the fallback limit reach the hash root.
+  A root refusal propagates, and a nested initialization error does not start a fallback.
 - **No cache.** With `useTopologyCache: false`, `FokosDB` sends no topology fetch and every request enters at
   the root.
 - **Runtime range topology (M6, optional).** Section 4.2.9 lists the tests.

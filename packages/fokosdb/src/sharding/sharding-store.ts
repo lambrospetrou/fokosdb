@@ -1030,21 +1030,30 @@ export class FokosShardingStore {
 		return rows;
 	}
 
-	deleteAdminOutbox(eventType: string, id: string): void {
-		this.#storage.sql.exec(`DELETE FROM fokos_admin_outbox WHERE event_type = ?1 AND id = ?2`, eventType, id);
+	deleteAdminOutbox(eventType: string, id: string, eventJson: string): void {
+		this.#storage.sql.exec(
+			`DELETE FROM fokos_admin_outbox WHERE event_type = ?1 AND id = ?2 AND json(event) = ?3`,
+			eventType,
+			id,
+			eventJson,
+		);
 	}
 
 	deleteAllAdminOutbox(): void {
 		this.#storage.sql.exec(`DELETE FROM fokos_admin_outbox`);
 	}
 
-	setAdminOutboxAttempt(eventType: string, id: string, attempt: number, nextAt: number): void {
-		this.#storage.sql.exec(
-			`UPDATE fokos_admin_outbox SET attempt = ?3, next_at = ?4 WHERE event_type = ?1 AND id = ?2`,
-			eventType,
-			id,
-			attempt,
-			nextAt,
+	setAdminOutboxAttempt(eventType: string, id: string, attempt: number, nextAt: number, eventJson: string): boolean {
+		return (
+			this.#storage.sql.exec(
+				`UPDATE fokos_admin_outbox SET attempt = ?3, next_at = ?4
+				  WHERE event_type = ?1 AND id = ?2 AND attempt = ?3 - 1 AND json(event) = ?5`,
+				eventType,
+				id,
+				attempt,
+				nextAt,
+				eventJson,
+			).rowsWritten > 0
 		);
 	}
 

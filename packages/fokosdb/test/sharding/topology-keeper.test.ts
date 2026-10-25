@@ -65,7 +65,7 @@ describe("topology keeper — reports", () => {
 			await keeper.registerRepartition(child, 5_100);
 			// One build for the delay: the second report does not move it.
 			await keeper.registerRepartition(hashSplitReport(sg, T, 1, [], 1_000), 5_200);
-			expect(scheduled).toEqual([6_000, 6_000]);
+			expect(scheduled).toEqual([6_000, 6_000, 6_000]);
 			keeper.runDueBuilds(5_999);
 			expect(parseHashBody(body(keeper.getTopology(sg))).bitCount).toBe(0);
 			keeper.runDueBuilds(6_000);
@@ -75,6 +75,36 @@ describe("topology keeper — reports", () => {
 			expect(view.bitCount).toBe(8);
 			expect(view.words[0] & 0xff).toBe(0b0000_1011);
 			expect(keeper.nextBuildAt()).toBeNull();
+		});
+	});
+
+	it.each(["same report", "same fact"])("restores a pending build after a schedule failure and a retry of the %s", async (retry) => {
+		await withKeeper(async (_keeper, { storage, sg }) => {
+			const scheduled: number[] = [];
+			const newKeeper = () =>
+				new FokosTopologyKeeper(storage, {
+					buildDelayMs: 1_000,
+					scheduleBuild: async (at) => {
+						scheduled.push(at);
+						if (scheduled.length === 1) {
+							throw new Error("schedule failed");
+						}
+					},
+				});
+			const first = newKeeper();
+			const event = hashSplitReport(sg, T, 0, [], 1_000);
+			await expect(first.registerRepartition(event, 5_000)).rejects.toThrow("schedule failed");
+			expect(first.nextBuildAt()).toBe(6_000);
+			const restarted = newKeeper();
+			const repeated = retry === "same report" ? event : hashSplitReport(sg, T, 0, [], 1_000);
+			await restarted.registerRepartition(repeated, 5_500);
+			expect(scheduled).toEqual([6_000, 6_000]);
+			expect(restarted.nextBuildAt()).toBe(6_000);
+			restarted.runDueBuilds(6_000);
+			expect(parseHashBody(body(restarted.getTopology(sg))).version).toBe(1n);
+			expect(restarted.nextBuildAt()).toBeNull();
+			await restarted.registerRepartition(repeated, 6_500);
+			expect(scheduled).toEqual([6_000, 6_000]);
 		});
 	});
 

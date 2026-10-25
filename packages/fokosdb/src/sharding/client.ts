@@ -140,7 +140,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	#firstRoot: FokosRouteContext<TPolicy> | undefined;
 	#topologyCache: FokosTopologyCacheOptions | undefined;
 	/** The fallback of each entry that came from the topology, by the context object that `resolve` returned. */
-	#fallbacks = new WeakMap<FokosRouteContext<TPolicy>, MissFallback<TPolicy>>();
+	#fallbacks = new WeakMap<FokosRouteContext<TPolicy>, { root: FokosRouteContext<TPolicy>; next: MissFallback<TPolicy> }>();
 
 	constructor(opts: FokosShardingClientOptions<TPolicy>) {
 		this.#router = new FokosRouter(opts.topology, opts.rangeConfig, opts.policy, opts.policyVersion);
@@ -196,16 +196,19 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 					const start = range ? rangeBoundaryAt(range.view, target.start) : null;
 					const end = range ? rangeBoundaryAt(range.view, target.end) : null;
 					const ctx = resolveRangePartitionContext(root, hashKey, start, end);
-					this.#fallbacks.set(ctx, (e) => {
-						const missing = notInitializedAt(e, SHARDING_ROUTING_CODES.range_partition_not_initialized, ctx.doName);
-						if (target.rank === 0 && (missing || awaitingData(e))) {
-							return this.#resolveKey(hashKey, rangeLookup, false, speculative);
-						}
-						if (!missing || !range) {
-							return null;
-						}
-						cutTopologyHint(range, rangeCutKey(range.view, target));
-						return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
+					this.#fallbacks.set(ctx, {
+						root,
+						next: (e) => {
+							const missing = notInitializedAt(e, SHARDING_ROUTING_CODES.range_partition_not_initialized, ctx.doName);
+							if (target.rank === 0 && (missing || awaitingData(e))) {
+								return this.#resolveKey(hashKey, rangeLookup, false, speculative);
+							}
+							if (!missing || !range) {
+								return null;
+							}
+							cutTopologyHint(range, rangeCutKey(range.view, target));
+							return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
+						},
 					});
 					return ctx;
 				}
@@ -216,12 +219,15 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 			return root;
 		}
 		const ctx = resolveDescendantHashPartitionContext(root, leaf.path);
-		this.#fallbacks.set(ctx, (e) => {
-			if (!notInitializedAt(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized, ctx.doName)) {
-				return null;
-			}
-			cutTopologyHint(hash, leaf.pos);
-			return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
+		this.#fallbacks.set(ctx, {
+			root,
+			next: (e) => {
+				if (!notInitializedAt(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized, ctx.doName)) {
+					return null;
+				}
+				cutTopologyHint(hash, leaf.pos);
+				return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
+			},
 		});
 		return ctx;
 	}
@@ -297,12 +303,13 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 					cost.totalForwardCount += routedError(e)?.routing.forwardCount ?? 0;
 					// Each miss is refused before any handler runs. A fallback that names the same partition
 					// again (the cut set is full) or that goes past the bound ends the fallback.
-					const next = fallbacks < MAX_TOPOLOGY_FALLBACKS ? (this.#fallbacks.get(target)?.(e) ?? null) : null;
-					if (!next || next.doName === target.doName) {
+					const fallback = this.#fallbacks.get(target);
+					const next = fallback?.next(e);
+					if (!fallback || !next) {
 						throw e;
 					}
+					target = fallbacks >= MAX_TOPOLOGY_FALLBACKS || next.doName === target.doName ? fallback.root : next;
 					fallbacks += 1;
-					target = next;
 				}
 			}
 		};

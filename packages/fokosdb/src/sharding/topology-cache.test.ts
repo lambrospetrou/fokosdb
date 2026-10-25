@@ -7,7 +7,15 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
 import type { FokosRouteContext } from "./route-context.js";
 import type { FokosEnvelope } from "./runtime-types.js";
-import { topologyGetForRangePath, topologyGetPath, type FokosTopologyCacheOptions } from "./topology-cache.js";
+import {
+	cachedHashTopology,
+	cutTopologyHint,
+	TOPOLOGY_CUT_MAX,
+	topologyGetForRangePath,
+	topologyGetPath,
+	type FokosTopologyCacheOptions,
+} from "./topology-cache.js";
+import { findLeaf } from "./topology-codec.js";
 import { encodeHashBitmap, encodeHashBody, encodeRangeBody, hashNodeKey, promotedKeysBloom } from "./topology-encode.js";
 
 type Ops = { op: { req: { n: number }; res: string } };
@@ -75,7 +83,7 @@ function setup(
 			await pending.shift();
 		}
 	};
-	return { shardGroup, client, pending, fetched, sent, settle };
+	return { shardGroup, client, cache, pending, fetched, sent, settle };
 }
 
 function shardGroupB64(shardGroup: string): string {
@@ -199,6 +207,89 @@ describe("topology cache — hash entries", () => {
 		expect(t.sent).toEqual([deep(t.shardGroup), PartitionIdHelper.hashId(t.shardGroup, root).doName]);
 		// The cut stays for this version: the next request goes to the parent first.
 		expect(t.client.resolve(key).doName).toBe(PartitionIdHelper.hashId(t.shardGroup, root).doName);
+	});
+});
+
+describe("topology cache — bounded fallback", () => {
+	const key = { hashKey: KeyCodec.encode("stale"), sortKey: NO_SORT_KEY };
+	const { root } = childOf(key.hashKey);
+	const missing = (doName: string) =>
+		new FokosRoutingError(SHARDING_ROUTING_CODES.hash_partition_not_initialized, {
+			message: "no identity",
+			attributes: { doName },
+		});
+	const chain = (depth: number) => {
+		const path = Array.from({ length: depth }, (_, d) => hashChildIndex(key.hashKey, d, 2));
+		return Array.from({ length: depth }, (_, d) => path.slice(0, d));
+	};
+	const setupTree = (
+		paths: number[][],
+		failAt = (doName: string): FokosRoutingError | null => (doName.includes(`~h.${root}.`) ? missing(doName) : null),
+	) => {
+		const nodes = paths.map((path) => hashNodeKey(PartitionIdHelper.fromHashIdxs("sg", [root, ...path]).encode(false).bytes));
+		const bytes = encodeHashBody({
+			epoch: 1,
+			version: 1,
+			rootTreesN: 2,
+			hashSplitN: 2,
+			bitmap: encodeHashBitmap(2, 2, nodes.length, () => nodes),
+			bloom: promotedKeysBloom(0, () => []),
+		});
+		const t = setup(new Map([[GET, () => bytes]]), failAt, { refreshMs: Number.MAX_SAFE_INTEGER });
+		return { ...t, rootName: PartitionIdHelper.hashId(t.shardGroup, root).doName };
+	};
+
+	it("enters at the root when a full cut set cannot remove the failed hint", async () => {
+		const paths = Array.from({ length: 11 }, (_, depth) =>
+			Array.from({ length: 2 ** depth }, (_, n) => Array.from({ length: depth }, (_, d) => (n >>> (depth - d - 1)) & 1)),
+		).flat();
+		const t = setupTree(paths);
+		t.client.resolve(key);
+		await t.settle();
+		const target = t.client.resolve(key);
+		const entry = cachedHashTopology(t.cache, target.topology)!;
+		const leaf = findLeaf(entry.view, 2, 2, key.hashKey, entry.cut);
+		for (let pos = 2048; entry.cut.size < TOPOLOGY_CUT_MAX; pos++) {
+			if (pos !== leaf.pos) {
+				cutTopologyHint(entry, pos);
+			}
+		}
+		const result = await t.client.point("op", key, { n: 1 });
+		expect(result.value).toBe(t.rootName);
+		expect(result.clientRpcs).toBe(2);
+		expect(t.sent).toEqual([target.doName, t.rootName]);
+		expect(entry.cut.size).toBe(TOPOLOGY_CUT_MAX);
+	});
+
+	it.each([17, 32])("enters at the root after bounded fallback through %i stale levels", async (depth) => {
+		const t = setupTree(chain(depth));
+		t.client.resolve(key);
+		await t.settle();
+		const result = await t.client.point("op", key, { n: 1 });
+		expect(result.value).toBe(t.rootName);
+		expect(result.clientRpcs).toBeLessThanOrEqual(18);
+		expect(t.sent.at(-1)).toBe(t.rootName);
+		expect(t.sent.filter((name) => name === t.rootName)).toHaveLength(1);
+	});
+
+	it("propagates a miss at the root after the final fallback", async () => {
+		const t = setupTree(chain(32), missing);
+		t.client.resolve(key);
+		await t.settle();
+		await expect(t.client.point("op", key, { n: 1 })).rejects.toMatchObject({ attributes: { doName: t.rootName } });
+		expect(t.sent.length).toBeLessThanOrEqual(18);
+		expect(t.sent.at(-1)).toBe(t.rootName);
+		expect(t.sent.filter((name) => name === t.rootName)).toHaveLength(1);
+	});
+
+	it("does not fall back after a nested miss at the fallback bound", async () => {
+		let calls = 0;
+		const t = setupTree(chain(32), (doName) => missing(++calls === 17 ? "another-partition" : doName));
+		t.client.resolve(key);
+		await t.settle();
+		await expect(t.client.point("op", key, { n: 1 })).rejects.toMatchObject({ attributes: { doName: "another-partition" } });
+		expect(t.sent).toHaveLength(17);
+		expect(t.sent).not.toContain(t.rootName);
 	});
 });
 

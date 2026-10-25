@@ -1,8 +1,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 import {
 	FokosShardingClient,
+	FokosShardingRuntime,
 	KeyCodec,
 	hashChildIndex,
 	resolveDescendantHashPartitionContext,
@@ -11,6 +12,7 @@ import {
 	type FokosTopologyRead,
 } from "../../src/sharding/index-server.js";
 import { parseHashBody } from "../../src/sharding/topology-codec.js";
+import type { FokosAdminOutbox } from "../../src/sharding/runtime-types.js";
 import type { CounterOps, CounterPolicy } from "./counter-host.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
 import { hashSplitReport } from "./topology-events.js";
@@ -167,6 +169,260 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 		// Longer than the first backoff delay of the outbox job (at most 3 s).
 		await scheduler.wait(3_500);
 		expect(await root(table).debugOutbox()).toEqual(before);
+	});
+});
+
+function heldSend() {
+	let resolve!: () => void;
+	let reject!: (error: Error) => void;
+	let settled = false;
+	const promise = new Promise<void>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	}).finally(() => {
+		settled = true;
+	});
+	return { promise, resolve, reject, settled: () => settled };
+}
+
+async function withOutboxRuntime(
+	fn: (input: {
+		runtime: FokosShardingRuntime<CounterPolicy, {}>;
+		state: DurableObjectState;
+		send: Mock<FokosAdminOutbox["send"]>;
+		afterOutbox: Mock<() => { nextRunAt: null }>;
+		enqueue: (id: string, at?: number) => void;
+		rows: () => Array<{ id: string; attempt: number; next_at: number }>;
+	}) => Promise<void>,
+): Promise<void> {
+	const table = makeCounterTable(100);
+	await runInDurableObject(stub(table.root.doName), async (_instance, state) => {
+		const send = vi.fn<FokosAdminOutbox["send"]>().mockResolvedValue(undefined);
+		const afterOutbox = vi.fn(() => ({ nextRunAt: null }));
+		const runtime = new FokosShardingRuntime<CounterPolicy, {}>({
+			ctx: state,
+			stub: (_ctx, doName) => stub(doName),
+			config: () => ({ fallbackAlarmMs: 60_000, fastPathDelayMs: 60_000 }),
+			operations: {},
+			hooks: {
+				evaluateSplit: () => false,
+				migration: { buildPage: () => ({ page: [], nextCursor: null }), applyPage: () => {}, validatePage: () => {} },
+				jobs: [
+					{
+						name: "after_admin_outbox",
+						canRun: () => true,
+						deadline: () => (afterOutbox.mock.calls.length === 0 ? 0 : null),
+						runStep: afterOutbox,
+					},
+				],
+			},
+			adminOutbox: () => ({ send }),
+		});
+		await runtime.fokosStatus({ rootContext: table.root });
+		try {
+			await fn({
+				runtime,
+				state,
+				send,
+				afterOutbox,
+				enqueue: (id, at = 0) => {
+					state.storage.sql.exec(
+						"INSERT INTO fokos_admin_outbox (event_type, id, event, next_at) VALUES ('topology.repartition_completed', ?1, jsonb('{}'), ?2)",
+						id,
+						at,
+					);
+				},
+				rows: () =>
+					state.storage.sql
+						.exec<{ id: string; attempt: number; next_at: number }>("SELECT id, attempt, next_at FROM fokos_admin_outbox ORDER BY id")
+						.toArray(),
+			});
+		} finally {
+			await runtime.fokosPrepareDestroy({});
+		}
+	});
+}
+
+describe.concurrent("Sharding runtime — admin outbox timeout", () => {
+	it.each(["resolve", "reject"] as const)("continues with the next job after 5 s and handles a late %s", async (outcome) => {
+		await withOutboxRuntime(async ({ runtime, send, afterOutbox, enqueue, rows }) => {
+			const held = heldSend();
+			send.mockReturnValue(held.promise);
+			enqueue("held");
+			const startedAt = Date.now();
+			let finished = false;
+			const pass = runtime.runDueWork().then(() => {
+				finished = true;
+			});
+			try {
+				await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_500, interval: 50 });
+				expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_900);
+				expect(held.settled()).toBe(false);
+				expect(afterOutbox).toHaveBeenCalledTimes(1);
+				expect(send).toHaveBeenCalledTimes(1);
+				const before = rows();
+				expect(before).toEqual([{ id: "held", attempt: 1, next_at: expect.any(Number) }]);
+				expect(before[0].next_at).toBeGreaterThan(Date.now());
+				if (outcome === "resolve") {
+					held.resolve();
+				} else {
+					held.reject(new Error("late admin rejection"));
+				}
+				await held.promise.catch(() => {});
+				await scheduler.wait(0);
+				expect(held.settled()).toBe(true);
+				expect(rows()).toEqual(outcome === "resolve" ? [] : before);
+			} finally {
+				held.resolve();
+				await pass;
+			}
+		});
+	});
+
+	it.each(["resolve", "reject"] as const)("releases the destroy wait after 5 s and ignores a late %s behind the fence", async (outcome) => {
+		await withOutboxRuntime(async ({ runtime, send, afterOutbox, enqueue, rows }) => {
+			const held = heldSend();
+			send.mockReturnValue(held.promise);
+			enqueue("held");
+			const pass = runtime.runDueWork();
+			let destroy: Promise<void> | undefined;
+			try {
+				await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1), WAIT);
+				let finished = false;
+				destroy = runtime.fokosPrepareDestroy({}).then(() => {
+					finished = true;
+				});
+				await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_500, interval: 50 });
+				expect(held.settled()).toBe(false);
+				expect(afterOutbox).not.toHaveBeenCalled();
+				const before = rows();
+				expect(before[0].attempt).toBe(0);
+				if (outcome === "resolve") {
+					held.resolve();
+				} else {
+					held.reject(new Error("late admin rejection behind the fence"));
+				}
+				await held.promise.catch(() => {});
+				await scheduler.wait(0);
+				expect(rows()).toEqual(before);
+			} finally {
+				held.resolve();
+				await Promise.all([pass, destroy]);
+			}
+		});
+	});
+
+	it("does not acknowledge a replacement payload with the same event ID", async () => {
+		await withOutboxRuntime(async ({ runtime, state, send, enqueue, rows }) => {
+			const held = heldSend();
+			send.mockReturnValue(held.promise);
+			enqueue("held");
+			let finished = false;
+			const pass = runtime.runDueWork().then(() => {
+				finished = true;
+			});
+			try {
+				await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_500, interval: 50 });
+				state.storage.sql.exec(
+					"UPDATE fokos_admin_outbox SET event = jsonb(?1), attempt = 0, next_at = ?2 WHERE id = 'held'",
+					JSON.stringify({ replacement: true }),
+					Date.now() + 60_000,
+				);
+				const before = rows();
+				held.resolve();
+				await held.promise;
+				await scheduler.wait(0);
+				expect(rows()).toEqual(before);
+			} finally {
+				held.resolve();
+				await pass;
+			}
+		});
+	});
+
+	it("acknowledges a late success during a retry without changing a replacement when that retry fails", async () => {
+		await withOutboxRuntime(async ({ runtime, state, send, enqueue, rows }) => {
+			const first = heldSend();
+			const retry = heldSend();
+			send.mockReturnValueOnce(first.promise).mockReturnValue(retry.promise);
+			enqueue("held");
+			let finished = false;
+			const pass = runtime.runDueWork().then(() => {
+				finished = true;
+			});
+			let retryPass: Promise<void> | undefined;
+			try {
+				await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_500, interval: 50 });
+				state.storage.sql.exec("UPDATE fokos_admin_outbox SET next_at = 0");
+				retryPass = runtime.runDueWork();
+				await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2), WAIT);
+				first.resolve();
+				await first.promise;
+				await scheduler.wait(0);
+				expect(rows()).toEqual([]);
+				enqueue("held", Date.now() + 60_000);
+				state.storage.sql.exec("UPDATE fokos_admin_outbox SET event = jsonb(?1)", JSON.stringify({ replacement: true }));
+				const before = rows();
+				retry.reject(new Error("the duplicate admin send fails"));
+				await retryPass;
+				expect(rows()).toEqual(before);
+			} finally {
+				first.resolve();
+				retry.resolve();
+				await Promise.all([pass, retryPass]);
+			}
+		});
+	});
+
+	it.each([
+		{ attempt: 0, event: { replacement: true } },
+		{ attempt: 2, event: {} },
+	])("keeps retry metadata for a replacement or newer attempt: %j", async ({ attempt, event }) => {
+		await withOutboxRuntime(async ({ runtime, state, send, enqueue, rows }) => {
+			const held = heldSend();
+			send.mockReturnValue(held.promise);
+			enqueue("held");
+			const pass = runtime.runDueWork();
+			try {
+				await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1), WAIT);
+				state.storage.sql.exec(
+					"UPDATE fokos_admin_outbox SET event = jsonb(?1), attempt = ?2, next_at = ?3",
+					JSON.stringify(event),
+					attempt,
+					Date.now() + 60_000,
+				);
+				const before = rows();
+				held.reject(new Error("the previous admin send fails"));
+				await pass;
+				expect(rows()).toEqual(before);
+			} finally {
+				held.resolve();
+				await pass;
+			}
+		});
+	});
+
+	it("shares the 5 s budget across sequential sends", async () => {
+		await withOutboxRuntime(async ({ runtime, send, afterOutbox, enqueue, rows }) => {
+			const held = heldSend();
+			send.mockImplementationOnce(async () => await scheduler.wait(3_000)).mockReturnValue(held.promise);
+			enqueue("first", 0);
+			enqueue("second", 1);
+			let finished = false;
+			const pass = runtime.runDueWork().then(() => {
+				finished = true;
+			});
+			try {
+				await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_500, interval: 50 });
+				expect(held.settled()).toBe(false);
+				expect(send.mock.calls.map(([entry]) => entry.id)).toEqual(["first", "second"]);
+				expect(afterOutbox).toHaveBeenCalledTimes(1);
+				expect(rows()).toEqual([{ id: "second", attempt: 1, next_at: expect.any(Number) }]);
+			} finally {
+				held.resolve();
+				await pass;
+			}
+		});
 	});
 });
 

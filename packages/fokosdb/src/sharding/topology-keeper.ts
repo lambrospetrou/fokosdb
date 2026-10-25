@@ -269,7 +269,7 @@ export class FokosTopologyKeeper {
 			}
 			// A repeated report changes nothing.
 			if (tryOne(sql.exec(`SELECT 1 FROM fokos_topo_repartitions WHERE shard_group = ?1 AND id = ?2`, event.shardGroup, event.id))) {
-				return null;
+				return group?.build_due_at ?? null;
 			}
 			// Each new fact gets the version that this report gives the shard group when it writes a new fact.
 			const previous = group?.version ?? 0;
@@ -293,7 +293,7 @@ export class FokosTopologyKeeper {
 				repartitionKey,
 				topologyEventToJson(event),
 			);
-			const buildDueAt = changed ? (group?.build_due_at ?? now + this.#buildDelayMs) : null;
+			const buildDueAt = group?.build_due_at ?? (changed ? now + this.#buildDelayMs : null);
 			sql.exec(
 				`INSERT INTO fokos_topo_groups
 				   (shard_group, root_trees_n, hash_split_n, version, hash_version, build_due_at, promoted_n, hash_nodes_n)

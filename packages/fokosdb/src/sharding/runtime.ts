@@ -102,6 +102,7 @@ const BUILTIN_JOBS = ["target_import", "target_ack", "source_repartition", "sour
 
 /** The most outbox rows that one step of the `admin_outbox` job sends. */
 const ADMIN_OUTBOX_BATCH = 16;
+const ADMIN_OUTBOX_TIMEOUT_MS = 5_000;
 const ADMIN_OUTBOX_RETRY_BASE_MS = 1_000;
 const ADMIN_OUTBOX_RETRY_MAX_MS = 5 * 60_000;
 
@@ -2334,29 +2335,54 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			this.#store.transactionSync(() => this.#store.deleteAllAdminOutbox());
 			return;
 		}
-		for (const row of this.#store.selectDueAdminOutbox(Date.now(), ADMIN_OUTBOX_BATCH)) {
-			if (this.#store.isDestroying()) {
-				return;
+		let expired = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => {
+				expired = true;
+				reject(new Error("fokos/runtime: admin outbox step timed out"));
+			}, ADMIN_OUTBOX_TIMEOUT_MS);
+		});
+		try {
+			for (const row of this.#store.selectDueAdminOutbox(Date.now(), ADMIN_OUTBOX_BATCH)) {
+				if (expired || this.#store.isDestroying()) {
+					return;
+				}
+				try {
+					const delivery = outbox.send({ eventType: row.eventType, id: row.id, event: JSON.parse(row.eventJson) }).then(() => {
+						if (!this.#store.isDestroying()) {
+							this.#store.transactionSync(() => this.#store.deleteAdminOutbox(row.eventType, row.id, row.eventJson));
+						}
+					});
+					this.#ctx.waitUntil(delivery.catch(() => {}));
+					await Promise.race([delivery, timeout]);
+				} catch (error) {
+					if (this.#store.isDestroying()) {
+						return;
+					}
+					const attempt = row.attempt + 1;
+					// The base delay plus a jittered backoff, so each retry waits from 1 s to 5 min.
+					const delay =
+						ADMIN_OUTBOX_RETRY_BASE_MS +
+						jitterBackoff(attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS);
+					const updated = this.#store.transactionSync(() =>
+						this.#store.setAdminOutboxAttempt(row.eventType, row.id, attempt, Date.now() + delay, row.eventJson),
+					);
+					if (!updated) {
+						continue;
+					}
+					console.warn({
+						...this.#logParams(),
+						message: "fokos/runtime: an admin outbox send failed. The runtime sends it again later.",
+						eventType: row.eventType,
+						id: row.id,
+						attempt,
+						error: String(error),
+					});
+				}
 			}
-			try {
-				await outbox.send({ eventType: row.eventType, id: row.id, event: JSON.parse(row.eventJson) });
-				this.#store.transactionSync(() => this.#store.deleteAdminOutbox(row.eventType, row.id));
-			} catch (error) {
-				const attempt = row.attempt + 1;
-				// The base delay plus a jittered backoff, so each retry waits from 1 s to 5 min.
-				const delay =
-					ADMIN_OUTBOX_RETRY_BASE_MS +
-					jitterBackoff(attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS);
-				this.#store.transactionSync(() => this.#store.setAdminOutboxAttempt(row.eventType, row.id, attempt, Date.now() + delay));
-				console.warn({
-					...this.#logParams(),
-					message: "fokos/runtime: an admin outbox send failed. The runtime sends it again later.",
-					eventType: row.eventType,
-					id: row.id,
-					attempt,
-					error: String(error),
-				});
-			}
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
