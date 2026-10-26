@@ -61,29 +61,28 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
+- Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
+- Extend the topology caching in clients from responses.
+- Revamp the item size statistics for better boundary calculations and choosing keys to promote.
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
-- Add topology keeper and encoding. Schema and versioning per change (split).
-- Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Optimize the transactions RTTs by having the Worker send the Transaction Coordinator (TC) request in parallel to the partitions prepare() and handing off the driving to the TC. Partitions reply to the TC directly, not the Worker. It has some nuances if partitions RPC the TC before the initial call arrives, but with some wait timeout it might worth it.
 - Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range.
-- Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
-- Count item data sizes in UTF-8 bytes, to match the `octet_length` the store uses. The current UTF-16 count under-counts non-ASCII data by up to 3x, so the item and transaction size caps admit more than they intend.
+- Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s. Optionally use the Workers Rate limit binding for colo-level accuracy.
 - Extend the split/migration flow to also allow writes while migration in-progress (probably will need some kind of logical replication of writes after the migration started `_fokos_replication_log`). Not needed once we use DO Snapshot API.
 
 ### Features
 
+- Allow online configuration (adding/removing/changing) global eventual indexes (DynamoDB GSIs) and push targets.
+- Add operation hooks that run during request forwarding and on the final serving partition (before, after, etc).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.
-- Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
-- Add global eventual indexes (DynamoDB GSIs).
+- Allow custom split conditions in user-provided function of the FokosDB partition DO class.
+- Allow custom FokosDB partition classes to add their own migration hooks in addition to the FokosDB items, so that custom data also moves to child partitions.
+- Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions.
 - Add automatic hashing of the item and signature comparison, similar to the managed "v".
 - Add external version in each write operation, to complement the partition driven "v" version.
-- Add conditions to batch non-transaction operations.
 - Add custom jobs to run on alarms, with their own best-effort interval.
-- Add operation hooks that will run on the final serving partition (onAfterOperation).
-- Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
-- Add FokosDBStd class with helper methods (e.g. paginator for queryItems).
 - Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Think about backups and export in a consistent fashion using Durable Object bookmarks.
@@ -91,11 +90,9 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
 - Expose an RPC/API to trigger a manual split.
-- Allow custom split conditions in user-provided function of the partition DO class, and also for custom item selection per child partition.
 - Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
 - Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
-- Support large items through R2.
 - Support CASPaxosDO for the data partitions for multi-region availability. Use Paxos Commit and CAS Paxos for the topology keeper for higher availability (speed is no issue).
 
 ## Benchmarks
@@ -120,6 +117,8 @@ pnpm --filter "@fokosdb-example/http-api" test:hurl
 
 ## Contributing
 
-This project is still work in progress and does breaking changes, so I don't really want new features to be contributed by external folks, yet.
+We are not accepting external pull requests at this time.
+FokosDB is evolving quickly and we want to keep the surface area manageable. That said, we'd love to hear from you:
 
-You can submit issues for bugs if you find something, or start a discussion if you have ideas, questions, or something else to say.
+- Bug reports & feature requests — [open an issue](https://github.com/lambrospetrou/fokosdb/issues)
+- Questions & ideas — [start a discussion](https://github.com/lambrospetrou/fokosdb/discussions)
