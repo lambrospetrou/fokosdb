@@ -1,12 +1,12 @@
 /**
- * A `TransactionCoordinatorDO` with test controls: RPCs that a test calls to hold, count, or answer
+ * A `FokosDBTransactionCoordinatorDO` with test controls: RPCs that a test calls to hold, count, or answer
  * one call, or to change a value. Each control is a field of one instance, for the same reason as the
  * test controls of `ControlledPartitionDO`.
  *
  * The class adds no behavior of its own: each override only holds, counts, or answers one call, or
  * replaces one tuning value.
  */
-import { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
+import { FokosDBTransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
 import type { TransactionCoordinatorDOConfigOverrides } from "../src/server/host-config.js";
 import type { RecoverTransactionRequest, RecoverTransactionResult } from "../src/shared/transaction-wire-types.js";
 
@@ -16,13 +16,13 @@ import type { RecoverTransactionRequest, RecoverTransactionResult } from "../src
  */
 export type RecoverResponseRule = { value: RecoverTransactionResult; hold?: boolean };
 
-export class ControlledTransactionCoordinatorDO extends TransactionCoordinatorDO {
+export class ControlledTransactionCoordinatorDO extends FokosDBTransactionCoordinatorDO {
 	#initiateWriteCalls = 0;
 	#recoverCalls = 0;
 	#recoverRule: (RecoverResponseRule & { held: Promise<void>; release: () => void; parked: boolean }) | null = null;
 	#config: TransactionCoordinatorDOConfigOverrides = {};
 
-	override async initiateWrite(...args: Parameters<TransactionCoordinatorDO["initiateWrite"]>) {
+	override async initiateWrite(...args: Parameters<FokosDBTransactionCoordinatorDO["initiateWrite"]>) {
 		this.#initiateWriteCalls++;
 		return await super.initiateWrite(...args);
 	}
@@ -67,7 +67,7 @@ export class ControlledTransactionCoordinatorDO extends TransactionCoordinatorDO
 		return this.#recoverRule?.parked ?? false;
 	}
 
-	/** Lets each held call answer, and restores the work of `TransactionCoordinatorDO` for later calls. */
+	/** Lets each held call answer, and restores the work of `FokosDBTransactionCoordinatorDO` for later calls. */
 	async testReleaseRecover(): Promise<void> {
 		this.#recoverRule?.release();
 		this.#recoverRule = null;

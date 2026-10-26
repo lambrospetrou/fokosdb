@@ -4,7 +4,7 @@
 // transactions with the same timestamp, from the same start state. Both paths must give its result.
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../server/host-config.js";
 import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helpers.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
@@ -25,7 +25,7 @@ type Harness = { participant: TransactionParticipant; store: PartitionStore; sto
 
 async function withPartition<R>(fn: (h: Harness) => R): Promise<R> {
 	const stub = testPartitionStub(`ordered-test.${crypto.randomUUID()}`);
-	return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const participant = new TransactionParticipant({
 			store,

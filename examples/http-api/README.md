@@ -43,10 +43,10 @@ route module for each top-level path under `/api`. `src/<path>/` holds the code 
 module:
 
 ```ts
-export { PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
+export { FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
 ```
 
-`CustomPartitionDO` is a `PartitionDO` subclass, declared here to exercise the subclassing path. It
+`CustomPartitionDO` is a `FokosDBPartitionDO` subclass, declared here to exercise the subclassing path. It
 carries its own binding and its own entry in the `new_sqlite_classes` migration, exactly as any
 subclass must.
 

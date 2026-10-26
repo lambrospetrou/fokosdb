@@ -1,5 +1,5 @@
 /**
- * Small primitives shared by the PartitionDO suites: isolated partition setup, key encoding,
+ * Small primitives shared by the FokosDBPartitionDO suites: isolated partition setup, key encoding,
  * split-status narrowing, and log capture. Split, migration, and promotion drivers live in
  * `partition-harness.ts`.
  */
@@ -16,10 +16,10 @@ import {
 	type FokosTableOptions,
 } from "../../src/shared/partition-context.js";
 import { materializationStubByName } from "../../src/shared/do-stubs.js";
-import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
-import type { ItemRpcPartitions, LeafMetrics, PartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
+import type { ItemRpcPartitions, LeafMetrics, FokosDBPartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import type { QueryItemsResult, SinglePartitionMeta } from "../../src/shared/types.js";
@@ -76,10 +76,10 @@ export function rangeAncestorsOf(envelope: FokosEnvelope<unknown>) {
 
 /** The RPC surface of a partition stub with every envelope opened. */
 export type OpenedPartitionRpc = {
-	[K in keyof PartitionOps]: (...args: Parameters<PartitionDO[K]>) => Promise<Opened<PartitionOps[K]["res"]>>;
+	[K in keyof PartitionOps]: (...args: Parameters<FokosDBPartitionDO[K]>) => Promise<Opened<PartitionOps[K]["res"]>>;
 };
 
-export function openedRpc(stub: DurableObjectStub<PartitionDO>): OpenedPartitionRpc {
+export function openedRpc(stub: DurableObjectStub<FokosDBPartitionDO>): OpenedPartitionRpc {
 	return new Proxy({} as OpenedPartitionRpc, {
 		get:
 			(_target, op: keyof PartitionOps) =>
@@ -98,8 +98,8 @@ export function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): Transact
 }
 
 /** The keys of the lock rows of one transaction on one partition, as `"<hash>/<sort>"`, in storage order. */
-export async function lockKeys(stub: DurableObjectStub<PartitionDO>, transactionId: string): Promise<string[]> {
-	return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) =>
+export async function lockKeys(stub: DurableObjectStub<FokosDBPartitionDO>, transactionId: string): Promise<string[]> {
+	return await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		new PartitionStore(state.storage)
 			.listPendingTxItems(transactionId)
 			.map((row) => `${new TextDecoder().decode(row.hk)}/${new TextDecoder().decode(row.sk)}`),
@@ -166,7 +166,7 @@ export function captureConsoleError() {
 }
 
 /** The materialization root that owns `hashKey`, from the route context of a base partition of the same table. */
-export function materializationOf(base: FokosDBRouteContext, hashKey: string): DurableObjectStub<MaterializationDO> {
+export function materializationOf(base: FokosDBRouteContext, hashKey: string): DurableObjectStub<FokosDBMaterializationDO> {
 	const mat = materializationTableConfig({
 		topology: base.topology,
 		rangeConfig: base.rangeConfig,
@@ -186,11 +186,11 @@ export const TARGET_WAIT = { timeout: 5_000, interval: 10 };
 
 /** The latest image of one base item in a materialization partition, or undefined when it has none. */
 export async function latestImage(
-	stub: DurableObjectStub<MaterializationDO>,
+	stub: DurableObjectStub<FokosDBMaterializationDO>,
 	hashKey: string,
 	sortKey = "s",
 ): Promise<{ revision: number; deleted: boolean; data: SqlStorageValue } | undefined> {
-	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const row = state.storage.sql
 			.exec<{
 				revision: number;

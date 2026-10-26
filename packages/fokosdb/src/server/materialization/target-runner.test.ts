@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { MaterializationDO } from "./do-materialization.js";
+import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { MaterializationCleanup } from "./materialization-cleanup.js";
 import { MaterializationStore, type LatestImage, type TargetRow } from "./materialization-store.js";
@@ -78,7 +78,7 @@ async function withRunner(
 	fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`runner-test.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, async (_instance: MaterializationDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const store = new MaterializationStore(state.storage);
 		const targets: FokosTargetDefinition[] = (opts.targets ?? ["t1"]).map((targetId) =>
 			opts.gsi ? { kind: "gsi", targetId, hashKey: { ref: "data" } } : { kind: "push_sink", targetId, binding: "SINK", method: "push" },

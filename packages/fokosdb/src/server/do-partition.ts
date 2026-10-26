@@ -124,7 +124,7 @@ import { fitBatchResponse } from "../shared/batch-response.js";
 // ─── item RPC types ───────────────────────────────────────────────────────────
 
 /**
- * Wire types for the item RPCs (db.ts → PartitionDO). Keys are canonical KeyBytes, encoded at the
+ * Wire types for the item RPCs (db.ts → FokosDBPartitionDO). Keys are canonical KeyBytes, encoded at the
  * db.ts entry, and `sortKey` is always present — the empty KeyBytes ([]) is the absent sentinel.
  * This matches the transaction and query RPCs, so every key crossing into a DO has one form.
  *
@@ -221,7 +221,7 @@ export type GsiWriteEntry = { opIndex: number; hashKey: KeyBytes; sortKey: KeyBy
 /** An ancestor of the producer whose late calls the receiver must reject. */
 export type GsiProducerFence = { ancestorId: string; minEpoch: number };
 
-/** A write of one `MaterializationDO` to a GSI table. Only `MaterializationDO` sends it. */
+/** A write of one `FokosDBMaterializationDO` to a GSI table. Only `FokosDBMaterializationDO` sends it. */
 export type GsiWriteEntriesRequest = {
 	/** The `DurableObjectId` of the producer, as `DurableObjectId.toString()` gives it. */
 	producerId: string;
@@ -386,7 +386,7 @@ type ItemRead = { found?: { item: GetItemRpcItem; bytes: number }; rowsRead: num
 const keyOf = (item: TransactionItemKey) => ({ hashKey: item.hashKey, sortKey: item.sortKey });
 const rowKeyOf = (row: { hk: KeyBytes; sk: KeyBytes }) => ({ hashKey: row.hk, sortKey: row.sk });
 
-export class PartitionDO extends DurableObject implements PartitionRpc {
+export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	/** The sharding runtime: identity, routing, repartitions, and the alarm. Every public method is one `dispatch`. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
 	#store: PartitionStore;
@@ -1375,7 +1375,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				continue;
 			}
 			const { opIndex, hashKey, sortKey } = item;
-			let local: ConditionalWriteResult<ReturnType<PartitionDO["upsertNow"]> | ReturnType<PartitionDO["deleteNow"]>>;
+			let local: ConditionalWriteResult<ReturnType<FokosDBPartitionDO["upsertNow"]> | ReturnType<FokosDBPartitionDO["deleteNow"]>>;
 			try {
 				// TODO: This might be performance slowdown instead of doing a transaction for all the items.
 				//       The only reason we do this is to allow partial application of the batch, but might reconsider.

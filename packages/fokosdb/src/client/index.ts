@@ -10,7 +10,7 @@
  */
 export { FokosDB, isFokosDBError } from "./db.js";
 export type { FokosDBError, FokosDBOptions, FokosDBResolvedOptions, FokosDBRetryOptions } from "./db.js";
-export { FokosStd } from "./fokos-std.js";
+export { FokosDBStd } from "./fokos-std.js";
 
 // ─── Item data and single-item operations ─────────────────────────────────────
 

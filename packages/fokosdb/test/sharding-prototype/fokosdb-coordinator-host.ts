@@ -1,5 +1,5 @@
 /**
- * PROTOTYPE. `TransactionCoordinatorDO` written as a second host of `FokosShardingRuntime`, so the coordinator
+ * PROTOTYPE. `FokosDBTransactionCoordinatorDO` written as a second host of `FokosShardingRuntime`, so the coordinator
  * pool grows by hash splits instead of a fixed `numTxCoordinators`. A coordinator is keyed by the idempotency
  * token: `{ hashKey: token, sortKey: empty }`. It has no range tree, no promotions, and no read-through.
  *
@@ -61,7 +61,7 @@ type Runtime = FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>;
 
 type TcStateRow = { transaction_id: string; idempotency_token: string; state: TCState; created_at: number; completed_at: number | null };
 
-export class TransactionCoordinatorDO extends DurableObject<Env> implements CoordinatorRpc {
+export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implements CoordinatorRpc {
 	readonly fokos: Runtime;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -178,7 +178,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 // ─── operations ──────────────────────────────────────────────────────────────
 
-function coordinatorOperations(host: TransactionCoordinatorDO): FokosOperations<CoordinatorOps> {
+function coordinatorOperations(host: FokosDBTransactionCoordinatorDO): FokosOperations<CoordinatorOps> {
 	return {
 		initiateWrite: {
 			shape: "point",
@@ -223,7 +223,7 @@ function coordinatorOperations(host: TransactionCoordinatorDO): FokosOperations<
 
 // ─── hooks ───────────────────────────────────────────────────────────────────
 
-function coordinatorHooks(host: TransactionCoordinatorDO): FokosShardingHooks<FokosDBPolicy> {
+function coordinatorHooks(host: FokosDBTransactionCoordinatorDO): FokosShardingHooks<FokosDBPolicy> {
 	const { fokos } = host;
 	const active = () => {
 		const lc = fokos.lifecycle();

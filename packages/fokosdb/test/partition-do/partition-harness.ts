@@ -1,7 +1,7 @@
-/** PartitionDO lifecycle helpers for splits, migration, and promotion. */
+/** FokosDBPartitionDO lifecycle helpers for splits, migration, and promotion. */
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { expect, vi } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testControlledPartitionStub, testPartitionStub } from "../stub-helpers.js";
 import type { ControlledPartitionDO } from "../controlled-partition-do.js";
 import type { GetItemRpcRequest, PutItemRpcRequest } from "../../src/server/do-partition.js";
@@ -78,18 +78,18 @@ export function makePartition(opts?: PartitionOptions): TestPartition {
 export class TestPartition {
 	readonly ctx: FokosDBRouteContext;
 	/** The raw stub: every call answers an envelope. `runInDurableObject` needs it. */
-	readonly stub: DurableObjectStub<PartitionDO>;
+	readonly stub: DurableObjectStub<FokosDBPartitionDO>;
 	/** The same stub with every envelope opened, as a test reads a response. */
 	readonly rpc: OpenedPartitionRpc;
 
-	private constructor(ctx: FokosDBRouteContext, stub?: DurableObjectStub<PartitionDO>) {
+	private constructor(ctx: FokosDBRouteContext, stub?: DurableObjectStub<FokosDBPartitionDO>) {
 		this.ctx = ctx;
 		this.stub = stub ?? testPartitionStub(ctx.doName, ctx.policy.ns);
 		this.rpc = openedRpc(this.stub);
 	}
 
 	/** Wraps a context that another partition (or a pure resolver) produced. */
-	static at(ctx: FokosDBRouteContext, stub?: DurableObjectStub<PartitionDO>): TestPartition {
+	static at(ctx: FokosDBRouteContext, stub?: DurableObjectStub<FokosDBPartitionDO>): TestPartition {
 		return new TestPartition(ctx, stub);
 	}
 
@@ -127,7 +127,7 @@ export class TestPartition {
 
 	/** The id of the split repartition of this partition, which a read-through caller must name. */
 	async splitRepartitionId(): Promise<string> {
-		return await runInDurableObject(this.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		return await runInDurableObject(this.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const rows = state.storage.sql
 				.exec<{ id: string }>(`SELECT id FROM fokos_repartitions WHERE kind IN ('hash_split', 'range_split') LIMIT 1`)
 				.toArray();
@@ -182,7 +182,7 @@ export class TestPartition {
 	 * GC, or hash-child migration excluding a promoted key) has to look at the storage instead.
 	 */
 	async localItemCount(hashKey: string): Promise<number> {
-		return await runInDurableObject(this.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		return await runInDurableObject(this.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const rows = state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ?`, kb(hashKey)).toArray();
 			return rows[0].n;
 		});
@@ -203,7 +203,7 @@ export class TestPartition {
 	 * result tells if the pass changed the lifecycle or the job record, and when the next work is due.
 	 */
 	async runDueWork(): Promise<DrivePass> {
-		return await runInDurableObject(this.stub, async (instance: PartitionDO, state: DurableObjectState) => {
+		return await runInDurableObject(this.stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const snapshot = () =>
 				JSON.stringify({ lifecycle: instance.fokos.lifecycle(), jobs: state.storage.kv.get(FOKOS_KV_KEYS.JOBS) ?? null });
 			const before = snapshot();
@@ -530,7 +530,7 @@ export async function useSmallBloom(...partitions: TestPartition[]): Promise<voi
 
 /** The promotion Bloom filter that `partition` stored. Fails when the partition has none. */
 export async function storedBloom(partition: TestPartition): Promise<PartialRangeTopology> {
-	const snapshot = await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+	const snapshot = await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		new FokosShardingStore(state.storage).getPromotionBloom(),
 	);
 	invariant(snapshot, `${partition.doName}: no promotion Bloom filter; the partition learns one from a read of a promoted key`);
@@ -597,7 +597,7 @@ export async function assertSplitTreeComplete(node: TestPartition): Promise<numb
 async function migrationProbe(child: TestPartition): Promise<string> {
 	const probe = async () => {
 		const migration = (await child.status()).migrationStatus ?? "none";
-		const inner = await runInDurableObject(child.stub, async (instance: PartitionDO, state: DurableObjectState) => {
+		const inner = await runInDurableObject(child.stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const alarmAt = await state.storage.getAlarm();
 			return { import: instance.fokos.lifecycle().import, alarmInMs: alarmAt === null ? null : alarmAt - Date.now() };
 		});

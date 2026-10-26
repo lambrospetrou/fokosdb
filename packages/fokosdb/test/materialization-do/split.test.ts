@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { ApplyLatestImagesRequest, MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type { ApplyLatestImagesRequest, FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import type { LatestImage } from "../../src/server/materialization/materialization-store.js";
 import { materializationTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { materializationStubByName } from "../../src/shared/do-stubs.js";
@@ -13,7 +13,7 @@ import type { ReceivedPush } from "./push-target-host.js";
 const PRODUCER_ID = "dd".repeat(32);
 const DONE_STATES = ["completed", "cleaned"];
 
-type Mat = { ctx: FokosDBRouteContext; stub: DurableObjectStub<MaterializationDO>; ref: FokosPartitionRef };
+type Mat = { ctx: FokosDBRouteContext; stub: DurableObjectStub<FokosDBMaterializationDO>; ref: FokosPartitionRef };
 
 /** The materialization root of a new table whose materialization class has the push target `sink`. */
 function materializationRoot(opts: PartitionOptions): Mat {
@@ -28,7 +28,7 @@ function materializationRoot(opts: PartitionOptions): Mat {
 	return { ctx, stub: materializationStubByName(env, ctx, ctx.doName), ref: { partitionId: ctx.partitionId, doName: ctx.doName } };
 }
 
-function stubOf(root: Mat, ref: FokosPartitionRef): DurableObjectStub<MaterializationDO> {
+function stubOf(root: Mat, ref: FokosPartitionRef): DurableObjectStub<FokosDBMaterializationDO> {
 	return materializationStubByName(env, root.ctx, ref.doName);
 }
 
@@ -43,13 +43,16 @@ async function apply(root: Mat, items: Array<Omit<Extract<LatestImage, { deleted
 }
 
 /** Runs the due work of each partition until `check` passes. */
-async function driveUntil(stubs: () => Promise<DurableObjectStub<MaterializationDO>[]>, check: () => Promise<boolean>): Promise<void> {
+async function driveUntil(
+	stubs: () => Promise<DurableObjectStub<FokosDBMaterializationDO>[]>,
+	check: () => Promise<boolean>,
+): Promise<void> {
 	for (let round = 0; round < 400; round++) {
 		if (await check()) {
 			return;
 		}
 		for (const stub of await stubs()) {
-			await runInDurableObject(stub, async (instance: MaterializationDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBMaterializationDO) => {
 				if (instance.fokos.initialized()) {
 					await instance.fokos.runDueWork();
 				}
@@ -61,8 +64,8 @@ async function driveUntil(stubs: () => Promise<DurableObjectStub<Materialization
 }
 
 /** The split state of a materialization partition. */
-async function rows(stub: DurableObjectStub<MaterializationDO>) {
-	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+async function rows(stub: DurableObjectStub<FokosDBMaterializationDO>) {
+	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const sql = state.storage.sql;
 		return {
 			items: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM latest_items`).one().n,
@@ -77,7 +80,7 @@ async function rows(stub: DurableObjectStub<MaterializationDO>) {
 
 const sink = () => env.PUSH_SINK_DO.getByName("sink");
 
-describe("MaterializationDO — splits", () => {
+describe("FokosDBMaterializationDO — splits", () => {
 	it("a hash split moves the items, the cursor, and the producer fences, and the children send with the split fence", async () => {
 		const root = materializationRoot({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const rootId = root.stub.id.toString();

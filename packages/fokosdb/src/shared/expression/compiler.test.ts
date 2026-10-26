@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
@@ -408,7 +408,7 @@ describe("update SQLite compiler", () => {
 
 	it("evaluates pre-image document expression in Workers SQLite", async () => {
 		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "remove", target: { ref: "data", path: "$.a" } },
 				{ action: "set", target: { ref: "data", path: "$.b" }, value: { ref: "data", path: "$.a" } },
@@ -423,7 +423,7 @@ describe("update SQLite compiler", () => {
 
 	it("evaluates plain array index removal order in Workers SQLite", async () => {
 		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "remove", target: { ref: "data", path: "$.r[1]" } },
 				{ action: "remove", target: { ref: "data", path: "$.r[2]" } },
@@ -437,7 +437,7 @@ describe("update SQLite compiler", () => {
 
 	it("rejects invalid target in applicability check in Workers SQLite", async () => {
 		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.missing.child" }, value: { val: 1 } }];
 			const plan = compileUpdateExpression(update);
 			const row = runUpdatePlan(state, plan, JSON.stringify({ a: 1 }));
@@ -447,7 +447,7 @@ describe("update SQLite compiler", () => {
 
 	it("evaluates if_not_exists and arithmetic increment in Workers SQLite", async () => {
 		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{
 					action: "set",
@@ -471,7 +471,7 @@ describe("update SQLite compiler", () => {
 
 	it("preserves boolean values copied from data references", async () => {
 		const stub = testPartitionStub(`update-boolean-ref-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.flag" }, value: { ref: "data", path: "$.source" } },
 			];
@@ -484,7 +484,7 @@ describe("update SQLite compiler", () => {
 
 	it("preserves boolean literals in if_not_exists fallbacks", async () => {
 		const stub = testPartitionStub(`update-boolean-fallback-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{
 					action: "set",
@@ -501,7 +501,7 @@ describe("update SQLite compiler", () => {
 
 	it("preserves string values that look like JSON literals", async () => {
 		const stub = testPartitionStub(`update-string-literal-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.number" }, value: { val: "5" } },
 				{ action: "set", target: { ref: "data", path: "$.boolean" }, value: { val: "true" } },
@@ -516,7 +516,7 @@ describe("update SQLite compiler", () => {
 
 	it("preserves string values copied from data references", async () => {
 		const stub = testPartitionStub(`update-string-ref-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data", path: "$.source" } },
 			];
@@ -529,7 +529,7 @@ describe("update SQLite compiler", () => {
 
 	it("preserves booleans copied through a value-passing function", async () => {
 		const stub = testPartitionStub(`update-passthrough-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			// SQLite carries a JSON boolean as 1 or 0, so a function that returns one of its arguments
 			// must receive that argument already encoded as JSON. Otherwise `true` lands as the number 1.
 			const update: UpdateExpression = [
@@ -558,7 +558,7 @@ describe("update SQLite compiler", () => {
 
 	it("stores the complete data and a document that a pass-through function returns as nested documents", async () => {
 		const stub = testPartitionStub(`update-passthrough-doc-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data" } },
 				{

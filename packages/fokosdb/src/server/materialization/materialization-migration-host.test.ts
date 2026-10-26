@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { MaterializationDO } from "./do-materialization.js";
+import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
 import type { RouteKey } from "../../sharding/repartition-types.js";
@@ -26,7 +26,7 @@ function image(hk: string, sk: string): LatestImage {
 
 async function inPartition<T>(name: string, fn: (store: MaterializationStore, sql: SqlStorage) => T): Promise<T> {
 	const stub = env.MATERIALIZATION_DO.getByName(`${name}.${crypto.randomUUID()}`);
-	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) =>
+	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
 		fn(new MaterializationStore(state.storage), state.storage.sql),
 	);
 }

@@ -41,6 +41,6 @@ export function makeFokosDB(env: Env, tableName: string, partitionOptions?: Part
 		hashSplitConditions: partitionOptions?.hashSplitConditions ?? DEFAULT_PARTITION_OPTIONS.hashSplitConditions,
 		rangeSplitConditions: partitionOptions?.rangeSplitConditions ?? DEFAULT_PARTITION_OPTIONS.rangeSplitConditions,
 		nsAdmin: "FOKOS_ADMIN_DO",
-		topologyEntrypoint: "FokosTopologyCache",
+		topologyEntrypoint: "FokosDBTopologyCache",
 	});
 }

@@ -1,6 +1,6 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, it, vi } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { testControlledPartitionStub, testPartitionStub } from "../stub-helpers.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
@@ -23,7 +23,7 @@ import {
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
 // operates at the same time cannot remove it.
-describe("PartitionDO - splitting", () => {
+describe("FokosDBPartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
@@ -47,7 +47,7 @@ describe("PartitionDO - splitting", () => {
 	it("preserves split_queued status across subsequent writes before the alarm runs", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		try {
-			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+			await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 				const status = async () => opened(await instance.status(partition.ctx));
 				await partition.triggerHashSplit({
 					apiPutItem: async (ctx, req) => opened(await instance.apiPutItem(ctx, req)),
@@ -111,7 +111,7 @@ describe("PartitionDO - splitting", () => {
 		// A lost reply leaves the source believing the target is initialized. A matching retry must
 		// therefore succeed AND leave an alarm behind, or the target has nothing to start itself with.
 		await expect(childStub.fokosInit(req)).resolves.not.toThrow();
-		await runInDurableObject(childStub, async (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(childStub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).not.toBeNull();
 		});
 
@@ -144,7 +144,7 @@ describe("PartitionDO - splitting", () => {
 		const attempts = async () =>
 			await runInDurableObject(
 				child,
-				(_i: PartitionDO, state: DurableObjectState) => new FokosShardingStore(state.storage).getImport()!.attempts,
+				(_i: FokosDBPartitionDO, state: DurableObjectState) => new FokosShardingStore(state.storage).getImport()!.attempts,
 			);
 
 		// The new import is due, so the request starts a pass. The pull fails because the source has not
@@ -167,7 +167,7 @@ describe("PartitionDO - splitting", () => {
 		// runInDurableObject keeps each caught rejection inside the execution context of the DO, so none
 		// of them leaks as an unhandled rejection at the worker level.
 		const { ctx: otherParentCtx } = makeStub();
-		await runInDurableObject(childStub, async (instance: PartitionDO) => {
+		await runInDurableObject(childStub, async (instance: FokosDBPartitionDO) => {
 			// A different repartition.
 			await expect(instance.fokosInit({ repartitionId: "r2", source, target: childCtx, slice })).rejects.toThrow(
 				fokosErrorWith("partition_context_mismatch"),
@@ -200,7 +200,7 @@ describe("PartitionDO - splitting", () => {
 
 		// Read the stored policy WITHOUT a request, so the assertion observes what fokosInit stored rather
 		// than writing the threshold itself.
-		const stored = await runInDurableObject(childStub, (instance: PartitionDO) => instance.fokos.policy());
+		const stored = await runInDurableObject(childStub, (instance: FokosDBPartitionDO) => instance.fokos.policy());
 		expect(stored.hashSplitConditions.maxSizeMb).toBe(25);
 	});
 
@@ -221,7 +221,7 @@ describe("PartitionDO - splitting", () => {
 		await partition.splitHash();
 
 		for (const child of await partition.children()) {
-			const analyzed = await runInDurableObject(child.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+			const analyzed = await runInDurableObject(child.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 				state.storage.sql
 					.exec<{ tbl: string }>(`SELECT DISTINCT tbl FROM sqlite_stat1`)
 					.toArray()
@@ -242,7 +242,7 @@ describe("PartitionDO - splitting", () => {
 		expect(before).toBeUndefined();
 
 		// Manually schedule an alarm to simulate a stale alarm (e.g. after a crash with no pending work).
-		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
+		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, ctx: DurableObjectState) => {
 			await ctx.storage.setAlarm(Date.now());
 		});
 
@@ -604,7 +604,7 @@ describe("PartitionDO - splitting", () => {
 				for (const child of children) {
 					count += await runInDurableObject(
 						child.stub,
-						(_instance: PartitionDO, state: DurableObjectState) =>
+						(_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 							state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM items WHERE ttl_epoch_utc_seconds IS NOT NULL").one().n,
 					);
 				}
@@ -622,7 +622,7 @@ describe("PartitionDO - splitting", () => {
 				// Simulate the item expiring mid-migration: the sweep must not run while a child is
 				// still migrating, so the expired row is still there until the hold releases.
 				for (const child of children) {
-					await runInDurableObject(child.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+					await runInDurableObject(child.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 						state.storage.sql.exec("UPDATE items SET ttl_epoch_utc_seconds = 1 WHERE hk = ?", kb("ttl-migration")),
 					);
 				}
@@ -652,7 +652,7 @@ describe("PartitionDO - splitting", () => {
 				// Call putItem directly on the instance (not via RPC stub) so the error stays local.
 				// Going through the stub would cause workerd to log the remote throw as an uncaught
 				// exception, which Vitest surfaces as an unhandled rejection even though we catch it.
-				await runInDurableObject(child.stub, async (instance: PartitionDO) => {
+				await runInDurableObject(child.stub, async (instance: FokosDBPartitionDO) => {
 					await expect(
 						instance.apiPutItem(child.ctx, {
 							hashKey: kb("key1"),

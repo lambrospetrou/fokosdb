@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { partitionStubByName } from "../../src/shared/do-stubs.js";
 import { decodeGsiSortKey } from "../../src/shared/gsi/sort-key.js";
 import { gsiTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
@@ -21,7 +21,7 @@ async function gsiEntries(base: FokosDBRouteContext, indexName: string, hashKey:
 	);
 	const ctx = new FokosRouter(table.topology, table.rangeConfig, table.policy, table.policyVersion).rootContext(kb(hashKey));
 	const stub = partitionStubByName(env, ctx, ctx.doName);
-	const rows = await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) =>
+	const rows = await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		state.storage.sql
 			.exec<{ sk: ArrayBuffer; data: string }>(`SELECT sk, json(data) AS data FROM items WHERE hk = ? ORDER BY sk`, kb(hashKey))
 			.toArray(),
@@ -39,8 +39,8 @@ async function gsiEntries(base: FokosDBRouteContext, indexName: string, hashKey:
 	});
 }
 
-async function materializationRows(stub: DurableObjectStub<MaterializationDO>) {
-	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+async function materializationRows(stub: DurableObjectStub<FokosDBMaterializationDO>) {
+	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const count = (table: string) => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).one().n;
 		return {
 			items: count("latest_items"),
@@ -60,7 +60,7 @@ function gsiTable() {
 	};
 }
 
-describe("MaterializationDO — GSI targets", () => {
+describe("FokosDBMaterializationDO — GSI targets", () => {
 	it("writes the entry of each GSI, moves it when the GSI key changes, and deletes it with the base item", async () => {
 		const t = gsiTable();
 		const mat = materializationOf(t.ctx, "o1");

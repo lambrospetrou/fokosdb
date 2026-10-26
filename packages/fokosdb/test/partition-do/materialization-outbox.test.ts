@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
@@ -9,8 +9,8 @@ import { PROMOTION_TEST_MAX_SIZE_MB, TestPartition, drainUntil, makePartition } 
 
 type OutboxRow = { hk: string; revision: number; is_deleted: number; is_local_only: number };
 
-async function outboxRows(stub: DurableObjectStub<PartitionDO>, hashKey?: string): Promise<OutboxRow[]> {
-	return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) =>
+async function outboxRows(stub: DurableObjectStub<FokosDBPartitionDO>, hashKey?: string): Promise<OutboxRow[]> {
+	return await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		state.storage.sql
 			.exec<{ hk: ArrayBuffer; revision: number; is_deleted: number; is_local_only: number }>(
 				`SELECT hk, revision, is_deleted, is_local_only FROM materialization_outbox ${hashKey === undefined ? "" : "WHERE hk = ?"} ORDER BY hk, sk`,
@@ -21,7 +21,7 @@ async function outboxRows(stub: DurableObjectStub<PartitionDO>, hashKey?: string
 	);
 }
 
-describe("PartitionDO — outbox capture", () => {
+describe("FokosDBPartitionDO — outbox capture", () => {
 	it("a table without capture writes no outbox row", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "d", kind: "text" });
@@ -32,7 +32,7 @@ describe("PartitionDO — outbox capture", () => {
 
 // The export runs during these splits, so an outbox row can leave before or after the copy. The
 // copy itself is checked without the export by the FokosMigrationHost test below.
-describe("PartitionDO — outbox migration", () => {
+describe("FokosDBPartitionDO — outbox migration", () => {
 	it("after a hash split no row stays on the source, and each row of a child is not local only", async () => {
 		const partition = makePartition({ captureChanges: true, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.triggerHashSplit();
@@ -67,7 +67,7 @@ describe("FokosMigrationHost — the export fences of the outbox stream", () => 
 	it("the last page gives each target the current epoch of the source and its fences, and the pages raise no epoch", async () => {
 		const source = makeStub({ captureChanges: true });
 		const target = makeStub({ captureChanges: true });
-		const pages = await runInDurableObject(source.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		const pages = await runInDurableObject(source.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage, { captureChanges: () => true });
 			for (const sk of ["1", "2"]) {
 				store.upsertItem({ hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
@@ -97,7 +97,7 @@ describe("FokosMigrationHost — the export fences of the outbox stream", () => 
 		expect(pages.pages.map((p) => (p.page as { fences?: unknown }).fences)).toEqual([undefined, undefined, fences]);
 		expect((pages.again.page as { fences?: unknown }).fences).toEqual(fences);
 
-		const stored = await runInDurableObject(target.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		const stored = await runInDurableObject(target.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage, { captureChanges: () => true });
 			const host = hostOf(store, "target-id");
 			for (const { page } of pages.pages) {

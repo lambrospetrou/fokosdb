@@ -1,16 +1,16 @@
 /**
- * A `PartitionDO` with test controls: RPCs that a test calls to hold, count, answer, or fail one
+ * A `FokosDBPartitionDO` with test controls: RPCs that a test calls to hold, count, answer, or fail one
  * call on one instance.
  *
  * The RPC dispatcher finds an operation on the class, thus a test cannot put a mock on one DO
- * instance. A mock on the `PartitionDO` prototype reaches every partition of every test in the
+ * instance. A mock on the `FokosDBPartitionDO` prototype reaches every partition of every test in the
  * isolate, and `vi.restoreAllMocks()` of a different test can remove it. Each test control of this class is
  * a field of one instance, and nothing else can reach it.
  *
- * The class adds no behavior of its own: `PartitionDO` does all the work, and each override only
+ * The class adds no behavior of its own: `FokosDBPartitionDO` does all the work, and each override only
  * holds, counts, answers, or fails one call, or replaces one tuning value.
  */
-import { PartitionDO } from "../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
 import type { FokosRuntimeConfigOverrides } from "../src/sharding/runtime-config.js";
 import type { PartitionDOConfigOverrides } from "../src/server/host-config.js";
@@ -69,8 +69,8 @@ export type TxOp =
 	| "txCancel"
 	| "apiBatchGetItems"
 	| "apiBatchWriteItems";
-export type TxRequest<Op extends TxOp> = Parameters<PartitionDO[Op]>[1];
-type TxResponse<Op extends TxOp> = Awaited<ReturnType<PartitionDO[Op]>>;
+export type TxRequest<Op extends TxOp> = Parameters<FokosDBPartitionDO[Op]>[1];
+type TxResponse<Op extends TxOp> = Awaited<ReturnType<FokosDBPartitionDO[Op]>>;
 
 /**
  * What an operation does in place of its work, for `times` calls. `error` fails the call with that
@@ -79,7 +79,7 @@ type TxResponse<Op extends TxOp> = Awaited<ReturnType<PartitionDO[Op]>>;
  */
 export type TxResponseRule<Op extends TxOp> = ({ error: string; afterWork?: boolean } | { value: TxResponse<Op> }) & { times?: number };
 
-export class ControlledPartitionDO extends PartitionDO {
+export class ControlledPartitionDO extends FokosDBPartitionDO {
 	#pullGate: (Gate & { spec: PullGateSpec }) | null = null;
 	#pullStats: PullStats = { calls: 0, heldTargets: [], pulls: [] };
 	#initGate: Gate | null = null;
@@ -103,7 +103,7 @@ export class ControlledPartitionDO extends PartitionDO {
 
 	/**
 	 * Logs the call, and applies the rule of `op` when one exists. Else it returns the promise of
-	 * `PartitionDO` itself, so a call with no rule has the same timing as on `PartitionDO`.
+	 * `FokosDBPartitionDO` itself, so a call with no rule has the same timing as on `FokosDBPartitionDO`.
 	 */
 	#tx<Op extends TxOp>(op: Op, req: TxRequest<Op>, work: () => Promise<TxResponse<Op>>): Promise<TxResponse<Op>> {
 		(this.#txCalls[op] as TxRequest<Op>[]).push(req);
@@ -168,7 +168,7 @@ export class ControlledPartitionDO extends PartitionDO {
 		return this.#tx("apiBatchWriteItems", req, () => super.apiBatchWriteItems(ctx, req));
 	}
 
-	// The constructor of PartitionDO reads both methods below, before the fields of this class exist.
+	// The constructor of FokosDBPartitionDO reads both methods below, before the fields of this class exist.
 	protected override fokosConfig(): PartitionDOConfigOverrides {
 		return #config in this ? this.#config : super.fokosConfig();
 	}
@@ -307,7 +307,7 @@ export class ControlledPartitionDO extends PartitionDO {
 	/** Replaces the setting overrides of this partition. `{}` restores the defaults. */
 	async testConfig(overrides: PartitionDOConfigOverrides): Promise<void> {
 		this.#config = overrides;
-		// `PartitionDO` caches its settings, and its constructor fills the cache before this class has
+		// `FokosDBPartitionDO` caches its settings, and its constructor fills the cache before this class has
 		// its fields. The next read resolves the settings again, with these overrides.
 		(this as unknown as { __cachedConfig?: unknown }).__cachedConfig = undefined;
 	}

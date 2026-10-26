@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
-import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
@@ -16,7 +16,7 @@ function aRejection(reason: Record<string, unknown>) {
 	return expect.arrayContaining([expect.objectContaining({ outcome: "rejected", reason: expect.objectContaining(reason) })]);
 }
 
-describe("PartitionDO — transactions spanning local and promoted keys", () => {
+describe("FokosDBPartitionDO — transactions spanning local and promoted keys", () => {
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
@@ -108,7 +108,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 	});
 });
 
-describe("PartitionDO — transaction routing separates backpressure from mis-routing", () => {
+describe("FokosDBPartitionDO — transaction routing separates backpressure from mis-routing", () => {
 	// An empty SQLite database is already several KB, so this cap is exceeded before anything is
 	// written and every "write" is refused for size.
 	const OVER_SIZE = { hashSplitConditions: { maxSizeMb: 0.000_001 } };
@@ -160,10 +160,10 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	});
 });
 
-describe("PartitionDO — single-shot transaction", () => {
+describe("FokosDBPartitionDO — single-shot transaction", () => {
 	/** Counts the lock rows this partition holds, whatever transaction owns them. */
-	async function pendingLockCount(stub: DurableObjectStub<PartitionDO>): Promise<number> {
-		return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	async function pendingLockCount(stub: DurableObjectStub<FokosDBPartitionDO>): Promise<number> {
+		return await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			return state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions`).one().n;
 		});
 	}
@@ -299,7 +299,7 @@ describe("PartitionDO — single-shot transaction", () => {
 	});
 });
 
-describe("PartitionDO — two-phase commit queues splits", () => {
+describe("FokosDBPartitionDO — two-phase commit queues splits", () => {
 	it("commits a prepared TTL put after its pending lock migrates through a hash split", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const { ctx, rpc } = partition;
@@ -312,7 +312,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		// holds the transaction and completes it, so the stale job keeps the lock.
 		const coordinator = vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
 			recoverTransactionForParticipant: async () => ({ state: "driving" as const }),
-		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
+		} as unknown as DurableObjectStub<FokosDBTransactionCoordinatorDO>);
 		try {
 			const items = withOpIndex([
 				{ hashKey: kb("split-ttl-put"), sortKey: kb("sk"), operation: "put" as const, data: "value", kind: "text" as const, ttlAt },
@@ -372,7 +372,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 	});
 });
 
-describe("PartitionDO — single-partition read snapshot", () => {
+describe("FokosDBPartitionDO — single-partition read snapshot", () => {
 	it("answers every key from local storage, positionally matched to the request", async () => {
 		const { ctx, rpc } = makeStub();
 		await rpc.apiPutItem(ctx, { hashKey: kb("snap-a"), sortKey: kb("sk"), data: "a", kind: "text" as const });
@@ -418,7 +418,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 	describe("after a hash split", () => {
 		/** Groups probe keys by the child DO that serves them, asking the split root who answered. */
 		async function keysByServingChild(
-			stub: DurableObjectStub<PartitionDO>,
+			stub: DurableObjectStub<FokosDBPartitionDO>,
 			ctx: FokosDBRouteContext,
 			count: number,
 		): Promise<Map<string, string[]>> {

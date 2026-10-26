@@ -7,7 +7,7 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { DEFAULT_LIMITS, encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
@@ -55,22 +55,25 @@ function insertCommittedToken(state: DurableObjectState, token: string): void {
  * needs two tokens, so the helper adds a committed token of its own.
  */
 async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<void> {
-	await runInDurableObject(coordinatorStub(coordinator.doName), async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
-		insertCommittedToken(state, `tc-split-filler-${crypto.randomUUID()}`);
-		const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
-		try {
-			instance.fokos.requestSplitEvaluation();
-			await vi.waitFor(() => expect(instance.fokos.lifecycle().activeRepartition).not.toBeNull(), { timeout: 5_000, interval: 10 });
-		} finally {
-			size.mockRestore();
-		}
-	});
+	await runInDurableObject(
+		coordinatorStub(coordinator.doName),
+		async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+			insertCommittedToken(state, `tc-split-filler-${crypto.randomUUID()}`);
+			const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
+			try {
+				instance.fokos.requestSplitEvaluation();
+				await vi.waitFor(() => expect(instance.fokos.lifecycle().activeRepartition).not.toBeNull(), { timeout: 5_000, interval: 10 });
+			} finally {
+				size.mockRestore();
+			}
+		},
+	);
 }
 
 async function roleOf(coordinator: FokosDBRouteContext): Promise<string> {
 	return await runInDurableObject(
 		coordinatorStub(coordinator.doName),
-		(instance: TransactionCoordinatorDO) => instance.fokos.lifecycle().role,
+		(instance: FokosDBTransactionCoordinatorDO) => instance.fokos.lifecycle().role,
 	);
 }
 
@@ -83,7 +86,7 @@ async function awaitSplitSettled(coordinator: FokosDBRouteContext, token: string
 	let owner: FokosPartitionRef | null = null;
 	await vi.waitFor(
 		async () => {
-			const { children, settled } = await runInDurableObject(stub, (instance: TransactionCoordinatorDO) => {
+			const { children, settled } = await runInDurableObject(stub, (instance: FokosDBTransactionCoordinatorDO) => {
 				const lifecycle = instance.fokos.lifecycle();
 				const resolved = instance.fokos.resolveOwner(tokenKey(token));
 				if (resolved.kind === "remote") {
@@ -98,7 +101,7 @@ async function awaitSplitSettled(coordinator: FokosDBRouteContext, token: string
 			for (const child of children) {
 				const importState = await runInDurableObject(
 					coordinatorStub(child.ref.doName),
-					(instance: TransactionCoordinatorDO) => instance.fokos.lifecycle().import?.state,
+					(instance: FokosDBTransactionCoordinatorDO) => instance.fokos.lifecycle().import?.state,
 				);
 				expect(importState).toBe("active");
 			}
@@ -121,7 +124,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		await queueCoordinatorSplit(root);
 		const owner = await awaitSplitSettled(root, token);
 
-		await runInDurableObject(coordinatorStub(owner.doName), (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+		await runInDurableObject(coordinatorStub(owner.doName), (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			const rows = state.storage.sql.exec(`SELECT transaction_id, state FROM tc_state WHERE idempotency_token = ?`, token).toArray();
 			expect(rows).toEqual([{ transaction_id: first.transactionId, state: "COMMITTED" }]);
 		});
@@ -161,7 +164,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			const commits = await txCalls(db, keys, "txCommit");
 			expect(commits.map((commit) => commit.transactionId)).toEqual([result.transactionId, result.transactionId]);
 			const owner = await awaitSplitSettled(root, token);
-			await runInDurableObject(coordinatorStub(owner.doName), (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+			await runInDurableObject(coordinatorStub(owner.doName), (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 				const rows = state.storage.sql.exec(`SELECT transaction_id, state FROM tc_state WHERE idempotency_token = ?`, token).toArray();
 				expect(rows).toEqual([{ transaction_id: result.transactionId, state: "COMMITTED" }]);
 			});
@@ -180,7 +183,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		// to confirm, so one recovery step completes it.
 		const root = coordinatorRouter(db).allRoots()[0];
 		const transactionId = `tx-${crypto.randomUUID()}`;
-		await runInDurableObject(coordinatorStub(root.doName), (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+		await runInDurableObject(coordinatorStub(root.doName), (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
 				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
 				 VALUES (?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
@@ -198,7 +201,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			async () => {
 				const rows = await runInDurableObject(
 					coordinatorStub(owner.doName),
-					(_instance: TransactionCoordinatorDO, state: DurableObjectState) =>
+					(_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) =>
 						state.storage.sql.exec(`SELECT state FROM tc_state WHERE transaction_id = ?`, transactionId).toArray(),
 				);
 				expect(rows).toEqual([{ state: "CANCELLED" }]);
@@ -259,7 +262,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		});
 
 		const root = coordinatorRouter(db).allRoots()[0];
-		await runInDurableObject(coordinatorStub(root.doName), async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+		await runInDurableObject(coordinatorStub(root.doName), async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			insertCommittedToken(state, `${token}-second`);
 			const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 			try {
@@ -294,34 +297,37 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const root = coordinatorRouter(db).allRoots()[0];
 		const logged = captureConsoleError();
 		try {
-			await runInDurableObject(coordinatorStub(root.doName), async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
-				const floorLogs = () => logged.withMessage(FLOOR_MESSAGE);
-				const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
-				try {
-					// Each refusal runs the decision before it throws.
-					for (const attempt of [1, 2]) {
-						await expect(
-							instance.initiateWrite(instance.fokos.routeContext(), {
-								clientRequestToken: `${token}-refused-${attempt}`,
-								table: createTableConfig(db.options()),
-								items: [],
-								executionMode: "standard",
-							}),
-						).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
-					}
-					expect(floorLogs()).toEqual([expect.objectContaining({ doName: root.doName, maxSizeBytes: expect.any(Number) })]);
+			await runInDurableObject(
+				coordinatorStub(root.doName),
+				async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+					const floorLogs = () => logged.withMessage(FLOOR_MESSAGE);
+					const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
+					try {
+						// Each refusal runs the decision before it throws.
+						for (const attempt of [1, 2]) {
+							await expect(
+								instance.initiateWrite(instance.fokos.routeContext(), {
+									clientRequestToken: `${token}-refused-${attempt}`,
+									table: createTableConfig(db.options()),
+									items: [],
+									executionMode: "standard",
+								}),
+							).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
+						}
+						expect(floorLogs()).toEqual([expect.objectContaining({ doName: root.doName, maxSizeBytes: expect.any(Number) })]);
 
-					// A decision under the cap clears the flag, so the next decision at the floor logs again.
-					size.mockReturnValue(0);
-					instance.fokos.requestSplitEvaluation();
-					size.mockReturnValue(Number.MAX_SAFE_INTEGER);
-					instance.fokos.requestSplitEvaluation();
-					expect(floorLogs()).toHaveLength(2);
-				} finally {
-					size.mockRestore();
-				}
-				expect(instance.fokos.lifecycle()).toMatchObject({ role: "owner", activeRepartition: null });
-			});
+						// A decision under the cap clears the flag, so the next decision at the floor logs again.
+						size.mockReturnValue(0);
+						instance.fokos.requestSplitEvaluation();
+						size.mockReturnValue(Number.MAX_SAFE_INTEGER);
+						instance.fokos.requestSplitEvaluation();
+						expect(floorLogs()).toHaveLength(2);
+					} finally {
+						size.mockRestore();
+					}
+					expect(instance.fokos.lifecycle()).toMatchObject({ role: "owner", activeRepartition: null });
+				},
+			);
 		} finally {
 			logged.spy.mockRestore();
 		}
@@ -338,7 +344,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const owner = await awaitSplitSettled(root, token);
 		const child = coordinatorStub(owner.doName);
 
-		const record = await runInDurableObject(child, (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+		const record = await runInDurableObject(child, (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			const imported = state.storage.kv.get<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT)!;
 			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...imported, state: "importing" });
 			return imported;
@@ -346,7 +352,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		try {
 			// runInDurableObject keeps the caught rejection inside the DO's execution context, so it does not
 			// leak as an unhandled rejection at the worker level.
-			await runInDurableObject(child, async (instance: TransactionCoordinatorDO) => {
+			await runInDurableObject(child, async (instance: FokosDBTransactionCoordinatorDO) => {
 				const childCtx = instance.fokos.routeContext();
 				await expect(
 					instance.initiateWrite(childCtx, {
@@ -361,7 +367,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				).rejects.toThrow(fokosErrorWith("partition_migrating"));
 			});
 		} finally {
-			await runInDurableObject(child, (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+			await runInDurableObject(child, (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 				state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, record);
 			});
 		}

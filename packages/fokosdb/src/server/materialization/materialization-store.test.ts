@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { MaterializationDO } from "./do-materialization.js";
+import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
 
@@ -18,7 +18,7 @@ type Harness = {
 
 async function withStore(fn: (h: Harness) => void): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`mat-store.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const store = new MaterializationStore(state.storage);
 		const image = (hk: string, revision: number, deleted: boolean): LatestImage =>
 			deleted

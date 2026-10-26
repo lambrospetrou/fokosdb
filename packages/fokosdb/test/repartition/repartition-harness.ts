@@ -15,7 +15,7 @@
  * RFC requires of it: eviction must not change behaviour.
  */
 import { runInDurableObject } from "cloudflare:test";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
@@ -166,7 +166,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		// — a cached stub would fail there with "cannot perform I/O on behalf of a different Durable
 		// Object", which is exactly the hop this harness exists to exercise.
 		const enter = async <T>(fn: (e: NodeEnv) => T | Promise<T>): Promise<T> =>
-			await runInDurableObject(testPartitionStub(stubName), async (_i: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(testPartitionStub(stubName), async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const sharding = new FokosShardingStore(storage);
 				const store = new PartitionStore(storage);

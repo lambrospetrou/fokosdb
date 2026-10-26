@@ -83,7 +83,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add custom jobs to run on alarms, with their own best-effort interval.
 - Add operation hooks that will run on the final serving partition (onAfterOperation).
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
-- Add FokosStd class with helper methods (e.g. paginator for queryItems).
+- Add FokosDBStd class with helper methods (e.g. paginator for queryItems).
 - Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Think about backups and export in a consistent fashion using Durable Object bookmarks.

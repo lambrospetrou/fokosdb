@@ -1,5 +1,5 @@
 /**
- * `fokosPrepareDestroy`, `fokosStatus` and `fokosPromotions` on a real `PartitionDO`.
+ * `fokosPrepareDestroy`, `fokosStatus` and `fokosPromotions` on a real `FokosDBPartitionDO`.
  *
  * A destroy traversal makes these RPCs before it deletes anything. The fence stops every background
  * transition. The status gives the split targets, and the paginated promotions listing gives the range
@@ -8,7 +8,7 @@
  */
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -27,7 +27,7 @@ async function allPromotionEntries(partition: TestPartition) {
 	return entries;
 }
 
-describe.concurrent("PartitionDO — fokosStatus", () => {
+describe.concurrent("FokosDBPartitionDO — fokosStatus", () => {
 	it("bootstraps an empty root from its context and reports no repartition", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
@@ -55,7 +55,7 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 		});
 		expect(await stub.fokosPromotions({ cursor: null })).toEqual({ entries: [], nextCursor: null });
 		// A target request carries no context, so the partition must still have none of its own.
-		await runInDurableObject(stub, (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(state.storage.kv.get(FOKOS_KV_KEYS.IDENTITY)).toBeUndefined();
 		});
 		expect(ctx.doName).not.toBe(targetName);
@@ -100,13 +100,13 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" });
 		const { ctx: otherCtx } = makeStub();
 
-		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(instance.fokosStatus({ rootContext: otherCtx })).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});
 });
 
-describe("PartitionDO — fokosPrepareDestroy", () => {
+describe("FokosDBPartitionDO — fokosPrepareDestroy", () => {
 	it("sets the fence, cancels the alarm, and adds no target when the DO wakes", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.triggerHashSplit();
@@ -116,11 +116,11 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 		const fenced = await partition.stub.fokosStatus({});
 		expect(fenced.destroying).toBe(true);
 		// The fence is durable, so nothing the DO wakes up to do can move the state on.
-		await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(partition.stub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).toBeNull();
 		});
 		expect(await runDurableObjectAlarm(partition.stub)).toBe(false);
-		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			await instance.alarm({ retryCount: 0, isRetry: false, scheduledTime: Date.now() });
 		});
 
@@ -140,7 +140,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 
 		await partition.stub.fokosPrepareDestroy({});
 
-		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(instance.apiPutItem(partition.ctx, { hashKey: kb("hk"), sortKey: kb("sk2"), data: "v", kind: "text" })).rejects.toThrow(
 				fokosErrorWith("partition_migrating"),
 			);
@@ -162,7 +162,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 		await expect(partition.stub.fokosPrepareDestroy({})).resolves.toBeUndefined();
 		await expect(partition.stub.fokosPrepareDestroy({})).resolves.toBeUndefined();
 
-		await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(partition.stub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).toBeNull();
 		});
 	});
@@ -211,7 +211,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 		const after = await partition.stub.fokosStatus({});
 		expect(after.destroying).toBe(true);
 		expect(after.split.every((e) => e.repartition.state === "queued" || e.repartition.state === "planned")).toBe(true);
-		await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(partition.stub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).toBeNull();
 		});
 	});

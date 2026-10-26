@@ -5,7 +5,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
-import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { TransactWriteItem } from "../../src/shared/transaction-api-types.js";
@@ -256,7 +256,7 @@ describe("transactWriteItems - ordered_per_item recovery", () => {
 
 		await partition.testClearTxResponse("txCommit");
 		await coordinator.testConfig({});
-		await runInDurableObject(coordinator, async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+		await runInDurableObject(coordinator, async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(`UPDATE tc_state SET next_recovery_at = 0 WHERE completed_at IS NULL`);
 			await (instance as unknown as { recoverStaleTransactions(): Promise<void> }).recoverStaleTransactions();
 			expect(state.storage.sql.exec<{ state: string }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, token).one().state).toBe(

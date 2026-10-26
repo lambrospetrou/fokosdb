@@ -1,5 +1,5 @@
 /**
- * Measures the expression engine inside a `PartitionDO`: the compile, the partition path, and the SQLite
+ * Measures the expression engine inside a `FokosDBPartitionDO`: the compile, the partition path, and the SQLite
  * statement over the `items` table of that partition. Run it with
  * `pnpm --filter fokosdb bench:workerd expression`.
  *
@@ -19,7 +19,7 @@
  */
 import { runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { makeStub } from "../partition-do/helpers.js";
 import {
 	BENCH_HASH_KEY,
@@ -64,9 +64,9 @@ function measure(fn: () => unknown): number {
 	return samples[Math.floor(SAMPLES / 2)];
 }
 
-it("expression compile and SQLite statements in a PartitionDO", async () => {
+it("expression compile and SQLite statements in a FokosDBPartitionDO", async () => {
 	const { ctx, stub } = makeStub();
-	const rows = await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+	const rows = await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		for (let i = 0; i < BENCH_ITEM_COUNT; i++) {
 			const put = await instance.apiPutItem(ctx, {
 				hashKey: BENCH_HASH_KEY,
@@ -93,7 +93,7 @@ it("expression compile and SQLite statements in a PartitionDO", async () => {
 	expect(sink.some((v) => v !== undefined)).toBe(true);
 	console.log(
 		[
-			`workerd, PartitionDO with ${BENCH_ITEM_COUNT} items, µs per call, median of ${SAMPLES} batches of at least ${MIN_BATCH_MS} ms`,
+			`workerd, FokosDBPartitionDO with ${BENCH_ITEM_COUNT} items, µs per call, median of ${SAMPLES} batches of at least ${MIN_BATCH_MS} ms`,
 			"| Case | Tree B | SQL B | Binds | Compile | Path | SQLite first | SQLite again |",
 			"| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
 			...rows,

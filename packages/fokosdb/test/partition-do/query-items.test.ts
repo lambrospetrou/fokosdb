@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
-	PartitionDO,
+	FokosDBPartitionDO,
 	QueryItemsRpcRequest,
 	QueryItemsRpcResponse,
 	type ProjectedWireRow,
@@ -33,7 +33,7 @@ import {
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
 // operates at the same time cannot remove it.
-describe("PartitionDO — range split", () => {
+describe("FokosDBPartitionDO — range split", () => {
 	// One request with every budget wide open; tests override the budget they exercise.
 	const fullRequest = (overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 		hashKey: kb("alice"),
@@ -91,7 +91,7 @@ describe("PartitionDO — range split", () => {
 		it("reads one candidate beyond a full evaluated-item budget and returns an inclusive cursor", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-eval");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 
 				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 10 })));
@@ -108,7 +108,7 @@ describe("PartitionDO — range split", () => {
 		it("returns no cursor when the evaluated-item budget ends on the last candidate", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-last");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 
 				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 45 })));
@@ -123,7 +123,7 @@ describe("PartitionDO — range split", () => {
 		it("count mode returns no items, zero response bytes, and the same page counters", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-count");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 
 				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 10 })));
@@ -142,7 +142,7 @@ describe("PartitionDO — range split", () => {
 		it("count mode with a filter returns the matched count below scannedCount", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-count-filter");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 				const plan = queryTree({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "040" }] } });
 
@@ -160,7 +160,7 @@ describe("PartitionDO — range split", () => {
 		it("a rejected candidate consumes the evaluated budgets and advances the cursor", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-rejected");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 				const plan = queryTree({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "044" }] } });
 
@@ -194,7 +194,7 @@ describe("PartitionDO — range split", () => {
 		it("a rejected candidate spends zero response bytes", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-bigzero");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({
@@ -221,7 +221,7 @@ describe("PartitionDO — range split", () => {
 		it("count and projection pages can stop at different positions and exchange cursors", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-exchange");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({
@@ -266,7 +266,7 @@ describe("PartitionDO — range split", () => {
 		it("physical rowsRead is reported from SQLite and is not derived from the logical counters", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-rowsread");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 
 				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 10 })));
@@ -281,7 +281,7 @@ describe("PartitionDO — range split", () => {
 			async (direction) => {
 				const { ctx, stub } = leaf;
 				const hashKey = kb(`lp-projection-${direction}`);
-				await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 					seed45(state, hashKey);
 					const plan = queryTree({
 						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }],
@@ -303,7 +303,7 @@ describe("PartitionDO — range split", () => {
 		it("a projection page stops on the response budget over the projected rows", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-projbudget");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				// A 60 KiB text cell estimates at 64 + 120 KiB, so two rows fit a 250 KiB page.
 				const doc = JSON.stringify({ big: "x".repeat(60 * 1024) });
@@ -332,7 +332,7 @@ describe("PartitionDO — range split", () => {
 		it("keeps undefined projected cells across the RPC hop", async () => {
 			const { ctx, stub, rpc } = leaf;
 			const hashKey = kb("lp-undefined");
-			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
 					// `opt` exists on every other item, so every other wire row has a missing first cell.
@@ -372,7 +372,7 @@ describe("PartitionDO — range split", () => {
 		it("runs a projection at the entry limit through the leaf", async () => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb("lp-limit");
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				const doc = Object.fromEntries(Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => [`f${k}`, k]));
 				store.upsertItem({ hk: hashKey, sk: kb("s"), data: JSON.stringify(doc), kind: "json", ttlAt: null, txOrderTs: 0 });
@@ -391,7 +391,7 @@ describe("PartitionDO — range split", () => {
 		it.each(["asc", "desc"] as const)("pages 400 KiB items without gaps or duplicates in %s order", async (direction) => {
 			const { ctx, stub } = leaf;
 			const hashKey = kb(`lp-huge-${direction}`);
-			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (const sk of ["a", "b", "c"]) {
 					const dataBytes = MAX_ITEM_BYTES - hashKey.byteLength - kb(sk).byteLength - EST_ROW_BYTES_K;

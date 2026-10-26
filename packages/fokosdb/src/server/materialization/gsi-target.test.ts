@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { MaterializationDO } from "./do-materialization.js";
+import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
 import type { ExpressionValue } from "../../shared/expression/types.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
@@ -13,7 +13,7 @@ const NO_SK = KeyCodec.encodeOptional(undefined);
 
 async function withStore(fn: (store: MaterializationStore, sql: SqlStorage) => void): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`gsi-target.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		fn(new MaterializationStore(state.storage), state.storage.sql);
 	});
 }

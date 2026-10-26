@@ -38,7 +38,7 @@ only `fokosdb/client` and `fokosdb/server`.
 | Import                    | What it gives you                                                 | Where it runs              |
 | ------------------------- | ----------------------------------------------------------------- | -------------------------- |
 | `fokosdb/client`          | `FokosDB`, its option and error types                             | Your Worker's request path |
-| `fokosdb/server`          | `PartitionDO`, `TransactionCoordinatorDO`                         | The Durable Objects        |
+| `fokosdb/server`          | `FokosDBPartitionDO`, `FokosDBTransactionCoordinatorDO`           | The Durable Objects        |
 | `fokosdb/sharding/client` | `FokosShardingClient`, routing types and errors                   | Your Worker's request path |
 | `fokosdb/sharding/server` | `FokosShardingRuntime`, for your own sharded Durable Object class | Your Durable Objects       |
 
@@ -74,16 +74,16 @@ the client one time at module scope or for each request.
 The options in `table` select the Durable Objects of the table. Every client of the table must give
 the same values, and the values must never change after the table has data.
 
-| Option              | Required | What it selects                                                                         |
-| ------------------- | -------- | --------------------------------------------------------------------------------------- |
-| `name`              | Yes      | The names of the Durable Objects. It must not start with `fokos.`.                      |
-| `ns`                | Yes      | The binding of the `PartitionDO` namespace.                                             |
-| `nsTx`              | Yes      | The binding of the `TransactionCoordinatorDO` namespace.                                |
-| `nsMat`             | No       | The binding of the `MaterializationDO` namespace. Required when `captureChanges` is on. |
-| `rootTreesN`        | Yes      | The number of root partitions, from 1 to 65,000.                                        |
-| `hashSplitN`        | Yes      | The number of children of each hash split, from 2 to 255.                               |
-| `coordinatorRootsN` | No       | The number of root transaction coordinators. Default: `2 * rootTreesN`, at most 65,000. |
-| `jurisdiction`      | No       | The jurisdiction of every Durable Object of the table. See the section below.           |
+| Option              | Required | What it selects                                                                                |
+| ------------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `name`              | Yes      | The names of the Durable Objects. It must not start with `fokos.`.                             |
+| `ns`                | Yes      | The binding of the `FokosDBPartitionDO` namespace.                                             |
+| `nsTx`              | Yes      | The binding of the `FokosDBTransactionCoordinatorDO` namespace.                                |
+| `nsMat`             | No       | The binding of the `FokosDBMaterializationDO` namespace. Required when `captureChanges` is on. |
+| `rootTreesN`        | Yes      | The number of root partitions, from 1 to 65,000.                                               |
+| `hashSplitN`        | Yes      | The number of children of each hash split, from 2 to 255.                                      |
+| `coordinatorRootsN` | No       | The number of root transaction coordinators. Default: `2 * rootTreesN`, at most 65,000.        |
+| `jurisdiction`      | No       | The jurisdiction of every Durable Object of the table. See the section below.                  |
 
 > [!WARNING]
 > If you change `name`, `ns`, `nsTx` or `jurisdiction`, the client connects to other, empty Durable
@@ -149,7 +149,7 @@ classes is not enough — re-export them, or the deploy fails with an unresolved
 
 ```ts
 // src/index.ts
-export { PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
+export { FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
 
 export default {
 	async fetch(request, env, ctx) {
@@ -164,15 +164,15 @@ Then declare the bindings and the migration:
 {
 	"durable_objects": {
 		"bindings": [
-			{ "name": "FOKOSDB_PARTITION_DO", "class_name": "PartitionDO" },
-			{ "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO", "class_name": "TransactionCoordinatorDO" },
+			{ "name": "FOKOSDB_PARTITION_DO", "class_name": "FokosDBPartitionDO" },
+			{ "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO", "class_name": "FokosDBTransactionCoordinatorDO" },
 		],
 	},
-	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO"] }],
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["FokosDBPartitionDO", "FokosDBTransactionCoordinatorDO"] }],
 }
 ```
 
-Subclassing `PartitionDO` works, and a subclass needs its own binding, its own entry in
+Subclassing `FokosDBPartitionDO` works, and a subclass needs its own binding, its own entry in
 `new_sqlite_classes`, and its own re-export.
 
 ### Cache the topology with Workers Cache
@@ -184,7 +184,7 @@ root forwards it to the partition that owns the key. With the topology cache, th
 partitions, and the coordinators read the topology of the table, and send each request to the
 deepest known partition.
 
-`FokosDBAutoAdminDO` records each completed split of the table. The `FokosTopologyCache` entrypoint
+`FokosDBAutoAdminDO` records each completed split of the table. The `FokosDBTopologyCache` entrypoint
 serves this topology, and [Workers Cache](https://developers.cloudflare.com/workers/cache/) keeps each
 answer for 10 seconds. After that, Workers Cache serves the stale answer for up to 600 seconds while it
 gets a new one. A stale topology is safe: a partition forwards a request that it does not own.
@@ -192,11 +192,11 @@ gets a new one. A stale topology is safe: a partition forwards a request that it
 You need Wrangler 4.107.0 or later, and a compatibility date of 2025-11-17 or later (or the
 `enable_ctx_exports` compatibility flag).
 
-1. Re-export `FokosDBAutoAdminDO` and `FokosTopologyCache` from the main module of your Worker:
+1. Re-export `FokosDBAutoAdminDO` and `FokosDBTopologyCache` from the main module of your Worker:
 
    ```ts
    // src/index.ts
-   export { PartitionDO, TransactionCoordinatorDO, FokosDBAutoAdminDO, FokosTopologyCache } from "fokosdb/server";
+   export { FokosDBPartitionDO, FokosDBTransactionCoordinatorDO, FokosDBAutoAdminDO, FokosDBTopologyCache } from "fokosdb/server";
    ```
 
 2. Bind the admin Durable Object, add its migration, and enable Workers Cache for the topology
@@ -207,17 +207,17 @@ You need Wrangler 4.107.0 or later, and a compatibility date of 2025-11-17 or la
    {
    	"durable_objects": {
    		"bindings": [
-   			{ "name": "FOKOSDB_PARTITION_DO", "class_name": "PartitionDO" },
-   			{ "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO", "class_name": "TransactionCoordinatorDO" },
+   			{ "name": "FOKOSDB_PARTITION_DO", "class_name": "FokosDBPartitionDO" },
+   			{ "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO", "class_name": "FokosDBTransactionCoordinatorDO" },
    			{ "name": "FOKOSDB_ADMIN_DO", "class_name": "FokosDBAutoAdminDO" },
    		],
    	},
    	"migrations": [
-   		{ "tag": "v1", "new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO"] },
+   		{ "tag": "v1", "new_sqlite_classes": ["FokosDBPartitionDO", "FokosDBTransactionCoordinatorDO"] },
    		{ "tag": "v2", "new_sqlite_classes": ["FokosDBAutoAdminDO"] },
    	],
    	"exports": {
-   		"FokosTopologyCache": { "type": "worker", "cache": { "enabled": true } },
+   		"FokosDBTopologyCache": { "type": "worker", "cache": { "enabled": true } },
    	},
    }
    ```
@@ -235,7 +235,7 @@ You need Wrangler 4.107.0 or later, and a compatibility date of 2025-11-17 or la
    		hashSplitN: 4,
    	},
    	nsAdmin: "FOKOSDB_ADMIN_DO",
-   	topologyEntrypoint: "FokosTopologyCache",
+   	topologyEntrypoint: "FokosDBTopologyCache",
    });
    ```
 
@@ -259,16 +259,16 @@ query of a GSI can miss a recent write.
 > list. If you change `fokosTargets()` later, the partitions log an error and keep the stored list.
 > If you turn on `captureChanges` on a table that has data, the GSIs never get the older items.
 
-1. Make a subclass of `MaterializationDO`, and declare the GSIs in `fokosTargets()`. The `targetId`
+1. Make a subclass of `FokosDBMaterializationDO`, and declare the GSIs in `fokosTargets()`. The `targetId`
    is the name of the GSI. This example declares two GSIs on a table of orders:
 
    ```ts
    // src/index.ts
-   import { MaterializationDO, type FokosTargetDefinition } from "fokosdb/server";
+   import { FokosDBMaterializationDO, type FokosTargetDefinition } from "fokosdb/server";
 
-   export { PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
+   export { FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
 
-   export class OrdersMaterializationDO extends MaterializationDO {
+   export class OrdersMaterializationDO extends FokosDBMaterializationDO {
    	protected override fokosTargets(): readonly FokosTargetDefinition[] {
    		return [
    			// The orders of a customer, sorted by `createdAt`. Each entry holds the full item.
@@ -299,12 +299,14 @@ query of a GSI can miss a recent write.
    {
    	"durable_objects": {
    		"bindings": [
-   			{ "name": "FOKOSDB_PARTITION_DO", "class_name": "PartitionDO" },
-   			{ "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO", "class_name": "TransactionCoordinatorDO" },
+   			{ "name": "FOKOSDB_PARTITION_DO", "class_name": "FokosDBPartitionDO" },
+   			{ "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO", "class_name": "FokosDBTransactionCoordinatorDO" },
    			{ "name": "FOKOSDB_ORDERS_MATERIALIZATION_DO", "class_name": "OrdersMaterializationDO" },
    		],
    	},
-   	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO", "OrdersMaterializationDO"] }],
+   	"migrations": [
+   		{ "tag": "v1", "new_sqlite_classes": ["FokosDBPartitionDO", "FokosDBTransactionCoordinatorDO", "OrdersMaterializationDO"] },
+   	],
    }
    ```
 
@@ -360,7 +362,7 @@ The rules of a GSI:
 - In a `filter` or a `projection` of a GSI query, `{ ref: "sortKey" }` reads the GSI sort key.
 - More than one item can have the same GSI keys. A GSI does not make a key unique.
 - When the GSI key of an item changes, a query can return the old entry and the new entry for a short time.
-- The GSI entries are in the `PartitionDO` namespace of the table. `db.destroy()` also deletes each GSI.
+- The GSI entries are in the `FokosDBPartitionDO` namespace of the table. `db.destroy()` also deletes each GSI.
 
 ## Package layout
 
@@ -390,7 +392,7 @@ package export condition for.
 | `pnpm lint:pkg`                 | `publint` on the packaged output                                                                               |
 | `pnpm cf-typegen`               | Regenerate `worker-configuration.d.ts`                                                                         |
 | `pnpm bench:expression`         | Expression engine benchmarks                                                                                   |
-| `pnpm bench:workerd expression` | Expression compile and SQLite statement times inside a `PartitionDO`                                           |
+| `pnpm bench:workerd expression` | Expression compile and SQLite statement times inside a `FokosDBPartitionDO`                                    |
 | `pnpm bench:alloc:expression`   | Heap bytes of the expression compile, in Node                                                                  |
 
 `wrangler.jsonc` here is never deployed. It gives vitest and `wrangler types` an entry point

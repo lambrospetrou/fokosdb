@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { BatchGetItemsRpcRequest, BatchGetItemsRpcResponse } from "../../src/server/do-partition.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { MAX_BATCH_GET_RESPONSE_BYTES, MAX_ITEMS_PER_BATCH } from "../../src/shared/transaction-limits.js";
-import { FokosStd } from "../../src/client/fokos-std.js";
+import { FokosDBStd } from "../../src/client/fokos-std.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { controlledPartition, keysAcrossPartitions, makeDB, partitionNameOf } from "../transactions/tx-helpers.js";
 import { kb } from "./helpers.js";
@@ -39,7 +39,7 @@ async function batchGet(partition: TestPartition, req: BatchGetItemsRpcRequest):
 const put = (partition: TestPartition, hashKey: string, sortKey: string, data: string) =>
 	partition.put({ hashKey: kb(hashKey), sortKey: kb(sortKey), data, kind: "text" });
 
-describe.concurrent("PartitionDO — apiBatchGetItems", () => {
+describe.concurrent("FokosDBPartitionDO — apiBatchGetItems", () => {
 	it("answers found and absent items by opIndex, with no key", async () => {
 		const partition = makePartition();
 		await put(partition, "a", "1", "one");
@@ -232,7 +232,7 @@ describe.concurrent("FokosDB.batchGetItems", () => {
 		}
 		expect(read.unprocessedKeys).toEqual(keys.slice(2));
 
-		const retried = await FokosStd.batchGetItemsWithRetry(db, { items: keys, maxResponseBytes }, { baseDelayMs: 1, maxDelayMs: 2 });
+		const retried = await FokosDBStd.batchGetItemsWithRetry(db, { items: keys, maxResponseBytes }, { baseDelayMs: 1, maxDelayMs: 2 });
 		expect(retried.items.map((item) => item.outcome)).toEqual(keys.map(() => "found"));
 		expect(retried.unprocessedKeys).toEqual([]);
 	});

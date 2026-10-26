@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { KeyCodec } from "./key-codec.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
@@ -12,14 +12,14 @@ const REFRESH_MS = DEFAULT_RUNTIME_CONFIG.rangeHierarchyRefreshMs;
 const kb = (s: string) => KeyCodec.encode(s);
 const UNBOUNDED = KeyCodec.encodeOptional(undefined);
 
-// Runs `fn` against a FokosShardingStore over REAL Durable Object storage. The PartitionDO constructor
+// Runs `fn` against a FokosShardingStore over REAL Durable Object storage. The FokosDBPartitionDO constructor
 // has already run the sharding migrations by the time the callback runs, and they are idempotent.
 async function withStore(
 	fn: (store: FokosShardingStore, state: DurableObjectState) => void | Promise<void>,
 	options?: FokosShardingStoreOptions,
 ): Promise<void> {
 	const stub = testPartitionStub(`sharding-store-test.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new FokosShardingStore(state.storage, options);
 		store.runMigrations();
 		await fn(store, state);

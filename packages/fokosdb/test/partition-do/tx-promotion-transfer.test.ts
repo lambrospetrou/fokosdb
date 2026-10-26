@@ -11,7 +11,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testCoordinatorContext, testCoordinatorRef } from "../stub-helpers.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
@@ -102,7 +102,7 @@ async function awaitNoCopies(partition: TestPartition, transactionId: string): P
 	);
 }
 
-describe("PartitionDO — a promotion source and the locks of the key it moved", () => {
+describe("FokosDBPartitionDO — a promotion source and the locks of the key it moved", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -112,7 +112,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		const transactionId = crypto.randomUUID();
 		const prepare = prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }], "bob-v1");
 		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
@@ -135,7 +135,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 	it("answers committed and applies nothing when only the copies remain", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
@@ -148,7 +148,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
 		// The payload of the copy belongs to the target, which applies it. A read of the key goes
 		// to the range root, so the source storage answers this.
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ?`, kb("alice")).one().n).toBe(0);
 		});
 	});
@@ -164,7 +164,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 			]),
 		);
 		expect(prepared).toMatchObject({ outcome: "accepted" });
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
@@ -179,7 +179,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).toMatchObject({ outcome: "accepted" });
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
@@ -193,7 +193,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).toMatchObject({ outcome: "accepted" });
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
@@ -211,7 +211,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		const keys = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => ({ hashKey: "bob", sortKey: `sk${String(i).padStart(3, "0")}` }));
 		const prepare = prepareOf(transactionId, keys, "many");
 		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
@@ -229,7 +229,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 	});
 });
 
-describe("PartitionDO — emergency repair on a promotion source", () => {
+describe("FokosDBPartitionDO — emergency repair on a promotion source", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -238,7 +238,7 @@ describe("PartitionDO — emergency repair on a promotion source", () => {
 		const now = Date.now();
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "bob", { guardedAt: now, data: "bob-v1" });
 			insertLock(state, transactionId, "alice", { guardedAt: now });
 			cutOverPromotion(state, "alice");
@@ -250,7 +250,7 @@ describe("PartitionDO — emergency repair on a promotion source", () => {
 		await expect(rpc.debugForceResolveTransaction(ctx, { transactionId, outcome: "commit" })).rejects.toThrow(/partition_fanout_failed/);
 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			// The copy keeps its quarantine: only its owner can end it.
 			expect(new PartitionStore(state.storage).listPendingTxItems(transactionId)[0].guarded_at).toBe(now);
 		});
@@ -266,7 +266,7 @@ describe("PartitionDO — emergency repair on a promotion source", () => {
 	it("counts what it resolved and logs one line for a call with no forward", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "bob", { guardedAt: Date.now() });
 		});
 		const logged = vi.spyOn(console, "info").mockImplementation(() => {});
@@ -290,7 +290,7 @@ describe("PartitionDO — emergency repair on a promotion source", () => {
 	});
 });
 
-describe("PartitionDO — stale recovery on a promotion source", () => {
+describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -315,7 +315,7 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 		const transactionId = crypto.randomUUID();
 		await coordinator().testRecoverResponse({ value: { state: "COMMITTED" }, hold: true });
 
-		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, "alice", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			const dispatch = vi.spyOn(instance.fokos, "dispatch");
@@ -342,7 +342,7 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 		const { stub, coordinator, coordinatorDoName } = await partitionWithCoordinator();
 		const transactionId = crypto.randomUUID();
 
-		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, "alice", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			cutOverPromotion(state, "alice");
@@ -365,7 +365,7 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 
-		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, "bob", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			insertLock(state, transactionId, "alice", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
@@ -397,7 +397,7 @@ async function prepareOn(partition: TestPartition, keys: { hashKey: string; sort
 
 /** Quarantines every row of the transactions at `partition`, as the stale job does for an over-age lock. */
 async function quarantine(partition: TestPartition, guardedAt: number, ...transactionIds: string[]): Promise<void> {
-	await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		for (const transactionId of transactionIds) {
 			expect(store.guardPendingTx(transactionId, guardedAt)).toBe(true);
@@ -407,7 +407,7 @@ async function quarantine(partition: TestPartition, guardedAt: number, ...transa
 
 /** The `guarded_at` of each lock row of one transaction at `partition`. */
 async function guardsOf(partition: TestPartition, transactionId: string): Promise<(number | null)[]> {
-	return await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+	return await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		new PartitionStore(state.storage).listPendingTxItems(transactionId).map((row) => row.guarded_at),
 	);
 }
@@ -416,7 +416,7 @@ async function forceCommit(partition: TestPartition, transactionId: string) {
 	return await partition.rpc.debugForceResolveTransaction(partition.ctx, { transactionId, outcome: "commit" });
 }
 
-describe("PartitionDO — the locks of a key that a real promotion moves", () => {
+describe("FokosDBPartitionDO — the locks of a key that a real promotion moves", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -534,7 +534,7 @@ describe("PartitionDO — the locks of a key that a real promotion moves", () =>
 	});
 });
 
-describe("PartitionDO — the locks on a hash split router", () => {
+describe("FokosDBPartitionDO — the locks on a hash split router", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});

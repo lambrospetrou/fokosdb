@@ -384,7 +384,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 ];
 
-export class TransactionCoordinatorDO extends DurableObject<Env> implements CoordinatorRpc {
+export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implements CoordinatorRpc {
 	/** The sharding runtime: identity, routing, splits, and the alarm. The pool grows by hash splits. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>;
 	#migrations: SQLSchemaMigrations;
@@ -1465,7 +1465,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		// Cancel any participant not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
-		// (e.g., response lost in transit). PartitionDO.cancel is a no-op DELETE, so sending it
+		// (e.g., response lost in transit). FokosDBPartitionDO.cancel is a no-op DELETE, so sending it
 		// to a participant that never prepared is safe.
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(

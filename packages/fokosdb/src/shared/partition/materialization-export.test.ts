@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
@@ -58,7 +58,7 @@ async function withExporter(
 	fn: (h: Harness) => Promise<void>,
 ): Promise<void> {
 	const stub = testPartitionStub(`export-test.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		let exporter: MaterializationExporter | undefined;
 		const store = new PartitionStore(state.storage, { captureChanges: () => true, onChangeCaptured: () => exporter?.wake() });
 		const calls: ExportCall[] = [];

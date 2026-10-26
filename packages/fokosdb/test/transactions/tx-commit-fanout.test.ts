@@ -5,7 +5,7 @@ import { DEFAULT_FANOUT_REQUEST_BUDGET_MS } from "../../src/shared/transaction-l
 import { controlledCoordinator, controlledPartition, keysAcrossPartitions, makeDB, txCalls, writeOutcome } from "./tx-helpers.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
-import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 
 /**
  * The commit fan-out carries keys only, and the `committed` answer waits for every participant: a
@@ -223,7 +223,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 			const transactionId = await runInDurableObject(
 				coordinator,
-				(_instance: TransactionCoordinatorDO, state: DurableObjectState) =>
+				(_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) =>
 					state.storage.sql.exec<{ transaction_id: string }>(`SELECT transaction_id FROM tc_state WHERE idempotency_token = ?`, token).one()
 						.transaction_id,
 			);
@@ -231,7 +231,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			const state = async () =>
 				await runInDurableObject(
 					coordinator,
-					(_instance: TransactionCoordinatorDO, s: DurableObjectState) =>
+					(_instance: FokosDBTransactionCoordinatorDO, s: DurableObjectState) =>
 						s.storage.sql.exec<{ state: string }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, transactionId).one().state,
 				);
 			return { coordinator, token, transactionId, commits, state };
@@ -245,7 +245,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 
 			// A background step can already have taken the transaction and moved it forward, so the test
 			// makes it due again.
-			const elapsed = await runInDurableObject(coordinator, async (instance: TransactionCoordinatorDO, ctx: DurableObjectState) => {
+			const elapsed = await runInDurableObject(coordinator, async (instance: FokosDBTransactionCoordinatorDO, ctx: DurableObjectState) => {
 				ctx.storage.sql.exec(`UPDATE tc_state SET next_recovery_at = 0 WHERE completed_at IS NULL`);
 				const start = Date.now();
 				await (instance as unknown as { recoverStaleTransactions(): Promise<void> }).recoverStaleTransactions();

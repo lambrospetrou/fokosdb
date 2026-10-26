@@ -44,7 +44,7 @@ const queryRequest = (plan: QueryExpressions): QueryItemsRpcRequest => ({
 	plan,
 });
 
-describe("PartitionDO — a request that carries a compiled plan", () => {
+describe("FokosDBPartitionDO — a request that carries a compiled plan", () => {
 	// A client that still compiles sends the plan in the field of the expression tree. The cast gives
 	// the plan the type of the field, as the wire does.
 	const condition = compileConditionExpression(stateIs("open")) as unknown as ConditionExpression;
@@ -104,7 +104,7 @@ describe("PartitionDO — a request that carries a compiled plan", () => {
 	});
 });
 
-describe("PartitionDO — an expression tree that does not compile", () => {
+describe("FokosDBPartitionDO — an expression tree that does not compile", () => {
 	it("fails apiPutItem and apiDeleteItem with sql_limit, and writes nothing", async () => {
 		const { ctx, rpc } = makeStub();
 		const key = { hashKey: kb("hk"), sortKey: kb("sk") };
@@ -152,7 +152,7 @@ describe("PartitionDO — an expression tree that does not compile", () => {
 	});
 });
 
-describe("PartitionDO — an expression with a term that the compiler drops after it registered the bindings of the term", () => {
+describe("FokosDBPartitionDO — an expression with a term that the compiler drops after it registered the bindings of the term", () => {
 	// `$.a + 1` is a number or is absent, so the comparison with `null` never passes. The compiler finds
 	// that after it registered the bindings of `$.a` and `1`, and no SQL uses the two bindings. Workers
 	// SQLite refuses a statement that binds more values than it has parameters.
@@ -204,7 +204,7 @@ describe("PartitionDO — an expression with a term that the compiler drops afte
 	);
 });
 
-describe("PartitionDO — a comparison of a data path with a literal", () => {
+describe("FokosDBPartitionDO — a comparison of a data path with a literal", () => {
 	// The guard of the comparison is 0, never NULL, for an item that is absent, that is not JSON, that
 	// does not have the path, or that has a different type at the path. Thus `not` gives true for each.
 	const IS_X: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "x" }] };

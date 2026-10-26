@@ -1,5 +1,5 @@
 /**
- * The 2PC wire: what `db.ts`, the TransactionCoordinatorDO and the PartitionDO participants send each
+ * The 2PC wire: what `db.ts`, the FokosDBTransactionCoordinatorDO and the FokosDBPartitionDO participants send each
  * other. None of it reaches a caller of FokosDB — the caller-facing shapes are in
  * `transaction-api-types.ts`, which this module builds on and never imports back from.
  */
@@ -24,12 +24,12 @@ export type TransactionPartitionsAnswer = { partitions: WirePartitionMeta[] };
 /** The `meta` of the participant answers that one request to the coordinator got. The client adds `txCoordinator`. */
 export type ParticipantsMeta = Omit<FokosMeta, "txCoordinator">;
 
-// ─── PartitionDO — Prepare ────────────────────────────────────────────────────
+// ─── FokosDBPartitionDO — Prepare ────────────────────────────────────────────────────
 
 export type TransactionOperationType = "put" | "delete" | "check" | "update";
 
 /**
- * The key half of a wire-IN item (db.ts/TC → PartitionDO): canonical KeyBytes, with sortKey always
+ * The key half of a wire-IN item (db.ts/TC → FokosDBPartitionDO): canonical KeyBytes, with sortKey always
  * present — the empty KeyBytes ([]) is the absent sentinel. This is all the routing needs, so the
  * operations that only have to REACH the owning partition (cancel, read) carry this and nothing else.
  */
@@ -38,7 +38,7 @@ export type TransactionItemKey = {
 	sortKey: KeyBytes;
 };
 
-// Wire-IN type (db.ts/TC → PartitionDO): keys are canonical KeyBytes (encoded at the db.ts entry).
+// Wire-IN type (db.ts/TC → FokosDBPartitionDO): keys are canonical KeyBytes (encoded at the db.ts entry).
 // sortKey is always present — the empty KeyBytes ([]) is the absent sentinel.
 export type TransactionItem = TransactionItemKey & {
 	/**
@@ -119,7 +119,7 @@ export type PrepareOutcome =
 
 export type PrepareResponse = PrepareOutcome & TransactionPartitionsAnswer;
 
-// ─── PartitionDO — Commit ─────────────────────────────────────────────────────
+// ─── FokosDBPartitionDO — Commit ─────────────────────────────────────────────────────
 
 export type CommitRequest = {
 	transactionId: TransactionId;
@@ -137,7 +137,7 @@ export type CommitOutcome = { outcome: "committed" };
 
 export type CommitResponse = CommitOutcome & TransactionPartitionsAnswer;
 
-// ─── PartitionDO — Cancel ─────────────────────────────────────────────────────
+// ─── FokosDBPartitionDO — Cancel ─────────────────────────────────────────────────────
 
 export type CancelRequest = {
 	transactionId: TransactionId;
@@ -170,7 +170,7 @@ export type DebugForceResolveTransactionResponse = (CommitOutcome | CancelOutcom
 	forwarded: number;
 };
 
-// ─── PartitionDO — ReadForTransaction ─────────────────────────────────────────
+// ─── FokosDBPartitionDO — ReadForTransaction ─────────────────────────────────────────
 
 /** A read item on the wire: the canonical keys plus the projection of the item, when it has one. */
 export type TransactionReadItem = TransactionItemKey & { projection?: readonly ProjectionExpression[] };
@@ -227,7 +227,7 @@ export type IndexedReadItemEncoded = ReadForTransactionItemResultEncoded & { par
 
 export type ReadForTransactionResponse = { items: IndexedReadItemEncoded[] } & TransactionPartitionsAnswer;
 
-// ─── PartitionDO — SingleShot (single-partition fast path) ───────────────────
+// ─── FokosDBPartitionDO — SingleShot (single-partition fast path) ───────────────────
 
 /**
  * A whole `transactWriteItems` handed to ONE partition, which validates and applies it inside one
@@ -268,7 +268,7 @@ export type SingleShotOutcome =
 
 export type SingleShotResponse = (SingleShotOutcome & TransactionPartitionsAnswer) | { outcome: "not_applicable" };
 
-// ─── PartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
+// ─── FokosDBPartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
 
 /**
  * A whole `transactGetItems` handed to ONE partition. It carries no transaction id: nothing is
@@ -306,7 +306,7 @@ export type ReadSnapshotResponse = (ReadSnapshotOutcome & TransactionPartitionsA
  */
 export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
 
-// ─── TransactionCoordinatorDO — recoverTransaction ───────────────────────────
+// ─── FokosDBTransactionCoordinatorDO — recoverTransaction ───────────────────────────
 
 export type TCTerminalState = Extract<TCState, "COMMITTED" | "CANCELLED">;
 

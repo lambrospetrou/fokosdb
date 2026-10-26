@@ -169,7 +169,7 @@ export type FokosDBRetryOptions = {
 	/**
 	 * The attempts of each read of a read transaction, and of the single-partition read of
 	 * `transactGetItems`. A read applies nothing, so an attempt again is safe. It is also the maximum
-	 * number of calls of each `FokosStd` batch retry helper. Default: 5.
+	 * number of calls of each `FokosDBStd` batch retry helper. Default: 5.
 	 */
 	maxAttempts?: number;
 };
@@ -715,7 +715,7 @@ export class FokosDB {
 	}
 
 	/**
-	 * The read view of the GSI `indexName`, a `targetId` of a GSI target of the `MaterializationDO` of the
+	 * The read view of the GSI `indexName`, a `targetId` of a GSI target of the `FokosDBMaterializationDO` of the
 	 * table. A `sortKeyCondition` applies to the GSI sort key. An entry has the GSI keys and the keys of
 	 * its base item.
 	 */
@@ -781,7 +781,7 @@ export class FokosDB {
 	/**
 	 * Reads 0 to 100 items by key, and answers each key in request order. It is not a snapshot across
 	 * partitions, and it does not retry: send `unprocessedKeys` again, with the `projection` and the
-	 * `maxResponseBytes` of the request, or use `FokosStd.batchGetItemsWithRetry`. Only a request that is
+	 * `maxResponseBytes` of the request, or use `FokosDBStd.batchGetItemsWithRetry`. Only a request that is
 	 * not valid throws.
 	 * `Ts` types each item by position, as `transactGetItems` does. The library cannot check `Ts`: it is the
 	 * caller's own statement about what each item holds.
@@ -792,7 +792,7 @@ export class FokosDB {
 
 	/**
 	 * Puts or deletes 0 to 100 items, and answers each operation in request order. It is not atomic, and
-	 * it does not retry: send `unprocessedItems` again, or use `FokosStd.batchWriteItemsWithRetry`. Only a
+	 * it does not retry: send `unprocessedItems` again, or use `FokosDBStd.batchWriteItemsWithRetry`. Only a
 	 * request that is not valid throws, because after the first RPC an error for the whole call could
 	 * not say which items applied.
 	 */
@@ -1213,10 +1213,10 @@ export class FokosDB {
 
 		// Walk the REQUEST, not the replies: the response is positionally matched to request.items, so
 		// the caller reads result[i] as the answer to items[i] instead of re-matching on keys. Neither
-		// the partition grouping above nor the fan-out inside a PartitionDO preserves order, so the
+		// the partition grouping above nor the fan-out inside a FokosDBPartitionDO preserves order, so the
 		// request order is restored here, once.
 		//
-		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
+		// Pair the two phases by key, not by position: FokosDBPartitionDO fans items out to child partitions and
 		// flattens the replies, so result order is not request order. KeyPairMap is the ONE identity
 		// primitive for a (hashKey, sortKey) pair — the same one commitLocal's keyset check uses. It
 		// compares the key bytes.

@@ -21,7 +21,7 @@ import type { FokosTopology } from "./route-context.js";
 
 export type FokosTopologyCacheOptions = {
 	/**
-	 * Host code. Fetches one encoded topology, for example through `ctx.exports.FokosTopologyCache.fetch`.
+	 * Host code. Fetches one encoded topology, for example through `ctx.exports.FokosDBTopologyCache.fetch`.
 	 * Give `signal` to the fetch, so the request stops when the refresh stops waiting for it.
 	 */
 	fetch(this: void, path: string, signal: AbortSignal): Promise<Response>;

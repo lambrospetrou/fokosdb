@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../server/host-config.js";
 import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helpers.js";
 import { PartitionStore } from "./partition-store.js";
@@ -30,11 +30,11 @@ type Harness = {
 };
 
 // Runs `fn` against a TransactionParticipant over REAL Durable Object storage (vitest-pool-workers).
-// The PartitionDO constructor has already run the schema migrations by the time the callback runs;
+// The FokosDBPartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
 async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promise<void> {
 	const stub = testPartitionStub(`participant-test.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const clock = { now: BASE_NOW };
 		const participant = new TransactionParticipant({
@@ -578,7 +578,7 @@ describe("TransactionParticipant - prepare", () => {
 				"a single-shot delete",
 				(participant: TransactionParticipant) => participant.executeSingleShot({ items: withOpIndex([{ ...X, operation: "delete" }]) }),
 			],
-			// The single-item delete of PartitionDO: one deleteItem at the partition clock.
+			// The single-item delete of FokosDBPartitionDO: one deleteItem at the partition clock.
 			[
 				"a single-item delete",
 				(_p: TransactionParticipant, store: PartitionStore) =>
@@ -604,7 +604,7 @@ describe("TransactionParticipant - prepare", () => {
 				(participant: TransactionParticipant) =>
 					participant.executeSingleShot({ items: withOpIndex([{ ...X, operation: "put", data: "new", kind: "text" }]) }),
 			],
-			// The single-item put of PartitionDO: one upsertItem at the partition clock.
+			// The single-item put of FokosDBPartitionDO: one upsertItem at the partition clock.
 			[
 				"a single-item put",
 				(_p: TransactionParticipant, store: PartitionStore) =>

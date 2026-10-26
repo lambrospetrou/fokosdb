@@ -8,7 +8,7 @@ import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, withMigrationHeld } from "./partition-harness.js";
 
-describe("PartitionDO — apiBatchWriteItems on an importing child", () => {
+describe("FokosDBPartitionDO — apiBatchWriteItems on an importing child", () => {
 	it("answers unprocessed with partition_migrating and applies nothing", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await withMigrationHeld(partition, async (waitForAllChildRequests) => {

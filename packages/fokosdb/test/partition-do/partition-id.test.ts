@@ -1,12 +1,12 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
 
-describe("PartitionDO - partitionId encoding", () => {
+describe("FokosDBPartitionDO - partitionId encoding", () => {
 	it("encodes root and child partition IDs with correct byte layout and text doNames", ({ expect }) => {
 		// makeStub uses rootTreesN=1, so pickPartition always lands on rootIdx=0.
 		const { ctx } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
@@ -29,7 +29,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		const partition = makePartition({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 1 } });
 		const children = await partition.splitHash();
 		const hashKey = "routing-consistency-key";
-		const owner = await runInDurableObject(partition.stub, (instance: PartitionDO) =>
+		const owner = await runInDurableObject(partition.stub, (instance: FokosDBPartitionDO) =>
 			instance.fokos.resolveOwner({ hashKey: kb(hashKey), sortKey: kb("sk") }),
 		);
 		expect(owner.kind).toBe("remote");

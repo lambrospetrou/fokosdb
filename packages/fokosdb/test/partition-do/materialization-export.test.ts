@@ -1,19 +1,19 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
-import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
 import { conditionTree, kb, latestImage, makeStub, materializationOf, TARGET_WAIT, withOpIndex } from "./helpers.js";
 
-async function outboxSize(stub: DurableObjectStub<PartitionDO>): Promise<number> {
+async function outboxSize(stub: DurableObjectStub<FokosDBPartitionDO>): Promise<number> {
 	return await runInDurableObject(
 		stub,
-		(_instance: PartitionDO, state: DurableObjectState) =>
+		(_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 			state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM materialization_outbox`).one().n,
 	);
 }
 
-describe("PartitionDO — materialization export", () => {
+describe("FokosDBPartitionDO — materialization export", () => {
 	it("exports each change to the materialization partition of its key, and empties the outbox", async () => {
 		// The push target refuses each item, so its cursor stays, and the tombstone stays for the read.
 		const { ctx, stub, rpc } = makeStub({ captureChanges: true, nsMat: "PUSH_MATERIALIZATION_DO" });
@@ -37,12 +37,12 @@ describe("PartitionDO — materialization export", () => {
 		const producerId = stub.id.toString();
 		const epoch = await runInDurableObject(
 			mat,
-			(_instance: MaterializationDO, state: DurableObjectState) =>
+			(_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
 				state.storage.sql.exec<{ epoch: number }>(`SELECT epoch FROM producer_fences WHERE producer_id = ?`, producerId).toArray()[0]
 					?.epoch,
 		);
 		expect(epoch).toBe(1);
-		const exportState = await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) =>
+		const exportState = await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 			state.storage.sql.exec(`SELECT epoch, is_call_open FROM materialization_export_state`).one(),
 		);
 		expect(exportState).toEqual({ epoch: 1, is_call_open: 0 });
@@ -111,7 +111,7 @@ describe("PartitionDO — materialization export", () => {
 		const { ctx, stub, rpc } = makeStub();
 		await rpc.apiPutItem(ctx, { hashKey: kb("a"), sortKey: kb("s"), data: "one", kind: "text" });
 		expect(await outboxSize(stub)).toBe(0);
-		const exportState = await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) =>
+		const exportState = await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 			state.storage.sql.exec(`SELECT epoch, is_call_open FROM materialization_export_state`).one(),
 		);
 		expect(exportState).toEqual({ epoch: 1, is_call_open: 0 });

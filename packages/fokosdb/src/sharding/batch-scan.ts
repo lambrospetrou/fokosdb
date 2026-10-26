@@ -1,6 +1,6 @@
 /**
  * The single byte-budgeted, cursor-paged scan used by every paged-streaming endpoint of
- * PartitionDO (item migration batches, pending-transaction metadata, promoted-key inheritance).
+ * FokosDBPartitionDO (item migration batches, pending-transaction metadata, promoted-key inheritance).
  *
  * Crash/resume contract (load-bearing for migration):
  * - The cursor advances past EVERY scanned row, matched or not, so a resumed scan never

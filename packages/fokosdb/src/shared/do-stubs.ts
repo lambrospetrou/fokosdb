@@ -10,9 +10,9 @@
  * The class imports are type-only, so this module carries no runtime dependency on the Durable
  * Object implementations and the client never pulls them into its bundle.
  */
-import type { PartitionDO } from "../server/do-partition.js";
-import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { MaterializationDO } from "../server/materialization/do-materialization.js";
+import type { FokosDBPartitionDO } from "../server/do-partition.js";
+import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import invariant from "./invariant.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import { topologyAdminName } from "../sharding/topology-codec.js";
@@ -21,16 +21,16 @@ import type { AdminNamespaceKey, FokosDBStubContext, TransactionCoordinatorNames
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.
  */
-export function partitionNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<PartitionDO> {
-	const ns: DurableObjectNamespace<PartitionDO> = env[ctx.policy.ns];
+export function partitionNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<FokosDBPartitionDO> {
+	const ns: DurableObjectNamespace<FokosDBPartitionDO> = env[ctx.policy.ns];
 	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
 }
 
 /**
  * The coordinator namespace the context names, with its jurisdiction applied.
  */
-export function txCoordinatorNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<TransactionCoordinatorDO> {
-	const ns: DurableObjectNamespace<TransactionCoordinatorDO> = env[ctx.policy.nsTx];
+export function txCoordinatorNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<FokosDBTransactionCoordinatorDO> {
+	const ns: DurableObjectNamespace<FokosDBTransactionCoordinatorDO> = env[ctx.policy.nsTx];
 	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
 }
 
@@ -38,9 +38,9 @@ export function txCoordinatorNamespace(env: Env, ctx: FokosDBStubContext): Durab
  * The materialization namespace the context names, with its jurisdiction applied. Only a table with
  * `nsMat` has one.
  */
-export function materializationNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<MaterializationDO> {
+export function materializationNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<FokosDBMaterializationDO> {
 	invariant(ctx.policy.nsMat !== undefined, "fokos/do-stubs: the table has no materialization namespace (nsMat)");
-	const ns: DurableObjectNamespace<MaterializationDO> = env[ctx.policy.nsMat];
+	const ns: DurableObjectNamespace<FokosDBMaterializationDO> = env[ctx.policy.nsMat];
 	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
 }
 
@@ -48,19 +48,23 @@ function stubOptions(ctx: FokosDBStubContext): DurableObjectNamespaceGetDurableO
 	return ctx.policy.locationHint === undefined ? undefined : { locationHint: ctx.policy.locationHint };
 }
 
-export function partitionStub(env: Env, ctx: FokosDBStubContext, id: DurableObjectId): DurableObjectStub<PartitionDO> {
+export function partitionStub(env: Env, ctx: FokosDBStubContext, id: DurableObjectId): DurableObjectStub<FokosDBPartitionDO> {
 	return partitionNamespace(env, ctx).get(id, stubOptions(ctx));
 }
 
-export function partitionStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<PartitionDO> {
+export function partitionStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<FokosDBPartitionDO> {
 	return partitionNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 
-export function materializationStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<MaterializationDO> {
+export function materializationStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<FokosDBMaterializationDO> {
 	return materializationNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 
-export function txCoordinatorStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
+export function txCoordinatorStubByName(
+	env: Env,
+	ctx: FokosDBStubContext,
+	doName: string,
+): DurableObjectStub<FokosDBTransactionCoordinatorDO> {
 	return txCoordinatorNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 
@@ -82,8 +86,8 @@ export function txCoordinatorStubForParticipant(
 	env: Env,
 	address: ParticipantCoordinatorAddress,
 	doName: string,
-): DurableObjectStub<TransactionCoordinatorDO> {
-	const ns: DurableObjectNamespace<TransactionCoordinatorDO> = env[address.nsTx];
+): DurableObjectStub<FokosDBTransactionCoordinatorDO> {
+	const ns: DurableObjectNamespace<FokosDBTransactionCoordinatorDO> = env[address.nsTx];
 	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(doName);
 }
 
@@ -100,7 +104,7 @@ export function pushTargetStub(env: Env, target: { binding: string; objectName?:
 
 /**
  * The fields that select the admin Durable Objects of a table: the `nsAdmin` binding and the
- * jurisdiction of the table. The `FokosTopologyCache` entrypoint receives them as its `ctx.props`.
+ * jurisdiction of the table. The `FokosDBTopologyCache` entrypoint receives them as its `ctx.props`.
  */
 export type TopologyAdminAddress = {
 	nsAdmin: AdminNamespaceKey;

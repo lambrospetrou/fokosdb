@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { FokosConditionCheckError, FokosError, FokosTransactionCancelledError } from "fokosdb/client";
-import { PartitionDO } from "fokosdb/server";
+import { FokosDBPartitionDO } from "fokosdb/server";
 import { databasesRoutes } from "./databases/routes.js";
 import { demo2Routes } from "./demo2/index.js";
 import { helloRoutes } from "./hello/routes.js";
@@ -12,7 +12,7 @@ import type { AppEnv } from "./shared.js";
 
 // Wrangler resolves Durable Object bindings against this module, so the classes must be re-exported
 // from the worker entry even though the implementations live in the library.
-export { FokosDBAutoAdminDO, FokosTopologyCache, PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
+export { FokosDBAutoAdminDO, FokosDBTopologyCache, FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
 export { CounterPartitionDO, SearchPartitionDO } from "./demo2/index.js";
 
 const api = new Hono<AppEnv>().basePath("/api");
@@ -90,6 +90,6 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
-// TESTING THE PartitionDO override capabilities.
+// TESTING THE FokosDBPartitionDO override capabilities.
 
-export class CustomPartitionDO extends PartitionDO {}
+export class CustomPartitionDO extends FokosDBPartitionDO {}

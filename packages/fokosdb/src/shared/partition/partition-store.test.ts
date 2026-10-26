@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { projectionTree, updateTree } from "../expression/test-fixtures.js";
 import type { UpdateExpression } from "../expression/types.js";
@@ -51,11 +51,11 @@ function expectedRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes)
 }
 
 // Runs `fn` against a PartitionStore over REAL Durable Object storage (vitest-pool-workers).
-// The PartitionDO constructor has already run the schema migrations by the time the callback runs;
+// The FokosDBPartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
 async function withStore(fn: (store: PartitionStore, state: DurableObjectState) => void | Promise<void>): Promise<void> {
 	const stub = testPartitionStub(`store-test.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		await fn(new PartitionStore(state.storage), state);
 	});
 }
@@ -1147,8 +1147,8 @@ describe("PartitionStore - deletion watermark", () => {
 
 	it("a real user delete updates both deletion-metadata fields in one statement", async () => {
 		const stub = testPartitionStub(`store-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
-			// Records every statement the store issues. The migrations already ran in the PartitionDO
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
+			// Records every statement the store issues. The migrations already ran in the FokosDBPartitionDO
 			// constructor, so the wrapped storage never sees a migration statement.
 			const statements: string[] = [];
 			const recordingStorage = {
@@ -2191,7 +2191,7 @@ describe("PartitionStore - materialization outbox", () => {
 
 	async function withCaptureStore(capture: boolean, fn: (store: PartitionStore, state: DurableObjectState) => void): Promise<void> {
 		const stub = testPartitionStub(`store-outbox-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			fn(new PartitionStore(state.storage, { captureChanges: () => capture }), state);
 		});
 	}

@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
@@ -14,7 +14,7 @@ import {
 	rangeOf,
 } from "./partition-harness.js";
 
-describe.concurrent("PartitionDO — range split", () => {
+describe.concurrent("FokosDBPartitionDO — range split", () => {
 	// The read-only tests walk the same settled N=4 tree, so it is built once. A test that needs
 	// another N, another config, or that changes a child's stored policy builds its own.
 	let shared: Awaited<ReturnType<typeof makeTriggeredRangeRoot>>;
@@ -78,7 +78,7 @@ describe.concurrent("PartitionDO — range split", () => {
 
 		// Read the child's stored policy WITHOUT a request, so the assertion observes what the router
 		// forwarded rather than writing the threshold itself.
-		const stored = await runInDurableObject(child.stub, (instance: PartitionDO) => instance.fokos.policy());
+		const stored = await runInDurableObject(child.stub, (instance: FokosDBPartitionDO) => instance.fokos.policy());
 		expect(stored.rangeSplitConditions.maxSizeMb).toBe(raisedMaxSizeMb);
 	});
 
@@ -179,7 +179,7 @@ describe.concurrent("PartitionDO — range split", () => {
 	describe("learned range slices", () => {
 		/** The depths of the rows in `fokos_range_hierarchy` of `partition`. */
 		const learnedDepths = async (partition: TestPartition) =>
-			await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+			await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 				state.storage.sql
 					.exec<{ depth: number }>(`SELECT depth FROM fokos_range_hierarchy`)
 					.toArray()

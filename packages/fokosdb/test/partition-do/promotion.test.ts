@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FokosError } from "../../src/shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
@@ -27,7 +27,7 @@ import {
 	useSmallBloom,
 } from "./partition-harness.js";
 
-describe.concurrent("PartitionDO — promotion detection and queuing", () => {
+describe.concurrent("FokosDBPartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and cuts it over to 'promoting'", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
@@ -69,11 +69,11 @@ describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 	});
 });
 
-describe("PartitionDO — TTL sweep during a promotion", () => {
+describe("FokosDBPartitionDO — TTL sweep during a promotion", () => {
 	async function expiredRows(partition: TestPartition, hashKey: string): Promise<number> {
 		return await runInDurableObject(
 			partition.stub,
-			(_instance: PartitionDO, state: DurableObjectState) =>
+			(_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 				state.storage.sql
 					.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND ttl_epoch_utc_seconds IS NOT NULL`, kb(hashKey))
 					.one().n,
@@ -91,7 +91,7 @@ describe("PartitionDO — TTL sweep during a promotion", () => {
 			await partition.triggerPromotion("alice");
 			await partition.awaitPromotedKeyStatus("alice", ["promoting"]);
 			// Both rows expire after the cutover. The range root has not pulled the items of alice yet.
-			await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				state.storage.sql.exec(`UPDATE items SET ttl_epoch_utc_seconds = 1 WHERE ttl_epoch_utc_seconds IS NOT NULL`);
 			});
 
@@ -121,7 +121,7 @@ describe("PartitionDO — TTL sweep during a promotion", () => {
 	});
 });
 
-describe.concurrent("PartitionDO — promotion cutover and routing", () => {
+describe.concurrent("FokosDBPartitionDO — promotion cutover and routing", () => {
 	/** Prepares a put of alice/sk1 on `partition`, and returns the transaction id and timestamp. */
 	async function prepareAlice(partition: TestPartition): Promise<{ transactionId: string; transactionTimestamp: number }> {
 		const transactionId = crypto.randomUUID();
@@ -209,7 +209,7 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 	});
 });
 
-describe.concurrent("PartitionDO — a hash split after a promotion", () => {
+describe.concurrent("FokosDBPartitionDO — a hash split after a promotion", () => {
 	it("does not copy the items of a promoted key to the hash split children", async () => {
 		// With maxSizeMb=1, the size limit of each child (1.1 MB) stays well above the data that a child
 		// gets from the split, so no size check of the test depends on a small margin.
@@ -267,7 +267,7 @@ describe.concurrent("PartitionDO — a hash split after a promotion", () => {
 	});
 });
 
-describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
+describe.concurrent("FokosDBPartitionDO — debugForcePromoteKey", () => {
 	it("forwards to the owning child on a split parent", async () => {
 		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await root.splitHash();
@@ -310,7 +310,7 @@ describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 			await vi.waitFor(async () => expect(await rangeRoot.controlled.testInitCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
 			expect(await partition.promotedKeyStatus("alice")).toBe("queued");
 
-			await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(partition.stub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 				state.storage.sql.exec(`UPDATE fokos_repartitions SET next_attempt_at = ?`, Date.now() + 60_000);
 				await state.storage.deleteAlarm();
 				expect(await state.storage.getAlarm()).toBeNull();
@@ -319,7 +319,7 @@ describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 			const again = await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 			expect(again.queued).toBe(false);
 
-			await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(partition.stub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 				expect(await state.storage.getAlarm(), "the status report must restore the fallback alarm").not.toBeNull();
 				state.storage.sql.exec(`UPDATE fokos_repartitions SET next_attempt_at = ?`, Date.now());
 			});
@@ -330,7 +330,7 @@ describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 	}, 30_000);
 });
 
-describe.concurrent("PartitionDO — a range root before its first page", () => {
+describe.concurrent("FokosDBPartitionDO — a range root before its first page", () => {
 	it("serves a read and a write at the source when a Bloom false positive names a range root before its cutover", async () => {
 		// A sender learns a promoted key only from an answer of its range root, and that answer comes
 		// after the cutover. Thus before the cutover, only a false positive of the filter names the range
@@ -396,7 +396,7 @@ describe.concurrent("PartitionDO — a range root before its first page", () => 
 			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 			await vi.waitFor(async () => expect(await rangeRoot.controlled.testInitCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
 
-			await runInDurableObject(rangeRoot.stub, async (instance: PartitionDO) => {
+			await runInDurableObject(rangeRoot.stub, async (instance: FokosDBPartitionDO) => {
 				await expect(
 					instance.apiPutItem(rangeRoot.ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: "v", kind: "text" }),
 				).rejects.toThrow(fokosErrorWith("partition_migrating", { importState: "awaiting_data" }));
@@ -421,7 +421,7 @@ describe.concurrent("PartitionDO — a range root before its first page", () => 
 
 			// The route override of the source names the range root now, so the source forwards the write
 			// and does not run it itself.
-			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+			await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 				await expect(
 					instance.apiPutItem(partition.ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: "v", kind: "text" }),
 				).rejects.toThrow(fokosErrorWith("partition_migrating", { importState: "awaiting_data" }));
@@ -434,7 +434,7 @@ describe.concurrent("PartitionDO — a range root before its first page", () => 
 	}, 30_000);
 });
 
-describe("PartitionDO — transaction commit and promotion candidates", () => {
+describe("FokosDBPartitionDO — transaction commit and promotion candidates", () => {
 	it("queues the promotion of a large local key when the forwarded part of the commit fails", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
@@ -464,7 +464,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 			],
 		};
 		try {
-			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+			await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 				// The commit tries every group, so the failed remote group gives the fan-out error.
 				await expect(instance.txCommit(partition.ctx, commit)).rejects.toThrow(fokosErrorWith("partition_fanout_failed"));
 			});
@@ -524,7 +524,7 @@ async function splitHashOnce(opts: Parameters<typeof makePartition>[0]): Promise
 	return partition;
 }
 
-describe.concurrent("PartitionDO — a transaction through a hash jump to a partition that does not exist", () => {
+describe.concurrent("FokosDBPartitionDO — a transaction through a hash jump to a partition that does not exist", () => {
 	it("falls back from the jump, keeps Bloom off, and sends the keys of one owner in one call", async () => {
 		const hashSplitN = 2;
 		const partition = await splitHashOnce({ ns: CONTROLLED_NS, hashSplitN });
@@ -567,12 +567,12 @@ describe.concurrent("PartitionDO — a transaction through a hash jump to a part
 		// answer is the root behind a new stub.
 		const plantMissingGrandchild = async (): Promise<TestPartition> => {
 			const root = TestPartition.at(partition.ctx);
-			await runInDurableObject(root.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(root.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const arena = HashTopology.create(hashSplitN, 0);
 				arena.updateFromHint(kb(h1), 2);
 				new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
 			});
-			await runInDurableObject(root.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(root.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				state.abort("reload the hash arena");
 			}).catch(() => {});
 			return TestPartition.at(partition.ctx);
@@ -613,7 +613,7 @@ describe.concurrent("PartitionDO — a transaction through a hash jump to a part
 	}, 30_000);
 });
 
-describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", () => {
+describe.concurrent("FokosDBPartitionDO — the Bloom step of the transaction shapes", () => {
 	/**
 	 * Gives `partition` a small Bloom filter, promotes `bob`, and reads it once, so the filter holds bob.
 	 * Returns the stored filter. Other hash keys that it reports as promoted are false positives.

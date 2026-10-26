@@ -14,7 +14,7 @@
 	},
 	"migrations": [
 		{
-			"new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO", "CustomPartitionDO"],
+			"new_sqlite_classes": ["FokosDBPartitionDO", "FokosDBTransactionCoordinatorDO", "CustomPartitionDO"],
 			"tag": "v1",
 		},
 		{
@@ -29,11 +29,11 @@
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "PartitionDO",
+				"class_name": "FokosDBPartitionDO",
 				"name": "PARTITION_DO",
 			},
 			{
-				"class_name": "TransactionCoordinatorDO",
+				"class_name": "FokosDBTransactionCoordinatorDO",
 				"name": "TRANSACTION_COORDINATOR_DO",
 			},
 			{
@@ -56,7 +56,7 @@
 	},
 	// The cached entrypoint of the encoded topology. Only `ctx.exports` reaches it: no route names it.
 	"exports": {
-		"FokosTopologyCache": {
+		"FokosDBTopologyCache": {
 			"type": "worker",
 			"cache": { "enabled": true },
 		},

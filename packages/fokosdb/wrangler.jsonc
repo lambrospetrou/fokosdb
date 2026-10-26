@@ -15,9 +15,9 @@
 	"migrations": [
 		{
 			"new_sqlite_classes": [
-				"PartitionDO",
-				"TransactionCoordinatorDO",
-				"MaterializationDO",
+				"FokosDBPartitionDO",
+				"FokosDBTransactionCoordinatorDO",
+				"FokosDBMaterializationDO",
 				"PushMaterializationDO",
 				"GsiMaterializationDO",
 				"PushSinkDO",
@@ -41,15 +41,15 @@
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "PartitionDO",
+				"class_name": "FokosDBPartitionDO",
 				"name": "PARTITION_DO",
 			},
 			{
-				"class_name": "TransactionCoordinatorDO",
+				"class_name": "FokosDBTransactionCoordinatorDO",
 				"name": "TRANSACTION_COORDINATOR_DO",
 			},
 			{
-				"class_name": "MaterializationDO",
+				"class_name": "FokosDBMaterializationDO",
 				"name": "MATERIALIZATION_DO",
 			},
 			{

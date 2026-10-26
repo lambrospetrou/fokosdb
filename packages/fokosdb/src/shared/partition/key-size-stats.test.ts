@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { KeySizeStats } from "./key-size-stats.js";
@@ -11,7 +11,7 @@ const keyLabel = (key: KeyBytes) => KeyCodec.decode(key) as string;
 /** Runs `fn` with a `KeySizeStats` over the storage of a new partition, which already ran the migrations. */
 async function withStats(fn: (stats: KeySizeStats, state: DurableObjectState) => void): Promise<void> {
 	const stub = testPartitionStub(`key-sizes.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		fn(new KeySizeStats(state.storage), state);
 	});
 }

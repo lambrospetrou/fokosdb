@@ -13,7 +13,7 @@
  */
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { PartitionIdHelper, hashChildIndex } from "../../src/sharding/partition-id.js";
@@ -54,7 +54,7 @@ async function withPullHeld(
 
 /** Rewrites the import record of the held target, as a second loop of the same import leaves it. */
 async function moveImportOn(target: TestPartition, change: Partial<FokosImportRecord>): Promise<void> {
-	await runInDurableObject(target.stub, (_i: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(target.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 		const record = state.storage.kv.get<FokosImportRecord>(IMPORT_KEY);
 		expect(record, `${target.doName}: no import record to move on`).toBeDefined();
 		state.storage.kv.put<FokosImportRecord>(IMPORT_KEY, { ...record!, ...change });
@@ -79,7 +79,7 @@ async function partitionWithHeldKey(): Promise<{ parent: TestPartition; child: T
 	return { parent, child: ownerOf(parent, HELD_KEY) };
 }
 
-describe("PartitionDO — a migration page that outlives its import record", () => {
+describe("FokosDBPartitionDO — a migration page that outlives its import record", () => {
 	it("drops an items page whose import completed while the page was in flight", { timeout: 30_000 }, async ({ expect }) => {
 		const { parent, child } = await partitionWithHeldKey();
 
@@ -117,7 +117,7 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 		const { parent, child } = await partitionWithHeldKey();
 		// A lock whose transaction resolves before the page lands would leak on the child, where nothing
 		// holds the coordinator that can release it.
-		await runInDurableObject(parent.stub, (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(parent.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
 				`INSERT INTO pending_tx_info (transaction_id, transaction_ts, created_at, coordinator_json, next_recovery_at)
 				 VALUES ('tx-stale', 1, 1000, '{"v":1,"route":{"doName":"tc-1"},"idempotencyToken":"tok-1"}', 6000)`,
@@ -138,7 +138,7 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 		await parent.awaitSplitCompleted();
 		const locks = await runInDurableObject(
 			child.stub,
-			(_i: PartitionDO, state: DurableObjectState) =>
+			(_i: FokosDBPartitionDO, state: DurableObjectState) =>
 				state.storage.sql
 					.exec<{ n: number }>(`SELECT (SELECT COUNT(*) FROM pending_transactions) + (SELECT COUNT(*) FROM pending_tx_info) AS n`)
 					.toArray()[0].n,

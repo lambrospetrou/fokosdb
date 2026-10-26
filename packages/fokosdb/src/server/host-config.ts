@@ -1,5 +1,5 @@
 /**
- * The settings of `PartitionDO`, `TransactionCoordinatorDO`, and `MaterializationDO`. Each class has a `fokosConfig()` method
+ * The settings of `FokosDBPartitionDO`, `FokosDBTransactionCoordinatorDO`, and `FokosDBMaterializationDO`. Each class has a `fokosConfig()` method
  * that returns overrides. The class merges them with the defaults below, validates the result, and
  * reads it at each use. A subclass can therefore return a value that depends on `this.env`, or on the
  * identity or the policy of the partition, and a changed value applies at its next read.
@@ -58,7 +58,7 @@ export type PartitionDOConfig = Readonly<{
 	 * deletes all copies of one transaction together, so it can delete up to 99 rows more.
 	 */
 	cleanupTxLockCopyRows: number;
-	/** The export of the item changes of a table with `captureChanges` to `MaterializationDO`. */
+	/** The export of the item changes of a table with `captureChanges` to `FokosDBMaterializationDO`. */
 	materializationExport: Readonly<MaterializationExportConfig>;
 	/**
 	 * The age of a topology cache entry that starts a refresh, in milliseconds. It applies when the
@@ -220,7 +220,7 @@ export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFr
 	topologyRefreshTimeoutMs: 30_000,
 });
 
-/** Merges `overrides` with the defaults of `PartitionDO` and validates the result. */
+/** Merges `overrides` with the defaults of `FokosDBPartitionDO` and validates the result. */
 export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): PartitionDOConfig {
 	const c = merge(DEFAULT_PARTITION_CONFIG, overrides);
 	if (c === DEFAULT_PARTITION_CONFIG) {
@@ -244,7 +244,7 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 	return c;
 }
 
-/** Merges `overrides` with the defaults of `MaterializationDO` and validates the result. */
+/** Merges `overrides` with the defaults of `FokosDBMaterializationDO` and validates the result. */
 export function resolveMaterializationConfig(overrides: MaterializationDOConfigOverrides): MaterializationDOConfig {
 	const c = merge(DEFAULT_MATERIALIZATION_CONFIG, overrides);
 	if (c === DEFAULT_MATERIALIZATION_CONFIG) {
@@ -256,7 +256,7 @@ export function resolveMaterializationConfig(overrides: MaterializationDOConfigO
 	return c;
 }
 
-/** Merges `overrides` with the defaults of `TransactionCoordinatorDO` and validates the result. */
+/** Merges `overrides` with the defaults of `FokosDBTransactionCoordinatorDO` and validates the result. */
 export function resolveCoordinatorConfig(overrides: TransactionCoordinatorDOConfigOverrides): TransactionCoordinatorDOConfig {
 	const c = merge(DEFAULT_COORDINATOR_CONFIG, overrides);
 	if (c === DEFAULT_COORDINATOR_CONFIG) {

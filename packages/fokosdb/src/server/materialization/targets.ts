@@ -1,5 +1,5 @@
 /**
- * The target definitions of `MaterializationDO` and the wire types of a push target.
+ * The target definitions of `FokosDBMaterializationDO` and the wire types of a push target.
  */
 import type { ExpressionValue, ProjectionExpression } from "../../shared/expression/types.js";
 import invariant from "../../shared/invariant.js";
@@ -40,7 +40,7 @@ export type PushTargetItem = {
 };
 
 export type PushTargetBatch = {
-	/** The `DurableObjectId` of the sending `MaterializationDO`, as `DurableObjectId.toString()` gives it (hex). */
+	/** The `DurableObjectId` of the sending `FokosDBMaterializationDO`, as `DurableObjectId.toString()` gives it (hex). */
 	producerId: string;
 	epoch: number;
 	ancestorFences: readonly { ancestorId: string; minEpoch: number }[];

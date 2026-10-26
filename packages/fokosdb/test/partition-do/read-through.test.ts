@@ -6,7 +6,7 @@
  */
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type {
 	BatchGetItemsRpcRequest,
 	BatchGetItemsRpcResponse,
@@ -54,7 +54,7 @@ const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> 
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
 // operates at the same time cannot remove it.
-describe("PartitionDO — fokosExecuteLocal", () => {
+describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 	// The two hash-split tests exercise the same two-child topology, so the split runs once.
 	let shared: { partition: TestPartition; children: TestPartition[]; repartitionId: string };
 	beforeAll(async () => {
@@ -77,7 +77,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		];
 		// runInDurableObject keeps the caught rejection inside the DO's execution context, so it does not
 		// leak as an unhandled rejection at the worker level.
-		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			for (const caller of impostors) {
 				await expect(
 					instance.fokosExecuteLocal({ op: "apiGetItem", repartitionId, caller, request: { hashKey: kb("hk"), sortKey: kb("sk") } }),
@@ -113,7 +113,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 
 		// The sibling asking for the same key is a routing defect, not an empty answer: an empty answer
 		// would let it cache "absent" for a key another child owns.
-		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(
 				instance.fokosExecuteLocal({
 					op: "apiGetItem",
@@ -145,7 +145,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		expect(mine.value.partitions[0].actorId).toBe(partition.stub.id.toString());
 
 		// One key outside the caller slice refuses the whole request, before any read.
-		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(instance.fokosExecuteLocal(request(sibling, [["alpha", "s1"]]))).rejects.toThrow(fokosErrorWith("partition_misrouted"));
 		});
 	});
@@ -210,7 +210,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			const sibling = (await partition.children()).find((c) => c.doName !== child.doName);
 			expect(sibling, "a two-way split should have a sibling").toBeDefined();
 			const repartitionId = await partition.splitRepartitionId();
-			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+			await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 				await expect(
 					instance.fokosExecuteLocal({
 						op: "apiGetItem",
@@ -254,7 +254,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		expect(page.meta.forwardCount, "a read-through answer is local; it never fans out").toBe(0);
 
 		// A cursor that sits in a sibling's slice is a routing defect, not an empty page.
-		await runInDurableObject(root.stub, async (instance: PartitionDO) => {
+		await runInDurableObject(root.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(
 				instance.fokosExecuteLocal({
 					op: "apiQueryItems",

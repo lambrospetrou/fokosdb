@@ -5,11 +5,11 @@
 import type { FokosOperation, FokosOperations } from "./api.js";
 import { todo } from "./api.js";
 import type { DocsDOOps } from "./example-host.js";
-import type { PartitionDO } from "./fokosdb-partition-host.js";
+import type { FokosDBPartitionDO } from "./fokosdb-partition-host.js";
 
-declare const partition: PartitionDO;
-declare const ctx: Parameters<PartitionDO["apiGetItem"]>[0];
-declare const getReq: Parameters<PartitionDO["apiGetItem"]>[1];
+declare const partition: FokosDBPartitionDO;
+declare const ctx: Parameters<FokosDBPartitionDO["apiGetItem"]>[0];
+declare const getReq: Parameters<FokosDBPartitionDO["apiGetItem"]>[1];
 
 async function dispatchIsTypedByName(): Promise<void> {
 	await partition.fokos.dispatch("apiGetItem", ctx, getReq);

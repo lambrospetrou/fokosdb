@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../json-types.js";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
@@ -23,7 +23,7 @@ type StoredFixture = {
 
 async function evaluate(item: StoredFixture | null, condition: ConditionExpression) {
 	const stub = testPartitionStub(`expression-runtime.${crypto.randomUUID()}`);
-	return await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const hashKey = KeyCodec.encode(item?.hashKey ?? "missing-hash-key");
 		const sortKey = item?.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
 		if (item) {
@@ -211,7 +211,7 @@ describe("compiled condition runtime", () => {
 
 	it("keeps the SQLite failure as the runtime error cause", async () => {
 		const stub = testPartitionStub(`expression-runtime.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const plan = { ...compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }), sql: "no_such_function()" };
 			const error = (() => {
 				try {
@@ -231,7 +231,7 @@ describe("compiled condition runtime", () => {
 		const condition: ConditionExpression = { op: "exists", args: [{ ref: "hashKey" }] };
 		const plan = compileConditionExpression(condition);
 		const stub = testPartitionStub(`expression-plan.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "text", data: "value" });
@@ -304,7 +304,7 @@ describe("compiled condition runtime", () => {
 	it("uses a primary-key lookup for a byte key literal", async () => {
 		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "sortKey" }, { b64: "YWI=" }] });
 		const stub = testPartitionStub(`expression-plan.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encode(new Uint8Array([0x61, 0x62]));
 			const queryPlan = state.storage.sql

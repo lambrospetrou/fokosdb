@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { FokosScheduler } from "./scheduler.js";
 import { FokosShardingStore } from "./sharding-store.js";
@@ -22,7 +22,7 @@ async function withScheduler(
 	fn: (scheduler: FokosScheduler, state: DurableObjectState, deadlineReads: () => number) => Promise<void>,
 ): Promise<void> {
 	const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
-	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new FokosShardingStore(state.storage);
 		store.runMigrations();
 		let reads = 0;
@@ -98,7 +98,7 @@ describe("FokosScheduler - deadline reads", () => {
 describe("FokosScheduler - lifecycle reads", () => {
 	it("gives all jobs one lifecycle result before the steps, and a new one after them", async () => {
 		const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new FokosShardingStore(state.storage);
 			store.runMigrations();
 			const made: FokosLifecycle[] = [];
@@ -151,7 +151,7 @@ describe("FokosScheduler - lifecycle reads", () => {
 
 	it("keeps each lifecycle field of one result at its first read, and a new result reads again", async () => {
 		const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const before = instance.fokos.lifecycle();
 			expect(before.destroying).toBe(false);
 

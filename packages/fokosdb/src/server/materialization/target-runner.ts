@@ -1,5 +1,5 @@
 /**
- * The in-memory runner that sends the changes of `MaterializationDO` to its targets.
+ * The in-memory runner that sends the changes of `FokosDBMaterializationDO` to its targets.
  *
  * Up to `concurrency` workers run while a target has due work. They take the targets in turn, and each
  * target has at most one batch in flight, so one slow target holds at most one worker. A step of a

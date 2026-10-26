@@ -10,7 +10,7 @@
  */
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
@@ -42,7 +42,10 @@ function withCaps(partition: TestPartition, caps: { hash?: number; range?: numbe
 }
 
 async function databaseSize(partition: TestPartition): Promise<number> {
-	return await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => state.storage.sql.databaseSize);
+	return await runInDurableObject(
+		partition.stub,
+		(_instance: FokosDBPartitionDO, state: DurableObjectState) => state.storage.sql.databaseSize,
+	);
 }
 
 /** The same partition with a hash cap that the current file exceeds by `CAP_DIVISOR`. */
@@ -91,14 +94,14 @@ async function prepare(partition: TestPartition, hashKey: string, sortKeys: stri
 
 /** Quarantines every lock row of `transactionId`, as the stale job does for an over-age lock. */
 async function quarantine(partition: TestPartition, transactionId: string, guardedAt: number): Promise<void> {
-	await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		expect(store.guardPendingTx(transactionId, guardedAt)).toBe(true);
 	});
 }
 
 async function guardsOf(partition: TestPartition, transactionId: string): Promise<(number | null)[]> {
-	return await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+	return await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		new PartitionStore(state.storage).listPendingTxItems(transactionId).map((row) => row.guarded_at),
 	);
 }
@@ -117,7 +120,7 @@ async function awaitPromotionQueued(partition: TestPartition, hashKey: string): 
 	await vi.waitFor(async () => expect(await partition.promotedKeyStatus(hashKey)).toBeDefined(), { timeout: 5_000, interval: 10 });
 }
 
-describe("PartitionDO - a hash leaf that refuses a write for size", () => {
+describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -178,7 +181,7 @@ describe("PartitionDO - a hash leaf that refuses a write for size", () => {
 		const threshold = (low.ctx.policy.hashSplitConditions.maxSizeMb ?? 0) * MB * DEFAULT_PARTITION_CONFIG.promotionFraction;
 		const estimate = await runInDurableObject(
 			partition.stub,
-			(_instance: PartitionDO, state: DurableObjectState) =>
+			(_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 				state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb("solo")).one().est_bytes,
 		);
 		expect(estimate).toBeLessThan(threshold);
@@ -207,14 +210,14 @@ describe("PartitionDO - a hash leaf that refuses a write for size", () => {
 		await partition.awaitPromotedKeyStatus("large", ["promoted"], { drive: [partition, rangeRoot] });
 		expect(await partition.localItemCount("large")).toBeGreaterThan(0);
 		// The completion deleted the estimate, so the decision does not name the key again.
-		await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(state.storage.sql.exec(`SELECT 1 FROM key_size_estimates WHERE hk = ?`, kb("large")).toArray()).toEqual([]);
 		});
 		const low = await lowHashCap(partition);
 
 		await expectRefused(low, small[0]);
 		await awaitSplitQueued(low);
-		await runInDurableObject(low.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(low.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const promotion = state.storage.sql
 				.exec<{ state: string }>(`SELECT state FROM fokos_repartitions WHERE kind = 'key_promotion'`)
 				.one();
@@ -232,7 +235,7 @@ describe("PartitionDO - a hash leaf that refuses a write for size", () => {
 	});
 });
 
-describe("PartitionDO - a hash leaf with more than one large key", () => {
+describe("FokosDBPartitionDO - a hash leaf with more than one large key", () => {
 	it("promotes the second large key while the promotion of the first cannot finish", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS });
 		// Both keys stay below the promotion threshold of the large cap, so no write promotes them.
@@ -240,7 +243,7 @@ describe("PartitionDO - a hash leaf with more than one large key", () => {
 		await putRows(partition, "second", 12, 16 * 1024);
 		const low = await lowHashCap(partition);
 		const threshold = (low.ctx.policy.hashSplitConditions.maxSizeMb ?? 0) * MB * DEFAULT_PARTITION_CONFIG.promotionFraction;
-		const estimates = await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+		const estimates = await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 			state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates ORDER BY est_bytes DESC`).toArray(),
 		);
 		expect(estimates.map((row) => row.est_bytes >= threshold)).toEqual([true, true]);
@@ -273,7 +276,7 @@ describe("PartitionDO - a hash leaf with more than one large key", () => {
 	});
 });
 
-describe("PartitionDO - a hash leaf that holds pending payloads only", () => {
+describe("FokosDBPartitionDO - a hash leaf that holds pending payloads only", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -359,7 +362,7 @@ describe("PartitionDO - a hash leaf that holds pending payloads only", () => {
 	);
 });
 
-describe("PartitionDO - a range leaf at its floor", () => {
+describe("FokosDBPartitionDO - a range leaf at its floor", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -381,7 +384,7 @@ describe("PartitionDO - a range leaf at its floor", () => {
 
 		expect((await low.status()).splitStatus).toBeUndefined();
 		expect(logged.withMessage(FLOOR_LOG)).toEqual([expect.objectContaining({ reason, doName: root.doName })]);
-		await runInDurableObject(low.stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(low.stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).toBeNull();
 		});
 	});

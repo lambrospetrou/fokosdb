@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { SQLITE_SCALAR_FUNCTIONS } from "./sqlite-functions.js";
 
@@ -65,7 +65,7 @@ describe("SQLite scalar function allowlist", () => {
 	it("contains only functions verified by the Workers SQLite runtime", async () => {
 		expect([...SQLITE_SCALAR_FUNCTIONS].sort()).toEqual(Object.keys(calls).sort());
 		const stub = testPartitionStub(`expression-functions.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			for (const call of Object.values(calls)) {
 				expect(() => state.storage.sql.exec(`SELECT ${call} AS value`).one()).not.toThrow();
 			}

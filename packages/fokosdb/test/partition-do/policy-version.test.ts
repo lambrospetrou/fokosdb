@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -11,14 +11,14 @@ function withPolicy(ctx: FokosDBRouteContext, policyVersion: number, maxSizeMb: 
 	return { ...ctx, policyVersion, policy: { ...ctx.policy, hashSplitConditions: { maxSizeMb } } };
 }
 
-describe("PartitionDO - policy version", () => {
+describe("FokosDBPartitionDO - policy version", () => {
 	it("stores a higher version, ignores a lower one, and lets the last writer win at an equal version", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub({ policyVersion: 1, hashSplitConditions: { maxSizeMb: 100 } });
 		const put = async (c: FokosDBRouteContext) =>
 			await rpc.apiPutItem(c, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" });
 		// Read the stored values WITHOUT a request, so the read does not write them.
 		const stored = async () =>
-			await runInDurableObject(stub, (instance: PartitionDO, state) => ({
+			await runInDurableObject(stub, (instance: FokosDBPartitionDO, state) => ({
 				maxSizeMb: instance.fokos.policy().hashSplitConditions.maxSizeMb,
 				policyVersion: instance.fokos.routeContext().policyVersion,
 				kv: state.storage.kv.get<{ policyVersion: number }>(FOKOS_KV_KEYS.POLICY)?.policyVersion,
@@ -45,7 +45,7 @@ describe("PartitionDO - policy version", () => {
 
 		// runInDurableObject keeps the caught rejection inside the execution context of the DO, so it does
 		// not leak as an unhandled rejection at the worker level.
-		await runInDurableObject(stub, async (instance: PartitionDO) => {
+		await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 			await expect(instance.apiPutItem(withPolicy(ctx, 1.5, 50), req)).rejects.toThrow(fokosErrorWith("partition_context_options_invalid"));
 		});
 	});

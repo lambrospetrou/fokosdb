@@ -3,7 +3,7 @@
 // lock row moves with its operation list and its last-write data in a promotion and in a hash split.
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { hashChildIndex } from "../../src/sharding/partition-id.js";
 import { updateTree } from "../../src/shared/expression/test-fixtures.js";
@@ -60,7 +60,7 @@ function keysOf(request: PrepareRequest): TransactionItemKey[] {
 
 /** The lock rows of one transaction on one partition: key, operation list, and whether the row has data. */
 async function locksOf(partition: TestPartition, transactionId: string) {
-	return await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+	return await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		new PartitionStore(state.storage)
 			.listPendingTxItems(transactionId)
 			.map((row) => ({
@@ -98,7 +98,7 @@ async function dataOf(partition: TestPartition, hk: string, sk: string): Promise
 	return res.found && "data" in res.item ? JSON.parse(res.item.data as string) : undefined;
 }
 
-describe("PartitionDO — the operations of one item reach one owner", () => {
+describe("FokosDBPartitionDO — the operations of one item reach one owner", () => {
 	// When two operations of one item went to the owner in two sub-requests, the second sub-request
 	// would find the lock of the first and write nothing. The lock row would then miss operations.
 	it("sends the equal keys of one txPrepare to one owner in one sub-request, with the Bloom filter on", async () => {
@@ -146,7 +146,7 @@ describe("PartitionDO — the operations of one item reach one owner", () => {
 	});
 });
 
-describe("PartitionDO — a lock row of an item with more than one operation moves with its key", () => {
+describe("FokosDBPartitionDO — a lock row of an item with more than one operation moves with its key", () => {
 	it("moves the operation list and the last-write data in a promotion, and the range root applies them", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		const request = prepareOf([put("alice", "locked", { n: 1 }), put("bob", "sk1", "b"), update("alice", "locked")]);

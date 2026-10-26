@@ -7,7 +7,7 @@ whole codebase (see the doc comment on `FokosTypeOverrides` in
 
 There is no runtime code here. `narrow-keys.ts` augments `FokosTypeOverrides` to `string` and then
 uses `@ts-expect-error` to assert that `Uint8Array` is rejected everywhere a key appears — `putItem`
-options, `SortKeyCondition`, `FokosStd.sortKeySuccessor`. `db-operations.ts` does the same against
+options, `SortKeyCondition`, `FokosDBStd.sortKeySuccessor`. `db-operations.ts` does the same against
 `FokosDB`'s six public operations (`putItem`, `getItem`, `deleteItem`, `transactWriteItems`,
 `transactGetItems`, `queryItems`), on both the request and the result side, relying on the
 augmentation from `narrow-keys.ts` applying to this whole package — TypeScript declaration merging is

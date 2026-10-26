@@ -21,7 +21,7 @@ declare module "fokosdb/client" {
 	}
 }
 
-import { FokosStd, type HashKey, type PutItemOptions, type SortKey, type SortKeyCondition } from "fokosdb/client";
+import { FokosDBStd, type HashKey, type PutItemOptions, type SortKey, type SortKeyCondition } from "fokosdb/client";
 
 const hashKey: HashKey = "user#1";
 const sortKey: SortKey = "profile";
@@ -39,7 +39,7 @@ const _condition: SortKeyCondition = { op: "begins_with", prefix: "profile" };
 // @ts-expect-error - a sort-key condition value must reject bytes once narrowed.
 const _badCondition: SortKeyCondition = { op: "begins_with", prefix: new Uint8Array() };
 
-// FokosStd.sortKeySuccessor is generic over SortKey, so it must narrow along with everything else.
-const _successor: string | undefined = FokosStd.sortKeySuccessor("profile");
+// FokosDBStd.sortKeySuccessor is generic over SortKey, so it must narrow along with everything else.
+const _successor: string | undefined = FokosDBStd.sortKeySuccessor("profile");
 // @ts-expect-error
-FokosStd.sortKeySuccessor(new Uint8Array());
+FokosDBStd.sortKeySuccessor(new Uint8Array());

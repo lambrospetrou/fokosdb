@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../json-types.js";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
@@ -50,7 +50,7 @@ function readProjected(state: DurableObjectState, plan: CompiledProjectionPlan, 
 
 async function project(item: StoredFixture | null, projection: readonly ProjectionExpression[]): Promise<ProjectedItem | undefined> {
 	const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-	return await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const hashKey = KeyCodec.encode(item?.hashKey ?? "missing-hash-key");
 		const sortKey = item?.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
 		if (item) {
@@ -63,7 +63,7 @@ async function project(item: StoredFixture | null, projection: readonly Projecti
 describe("projected point read", () => {
 	it.each(PROJECTION_PRESENCE_FIXTURES)("$name", async ({ item, projection, expected }) => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode(item.hashKey);
 			const sortKey = item.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
 			putFixture(state.storage, hashKey, sortKey, item);
@@ -249,7 +249,7 @@ describe("projected point read", () => {
 
 	it("evaluates if_not_exists and arithmetic inside a condition", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "json", data: { qty: 3, price: 40 } });
@@ -277,7 +277,7 @@ describe("projected point read", () => {
 
 	it("evaluates a pass-through function inside a condition", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "json", data: { f: 1 } });
@@ -316,7 +316,7 @@ describe("projected point read", () => {
 
 	it("evaluates pass-through conditions against an absent sort key", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "json", data: { n: 7 }, ttlAt: 2_000_000_000 });
@@ -345,7 +345,7 @@ describe("projected point read", () => {
 
 	it("reads a plan with no descriptor and binds the empty pool", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "text", data: "v" });
@@ -423,7 +423,7 @@ describe("pool and direct layouts agree", () => {
 
 	it.each(cases)("$name", async ({ item, condition, expected }) => {
 		const stub = testPartitionStub(`expression-pool.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode(item.hashKey);
 			const sortKey = item.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
 			putFixture(state.storage, hashKey, sortKey, item);
@@ -464,7 +464,7 @@ describe("query statement", () => {
 
 	it("marks rows by the filter and nulls projected cells on misses", async () => {
 		const stub = testPartitionStub(`expression-query.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			for (const fixture of [item("a", { status: "x", n: 1 }), item("b", { status: "y", n: 2 }), item("c", { status: "x", n: 3 })]) {
 				putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode(fixture.sortKey!), fixture);
 			}
@@ -496,7 +496,7 @@ describe("query statement", () => {
 
 	it("filters and projects with if_not_exists and arithmetic", async () => {
 		const stub = testPartitionStub(`expression-query.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			for (const fixture of [item("a", { n: 1 }), item("b", {}), item("c", { n: 5 })]) {
 				putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode(fixture.sortKey!), fixture);
 			}
@@ -515,7 +515,7 @@ describe("query statement", () => {
 
 	it("runs a 100-choice in filter with a maximum-size projection in one statement", async () => {
 		const stub = testPartitionStub(`expression-query.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode("a"), item("a", { n: 5 }));
 			const plan = compileQueryExpression({
 				filter: {
@@ -545,7 +545,7 @@ describe("query statement", () => {
 
 	it("binds an empty pool for a plan with no descriptor", async () => {
 		const stub = testPartitionStub(`expression-query.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode("a"), item("a", "v", 2_000_000_000));
 			putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode("b"), item("b", "v"));
 			const plan = compileQueryExpression({
@@ -562,7 +562,7 @@ describe("query statement", () => {
 		"the CTE statement searches the items index once, without materializing or sorting, in %s order",
 		async (direction) => {
 			const stub = testPartitionStub(`expression-query.${crypto.randomUUID()}`);
-			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				for (const fixture of [item("a", { n: 1 }), item("b", { n: 2 }), item("c", { n: 3 })]) {
 					putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode(fixture.sortKey!), fixture);
 				}
@@ -605,7 +605,7 @@ describe("query statement", () => {
 describe("projected point read — limits", () => {
 	it("runs a maximum-size projection in one statement", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("h");
 			const sortKey = KeyCodec.encode("a");
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "h", sortKey: "a", data: { n: 5 }, kind: "json" });
@@ -631,7 +631,7 @@ describe("projected point read — limits", () => {
 
 	it("a projected read of a 400 KiB item returns a wire row two orders of magnitude smaller", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("h");
 			const sortKey = KeyCodec.encode("a");
 			// The pad is sized so the measured row lands just under the item byte cap.

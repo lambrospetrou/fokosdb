@@ -272,7 +272,7 @@ export type SingleShotResult = { response: SingleShotOutcome; promotionCandidate
 /**
  * The 2PC participant: prepare/commit/cancel/read for the items this partition owns locally.
  * Routing fan-out (groupItemsByRouting), child RPCs, alarm scheduling, and stale-tx recovery
- * driving stay in PartitionDO — this class only implements the local protocol semantics over
+ * driving stay in FokosDBPartitionDO — this class only implements the local protocol semantics over
  * the PartitionStore.
  */
 export class TransactionParticipant {

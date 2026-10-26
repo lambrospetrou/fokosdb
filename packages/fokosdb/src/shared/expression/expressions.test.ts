@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import type { JsonValue } from "../json-types.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
@@ -12,7 +12,7 @@ import type { ConditionExpression, UpdateExpression } from "./types.js";
 
 /**
  * The showcase suite for condition expressions. Every case here is a happy-path example of how a
- * user writes a condition, evaluated against real items inside a real PartitionDO. The suite has no
+ * user writes a condition, evaluated against real items inside a real FokosDBPartitionDO. The suite has no
  * error cases on purpose: it is the single place to read to learn what the feature can express.
  */
 
@@ -90,7 +90,7 @@ const stringLiteralItem: ShowcaseItem = {
 const partition = testPartitionStub(`expression-showcase.${crypto.randomUUID()}`);
 
 beforeAll(async () => {
-	await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
+	await runInDurableObject(partition, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		for (const item of [shippedOrder, pendingOrder, note, binaryItem, stringLiteralItem]) {
 			store.upsertItem({
@@ -107,7 +107,7 @@ beforeAll(async () => {
 
 /** Compiles the condition and evaluates it against one seeded item, exactly as a write path does. */
 async function evaluate(item: ShowcaseItem, condition: ConditionExpression): Promise<boolean> {
-	return await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(partition, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const result = evaluateConditionPlan(
 			state.storage,
 			compileConditionExpression(condition),
@@ -687,7 +687,7 @@ function accountWithout(key: keyof typeof account): Record<string, JsonValue> {
 async function applyUpdate(before: JsonValue | undefined, update: UpdateExpression): Promise<JsonValue> {
 	const hk = KeyCodec.encode(updateHashKey);
 	const sk = KeyCodec.encode(`update#${crypto.randomUUID()}`);
-	return await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(partition, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		if (before !== undefined) {
 			store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, txOrderTs: 1 });

@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { kb } from "./helpers.js";
@@ -19,7 +19,7 @@ const SEED = { readTs: 999_000_000, writeTs: 500_000, deleteWatermarkTs: 777_000
  * `{ maxDeleteTxOrderTs: 777_000_000, maxDeletedV: 4 }`.
  */
 async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk: KeyBytes }, victim: { hk: KeyBytes; sk: KeyBytes }) {
-	return await runInDurableObject(node.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(node.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		store.upsertItem({ hk: marker.hk, sk: marker.sk, data: "marker-data", kind: "text", ttlAt: null, txOrderTs: SEED.writeTs });
 		for (let i = 0; i < 3; i++) {
@@ -33,13 +33,13 @@ async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk:
 
 /** Reads the marker row and the deletion metadata of `node` straight from its storage. */
 async function storeStateOf(node: TestPartition, marker: { hk: KeyBytes; sk: KeyBytes }) {
-	return await runInDurableObject(node.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+	return await runInDurableObject(node.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		return { row: store.getItem(marker.hk, marker.sk).row, meta: store.getDeletionMetadata() };
 	});
 }
 
-describe.concurrent("PartitionDO — migration carries item timestamps and deletion metadata", () => {
+describe.concurrent("FokosDBPartitionDO — migration carries item timestamps and deletion metadata", () => {
 	it("a hash split copies both item timestamps and both deletion-metadata values", async () => {
 		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const marker = { hk: kb("marker"), sk: kb("sk") };

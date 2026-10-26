@@ -1,10 +1,10 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB, isFokosDBError } from "./db.js";
-import { FokosStd } from "./fokos-std.js";
+import { FokosDBStd } from "./fokos-std.js";
 import invariant from "../shared/invariant.js";
-import { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import { PartitionDO } from "../server/do-partition.js";
+import { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import { FokosDBPartitionDO } from "../server/do-partition.js";
 import {
 	DEFAULT_EVALUATED_ITEMS_PER_PAGE,
 	DEFAULT_RESPONSE_BYTES_PER_PAGE,
@@ -673,7 +673,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			});
 		});
 
-		describe("FokosDB.queryItems — negative prefix match with FokosStd.notBeginsWith", () => {
+		describe("FokosDB.queryItems — negative prefix match with FokosDBStd.notBeginsWith", () => {
 			// The complement of a prefix is two ranges, one sub-query each. The fixture covers every
 			// boundary: an item with no sort key (sorts first), the bare prefix, keys under the prefix, the
 			// successor key itself, a later string key, and a binary key (sorts after every string).
@@ -692,20 +692,20 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("returns every item whose sort key does not begin with the prefix, in sort order", async () => {
 				const db = await populate();
-				const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#") });
+				const res = await db.queryItems({ queries: FokosDBStd.notBeginsWith("k", "order#") });
 				expect(sksOf(res)).toEqual(EXPECTED_ASC);
 				expect(res.count).toBe(EXPECTED_ASC.length);
 			});
 
 			it("keeps the order reversed with scanIndexForward=false", async () => {
 				const db = await populate();
-				const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#", { scanIndexForward: false }) });
+				const res = await db.queryItems({ queries: FokosDBStd.notBeginsWith("k", "order#", { scanIndexForward: false }) });
 				expect(sksOf(res)).toEqual([...EXPECTED_ASC].reverse());
 			});
 
 			it("pages across the boundary between the two ranges without a gap or a duplicate", async () => {
 				const db = await populate();
-				const queries = FokosStd.notBeginsWith("k", "order#");
+				const queries = FokosDBStd.notBeginsWith("k", "order#");
 				const seen: Array<string | Uint8Array | undefined> = [];
 				let cursor: string | undefined;
 				let pages = 0;
@@ -727,7 +727,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const db = await populate();
 				await db.putItem({ hashKey: "other", sortKey: "z", data: "x" });
 				const res = await db.queryItems({
-					queries: [...FokosStd.notBeginsWith("k", "order#"), { hashKey: "other" }],
+					queries: [...FokosDBStd.notBeginsWith("k", "order#"), { hashKey: "other" }],
 					select: "count",
 				});
 				expect(res.items).toEqual([]);
@@ -1034,7 +1034,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				}),
 				{ servedBy: [{ ...leaf, _rangeAncestors: [] }], forwardCount: 1, servedByTruncated: false },
 			);
-			const spy = vi.spyOn(PartitionDO.prototype, "apiGetItem").mockRejectedValue(internal);
+			const spy = vi.spyOn(FokosDBPartitionDO.prototype, "apiGetItem").mockRejectedValue(internal);
 			try {
 				await expect(db.getItem({ hashKey: "alice" })).rejects.toThrow(fokosErrorWith("partition_migrating"));
 				const raised: FokosError = await db.getItem({ hashKey: "alice" }).then(
@@ -1072,7 +1072,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				},
 				routing: { servedBy: [{ ...leaf, _rangeAncestors: [] }], forwardCount: 1, servedByTruncated: false },
 			};
-			const spy = vi.spyOn(PartitionDO.prototype, "apiGetItem").mockResolvedValue(answer as never);
+			const spy = vi.spyOn(FokosDBPartitionDO.prototype, "apiGetItem").mockResolvedValue(answer as never);
 			try {
 				const raised = await db.getItem({ hashKey: "alice" }).then(
 					() => {
@@ -1109,10 +1109,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				servedByTruncated: false,
 			});
 			// The first sub-query runs the real method. The second one fails.
-			const original = Reflect.get(PartitionDO.prototype, "apiQueryItems") as PartitionDO["apiQueryItems"];
+			const original = Reflect.get(FokosDBPartitionDO.prototype, "apiQueryItems") as FokosDBPartitionDO["apiQueryItems"];
 			const spy = vi
-				.spyOn(PartitionDO.prototype, "apiQueryItems")
-				.mockImplementationOnce(function (this: PartitionDO, ...args) {
+				.spyOn(FokosDBPartitionDO.prototype, "apiQueryItems")
+				.mockImplementationOnce(function (this: FokosDBPartitionDO, ...args) {
 					return original.apply(this, args);
 				})
 				.mockRejectedValueOnce(failure);
@@ -1415,7 +1415,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			await db.putItem({ hashKey: "alice", sortKey: "a1", data: "x" });
 
-			const spy = vi.spyOn(PartitionDO.prototype, "apiQueryItems");
+			const spy = vi.spyOn(FokosDBPartitionDO.prototype, "apiQueryItems");
 			try {
 				await db.queryItems({ queries: [{ hashKey: "alice" }] });
 				const defaults = spy.mock.calls.at(-1)![1];
@@ -1527,7 +1527,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 	describe("FokosDB — limits and key validation are uniform across the APIs", () => {
 		it("rejects an over-size clientRequestToken before the coordinator RPC", async () => {
 			const db = makeDB();
-			const initiateWrite = vi.spyOn(TransactionCoordinatorDO.prototype, "initiateWrite");
+			const initiateWrite = vi.spyOn(FokosDBTransactionCoordinatorDO.prototype, "initiateWrite");
 			try {
 				await expect(
 					db.transactWriteItems({

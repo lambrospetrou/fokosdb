@@ -1,10 +1,10 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { projectionTree } from "../../src/shared/expression/test-fixtures.js";
 import { kb, makeStub } from "./helpers.js";
 
-describe.concurrent("PartitionDO - putItem / getItem", () => {
+describe.concurrent("FokosDBPartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {
 		const { ctx, rpc } = makeStub();
 
@@ -244,17 +244,17 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 			});
 			await scheduler.wait(600);
 
-			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				state.storage.sql.exec(`UPDATE items SET ttl_epoch_utc_seconds = 1`);
 			});
 			await scheduler.wait(600);
-			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items`).toArray()[0].n).toBe(1);
 			});
 
 			await rpc.status(ctx);
 			await scheduler.wait(600);
-			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items`).toArray()[0].n).toBe(0);
 			});
 		});
@@ -287,7 +287,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 });
 
-describe.concurrent("PartitionDO - deleteItem", () => {
+describe.concurrent("FokosDBPartitionDO - deleteItem", () => {
 	it("returns deleted:false for a missing key", async ({ expect }) => {
 		const { ctx, rpc } = makeStub();
 

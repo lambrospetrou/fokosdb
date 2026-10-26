@@ -1,6 +1,10 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { ApplyLatestImagesRequest, LatestImage, MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type {
+	ApplyLatestImagesRequest,
+	LatestImage,
+	FokosDBMaterializationDO,
+} from "../../src/server/materialization/do-materialization.js";
 import { materializationStubByName } from "../../src/shared/do-stubs.js";
 import { createTableConfig, materializationTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -56,7 +60,7 @@ function deleted(opIndex: number, hashKey: string, revision: number): LatestImag
 }
 
 async function apply(
-	target: { ctx: FokosDBRouteContext; stub: DurableObjectStub<MaterializationDO> },
+	target: { ctx: FokosDBRouteContext; stub: DurableObjectStub<FokosDBMaterializationDO> },
 	req: Partial<ApplyLatestImagesRequest>,
 ) {
 	const envelope = await target.stub.applyLatestImages(target.ctx, {
@@ -69,8 +73,8 @@ async function apply(
 	return envelope.value;
 }
 
-async function storedImage(stub: DurableObjectStub<MaterializationDO>, hashKey: string): Promise<StoredImage | undefined> {
-	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+async function storedImage(stub: DurableObjectStub<FokosDBMaterializationDO>, hashKey: string): Promise<StoredImage | undefined> {
+	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const row = state.storage.sql
 			.exec<
 				Omit<StoredImage, "deleted"> & { deleted_at_ms: number | null }
@@ -84,26 +88,26 @@ async function storedImage(stub: DurableObjectStub<MaterializationDO>, hashKey: 
 	});
 }
 
-async function keyEstimate(stub: DurableObjectStub<MaterializationDO>, hashKey: string): Promise<number | undefined> {
+async function keyEstimate(stub: DurableObjectStub<FokosDBMaterializationDO>, hashKey: string): Promise<number | undefined> {
 	return await runInDurableObject(
 		stub,
-		(_instance: MaterializationDO, state: DurableObjectState) =>
+		(_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
 			state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb(hashKey)).toArray()[0]
 				?.est_bytes,
 	);
 }
 
-async function producerEpoch(stub: DurableObjectStub<MaterializationDO>, producerId: string): Promise<number | undefined> {
+async function producerEpoch(stub: DurableObjectStub<FokosDBMaterializationDO>, producerId: string): Promise<number | undefined> {
 	return await runInDurableObject(
 		stub,
-		(_instance: MaterializationDO, state: DurableObjectState) =>
+		(_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
 			state.storage.sql.exec<{ epoch: number }>(`SELECT epoch FROM producer_fences WHERE producer_id = ?`, producerId).toArray()[0]?.epoch,
 	);
 }
 
 const ackedOpIndexes = (res: { acknowledged: Array<{ opIndex: number }> }) => res.acknowledged.map((a) => a.opIndex).sort((a, b) => a - b);
 
-describe("MaterializationDO — applyLatestImages revisions", () => {
+describe("FokosDBMaterializationDO — applyLatestImages revisions", () => {
 	it("applies a newer revision, and acknowledges an equal or older revision with no write", async () => {
 		const m = makeMaterialization().at("x");
 		expect(await apply(m, { items: [live(0, "x", 2)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }], failed: [] });
@@ -155,7 +159,7 @@ describe("MaterializationDO — applyLatestImages revisions", () => {
 	});
 });
 
-describe("MaterializationDO — applyLatestImages producer epochs", () => {
+describe("FokosDBMaterializationDO — applyLatestImages producer epochs", () => {
 	it("stores a higher epoch, and refuses a call below the stored epoch with producer_epoch_fenced", async () => {
 		const m = makeMaterialization().at("x");
 		await apply(m, { epoch: 2, items: [live(0, "x", 1)] });
@@ -176,7 +180,7 @@ describe("MaterializationDO — applyLatestImages producer epochs", () => {
 	it("writes a fence row only when an epoch goes up", async () => {
 		const m = makeMaterialization().at("x");
 		await apply(m, { epoch: 3, items: [live(0, "x", 1)] });
-		const changes = await runInDurableObject(m.stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+		const changes = await runInDurableObject(m.stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 			const store = new MaterializationStore(state.storage);
 			const changed = () => state.storage.sql.exec<{ n: number }>(`SELECT changes() AS n`).one().n;
 			const out: number[] = [];
@@ -206,7 +210,7 @@ describe("MaterializationDO — applyLatestImages producer epochs", () => {
 	});
 });
 
-describe("MaterializationDO — applyLatestImages size and routing", () => {
+describe("FokosDBMaterializationDO — applyLatestImages size and routing", () => {
 	it("above its size limit refuses each newer live image with partition_over_size, and still applies each delete and each fence", async () => {
 		const mat = makeMaterialization({ maxSizeMb: 0.0001, keepTombstones: true });
 		await mat.refuse("x");

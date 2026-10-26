@@ -3,8 +3,8 @@
  * partition context and no jurisdiction.
  */
 import { env } from "cloudflare:workers";
-import type { PartitionDO } from "../src/server/do-partition.js";
-import type { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
+import type { FokosDBPartitionDO } from "../src/server/do-partition.js";
+import type { FokosDBTransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
 import { createTableConfig, type FokosDBRouteContext, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
 import { FokosRouter } from "../src/sharding/router.js";
 import { COORDINATOR_REF_VERSION, type CoordinatorRef } from "../src/shared/transaction-wire-types.js";
@@ -14,8 +14,8 @@ import type { ControlledPartitionDO } from "./controlled-partition-do.js";
 export function testPartitionStub(
 	nameOrId: string | DurableObjectId,
 	ns: PartitionNamespaceKey = "PARTITION_DO",
-): DurableObjectStub<PartitionDO> {
-	const namespace: DurableObjectNamespace<PartitionDO> = env[ns];
+): DurableObjectStub<FokosDBPartitionDO> {
+	const namespace: DurableObjectNamespace<FokosDBPartitionDO> = env[ns];
 	return typeof nameOrId === "string" ? namespace.getByName(nameOrId) : namespace.get(nameOrId);
 }
 
@@ -24,7 +24,7 @@ export function testControlledPartitionStub(name: string): DurableObjectStub<Con
 	return env.CONTROLLED_PARTITION_DO.getByName(name);
 }
 
-export function testCoordinatorStubByName(doName: string): DurableObjectStub<TransactionCoordinatorDO> {
+export function testCoordinatorStubByName(doName: string): DurableObjectStub<FokosDBTransactionCoordinatorDO> {
 	return env.TRANSACTION_COORDINATOR_DO.getByName(doName);
 }
 

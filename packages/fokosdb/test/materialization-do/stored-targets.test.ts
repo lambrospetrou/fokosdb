@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { MaterializationStore } from "../../src/server/materialization/materialization-store.js";
 import type { FokosTargetDefinition } from "../../src/server/materialization/targets.js";
 import type { ExpressionValue } from "../../src/shared/expression/types.js";
@@ -18,10 +18,10 @@ function aboveSqlLimit(): ExpressionValue {
 async function errorsOfNewInstance(targets: readonly FokosTargetDefinition[]): Promise<Array<Record<string, unknown>>> {
 	const name = `stored-targets.${crypto.randomUUID()}`;
 	const stub = env.MATERIALIZATION_DO.getByName(name);
-	await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		new MaterializationStore(state.storage).storeTargets(targets);
 	});
-	await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		state.abort("test restart");
 	}).catch(() => {});
 	const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -31,7 +31,7 @@ async function errorsOfNewInstance(targets: readonly FokosTargetDefinition[]): P
 	return errors.mock.calls.map(([fields]) => fields as Record<string, unknown>);
 }
 
-describe("MaterializationDO — the check of the stored target list", () => {
+describe("FokosDBMaterializationDO — the check of the stored target list", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});

@@ -1,5 +1,5 @@
 /**
- * The cleanup of `MaterializationDO`: it deletes the change positions that each target finished, and
+ * The cleanup of `FokosDBMaterializationDO`: it deletes the change positions that each target finished, and
  * the tombstones that each target read and that no target still needs.
  *
  * A pass has two phases. The first deletes the positions at or below the lowest cursor. The second

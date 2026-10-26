@@ -19,7 +19,7 @@ function options(tableName: string, extra: Partial<FokosDBOptions> = {}): FokosD
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 0.25 },
 		nsAdmin: "FOKOS_ADMIN_DO",
-		topologyEntrypoint: "FokosTopologyCache",
+		topologyEntrypoint: "FokosDBTopologyCache",
 		...extra,
 	};
 }

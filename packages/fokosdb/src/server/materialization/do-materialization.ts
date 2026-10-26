@@ -96,11 +96,11 @@ type MaterializationRpc = FokosShardingRpc & {
  * Each accepted image gets a change position, and the target runner sends the latest image of each
  * changed item to each target of `fokosTargets()`.
  *
- * It splits with the rules of `PartitionDO`: a hash split, a promotion of a large base hash key, and a
+ * It splits with the rules of `FokosDBPartitionDO`: a hash split, a promotion of a large base hash key, and a
  * range split of a promoted key. The migration moves the items with their positions and their
  * `target_retry` rows, and the split fences of each target.
  */
-export class MaterializationDO extends DurableObject<Env> implements MaterializationRpc {
+export class FokosDBMaterializationDO extends DurableObject<Env> implements MaterializationRpc {
 	/** The sharding runtime: identity, routing, and the alarm. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, MaterializationOps>;
 	#store: MaterializationStore;
@@ -318,7 +318,7 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 					this.#store.deleteCursorSnapshot(hashKey);
 				}
 			},
-			// A split keeps its rows, as `PartitionDO` does. A promotion deletes the items of its key in
+			// A split keeps its rows, as `FokosDBPartitionDO` does. A promotion deletes the items of its key in
 			// steps of a limited size, because one large delete holds each request of this partition
 			// until its write is durable.
 			cleanupSourceStep: (plan) => {
@@ -534,7 +534,7 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 	}
 
 	/**
-	 * Override to change the settings of this class. The rules of `PartitionDO.fokosConfig` apply.
+	 * Override to change the settings of this class. The rules of `FokosDBPartitionDO.fokosConfig` apply.
 	 */
 	protected fokosConfig(): MaterializationDOConfigOverrides {
 		return {};
@@ -542,7 +542,7 @@ export class MaterializationDO extends DurableObject<Env> implements Materializa
 
 	/**
 	 * Override to change the settings of the sharding runtime of this class. The rules of
-	 * `PartitionDO.fokosRuntimeConfig` apply.
+	 * `FokosDBPartitionDO.fokosRuntimeConfig` apply.
 	 */
 	protected fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
 		return {};

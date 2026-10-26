@@ -13,7 +13,7 @@ import { kb, makeStub } from "./helpers.js";
  * the cause. Each expression here is at a limit of the expression engine, where its SQL is deepest.
  * The compiler accepts it, so it must run.
  */
-describe("PartitionDO — an expression at the limits of the engine runs in SQLite", () => {
+describe("FokosDBPartitionDO — an expression at the limits of the engine runs in SQLite", () => {
 	const key = { hashKey: kb("hk"), sortKey: kb("sk") };
 	const ok = { outcome: "ok" };
 	const rejected = { outcome: "rejected", reason: { code: "condition_failed" } };

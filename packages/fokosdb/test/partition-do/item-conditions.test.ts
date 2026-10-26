@@ -1,9 +1,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { conditionTree, kb, makeStub, opened } from "./helpers.js";
 
-describe("PartitionDO - conditional putItem", () => {
+describe("FokosDBPartitionDO - conditional putItem", () => {
 	describe("item_not_exists", () => {
 		it("succeeds and creates the item when it does not exist", async ({ expect }) => {
 			const { ctx, rpc } = makeStub();
@@ -24,7 +24,7 @@ describe("PartitionDO - conditional putItem", () => {
 		it("rejects when item already exists, leaving it unchanged", async ({ expect }) => {
 			const { ctx, stub, rpc } = makeStub();
 
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 				await instance.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "original", kind: "text" as const });
 
 				const res = opened(
@@ -48,7 +48,7 @@ describe("PartitionDO - conditional putItem", () => {
 
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb(), data: "original", kind: "text" as const });
 
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 				const res = opened(
 					await instance.apiPutItem(ctx, {
 						hashKey: kb("hk"),
@@ -88,7 +88,7 @@ describe("PartitionDO - conditional putItem", () => {
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const }); // v is now 2
 
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 				const res = opened(
 					await instance.apiPutItem(ctx, {
 						hashKey: kb("hk"),
@@ -108,7 +108,7 @@ describe("PartitionDO - conditional putItem", () => {
 		it("rejects when the item does not exist (actual v is null)", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 				const res = opened(
 					await instance.apiPutItem(ctx, {
 						hashKey: kb("hk"),
@@ -177,7 +177,7 @@ describe("PartitionDO - conditional putItem", () => {
 			// attribute_equals with value=1 would pass — but we never reach it.
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "original", kind: "text" as const });
 
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 				const res = opened(
 					await instance.apiPutItem(ctx, {
 						hashKey: kb("hk"),
@@ -207,7 +207,7 @@ describe("PartitionDO - conditional putItem", () => {
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const }); // v is now 2
 
 			// attribute_equals v=2 passes, then attribute_equals v=1 fails.
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 				const res = opened(
 					await instance.apiPutItem(ctx, {
 						hashKey: kb("hk"),
@@ -245,7 +245,7 @@ describe("PartitionDO - conditional putItem", () => {
 	});
 });
 
-describe("PartitionDO - deleteItem", () => {
+describe("FokosDBPartitionDO - deleteItem", () => {
 	describe("conditional deleteItem", () => {
 		describe("item_exists", () => {
 			it("succeeds and deletes the item when it exists", async ({ expect }) => {
@@ -265,7 +265,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("rejects when item does not exist, making the operation a no-op", async ({ expect }) => {
 				const { ctx, stub, rpc } = makeStub();
 
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 					const res = opened(
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
@@ -283,7 +283,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("works when sortKey is absent", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 					const res = opened(
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
@@ -316,7 +316,7 @@ describe("PartitionDO - deleteItem", () => {
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const }); // v is now 2
 
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 					const res = opened(
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
@@ -336,7 +336,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("rejects when the item does not exist (actual v is null)", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 					const res = opened(
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
@@ -374,7 +374,7 @@ describe("PartitionDO - deleteItem", () => {
 
 				// item_exists is listed first and will fail since no item exists.
 				// attribute_equals would never be reached.
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 					const res = opened(
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
@@ -399,7 +399,7 @@ describe("PartitionDO - deleteItem", () => {
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const }); // v is now 2
 
 				// item_exists passes, then attribute_equals v=1 fails.
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await runInDurableObject(stub, async (instance: FokosDBPartitionDO) => {
 					const res = opened(
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),

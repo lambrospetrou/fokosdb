@@ -4,12 +4,12 @@
  * A Worker that uses them must re-export each from its own entry module, otherwise wrangler cannot
  * find the classes its bindings name.
  */
-export { PartitionDO } from "./do-partition.js";
+export { FokosDBPartitionDO } from "./do-partition.js";
 export type { PartitionOps, PartitionRpc } from "./do-partition.js";
 
-export { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+export { FokosDBTransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 
-export { MaterializationDO } from "./materialization/do-materialization.js";
+export { FokosDBMaterializationDO } from "./materialization/do-materialization.js";
 export type {
 	ApplyLatestImagesRequest,
 	ApplyLatestImagesResponse,
@@ -25,4 +25,4 @@ export type {
 /** The admin Durable Object of the topology. Bind it, and name the binding in the `nsAdmin` table option. */
 export { FokosDBAutoAdminDO } from "./do-auto-admin.js";
 /** The cached topology entrypoint. Re-export it, enable its cache, and name it in the `topologyEntrypoint` table option. */
-export { FokosTopologyCache } from "./topology-entrypoint.js";
+export { FokosDBTopologyCache } from "./topology-entrypoint.js";

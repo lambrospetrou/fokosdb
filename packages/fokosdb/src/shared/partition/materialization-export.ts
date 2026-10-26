@@ -1,5 +1,5 @@
 /**
- * The export of the `materialization_outbox` rows of a base partition to `MaterializationDO`.
+ * The export of the `materialization_outbox` rows of a base partition to `FokosDBMaterializationDO`.
  *
  * In-memory workers run while due rows exist. A worker claims a batch of rows in one storage
  * transaction, sends the latest image of each row in one call, and applies the answer in a second

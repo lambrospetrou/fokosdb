@@ -22,7 +22,7 @@ type QuerySpec = QueryItemsOptions["queries"][number];
  * Client-side helpers for `FokosDB`. The request builders send no RPC. The retry helpers send requests
  * only through the `ItemBatcher` they get.
  */
-export class FokosStd {
+export class FokosDBStd {
 	/**
 	 * Calls `db.batchGetItems` with every key, then again with `unprocessedKeys` and the `projection` and
 	 * `maxResponseBytes` of the request, until no key stays unprocessed or the calls reach
@@ -111,7 +111,7 @@ export class FokosStd {
 		}
 		const scanIndexForward = options?.scanIndexForward ?? true;
 		const below: QuerySpec = { hashKey, sortKeyCondition: { op: "lt", value: sortKeyPrefix }, scanIndexForward };
-		const successor = FokosStd.sortKeySuccessor(sortKeyPrefix);
+		const successor = FokosDBStd.sortKeySuccessor(sortKeyPrefix);
 		if (successor === undefined) {
 			return [below];
 		}

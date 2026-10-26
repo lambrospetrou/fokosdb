@@ -1,9 +1,9 @@
 /**
- * `gsiWriteEntries`: the internal partition operation that a `MaterializationDO` writes a GSI table with.
+ * `gsiWriteEntries`: the internal partition operation that a `FokosDBMaterializationDO` writes a GSI table with.
  */
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { GsiWriteEntriesRequest, GsiWriteEntriesResponse, GsiWriteEntry, PartitionDO } from "../../src/server/do-partition.js";
+import type { GsiWriteEntriesRequest, GsiWriteEntriesResponse, GsiWriteEntry, FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";
@@ -44,7 +44,7 @@ function gsiTable() {
 			return env.value;
 		},
 		async epochs(): Promise<Record<string, number>> {
-			return await runInDurableObject(t.stub, (_i: PartitionDO, state: DurableObjectState) =>
+			return await runInDurableObject(t.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) =>
 				Object.fromEntries(
 					state.storage.sql
 						.exec<{ producer_id: string; epoch: number }>(`SELECT producer_id, epoch FROM producer_fences`)
@@ -56,13 +56,14 @@ function gsiTable() {
 		async count(): Promise<number> {
 			return await runInDurableObject(
 				t.stub,
-				(_i: PartitionDO, state: DurableObjectState) => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items`).one().n,
+				(_i: FokosDBPartitionDO, state: DurableObjectState) =>
+					state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items`).one().n,
 			);
 		},
 	};
 }
 
-describe("PartitionDO — gsiWriteEntries", () => {
+describe("FokosDBPartitionDO — gsiWriteEntries", () => {
 	it("applies puts and deletes, and stores the epoch of the producer", async () => {
 		const t = gsiTable();
 		const res = await t.write({ epoch: 2, items: [put(0, "g", "a", "u1"), put(1, "g", "a", "u2")] });
@@ -119,7 +120,7 @@ describe("PartitionDO — gsiWriteEntries", () => {
 		const budget = { pageBytes: 1 << 20, pageRows: 1, scanRows: 100 };
 		const host = (store: PartitionStore) =>
 			new FokosMigrationHost({ store, logParams: () => ({}), captureChanges: () => false, selfId: () => "self" });
-		const pages = await runInDurableObject(source.stub, (_i: PartitionDO, state: DurableObjectState) => {
+		const pages = await runInDurableObject(source.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			const h = host(new PartitionStore(state.storage));
 			const out: unknown[] = [];
 			let cursor: unknown = { stream: "pending_tx", cursor: null };
@@ -139,7 +140,7 @@ describe("PartitionDO — gsiWriteEntries", () => {
 
 		const target = gsiTable();
 		await target.write({ epoch: 9, items: [put(0, "x", "a", "u1")] });
-		await runInDurableObject(target.stub, (_i: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(target.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 			const h = host(new PartitionStore(state.storage));
 			for (const page of pages) {
 				h.applyPage(page, slice);

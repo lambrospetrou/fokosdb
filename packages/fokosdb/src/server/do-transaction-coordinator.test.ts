@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import type { PartitionDO } from "./do-partition.js";
+import type { FokosDBTransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import type { FokosDBPartitionDO } from "./do-partition.js";
 import * as doStubs from "../shared/do-stubs.js";
 import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import {
@@ -76,7 +76,7 @@ afterEach(() => {
 type CoordinatorInternals = {
 	/** The public RPC: it goes through the runtime, admission included. */
 	initiateWrite(ctx: FokosDBRouteContext, request: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>>;
-	fokos: TransactionCoordinatorDO["fokos"];
+	fokos: FokosDBTransactionCoordinatorDO["fokos"];
 	fokosNow(): number;
 	hooks(): FokosShardingHooks<FokosDBPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
@@ -248,7 +248,7 @@ async function withCoordinator(
 	const ctx = testCoordinatorContext();
 	const stub = testCoordinatorStubByName(ctx.doName);
 	await stub.recoverTransaction(ctx, { transactionId: "no-such-transaction", idempotencyToken: TOKEN });
-	await runInDurableObject(stub, async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+	await runInDurableObject(stub, async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 		await fn(instance as unknown as CoordinatorInternals, state, ctx);
 	});
 }
@@ -259,7 +259,7 @@ async function runJobs(tc: CoordinatorInternals): Promise<void> {
 	tc.sweepExpiredTransactions();
 }
 
-describe("TransactionCoordinatorDO - loadFinalResponse: committed only after every participant confirmed", () => {
+describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only after every participant confirmed", () => {
 	it("reports committed in state COMMITTED", async () => {
 		await withCoordinator((tc, state) => {
 			seed(state, "COMMITTED");
@@ -336,7 +336,7 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 	});
 });
 
-describe("TransactionCoordinatorDO - participant resolution", () => {
+describe("FokosDBTransactionCoordinatorDO - participant resolution", () => {
 	it("resolves each item to the root of its key in the table config, and stores the root contexts", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			const topology = { ...ctx.topology, rootTreesN: 8 };
@@ -421,7 +421,7 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 	});
 });
 
-describe("TransactionCoordinatorDO - bounded transaction storage", () => {
+describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => {
 	it.each([{}, { maxSizeMb: 10_000 }])(
 		"splits and refuses new transactions before the storage limit with hashSplitConditions %j",
 		async (hashSplitConditions) => {
@@ -694,7 +694,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				return enveloped({ outcome: "accepted" as const });
 			});
 			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await tc.recoverStaleTransactions();
 
@@ -718,7 +718,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 					message: "partition exceeded its limits, please retry later",
 				});
 			});
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
@@ -943,7 +943,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			seed(state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
 			insertParticipant(state, { name: "p1" });
 			const txPrepare = vi.fn(async (_pCtx: unknown, _request: { transactionId: string }) => enveloped({ outcome: "accepted" as const }));
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
@@ -983,7 +983,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			);
 			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
 				(_env, _ctx, name) =>
-					({ txPrepare: name === "p1" ? throwingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
+					({ txPrepare: name === "p1" ? throwingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
@@ -1037,7 +1037,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			);
 			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
 				(_env, _ctx, name) =>
-					({ txPrepare: name === "p1" ? acceptingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
+					({ txPrepare: name === "p1" ? acceptingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
@@ -1312,7 +1312,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				return enveloped({ outcome: op === "txCommit" ? ("committed" as const) : ("cancelled" as const) });
 			};
 			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
-				() => ({ txCommit: record("txCommit"), txCancel: record("txCancel") }) as unknown as DurableObjectStub<PartitionDO>,
+				() => ({ txCommit: record("txCommit"), txCancel: record("txCancel") }) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 			return sent;
 		}
@@ -1374,7 +1374,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 							}
 							return enveloped({ outcome: "committed" as const });
 						},
-					}) as unknown as DurableObjectStub<PartitionDO>,
+					}) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 			return committedBy;
 		}
@@ -1450,7 +1450,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 	});
 });
 
-describe("TransactionCoordinatorDO - idempotency sweep", () => {
+describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	it("deletes one batch and runs again at once while expired rows remain", async () => {
 		await withCoordinator(async (tc, state) => {
 			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
@@ -1625,7 +1625,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	});
 });
 
-describe("TransactionCoordinatorDO - bounded preparing hold", () => {
+describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 	it("cancels with the stored cause and marks every operation not_evaluated when older than MAX_PREPARING_HOLD_MS and participant throws", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING", undefined, Date.now() - 30_000);
@@ -1634,7 +1634,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				throw new Error("partition unreachable");
 			});
 			const txCancel = vi.fn(async () => enveloped(undefined));
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
@@ -1673,7 +1673,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
@@ -1692,7 +1692,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			insertParticipant(state, { name: "p1" });
 			const txPrepare = vi.fn(async () => enveloped({ outcome: "accepted" as const }));
 			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
@@ -1744,7 +1744,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 						txPrepare: name === "p1" ? async () => enveloped({ outcome: "accepted" as const }) : p2Prepare,
 						txCommit,
 						txCancel,
-					}) as unknown as DurableObjectStub<PartitionDO>,
+					}) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 			return { txCommit, txCancel };
 		}
@@ -1810,7 +1810,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 					({
 						txPrepare,
 						txCancel: name === "p1" ? txCancelP1 : txCancelP2,
-					}) as unknown as DurableObjectStub<PartitionDO>,
+					}) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
@@ -1843,7 +1843,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				throw new Error("p1 unreachable");
 			});
 			const txCancel = vi.fn(async () => enveloped(undefined));
-			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
@@ -1866,7 +1866,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 	});
 });
 
-describe("TransactionCoordinatorDO - migration pages", () => {
+describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
 	it("pages the ledger by the row budget, and keeps only the transactions the target owns", async () => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 		await withCoordinator((tc, state) => {
@@ -1939,7 +1939,7 @@ describe("TransactionCoordinatorDO - migration pages", () => {
 	});
 });
 
-describe("TransactionCoordinatorDO - migration of an item with more than one operation", () => {
+describe("FokosDBTransactionCoordinatorDO - migration of an item with more than one operation", () => {
 	it("moves every tc_items row with its op_index", async () => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 		await withCoordinator((tc, state) => {
@@ -1969,14 +1969,14 @@ describe("TransactionCoordinatorDO - migration of an item with more than one ope
 	});
 });
 
-describe("TransactionCoordinatorDO - recoverTransactionForParticipant", () => {
+describe("FokosDBTransactionCoordinatorDO - recoverTransactionForParticipant", () => {
 	// A lock stores only the name of the coordinator and the token. The coordinator routes the call
 	// with the route context it stored.
 	it("answers from the ledger through the stored route context", async () => {
 		await withCoordinator(async (tc, state) => {
 			insertState(state, { token: TOKEN, transactionId: TX_ID, state: "COMMITTED", createdAt: BASE_TIME, completedAt: BASE_TIME });
 
-			const coordinator = tc as unknown as TransactionCoordinatorDO;
+			const coordinator = tc as unknown as FokosDBTransactionCoordinatorDO;
 			await expect(coordinator.recoverTransactionForParticipant({ transactionId: TX_ID, idempotencyToken: TOKEN })).resolves.toEqual({
 				state: "COMMITTED",
 			});
@@ -1989,13 +1989,13 @@ describe("TransactionCoordinatorDO - recoverTransactionForParticipant", () => {
 		await expect(stub.recoverTransactionForParticipant({ transactionId: TX_ID, idempotencyToken: TOKEN })).resolves.toEqual({
 			state: "not_found",
 		});
-		await runInDurableObject(stub, (instance: TransactionCoordinatorDO) => {
+		await runInDurableObject(stub, (instance: FokosDBTransactionCoordinatorDO) => {
 			expect(instance.fokos.initialized()).toBe(false);
 		});
 	});
 });
 
-describe("TransactionCoordinatorDO - fokosDestroy", () => {
+describe("FokosDBTransactionCoordinatorDO - fokosDestroy", () => {
 	// The idempotency window lives in tc_state. A coordinator that survives FokosDB.destroy() answers a
 	// replayed clientRequestToken with the old transaction's outcome — "committed" for data that was
 	// wiped with the partitions.
@@ -2012,7 +2012,7 @@ describe("TransactionCoordinatorDO - fokosDestroy", () => {
 			// the next caller re-run the migrations) without killing the run.
 			const abort = vi.spyOn(state, "abort").mockImplementation(() => {});
 
-			await (tc as unknown as TransactionCoordinatorDO).fokosDestroy();
+			await (tc as unknown as FokosDBTransactionCoordinatorDO).fokosDestroy();
 
 			expect(abort).toHaveBeenCalledWith("__special_destroy_sentinel");
 			// deleteAll() drops the tables themselves, migration bookkeeping included — which is exactly
@@ -2024,7 +2024,7 @@ describe("TransactionCoordinatorDO - fokosDestroy", () => {
 	});
 });
 
-describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () => {
+describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare", () => {
 	function unavailableWire(code: "partition_migrating" | "partition_over_size"): FokosErrorWire {
 		const def = code === "partition_migrating" ? SHARDING_UNAVAILABLE_CODES.partition_migrating : UNAVAILABLE_CODES.partition_over_size;
 		return FokosError.toWire(new FokosUnavailableError(def, { message: "refused" }));
@@ -2108,7 +2108,7 @@ describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () =
 	});
 });
 
-describe("TransactionCoordinatorDO - fatal prepare errors", () => {
+describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 	const fatal = () => new FokosValidationError(VALIDATION_CODES.transact_version_after_write, { message: "refused" });
 	const expressionError = () => new FokosExpressionError(EXPRESSION_CODES.expression_invalid, { message: "not valid" });
 	const transient = () => new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, { message: "migrating" });
@@ -2138,7 +2138,7 @@ describe("TransactionCoordinatorDO - fatal prepare errors", () => {
 					txPrepare: (ctx: unknown, req: { transactionId: string }) => txPrepare(ctx, req, name),
 					txCancel: (ctx: unknown, req: unknown) => txCancel(ctx, req, name),
 					txCommit,
-				}) as unknown as DurableObjectStub<PartitionDO>,
+				}) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 		);
 		const callsFor = (fn: typeof txPrepare | typeof txCancel, name?: string) =>
 			fn.mock.calls.filter(

@@ -1,5 +1,5 @@
 /**
- * The half of the migration of `MaterializationDO` that the host owns: the streams that carry its rows.
+ * The half of the migration of `FokosDBMaterializationDO` that the host owns: the streams that carry its rows.
  *
  * The streams run in order, and each drains before the next starts:
  *

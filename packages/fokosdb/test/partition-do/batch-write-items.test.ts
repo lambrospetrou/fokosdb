@@ -3,12 +3,12 @@
  */
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { FokosStd } from "../../src/client/fokos-std.js";
+import { FokosDBStd } from "../../src/client/fokos-std.js";
 import type {
 	BatchWriteItemsRpcRequest,
 	BatchWriteItemsRpcResponse,
 	BatchWriteRpcItem,
-	PartitionDO,
+	FokosDBPartitionDO,
 } from "../../src/server/do-partition.js";
 import type { ItemBatcher } from "../../src/shared/batch-api-types.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
@@ -92,7 +92,7 @@ async function readData(partition: TestPartition, hashKey: string, sortKey: stri
 async function overSize(partition: TestPartition): Promise<TestPartition> {
 	const size = await runInDurableObject(
 		partition.stub,
-		(_instance: PartitionDO, state: DurableObjectState) => state.storage.sql.databaseSize,
+		(_instance: FokosDBPartitionDO, state: DurableObjectState) => state.storage.sql.databaseSize,
 	);
 	const ctx: FokosDBRouteContext = {
 		...partition.ctx,
@@ -101,7 +101,7 @@ async function overSize(partition: TestPartition): Promise<TestPartition> {
 	return TestPartition.at(ctx, partition.stub);
 }
 
-describe.concurrent("PartitionDO — apiBatchWriteItems", () => {
+describe.concurrent("FokosDBPartitionDO — apiBatchWriteItems", () => {
 	it("applies puts and deletes with the version and the deleted flag of each", async () => {
 		const partition = makePartition();
 		await partition.put({ hashKey: kb("a"), sortKey: kb("1"), data: "old", kind: "text" });
@@ -481,13 +481,13 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 	});
 });
 
-describe.concurrent("FokosStd.batchWriteItemsWithRetry", () => {
+describe.concurrent("FokosDBStd.batchWriteItemsWithRetry", () => {
 	it("sends the unprocessed items again until each applies, and joins the meta", async () => {
 		const db = makeDB({ controlled: true });
 		const [failing, ok] = keysAcrossPartitions(db, 2, "retry-ok");
 		await controlledPartition(db, failing).testTxResponse("apiBatchWriteItems", { error: "Network connection lost.", times: 1 });
 
-		const write = await FokosStd.batchWriteItemsWithRetry(
+		const write = await FokosDBStd.batchWriteItemsWithRetry(
 			db,
 			{
 				items: [
@@ -514,7 +514,7 @@ describe.concurrent("FokosStd.batchWriteItemsWithRetry", () => {
 		await controlledPartition(db, key).testTxResponse("apiBatchWriteItems", { error: "Network connection lost." });
 
 		const items = [{ operation: "put" as const, ...key, data: "v" }];
-		const write = await FokosStd.batchWriteItemsWithRetry(db, { items }, { baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 3 });
+		const write = await FokosDBStd.batchWriteItemsWithRetry(db, { items }, { baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 3 });
 
 		expect(write.results).toMatchObject([{ outcome: "unknown" }]);
 		expect(write.unprocessedItems).toEqual(items);
@@ -540,7 +540,7 @@ describe.concurrent("FokosStd.batchWriteItemsWithRetry", () => {
 			},
 		};
 		try {
-			const write = await FokosStd.batchWriteItemsWithRetry(
+			const write = await FokosDBStd.batchWriteItemsWithRetry(
 				batcher,
 				{
 					items: [
@@ -566,18 +566,18 @@ describe.concurrent("FokosStd.batchWriteItemsWithRetry", () => {
 		const db = makeDB({ controlled: true });
 		const [key] = keysAcrossPartitions(db, 1, "retry-options");
 		await expect(
-			FokosStd.batchWriteItemsWithRetry(db, { items: [{ operation: "put", ...key, data: "v" }] }, { baseDelayMs: 10, maxDelayMs: 5 }),
+			FokosDBStd.batchWriteItemsWithRetry(db, { items: [{ operation: "put", ...key, data: "v" }] }, { baseDelayMs: 10, maxDelayMs: 5 }),
 		).rejects.toThrow(fokosErrorWith("fokosdb_options_invalid"));
 		expect(await recordedTxCalls(controlledPartition(db, key), "apiBatchWriteItems")).toHaveLength(0);
 	});
 });
 
-describe.concurrent("FokosStd.batchGetItemsWithRetry", () => {
+describe.concurrent("FokosDBStd.batchGetItemsWithRetry", () => {
 	it("answers an empty request with an empty result, for reads and writes", async () => {
 		const db = makeDB();
 		const meta = { forwardCount: 0, partitions: [] };
-		await expect(FokosStd.batchGetItemsWithRetry(db, { items: [] })).resolves.toEqual({ items: [], unprocessedKeys: [], meta });
-		await expect(FokosStd.batchWriteItemsWithRetry(db, { items: [] })).resolves.toEqual({ results: [], unprocessedItems: [], meta });
+		await expect(FokosDBStd.batchGetItemsWithRetry(db, { items: [] })).resolves.toEqual({ items: [], unprocessedKeys: [], meta });
+		await expect(FokosDBStd.batchWriteItemsWithRetry(db, { items: [] })).resolves.toEqual({ results: [], unprocessedItems: [], meta });
 	});
 
 	it("sends the unprocessed keys again with the projection of the request", async () => {
@@ -587,7 +587,7 @@ describe.concurrent("FokosStd.batchGetItemsWithRetry", () => {
 		await db.putItem({ ...ok, data: { name: "o", score: 2 } });
 		await controlledPartition(db, failing).testTxResponse("apiBatchGetItems", { error: "Network connection lost.", times: 1 });
 
-		const read = await FokosStd.batchGetItemsWithRetry(
+		const read = await FokosDBStd.batchGetItemsWithRetry(
 			db,
 			{ items: [failing, ok], projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }] },
 			{ baseDelayMs: 1, maxDelayMs: 2 },
@@ -620,7 +620,7 @@ describe("FokosDB.batchWriteItems — the RPC limit", () => {
 			},
 		};
 
-		const write = await FokosStd.batchWriteItemsWithRetry(batcher, { items }, { baseDelayMs: 1, maxDelayMs: 2 });
+		const write = await FokosDBStd.batchWriteItemsWithRetry(batcher, { items }, { baseDelayMs: 1, maxDelayMs: 2 });
 
 		expect(calls).toEqual([100]);
 		for (const result of write.results) {

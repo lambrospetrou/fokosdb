@@ -1,5 +1,5 @@
 /**
- * The writer of the GSI tables of a `MaterializationDO`. It holds one `FokosShardingClient` for each
+ * The writer of the GSI tables of a `FokosDBMaterializationDO`. It holds one `FokosShardingClient` for each
  * GSI shard group, sends `gsiWriteEntries` to the owner partition of each entry, and maps each entry
  * to one outcome. It does not use `FokosDB`.
  */

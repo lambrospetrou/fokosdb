@@ -6,7 +6,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { expect, vi } from "vitest";
 import { FokosDB, type FokosDBRetryOptions } from "../../src/client/db.js";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
 	coordinatorShardGroup,
@@ -278,7 +278,7 @@ export async function holdPendingLock(
 export async function betweenPhases<T>(
 	db: FokosDB,
 	key: Key,
-	between: (instance: PartitionDO, state: DurableObjectState, pCtx: FokosDBRouteContext) => Promise<void>,
+	between: (instance: FokosDBPartitionDO, state: DurableObjectState, pCtx: FokosDBRouteContext) => Promise<void>,
 	read: () => Promise<T>,
 ): Promise<T> {
 	const partition = controlledPartition(db, key);
@@ -289,7 +289,7 @@ export async function betweenPhases<T>(
 		// The caller gets a failure of the read from the `await` below.
 		result.catch(() => {});
 		await vi.waitFor(async () => expect(await partition.testReadPhaseParked()).toBe(true), { timeout: 5000, interval: 10 });
-		await runInDurableObject(partition, (instance: PartitionDO, state: DurableObjectState) => between(instance, state, pCtx));
+		await runInDurableObject(partition, (instance: FokosDBPartitionDO, state: DurableObjectState) => between(instance, state, pCtx));
 		await partition.testReleaseReadPhase();
 		return await result;
 	} finally {

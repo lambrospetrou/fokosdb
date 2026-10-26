@@ -6,7 +6,7 @@
  * deployed; the fetch handler exists only because wrangler expects a default export.
  */
 import { DurableObject } from "cloudflare:workers";
-import { PartitionDO } from "../src/server/do-partition.js";
+import { FokosDBPartitionDO } from "../src/server/do-partition.js";
 import { FOKOS_ERROR_CATEGORIES, FokosError, FokosInternalError, type FokosCodeDef } from "../src/shared/errors.js";
 import { FOKOS_LIBRARY_CODE_TABLES, type FokosErrorCode } from "../src/shared/errors-operations.js";
 import { SHARDING_INTERNAL_CODES } from "../src/sharding/errors.js";
@@ -14,19 +14,19 @@ import { SHARDING_INTERNAL_CODES } from "../src/sharding/errors.js";
 /** Every code definition of the library by its code. */
 export const CODE_DEFS: Record<FokosErrorCode, FokosCodeDef> = Object.assign({}, ...FOKOS_LIBRARY_CODE_TABLES);
 
-export { PartitionDO } from "../src/server/do-partition.js";
-export { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
-export { MaterializationDO } from "../src/server/materialization/do-materialization.js";
+export { FokosDBPartitionDO } from "../src/server/do-partition.js";
+export { FokosDBTransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
+export { FokosDBMaterializationDO } from "../src/server/materialization/do-materialization.js";
 // A materialization class with a push target, and the push target that it sends to.
 export { PushMaterializationDO, PushSinkDO } from "./materialization-do/push-target-host.js";
 // A materialization class with GSI targets.
 export { GsiMaterializationDO } from "./materialization-do/gsi-target-host.js";
 export { FokosDBAutoAdminDO } from "../src/server/do-auto-admin.js";
-export { FokosTopologyCache } from "../src/server/topology-entrypoint.js";
+export { FokosDBTopologyCache } from "../src/server/topology-entrypoint.js";
 
 // db.test.ts runs its whole suite over CUSTOM_PARTITION_DO as well, so that a
-// subclassed PartitionDO stays covered.
-export class CustomPartitionDO extends PartitionDO {}
+// subclassed FokosDBPartitionDO stays covered.
+export class CustomPartitionDO extends FokosDBPartitionDO {}
 
 // Partition tests that must hold, count, answer, or fail one call use this class. The module lists its test controls.
 export { ControlledPartitionDO } from "./controlled-partition-do.js";

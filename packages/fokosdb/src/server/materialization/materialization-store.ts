@@ -1,5 +1,5 @@
 /**
- * The SQLite storage of `MaterializationDO`: the latest image of each base item that the partition
+ * The SQLite storage of `FokosDBMaterializationDO`: the latest image of each base item that the partition
  * accepted, the highest epoch of each producer, the change positions that the targets read, the state
  * of each target, and the failed items of each target. The size estimate of each base hash key
  * belongs to `keySizes`, which this store updates in the transaction of each image write.

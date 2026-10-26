@@ -2,7 +2,7 @@
  * The single home for item validation: key rules, key size caps, data size caps, and the
  * transaction count/payload caps. Every public path goes through these — putItem, getItem,
  * deleteItem, queryItems, transactWriteItems, transactGetItems — so a rule cannot apply through one
- * API and not another. Used by both the FokosDB client (db.ts) and the TransactionCoordinatorDO,
+ * API and not another. Used by both the FokosDB client (db.ts) and the FokosDBTransactionCoordinatorDO,
  * which keeps client-side and coordinator-side validation in lockstep.
  *
  * Encoding lives here too: a key's size cap is measured on the ENCODED bytes, so capping and

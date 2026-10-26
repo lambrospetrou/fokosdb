@@ -1,5 +1,5 @@
 /**
- * PROTOTYPE. `PartitionDO` written as a host of `FokosShardingRuntime`, against the real FokosDB wire types.
+ * PROTOTYPE. `FokosDBPartitionDO` written as a host of `FokosShardingRuntime`, against the real FokosDB wire types.
  * Storage calls are `todo()`; every routing, merge, and walk decision is written out, because those are what
  * the runtime API must carry. This file is type-checked and never runs.
  */
@@ -155,7 +155,7 @@ const JOB_STALE_TX = "stale_tx_recovery";
 
 type Runtime = FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
 
-export class PartitionDO extends DurableObject<Env> implements PartitionRpc {
+export class FokosDBPartitionDO extends DurableObject<Env> implements PartitionRpc {
 	readonly fokos: Runtime;
 	declare readonly store: PartitionStore;
 	declare readonly participant: TransactionParticipant;
@@ -219,7 +219,7 @@ function writeSignals(call: FokosLocalCall, candidates: PromotionCandidate[], po
 	});
 }
 
-function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
+function partitionOperations(host: FokosDBPartitionDO): FokosOperations<PartitionOps> {
 	const { fokos, store, participant } = host;
 	return {
 		apiPutItem: {
@@ -494,7 +494,7 @@ async function walkRange(
 
 // ─── hooks ───────────────────────────────────────────────────────────────────
 
-function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDBPolicy> {
+function partitionHooks(host: FokosDBPartitionDO): FokosShardingHooks<FokosDBPolicy> {
 	const { fokos, store, participant } = host;
 	return {
 		evaluateSplit: ({ identity, policy }) => {
@@ -563,6 +563,6 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDBPolicy> {
 	};
 }
 
-/** `PartitionDO` is a host of its own class only when `stub` returns one of its own kind. This keeps the type honest. */
-export type PartitionStub = DurableObjectStub<PartitionDO>;
+/** `FokosDBPartitionDO` is a host of its own class only when `stub` returns one of its own kind. This keeps the type honest. */
+export type PartitionStub = DurableObjectStub<FokosDBPartitionDO>;
 export type { FokosPartitionRef };

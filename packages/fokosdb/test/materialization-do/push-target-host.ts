@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import type { FokosTargetDefinition, PushTargetBatch, PushTargetResult } from "../../src/server/materialization/targets.js";
 
 /** One item that the push target received. */
@@ -65,7 +65,7 @@ export class PushSinkDO extends DurableObject<Env> {
 }
 
 /** A materialization class with one push target: the `PushSinkDO` named `sink`. */
-export class PushMaterializationDO extends MaterializationDO {
+export class PushMaterializationDO extends FokosDBMaterializationDO {
 	protected override fokosTargets(): readonly FokosTargetDefinition[] {
 		return [{ kind: "push_sink", targetId: "sink", binding: "PUSH_SINK_DO", method: "push", objectName: "sink" }];
 	}

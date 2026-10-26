@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { parentJsonPath, validateReadJsonPath } from "./path.js";
@@ -53,7 +53,7 @@ describe("SQLite read JSON paths", () => {
 
 	it("supports quoted special labels in Workers SQLite", async () => {
 		const stub = testPartitionStub(`expression-path.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const document = { "a.b[0]": 1, 'quote"key': 2 };
 			for (const [path, value] of [
 				['$."a.b[0]"', 1],
@@ -68,7 +68,7 @@ describe("SQLite read JSON paths", () => {
 
 	it("keeps hostile path text in a SQL binding", async () => {
 		const stub = testPartitionStub(`expression-path.${crypto.randomUUID()}`);
-		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const label = "x'); DROP TABLE items; --";
 			const path = `$."${label}"`;
 			validateReadJsonPath(path);

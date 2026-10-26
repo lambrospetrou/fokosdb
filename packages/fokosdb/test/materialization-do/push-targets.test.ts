@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { MaterializationDO } from "../../src/server/materialization/do-materialization.js";
+import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { validateTargets, type FokosTargetDefinition } from "../../src/server/materialization/targets.js";
 import { kb, makeStub, materializationOf, TARGET_WAIT } from "../partition-do/helpers.js";
 import type { ReceivedPush } from "./push-target-host.js";
@@ -11,8 +11,8 @@ async function latestPushes(producerId: string): Promise<Record<string, Received
 	return Object.fromEntries(rows.map((row) => [row.hashKey, row]));
 }
 
-async function materializationState(stub: DurableObjectStub<MaterializationDO>) {
-	return await runInDurableObject(stub, (_instance: MaterializationDO, state: DurableObjectState) => {
+async function materializationState(stub: DurableObjectStub<FokosDBMaterializationDO>) {
+	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 		const count = (table: string) => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).one().n;
 		return {
 			items: count("latest_items"),
@@ -23,7 +23,7 @@ async function materializationState(stub: DurableObjectStub<MaterializationDO>) 
 	});
 }
 
-describe("MaterializationDO — push targets", () => {
+describe("FokosDBMaterializationDO — push targets", () => {
 	it("sends each base change to the push target, and cleans up the positions and the tombstones", async () => {
 		const { ctx, rpc } = makeStub({ captureChanges: true, nsMat: "PUSH_MATERIALIZATION_DO" });
 		const mat = materializationOf(ctx, "a");

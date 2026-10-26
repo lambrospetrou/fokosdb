@@ -4,7 +4,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
-import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
 import { createTableConfig } from "../../src/shared/partition-context.js";
 import { DEFAULT_LIMITS, encodeHashKey, encodeSortKey } from "../../src/shared/transaction-limits.js";
@@ -33,7 +33,7 @@ async function initiateWrite(
 ): Promise<InitiateWriteResponseEncoded> {
 	const root = coordinatorRouter(db).allRoots()[0];
 	const stub = env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(root.doName);
-	return await runInDurableObject(stub, async (instance: TransactionCoordinatorDO) => {
+	return await runInDurableObject(stub, async (instance: FokosDBTransactionCoordinatorDO) => {
 		const response = await instance.initiateWrite(root, {
 			clientRequestToken: `tree-${crypto.randomUUID()}`,
 			table: createTableConfig(db.options()),

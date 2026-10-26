@@ -1,7 +1,7 @@
 /**
  * The cached entrypoint that serves the encoded topology of the shard groups of FokosDB. The Worker
  * re-exports it from its main module and enables its cache. A caller reaches it through
- * `exports.FokosTopologyCache({ props }).fetch(...)`, with the admin address of its table as the
+ * `exports.FokosDBTopologyCache({ props }).fetch(...)`, with the admin address of its table as the
  * props. Workers Cache keys an entry also by the props, so all the callers of one table share one
  * entry for each path.
  */
@@ -14,7 +14,7 @@ const TOPOLOGY_MAX_AGE_S = 10;
 /** `stale-while-revalidate` of a topology answer, in seconds. */
 const TOPOLOGY_STALE_WHILE_REVALIDATE_S = 600;
 
-export class FokosTopologyCache extends WorkerEntrypoint<Env, TopologyAdminAddress> {
+export class FokosDBTopologyCache extends WorkerEntrypoint<Env, TopologyAdminAddress> {
 	async fetch(request: Request): Promise<Response> {
 		const address = this.ctx.props;
 		return await fokosTopologyEntrypointFetch(request, {

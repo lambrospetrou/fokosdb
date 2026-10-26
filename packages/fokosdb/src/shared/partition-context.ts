@@ -9,9 +9,9 @@
 // Durable Object implementations. The namespace-key filter below needs them to match by class
 // identity. A structural alternative collapses to `any` when TypeScript resolves it mid-cycle from
 // do-partition.ts itself.
-import type { PartitionDO } from "../server/do-partition.js";
-import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { MaterializationDO } from "../server/materialization/do-materialization.js";
+import type { FokosDBPartitionDO } from "../server/do-partition.js";
+import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
@@ -26,15 +26,15 @@ export type SplitConditions = {
 };
 
 export type PartitionNamespaceKey = {
-	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
+	[K in keyof Env]: Env[K] extends DurableObjectNamespace<FokosDBPartitionDO> ? K : never;
 }[keyof Env];
 
 export type TransactionCoordinatorNamespaceKey = {
-	[K in keyof Env]: Env[K] extends DurableObjectNamespace<TransactionCoordinatorDO> ? K : never;
+	[K in keyof Env]: Env[K] extends DurableObjectNamespace<FokosDBTransactionCoordinatorDO> ? K : never;
 }[keyof Env];
 
 export type MaterializationNamespaceKey = {
-	[K in keyof Env]: Env[K] extends DurableObjectNamespace<MaterializationDO> ? K : never;
+	[K in keyof Env]: Env[K] extends DurableObjectNamespace<FokosDBMaterializationDO> ? K : never;
 }[keyof Env];
 
 export type AdminNamespaceKey = {
@@ -50,7 +50,7 @@ export type AdminNamespaceKey = {
 export type FokosDBPolicy = {
 	ns: PartitionNamespaceKey;
 	nsTx: TransactionCoordinatorNamespaceKey;
-	/** The binding of the `MaterializationDO` namespace. Present when the table has one. */
+	/** The binding of the `FokosDBMaterializationDO` namespace. Present when the table has one. */
 	nsMat?: MaterializationNamespaceKey;
 	/**
 	 * The location hint for the Durable Objects of this table. It is best-effort placement advice for
@@ -71,7 +71,7 @@ export type FokosDBPolicy = {
 	captureChanges?: true;
 	/** The binding of the `FokosDBAutoAdminDO` namespace. Absent: no partition or coordinator reports its repartitions. */
 	nsAdmin?: AdminNamespaceKey;
-	/** The export name of the `FokosTopologyCache` entrypoint. Absent: no caller reads the topology. Needs `nsAdmin`. */
+	/** The export name of the `FokosDBTopologyCache` entrypoint. Absent: no caller reads the topology. Needs `nsAdmin`. */
 	topologyEntrypoint?: string;
 };
 
@@ -177,11 +177,11 @@ export type FokosDBTableConfig = {
 export type FokosTableIdentity = {
 	/** The name of the table. It must not start with `"fokos."`. */
 	readonly name: string;
-	/** The binding of the `PartitionDO` namespace. */
+	/** The binding of the `FokosDBPartitionDO` namespace. */
 	readonly ns: PartitionNamespaceKey;
-	/** The binding of the `TransactionCoordinatorDO` namespace. */
+	/** The binding of the `FokosDBTransactionCoordinatorDO` namespace. */
 	readonly nsTx: TransactionCoordinatorNamespaceKey;
-	/** The binding of the `MaterializationDO` namespace. Required when `captureChanges` is true. */
+	/** The binding of the `FokosDBMaterializationDO` namespace. Required when `captureChanges` is true. */
 	readonly nsMat?: MaterializationNamespaceKey;
 	/** The number of root partitions, from 1 to 65,000. A hash of the hash key selects one. */
 	readonly rootTreesN: number;
@@ -246,7 +246,7 @@ export type FokosTableOptions = {
 	 */
 	nsAdmin?: AdminNamespaceKey;
 	/**
-	 * The export name of the `FokosTopologyCache` entrypoint, for example `"FokosTopologyCache"`. The
+	 * The export name of the `FokosDBTopologyCache` entrypoint, for example `"FokosDBTopologyCache"`. The
 	 * Worker must re-export the entrypoint from its main module, and use a compatibility date of
 	 * 2025-11-17 or later (or the `enable_ctx_exports` compatibility flag). With it, the clients, the partitions and the coordinators read the encoded
 	 * topology of the table, and send each request to the deepest known partition. It needs `nsAdmin`.

@@ -7,13 +7,13 @@
 //
 // For random keys, each property checks on a settled router that exactly one target of its split
 // plan accepts the key in `belongsToTarget`, and that this target is the one `resolveOwner` gives.
-// The hash plan comes from the example host of the runtime, and the range plan from `PartitionDO`.
+// The hash plan comes from the example host of the runtime, and the range plan from `FokosDBPartitionDO`.
 //
 // The tree of each property is built once. The check only reads the router, so every run shares it.
 import { runInDurableObject } from "cloudflare:test";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import {
 	FokosShardingStore,
 	KeyCodec,
@@ -97,7 +97,7 @@ describe("Property: belongsToTarget and resolveOwner agree", () => {
 		const { root } = await makeTriggeredRangeRoot(4);
 		await root.awaitSplitCompleted();
 
-		await runInDurableObject(root.stub, (instance: PartitionDO, state: DurableObjectState) => {
+		await runInDurableObject(root.stub, (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const keys = arbKeyText.map((sk) => ({ hashKey: kb("alice"), sortKey: kb(sk) }));
 			assertOwnershipAgrees(instance.fokos, state.storage, keys);
 		});

@@ -17,7 +17,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import { KeyCodec, KeyPairMap } from "../../src/sharding/key-codec.js";
 import { conditionTree, updateTree } from "../../src/shared/expression/test-fixtures.js";
@@ -149,7 +149,7 @@ describe("ordered per-item execution — the paths agree with the reference run"
 		{ timeout: PROPERTY_TIMEOUT_MS },
 		async () => {
 			const stub = testPartitionStub(`ordered-property.${crypto.randomUUID()}`);
-			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				const participant = new TransactionParticipant({
 					store,
