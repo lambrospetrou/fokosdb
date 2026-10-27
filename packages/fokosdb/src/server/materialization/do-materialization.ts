@@ -152,10 +152,10 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				return (row) => owns({ hashKey: row.hk, sortKey: row.sk });
 			},
 			producerId: () => this.ctx.id.toString(),
-			push: async (target, batch) => {
-				const stub = pushTargetStub(this.env, target) as Record<string, (batch: unknown) => Promise<unknown>>;
-				return await stub[target.method](batch);
+			checkPushTarget: (target) => {
+				pushTargetStub(this.env, target);
 			},
+			push: async (target, batch) => await pushTargetStub(this.env, target)[target.method](batch),
 			config: () => this.config().targetRunner,
 			scheduleRetry: (runAt) => {
 				this.fokos.scheduleJob(JOB_TARGET_PUSH, runAt).catch((error: unknown) => {
@@ -187,10 +187,11 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	}
 
 	/**
-	 * Validates the stored target list one time for each instance, and checks the plans of each GSI
-	 * target. A failure logs one error for each target, and changes nothing: the partition keeps the
-	 * stored list, and the target runner stops only a GSI target whose plans fail. It never throws,
-	 * because a throw in `blockConcurrencyWhile` resets the Durable Object.
+	 * Validates the stored target list one time for each instance, checks the plans of each GSI
+	 * target, and checks that the Worker env has the binding of each push target. A failure logs one
+	 * error for each target, and changes nothing: the partition keeps the stored list, and the target
+	 * runner stops only a GSI target whose plans fail. It never throws, because a throw in
+	 * `blockConcurrencyWhile` resets the Durable Object.
 	 */
 	#checkStoredTargets(): void {
 		try {
@@ -201,6 +202,8 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 					validateTargets([target]);
 					if (target.kind === "gsi") {
 						this.#gsiPlans.set(target.targetId, checkGsiPlans(this.#store, target));
+					} else {
+						pushTargetStub(this.env, target);
 					}
 				} catch (error) {
 					valid = false;

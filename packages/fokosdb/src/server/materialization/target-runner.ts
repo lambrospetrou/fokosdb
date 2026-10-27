@@ -47,6 +47,8 @@ export type GsiEntryOutcome =
 	| { outcome: "rejected" | "unprocessed" | "unknown"; code: string; wholeCall?: boolean };
 
 const BATCH_REQUEST_TOO_LARGE = "batch_request_too_large";
+/** The code of each item of a push call to a target that does not implement the method. */
+const PUSH_METHOD_MISSING = "push_method_missing";
 
 /**
  * The GSI entry that the latest image of an item gives. It runs in the claim transaction. When it
@@ -93,6 +95,11 @@ export type TargetRunnerDeps = {
 	ownerCheck: () => (row: { hk: KeyBytes; sk: KeyBytes }) => boolean;
 	/** The `DurableObjectId` of this partition, in hex. */
 	producerId: () => string;
+	/**
+	 * Throws when this instance cannot call a push target, for example when the Worker env has no
+	 * binding of that name. The Worker env does not change during the life of an instance.
+	 */
+	checkPushTarget: (target: PushSinkTargetDefinition) => void;
 	/** Sends one batch to a push target, and returns the answer of the target as it is. */
 	push: (target: PushSinkTargetDefinition, batch: PushTargetBatch) => Promise<unknown>;
 	/** Sends one `gsiWriteEntries` call to a GSI table, and returns one outcome for each entry, in order. */
@@ -126,6 +133,8 @@ type TargetState = {
 	failures: number;
 	/** While the circuit breaker is open, the time of the next probe. 0 while it is closed. */
 	probeAt: number;
+	/** True when this instance cannot call the push target. The runner then never steps the target. */
+	unavailable: boolean;
 };
 
 type ClaimedItem = {
@@ -218,7 +227,8 @@ export class TargetRunner {
 	/**
 	 * The time at which the alarm must start the loop, or null when no work is due. A target is due now
 	 * when a position above its cursor exists, or at the earliest backoff end of its `retry` rows. A
-	 * target with an open circuit breaker is due at its next probe.
+	 * target with an open circuit breaker is due at its next probe. A target that this instance cannot
+	 * call is never due.
 	 */
 	deadline(): number | null {
 		const now = this.#deps.now();
@@ -228,7 +238,11 @@ export class TargetRunner {
 		const { store } = this.#deps;
 		let at = this.#deps.cleanup.deadline(now);
 		for (const row of store.targetRows()) {
-			const probeAt = this.#states.get(row.targetId)?.probeAt ?? 0;
+			const state = this.#states.get(row.targetId);
+			if (state?.unavailable === true) {
+				continue;
+			}
+			const probeAt = state?.probeAt ?? 0;
 			const due = probeAt > now ? probeAt : store.hasPositionAfter(row.cursorSeq) ? now : store.earliestRetryAt(row.targetId);
 			if (due !== null && (at === null || due < at)) {
 				at = due;
@@ -280,7 +294,7 @@ export class TargetRunner {
 			const index = (this.#next + i) % targets.length;
 			const target = targets[index];
 			const state = this.#state(target.targetId);
-			if (state.inFlight || state.idle || state.probeAt > now) {
+			if (state.inFlight || state.idle || state.unavailable || state.probeAt > now) {
 				continue;
 			}
 			this.#next = (index + 1) % targets.length;
@@ -299,6 +313,7 @@ export class TargetRunner {
 				started: false,
 				failures: 0,
 				probeAt: 0,
+				unavailable: false,
 			};
 			this.#states.set(targetId, state);
 		}
@@ -309,6 +324,9 @@ export class TargetRunner {
 		const state = this.#state(target.targetId);
 		state.inFlight = true;
 		try {
+			if (target.kind === "push_sink" && !this.#pushTargetAvailable(target, state)) {
+				return;
+			}
 			const evaluator = target.kind === "gsi" ? this.#gsiEvaluator(target) : undefined;
 			if (evaluator === null) {
 				this.#recordFailure(target.targetId, state);
@@ -323,6 +341,27 @@ export class TargetRunner {
 		} finally {
 			state.inFlight = false;
 			state.readSeq = null;
+		}
+	}
+
+	/**
+	 * False when this instance cannot call a push target. The check runs before the claim, so the
+	 * target then writes nothing: no claim, no epoch raise, and no `retry` row. The Worker env does not
+	 * change during the life of an instance, so the runner never steps the target again, and the
+	 * target sets no alarm. The positions and the tombstones that the target did not read stay.
+	 */
+	#pushTargetAvailable(target: PushSinkTargetDefinition, state: TargetState): boolean {
+		try {
+			this.#deps.checkPushTarget(target);
+			return true;
+		} catch (error) {
+			state.unavailable = true;
+			this.#logError("fokos/mat: this instance cannot call a push target, and stops it", {
+				targetId: target.targetId,
+				binding: target.binding,
+				error: String(error),
+			});
+			return false;
 		}
 	}
 
@@ -674,6 +713,9 @@ export class TargetRunner {
 	 * Sends one batch. Returns null when the answer is unknown: the call threw, timed out, or answered
 	 * the wrong shape. The timer of the timeout is cleared when the call answers: a pending timer keeps
 	 * the Durable Object from hibernation, and it is billed for that time.
+	 *
+	 * A target that does not implement the method answers with an error, so the call is done, and no
+	 * item of it can apply later. The call then fails as a whole, and the epoch stays.
 	 */
 	async #send(target: PushSinkTargetDefinition, batch: ClaimedBatch): Promise<PushTargetResult[] | null> {
 		const request: PushTargetBatch = {
@@ -689,6 +731,15 @@ export class TargetRunner {
 			}
 			return answer;
 		} catch (error) {
+			if (isMissingRpcMethod(error)) {
+				this.#logError("fokos/mat: a push target does not implement its method", {
+					targetId: target.targetId,
+					binding: target.binding,
+					method: target.method,
+					error: String(error),
+				});
+				return batch.items.map(() => ({ outcome: "retry", code: PUSH_METHOD_MISSING }));
+			}
 			this.#logError("fokos/mat: a push call has no answer", { targetId: target.targetId, epoch: batch.epoch, error: String(error) });
 			return null;
 		}
@@ -850,6 +901,22 @@ function toPushItem(image: TargetImage): PushTargetItem {
 			break;
 	}
 	return { ...base, deleted: false, value, ...(image.ttlAt !== null ? { ttlAt: image.ttlAt } : {}) };
+}
+
+/** The start of each message that workerd gives for a method that the receiver does not implement. */
+const MISSING_RPC_METHOD_MESSAGE = /^The RPC receiver does not implement /;
+
+/**
+ * True for the error of an RPC call to a method that the receiver does not implement. The receiver
+ * runs no code of the target for such a call. workerd gives a `TypeError` with `remote: true`, and
+ * the message is not documented, so a test in workerd pins it. When the message changes, the error
+ * is an unknown answer, which is safe: the epoch goes up.
+ *
+ * The match is also safe when a method of the target throws an error with this message: the call
+ * is done, so no item of it can apply later.
+ */
+export function isMissingRpcMethod(error: unknown): boolean {
+	return error instanceof TypeError && (error as { remote?: unknown }).remote === true && MISSING_RPC_METHOD_MESSAGE.test(error.message);
 }
 
 function isPushTargetResult(value: unknown): value is PushTargetResult {

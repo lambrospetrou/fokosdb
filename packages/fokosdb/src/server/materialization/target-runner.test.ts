@@ -4,7 +4,7 @@ import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { MaterializationCleanup } from "./materialization-cleanup.js";
 import { MaterializationStore, type LatestImage, type TargetRow } from "./materialization-store.js";
-import { TargetRunner, type TargetRunnerConfig } from "./target-runner.js";
+import { isMissingRpcMethod, TargetRunner, type TargetRunnerConfig } from "./target-runner.js";
 import type { FokosTargetDefinition, PushTargetBatch, PushTargetResult } from "./targets.js";
 import type { GsiWriteEntriesRequest } from "../do-partition.js";
 import { compileGsiPlans, desiredGsiEntry, type GsiDesiredEntry } from "./gsi-target.js";
@@ -65,6 +65,8 @@ async function withRunner(
 		answer?: Answer;
 		config?: Partial<TargetRunnerConfig>;
 		owns?: (hk: string) => boolean;
+		/** Runs when a step checks a push target, and throws when this instance cannot call the target. */
+		checkPushTarget?: (targetId: string) => void;
 		/**
 		 * Makes each target a GSI target. `answer` gives the outcomes of each GSI call, or throws. `plans`
 		 * runs when a step gets the evaluator of a target, and throws when the target cannot evaluate.
@@ -99,6 +101,7 @@ async function withRunner(
 			canRun: () => true,
 			ownerCheck: () => (row) => opts.owns?.(KeyCodec.decode(row.hk) as string) ?? true,
 			producerId: () => "aa".repeat(32),
+			checkPushTarget: (target) => opts.checkPushTarget?.(target.targetId),
 			push: async (target, batch) => {
 				const call = { targetId: target.targetId, batch };
 				calls.push(call);
@@ -422,6 +425,92 @@ describe("TargetRunner — failed items", () => {
 				expect(h.target("t1")).toMatchObject({ cursorSeq: 3, isBatchOpen: false });
 			},
 		);
+	});
+
+	it("a push target that this instance cannot call is stopped before its claim, and is never due", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const stopped = () =>
+			errors.mock.calls.filter(
+				([fields]) => (fields as { message?: string }).message === "fokos/mat: this instance cannot call a push target, and stops it",
+			);
+		try {
+			await withRunner(
+				{
+					targets: ["bad", "good"],
+					checkPushTarget: (targetId) => {
+						if (targetId === "bad") {
+							throw new Error("the Worker env has no binding SINK");
+						}
+					},
+				},
+				async (h) => {
+					h.ingest("a", 1);
+					await h.drain();
+					expect(h.calls.map((c) => [c.targetId, sent(c)])).toEqual([["good", ["a@1"]]]);
+					// No claim: the batch marker, the epoch, and the cursor of the stopped target stay.
+					expect(h.target("bad")).toMatchObject({ epoch: 1, cursorSeq: 0, isBatchOpen: false });
+					expect(h.retryRows()).toEqual([]);
+					// The position above its cursor does not make the stopped target due.
+					expect(h.runner.deadline()).toBeNull();
+
+					h.ingest("b", 1);
+					await h.drain();
+					expect(h.calls.map((c) => [c.targetId, sent(c)])).toEqual([
+						["good", ["a@1"]],
+						["good", ["b@1"]],
+					]);
+					expect(stopped()).toEqual([[expect.objectContaining({ targetId: "bad", binding: "SINK" })]]);
+				},
+			);
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	it("a push target that does not implement its method fails the call as a whole, and keeps the epoch", async () => {
+		let missing = true;
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await withRunner(
+				{
+					answer: (call) => {
+						if (missing) {
+							throw Object.assign(new TypeError('The RPC receiver does not implement "push".'), { remote: true });
+						}
+						return applyAll(call);
+					},
+				},
+				async (h) => {
+					h.ingest("a", 1);
+					await h.drain();
+					// Three calls fail, and then the breaker waits for its probe.
+					expect(h.calls.map((c) => c.batch.epoch)).toEqual([1, 1, 1]);
+					expect(h.retryRows()).toEqual([]);
+					expect(h.target("t1")).toMatchObject({ epoch: 1, cursorSeq: 0 });
+					expect(h.runner.deadline()).toBe(h.now() + 5_000);
+
+					// The target deploys the method, and the probe sends the same item with the same epoch.
+					missing = false;
+					h.advance(5_000);
+					h.runner.wake();
+					await h.drain();
+					expect(h.calls.map((c) => [c.batch.epoch, sent(c)]).at(-1)).toEqual([1, ["a@1"]]);
+					expect(h.target("t1")).toMatchObject({ epoch: 1, cursorSeq: 1, isBatchOpen: false });
+				},
+			);
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	it("isMissingRpcMethod matches only a remote TypeError with the message of workerd", () => {
+		const remote = (error: Error) => Object.assign(error, { remote: true });
+		expect(isMissingRpcMethod(remote(new TypeError('The RPC receiver does not implement "push".')))).toBe(true);
+		expect(isMissingRpcMethod(remote(new TypeError('The RPC receiver does not implement the method "push".')))).toBe(true);
+		// A local error, another type, or another message is an unknown answer.
+		expect(isMissingRpcMethod(new TypeError('The RPC receiver does not implement "push".'))).toBe(false);
+		expect(isMissingRpcMethod(remote(new Error('The RPC receiver does not implement "push".')))).toBe(false);
+		expect(isMissingRpcMethod(remote(new TypeError("Network connection lost.")))).toBe(false);
 	});
 
 	it("an unknown answer raises the epoch and sends the same items again at once", async () => {

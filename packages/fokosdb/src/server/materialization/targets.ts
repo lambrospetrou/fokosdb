@@ -55,7 +55,8 @@ const MAX_GSI_TARGETS = 10;
 
 /**
  * Throws when the target list is not valid. A `targetId` is not empty, has no `~`, and is unique.
- * The expressions of a GSI target are valid. Push projections are not supported yet.
+ * The expressions of a GSI target are valid, and no projection value of a GSI target is only bytes.
+ * Push projections are not supported yet.
  */
 export function validateTargets(targets: readonly FokosTargetDefinition[]): void {
 	const ids = new Set<string>();
@@ -76,7 +77,7 @@ export function validateTargets(targets: readonly FokosTargetDefinition[]): void
 					analyzeExpressionValue(target.sortKey, "projection");
 				}
 				if (target.projection !== undefined) {
-					validateProjectionExpression(target.projection);
+					validateProjectionExpression(target.projection, { jsonDocument: true });
 				}
 				break;
 			case "push_sink":

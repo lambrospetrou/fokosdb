@@ -74,6 +74,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
+- Better support for binary blobs in GSI/push target projections for "data".
 - Allow online configuration (adding/removing/changing) global eventual indexes (DynamoDB GSIs) and push targets.
 - Add operation hooks that run during request forwarding and on the final serving partition (before, after, etc).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.

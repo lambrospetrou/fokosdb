@@ -7,7 +7,8 @@ import { decodeGsiSortKey } from "../../src/shared/gsi/sort-key.js";
 import { gsiTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { kb, makeStub, materializationOf, TARGET_WAIT } from "../partition-do/helpers.js";
+import { MaterializationStore } from "../../src/server/materialization/materialization-store.js";
+import { captureConsoleError, kb, makeStub, materializationOf, TARGET_WAIT } from "../partition-do/helpers.js";
 
 type Entry = { sortKey?: string; baseHashKey: string; baseSortKey?: string; data: unknown };
 
@@ -122,5 +123,31 @@ describe("FokosDBMaterializationDO — GSI targets", () => {
 			expect(await gsiEntries(t.ctx, "byStatus", "DONE")).toHaveLength(1);
 			expect(await materializationRows(mat)).toMatchObject({ retries: [] });
 		}, TARGET_WAIT);
+	});
+
+	it("a projection of the hash key is a violation of an item with a binary key only", async () => {
+		const { ctx, rpc } = makeStub({ captureChanges: true });
+		const mat = materializationOf(ctx, "t1");
+		await runInDurableObject(mat, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
+			new MaterializationStore(state.storage).storeTargets([
+				{ kind: "gsi", targetId: "byG", hashKey: { ref: "data", path: "$.g" }, projection: [{ expr: { ref: "hashKey" }, as: "k" }] },
+			]);
+		});
+		const logs = captureConsoleError();
+		try {
+			const data = JSON.stringify({ g: "G" });
+			await rpc.apiPutItem(ctx, { hashKey: kb("t1"), sortKey: kb("s"), data, kind: "json" });
+			await rpc.apiPutItem(ctx, { hashKey: KeyCodec.encode(new Uint8Array([1, 2])), sortKey: kb("s"), data, kind: "json" });
+			await vi.waitFor(async () => {
+				expect(await gsiEntries(ctx, "byG", "G")).toEqual([{ baseHashKey: "t1", baseSortKey: "s", data: { k: "t1" } }]);
+				expect(await materializationRows(mat)).toMatchObject({
+					items: 2,
+					keySets: 1,
+					retries: [{ target_id: "byG", kind: "violation", last_error: "update_value_is_bytes" }],
+				});
+			}, TARGET_WAIT);
+		} finally {
+			logs.spy.mockRestore();
+		}
 	});
 });

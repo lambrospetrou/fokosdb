@@ -1,4 +1,5 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { MaterializationStore } from "../../src/server/materialization/materialization-store.js";
@@ -60,8 +61,45 @@ describe("FokosDBMaterializationDO — the check of the stored target list", () 
 		]);
 	});
 
+	it("logs one error for a stored GSI target with a projection value that is only bytes", async () => {
+		const errors = await errorsOfNewInstance([
+			{ kind: "gsi", targetId: "bytes", hashKey: { ref: "data", path: "$.a" }, projection: [{ expr: { b64: "AQID" }, as: "x" }] },
+		]);
+		expect(errors).toEqual([
+			expect.objectContaining({
+				message: "fokos/mat: a stored target is not valid",
+				targetId: "bytes",
+				kind: "gsi",
+				error: expect.stringContaining("must not be bytes"),
+			}),
+		]);
+	});
+
+	it("logs one error for each stored push target that this instance cannot call", async () => {
+		const errors = await errorsOfNewInstance([
+			{ kind: "push_sink", targetId: "sink", binding: "PUSH_SINK_DO", method: "push", objectName: "sink" },
+			{ kind: "push_sink", targetId: "missing", binding: "NO_SUCH_BINDING", method: "push" },
+			// A namespace binding with no objectName has no method `push`.
+			{ kind: "push_sink", targetId: "noObject", binding: "PUSH_SINK_DO", method: "push" },
+		]);
+		expect(errors).toEqual([
+			expect.objectContaining({
+				message: "fokos/mat: a stored target is not valid",
+				targetId: "missing",
+				kind: "push_sink",
+				attributes: { detail: expect.stringContaining("has no binding NO_SUCH_BINDING") },
+			}),
+			expect.objectContaining({
+				message: "fokos/mat: a stored target is not valid",
+				targetId: "noObject",
+				kind: "push_sink",
+				attributes: { detail: expect.stringContaining("the binding PUSH_SINK_DO has no method push") },
+			}),
+		]);
+	});
+
 	it("logs one error when only the rules of the whole list fail", async () => {
-		const push = { kind: "push_sink", targetId: "same", binding: "SINK", method: "push" } as const;
+		const push = { kind: "push_sink", targetId: "same", binding: "PUSH_SINK_DO", method: "push", objectName: "sink" } as const;
 		expect(await errorsOfNewInstance([push, push])).toEqual([
 			expect.objectContaining({
 				message: "fokos/mat: the stored target list is not valid",

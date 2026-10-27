@@ -95,11 +95,28 @@ export function txCoordinatorStubForParticipant(
  * The stub of a push target: the service binding `binding` of the Worker env, or the Durable Object
  * `objectName` of the namespace binding `binding`. A push target is not a FokosDB class, so no
  * jurisdiction and no location hint of the table apply.
+ *
+ * Throws when the Worker env has no such binding, or when the stub has no function `method`. Each
+ * property of a stub is a function, so the check finds only a binding of the wrong kind, for example
+ * a namespace with no `objectName`. A method that the target does not implement fails at the call.
  */
-export function pushTargetStub(env: Env, target: { binding: string; objectName?: string }): unknown {
+export function pushTargetStub(
+	env: Env,
+	target: { binding: string; method: string; objectName?: string },
+): Record<string, (batch: unknown) => Promise<unknown>> {
 	const binding: unknown = (env as unknown as Record<string, unknown>)[target.binding];
 	invariant(typeof binding === "object" && binding !== null, () => `fokos/do-stubs: the Worker env has no binding ${target.binding}`);
-	return target.objectName === undefined ? binding : (binding as DurableObjectNamespace).getByName(target.objectName);
+	let stub: unknown = binding;
+	if (target.objectName !== undefined) {
+		const ns = binding as Partial<DurableObjectNamespace>;
+		invariant(typeof ns.getByName === "function", () => `fokos/do-stubs: the binding ${target.binding} is not a Durable Object namespace`);
+		stub = ns.getByName(target.objectName);
+	}
+	invariant(
+		typeof (stub as Record<string, unknown>)[target.method] === "function",
+		() => `fokos/do-stubs: the binding ${target.binding} has no method ${target.method}`,
+	);
+	return stub as Record<string, (batch: unknown) => Promise<unknown>>;
 }
 
 /**

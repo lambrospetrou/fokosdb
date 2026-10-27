@@ -88,8 +88,11 @@ export function validateUpdateExpression(expression: unknown): UpdateExpressionA
  * One analysis context serves the whole list, so the operator and function budget counts across
  * entries, exactly as it does across the actions of one update. Each entry runs `analyzeValue`
  * before its name resolves, so a malformed node fails as an expression error, not a naming error.
+ *
+ * With `jsonDocument`, the projection builds one JSON document, so an entry whose only non-null
+ * type is bytes fails, with the rule of an update value.
  */
-export function validateProjectionExpression(expression: unknown): ProjectionExpressionAnalysis {
+export function validateProjectionExpression(expression: unknown, options: { jsonDocument?: boolean } = {}): ProjectionExpressionAnalysis {
 	if (!Array.isArray(expression) || expression.length === 0) {
 		throw new ExpressionError("invalid_ast", "projection must contain at least one entry");
 	}
@@ -101,7 +104,10 @@ export function validateProjectionExpression(expression: unknown): ProjectionExp
 	for (const entry of expression) {
 		assertNode(entry, "invalid projection entry");
 		assertFields(entry, "expr", undefined, "as");
-		analyzeValue(entry.expr, 1, context);
+		const facts = analyzeValue(entry.expr, 1, context);
+		if (options.jsonDocument === true) {
+			assertJsonValueTypes(facts, "a projection value of a JSON document");
+		}
 		const name = projectionEntryName(entry);
 		if (names.has(name)) {
 			throw new ExpressionError("invalid_ast", "duplicate projection name");
@@ -311,20 +317,20 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 const JSON_VALUE_TYPES: readonly ExpressionNativeType[] = ["boolean", "number", "text", "array", "object"];
 
 /**
- * Refuses a `set` value that a JSON document can never hold.
+ * Refuses a `set` value, or a projection value of a JSON document, that a JSON document can never hold.
  *
  * JSON has no byte type. A value whose only non-null outcome is bytes — a byte literal, or `unhex` —
  * can never write a valid document, so it fails here, at compile time, with a message the caller can
  * act on. A value that is bytes for SOME items only — a key reference, which is text for a text key
- * and bytes for a binary one — passes here, and the compiler carries a per-item type test into
- * `applicableSql` instead.
+ * and bytes for a binary one — passes here. For a `set` value, the compiler carries a per-item type
+ * test into `applicableSql` instead. A GSI projection makes each such item a violation.
  *
  * A byte literal is still a valid ARGUMENT: `size` over one is a number, and that is a valid value.
  * The test is therefore over the type of the whole value, never over the nodes inside it.
  */
-function assertUpdateValueTypes(facts: ValueFacts): void {
+function assertJsonValueTypes(facts: ValueFacts, valueName: string): void {
 	if (facts.types.has("bytes") && !JSON_VALUE_TYPES.some((type) => facts.types.has(type))) {
-		throw new ExpressionError("invalid_type", "an update value must not be bytes");
+		throw new ExpressionError("invalid_type", `${valueName} must not be bytes`);
 	}
 }
 
@@ -374,7 +380,7 @@ function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
 		targets.push({ action: item.action, segments });
 
 		if (actionDef.hasValue) {
-			assertUpdateValueTypes(analyzeValue(item.value, 1, context));
+			assertJsonValueTypes(analyzeValue(item.value, 1, context), "an update value");
 		}
 	}
 
