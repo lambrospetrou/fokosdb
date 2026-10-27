@@ -724,6 +724,8 @@ topologyCache?: {
 	fetch(this: void, path: string, signal: AbortSignal): Promise<Response>;
 	/** The `waitUntil` of the request (Worker) or of the `DurableObjectState` (Durable Object). */
 	waitUntil(this: void, promise: Promise<unknown>): void;
+	/** The source of the topology. Options with different scopes never share an entry. Default "". */
+	scope?: string;
 	/** The age of an entry that starts a refresh. Default 10,000. */
 	refreshMs?: number;
 	/** The time after which a refresh that did not end can start again. Default 30,000. */
@@ -741,8 +743,10 @@ has `waitUntil`, and a promise there prevents eviction until it settles or for 1
 ([Durable Object state](https://developers.cloudflare.com/durable-objects/api/state/)).
 
 **The cache.** One module-scope `LRUCache` for the isolate holds the hash entries and the range entries
-(Section 4.2.9). The key of a hash entry is `h|<shardGroup>|<rootTreesN>|<hashSplitN>`. The client and the runtime
-of one isolate share it.
+(Section 4.2.9). The key of a hash entry is `h|<scope>|<shardGroup>|<rootTreesN>|<hashSplitN>`. The client and the
+runtime of one isolate share it. `<scope>` is the JSON string of the `scope` option (default `""`). Workers Cache keys
+an entry also by `ctx.props`, so two tables with the same shard group and another admin address get different bodies.
+FokosDB sets `scope` to the admin address `[nsAdmin, jurisdiction]`, so these tables also get different cache entries.
 
 ```ts
 type TopologyEntry = {
@@ -1102,7 +1106,7 @@ A caller then enters at most at rank `m`, and the partition forwards. The result
 32-byte keys, 1 MiB holds about 26,000 leaves.
 
 **The cache entry.** A range entry is in the same `LRUCache` as the hash entries, with the key
-`r|<shardGroup>|<hashKey>`, the same byte budget, and the same refresh rules. It holds the parsed header, the views,
+`r|<scope>|<shardGroup>|<hashKey>`, the same byte budget, and the same refresh rules. It holds the parsed header, the views,
 and the `cut` set. Its size is the `byteLength` of the body plus 16 bytes for each `cut` entry.
 
 **Resolution** for a key with a Bloom hit:

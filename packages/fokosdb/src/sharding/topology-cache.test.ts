@@ -9,6 +9,7 @@ import type { FokosRouteContext } from "./route-context.js";
 import type { FokosEnvelope } from "./runtime-types.js";
 import {
 	cachedHashTopology,
+	cachedRangeTopology,
 	cutTopologyHint,
 	TOPOLOGY_CUT_MAX,
 	topologyGetForRangePath,
@@ -207,6 +208,35 @@ describe("topology cache — hash entries", () => {
 		expect(t.sent).toEqual([deep(t.shardGroup), PartitionIdHelper.hashId(t.shardGroup, root).doName]);
 		// The cut stays for this version: the next request goes to the parent first.
 		expect(t.client.resolve(key).doName).toBe(PartitionIdHelper.hashId(t.shardGroup, root).doName);
+	});
+});
+
+describe("topology cache — scope", () => {
+	it("keeps the hash and range entries of two scopes apart, also for one topology object", async () => {
+		const topology = { shardGroup: `tc_${crypto.randomUUID()}`, rootTreesN: 2, hashSplitN: 2 };
+		const hashKey = KeyCodec.encode("scoped");
+		const pending: Promise<unknown>[] = [];
+		const fetched: string[] = [];
+		const options = (scope: string | undefined, version: number): FokosTopologyCacheOptions => ({
+			fetch: async (path) => {
+				fetched.push(`${scope}:${path.includes("GetForRange") ? "range" : "hash"}`);
+				const body = path.includes("GetForRange")
+					? encodeRangeBody({ epoch: 1, version, boundaries: [], levels: [], depths: [], truncatedAtRank: null })
+					: hashBody({ version });
+				return new Response(body);
+			},
+			waitUntil: (p) => pending.push(p),
+			...(scope === undefined ? {} : { scope }),
+		});
+		const all = [options("a", 1), options("b", 2), options(undefined, 3)];
+		for (const opts of all) {
+			expect(cachedHashTopology(opts, topology)).toBeUndefined();
+			expect(cachedRangeTopology(opts, topology.shardGroup, hashKey)).toBeUndefined();
+		}
+		await Promise.all(pending);
+		expect(fetched.sort()).toEqual(["a:hash", "a:range", "b:hash", "b:range", "undefined:hash", "undefined:range"]);
+		expect(all.map((opts) => cachedHashTopology(opts, topology)?.view.version)).toEqual([1n, 2n, 3n]);
+		expect(all.map((opts) => cachedRangeTopology(opts, topology.shardGroup, hashKey)?.view.version)).toEqual([1n, 2n, 3n]);
 	});
 });
 

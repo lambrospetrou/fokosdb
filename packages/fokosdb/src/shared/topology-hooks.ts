@@ -48,6 +48,8 @@ export function topologyCacheFor(
 			return await entrypoint({ props: address }).fetch(`http://fokos-topology${path}`, { signal });
 		},
 		waitUntil,
+		// The entrypoint answers by the admin address, so the isolate cache keys by it too.
+		scope: JSON.stringify([address.nsAdmin, address.jurisdiction ?? null]),
 		...(settings.refreshMs === undefined ? {} : { refreshMs: settings.refreshMs }),
 		...(settings.refreshTimeoutMs === undefined ? {} : { refreshTimeoutMs: settings.refreshTimeoutMs }),
 	};

@@ -27,6 +27,11 @@ export type FokosTopologyCacheOptions = {
 	fetch(this: void, path: string, signal: AbortSignal): Promise<Response>;
 	/** The `waitUntil` of the request (Worker) or of the `DurableObjectState` (Durable Object). */
 	waitUntil(this: void, promise: Promise<unknown>): void;
+	/**
+	 * The source of the topology, for example the admin binding and the jurisdiction that `fetch` reads
+	 * from. Options with different scopes never share an entry, also for the same shard group. Default "".
+	 */
+	scope?: string;
 	/** The age of an entry that starts a refresh. Default 10,000. */
 	refreshMs?: number;
 	/** The time after which a refresh that did not end can start again. Default 30,000. */
@@ -83,8 +88,13 @@ export function topologyGetForRangePath(shardGroup: string, hashKey: KeyBytes): 
 	return `${topologyGetPath(shardGroup).replace("topology.Get", "topology.GetForRange")}&hk=${toBase64Url(hashKey)}`;
 }
 
-/** The cache key of the hash entry of each topology object. A client keeps one topology object. */
-const hashKeys = new WeakMap<FokosTopology, string>();
+/** The scope part of a cache key. A JSON string ends at its closing quote, so no two scopes give the same prefix. */
+function scopeOf(opts: FokosTopologyCacheOptions): string {
+	return JSON.stringify(opts.scope ?? "");
+}
+
+/** The scope and the cache key of the hash entry of each topology object. A client keeps one topology object. */
+const hashKeys = new WeakMap<FokosTopology, { scope: string | undefined; key: string }>();
 
 /**
  * The hash entry of a shard group, or undefined. It starts a refresh when the entry is absent or old.
@@ -92,11 +102,12 @@ const hashKeys = new WeakMap<FokosTopology, string>();
  * two map reads and no allocation.
  */
 export function cachedHashTopology(opts: FokosTopologyCacheOptions, topology: FokosTopology): TopologyEntry<HashTopologyView> | undefined {
-	let key = hashKeys.get(topology);
-	if (key === undefined) {
-		key = `h|${topology.shardGroup}|${topology.rootTreesN}|${topology.hashSplitN}`;
-		hashKeys.set(topology, key);
+	let memo = hashKeys.get(topology);
+	if (memo === undefined || memo.scope !== opts.scope) {
+		memo = { scope: opts.scope, key: `h|${scopeOf(opts)}|${topology.shardGroup}|${topology.rootTreesN}|${topology.hashSplitN}` };
+		hashKeys.set(topology, memo);
 	}
+	const key = memo.key;
 	const entry = cache.get(key) as TopologyEntry<HashTopologyView> | undefined;
 	if (shouldRefresh(opts, key, entry)) {
 		opts.waitUntil(
@@ -120,7 +131,7 @@ export function cachedRangeTopology(
 	shardGroup: string,
 	hashKey: KeyBytes,
 ): TopologyEntry<RangeTopologyView> | undefined {
-	const key = `r|${shardGroup}|${toBase64Url(hashKey)}`;
+	const key = `r|${scopeOf(opts)}|${shardGroup}|${toBase64Url(hashKey)}`;
 	const entry = cache.get(key) as TopologyEntry<RangeTopologyView> | undefined;
 	if (shouldRefresh(opts, key, entry)) {
 		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, hashKey), parseRangeBody));
