@@ -2,7 +2,8 @@
  * Measures the storage and the SQLite row writes of GSI materialization in workerd.
  * `pnpm bench:workerd` runs it. The numbers are from the local runtime, not from production.
  */
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { expect, it, vi } from "vitest";
 import { partitionStubByName } from "../../src/shared/do-stubs.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";

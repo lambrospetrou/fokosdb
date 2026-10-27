@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { env } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { FokosDB } from "../../src/client/db.js";
 import { materializationStubByName, partitionStubByName } from "../../src/shared/do-stubs.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";

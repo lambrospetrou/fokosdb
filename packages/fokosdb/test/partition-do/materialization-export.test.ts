@@ -1,4 +1,5 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";

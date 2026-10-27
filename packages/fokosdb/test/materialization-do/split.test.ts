@@ -1,4 +1,5 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ApplyLatestImagesRequest, FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import type { LatestImage } from "../../src/server/materialization/materialization-store.js";

@@ -3,7 +3,8 @@
  * split-status narrowing, and log capture. Split, migration, and promotion drivers live in
  * `partition-harness.ts`.
  */
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import { testPartitionStub } from "../stub-helpers.js";

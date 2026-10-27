@@ -1,4 +1,5 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";

@@ -7,7 +7,8 @@
  * parked far in the future, so no scheduler pass advances it. The tests at the end of the file run a
  * real promotion or a real hash split.
  */
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
