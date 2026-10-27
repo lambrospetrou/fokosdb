@@ -17,7 +17,9 @@ export class PushSinkDO extends DurableObject<Env> {
 			`CREATE TABLE IF NOT EXISTS received (producer TEXT NOT NULL, hk TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL, data TEXT, epoch INTEGER NOT NULL)`,
 		);
 		ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS refused (producer TEXT PRIMARY KEY)`);
-		ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS calls (producer TEXT NOT NULL, fences TEXT NOT NULL)`);
+		ctx.storage.sql.exec(
+			`CREATE TABLE IF NOT EXISTS calls (producer TEXT NOT NULL, table_name TEXT NOT NULL, target_id TEXT NOT NULL, fences TEXT NOT NULL)`,
+		);
 	}
 
 	/** Makes each later call of `producerId` fail as a whole, so the cursor of its target stays. */
@@ -26,7 +28,13 @@ export class PushSinkDO extends DurableObject<Env> {
 	}
 
 	push(batch: PushTargetBatch): PushTargetResult[] {
-		this.ctx.storage.sql.exec(`INSERT INTO calls (producer, fences) VALUES (?, ?)`, batch.producerId, JSON.stringify(batch.ancestorFences));
+		this.ctx.storage.sql.exec(
+			`INSERT INTO calls (producer, table_name, target_id, fences) VALUES (?, ?, ?, ?)`,
+			batch.producerId,
+			batch.tableName,
+			batch.targetId,
+			JSON.stringify(batch.ancestorFences),
+		);
 		if (this.ctx.storage.sql.exec(`SELECT 1 FROM refused WHERE producer = ?`, batch.producerId).toArray().length > 0) {
 			return batch.items.map(() => ({ outcome: "retry", code: "refused" }));
 		}
@@ -43,6 +51,17 @@ export class PushSinkDO extends DurableObject<Env> {
 			);
 			return { outcome: "applied" };
 		});
+	}
+
+	/** The table and the target of each call of `producerId`, in call order. */
+	senders(producerId: string): Pick<PushTargetBatch, "tableName" | "targetId">[] {
+		return this.ctx.storage.sql
+			.exec<{ table_name: string; target_id: string }>(
+				`SELECT table_name, target_id FROM calls WHERE producer = ? ORDER BY rowid`,
+				producerId,
+			)
+			.toArray()
+			.map((row) => ({ tableName: row.table_name, targetId: row.target_id }));
 	}
 
 	/** The ancestor fences of each call of `producerId`, in call order. */

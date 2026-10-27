@@ -93,6 +93,8 @@ export type TargetRunnerDeps = {
 	canRun: () => boolean;
 	/** A check of the keys that this partition owns now. The runner gets a new check for each transaction. */
 	ownerCheck: () => (row: { hk: KeyBytes; sk: KeyBytes }) => boolean;
+	/** The name of the base table. */
+	tableName: () => string;
 	/** The `DurableObjectId` of this partition, in hex. */
 	producerId: () => string;
 	/**
@@ -719,6 +721,8 @@ export class TargetRunner {
 	 */
 	async #send(target: PushSinkTargetDefinition, batch: ClaimedBatch): Promise<PushTargetResult[] | null> {
 		const request: PushTargetBatch = {
+			tableName: this.#deps.tableName(),
+			targetId: target.targetId,
 			producerId: this.#deps.producerId(),
 			epoch: batch.epoch,
 			ancestorFences: batch.ancestorFences,

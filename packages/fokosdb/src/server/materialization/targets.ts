@@ -40,6 +40,10 @@ export type PushTargetItem = {
 };
 
 export type PushTargetBatch = {
+	/** The name of the base table, with no `fokos.` shard group prefix. */
+	tableName: string;
+	/** The target that sends the batch. Each target has its own epoch and its own ancestor fences. */
+	targetId: string;
 	/** The `DurableObjectId` of the sending `FokosDBMaterializationDO`, as `DurableObjectId.toString()` gives it (hex). */
 	producerId: string;
 	epoch: number;

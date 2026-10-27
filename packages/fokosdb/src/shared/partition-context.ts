@@ -110,9 +110,7 @@ export function materializationTableConfig(table: FokosDBTableConfig): FokosDBTa
  * gives one shard group. The name is the address of the GSI data, so it must never change.
  */
 export function gsiShardGroup(topology: FokosTopology, indexName: string): string {
-	const tableName = topology.shardGroup.startsWith(MATERIALIZATION_SHARD_GROUP_PREFIX)
-		? topology.shardGroup.slice(MATERIALIZATION_SHARD_GROUP_PREFIX.length)
-		: tableNameOf(topology);
+	const tableName = baseTableName(topology);
 	return `${RESERVED_SHARD_GROUP_PREFIX}gsiv1.${tableName.length}.${tableName}.${indexName}`;
 }
 
@@ -144,6 +142,13 @@ export function gsiTableConfig(table: FokosDBTableConfig, indexName: string): Fo
 		topology: { ...table.topology, shardGroup: gsiShardGroup(table.topology, indexName) },
 		policy: { ...policy, limits: gsiLimits(resolveLimits(table.policy.limits)) },
 	};
+}
+
+/** The table name, from the partition group or the materialization group of the table. */
+export function baseTableName(topology: FokosTopology): string {
+	return topology.shardGroup.startsWith(MATERIALIZATION_SHARD_GROUP_PREFIX)
+		? topology.shardGroup.slice(MATERIALIZATION_SHARD_GROUP_PREFIX.length)
+		: tableNameOf(topology);
 }
 
 function tableNameOf(topology: FokosTopology): string {

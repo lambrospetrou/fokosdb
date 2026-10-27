@@ -101,6 +101,7 @@ async function withRunner(
 			targets: () => targets,
 			canRun: () => true,
 			ownerCheck: () => (row) => opts.owns?.(KeyCodec.decode(row.hk) as string) ?? true,
+			tableName: () => "orders",
 			producerId: () => "aa".repeat(32),
 			checkPushTarget: (target) => opts.checkPushTarget?.(target.targetId),
 			push: async (target, batch) => {
@@ -189,6 +190,8 @@ describe("TargetRunner — batches and cursors", () => {
 
 			expect(h.calls).toHaveLength(1);
 			expect(h.calls[0].batch).toEqual({
+				tableName: "orders",
+				targetId: "t1",
 				producerId: "aa".repeat(32),
 				epoch: 1,
 				ancestorFences: [],

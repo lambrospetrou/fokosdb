@@ -284,8 +284,8 @@ Materialization Shard Group: fokos.m.<tableName> (MaterializationDO)
   - Receiver: producer_fences; in-memory runner round-robins targets (2 workers); alarm is fallback
           |
           +-----------------------------------------------+
-          | gsiWriteEntries(producerId, epoch,            | PushTargetBatch(producerId, epoch,
-          |   ancestorFences, entries)                    |   ancestorFences, items)
+          | gsiWriteEntries(producerId, epoch,            | PushTargetBatch(tableName, targetId,
+          |   ancestorFences, entries)                    |   producerId, epoch, ancestorFences, items)
           v                                               v
 GSI Shard Groups (up to 10):                       Remote Push Targets:
   fokos.gsiv1.<n>.<tableName>.<indexName>            Workers RPC to a WorkerEntrypoint or DurableObject
@@ -859,6 +859,10 @@ export type PushTargetItem = {
 };
 
 export type PushTargetBatch = {
+	/** The name of the base table, with no `fokos.` shard group prefix. */
+	tableName: string;
+	/** The target that sends the batch. Each target has its own epoch and its own ancestor fences. */
+	targetId: string;
 	/** The `DurableObjectId` of the sending `MaterializationDO`, as `DurableObjectId.toString()` gives it (hex). */
 	producerId: string;
 	epoch: number;
@@ -884,7 +888,13 @@ The push target contract:
 - `revision` strictly increases for each `(baseHashKey, baseSortKey)` across creates, updates, and deletes.
 - Two pushes for one key can arrive out of order when an earlier call stays in flight after a lost response. Thus the
   push target must keep the highest applied `revision` of each key and ignore each push with
-  `revision <= appliedRevision`.
+  `revision <= appliedRevision`. The key is `(tableName, baseHashKey, baseSortKey)`, because one push target can
+  receive the batches of more than one table.
+- A push target that checks the producer epoch uses the receiver rules of Section 4.2.9 with the producer
+  `(producerId, targetId)` and the ancestor `(ancestorId, targetId)`. Each target of one `MaterializationDO` has its
+  own epoch, and two targets of one table can send to the same push target.
+- The batch carries no other part of the table configuration. The policy holds the bindings and the split settings
+  of the producer, and a push target has no use for them.
 - A push target that checks the producer epoch with the receiver rules of Section 4.2.9 can delete the revision of a
   deleted key after it applies the delete. A push target that does not check the epoch must keep that revision. Its
   retention is the choice of the push target.
@@ -897,7 +907,7 @@ The push target contract:
 | --- | --- | --- | --- |
 | Base `PartitionDO` -> `MaterializationDO` (`applyLatestImages`) | `DurableObjectId` of the base partition, in hex | `materialization_export_state` | The producer epoch, then the revision (Section 4.2.4) |
 | `MaterializationDO` -> GSI `PartitionDO` (`gsiWriteEntries`) | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the GSI target | The producer epoch |
-| `MaterializationDO` -> push target | `DurableObjectId` of the `MaterializationDO`, in hex | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 4.2.8). |
+| `MaterializationDO` -> push target | `DurableObjectId` of the `MaterializationDO`, in hex, with `targetId` | `materialization_targets.epoch` of the push target | The revision. The producer epoch is optional (Section 4.2.8). |
 
 Each GSI shard group gets calls from one target only. Thus a GSI partition stores one epoch for each
 `MaterializationDO`, and the producer ID needs no `targetId`. The producer ID is the `DurableObjectId` as
