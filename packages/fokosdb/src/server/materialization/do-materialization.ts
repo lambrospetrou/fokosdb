@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { FokosDBPolicy, FokosDBRouteContext } from "../../shared/partition-context.js";
+import { baseTableName, type FokosDBPolicy, type FokosDBRouteContext } from "../../shared/partition-context.js";
 import { FokosShardingRuntime } from "../../sharding/runtime.js";
 import type { FokosRuntimeConfigOverrides } from "../../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosLifecycle, FokosLocalCall, FokosOperations, FokosShardingHooks } from "../../sharding/runtime-types.js";
@@ -151,6 +151,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				const owns = this.fokos.ownerCheck();
 				return (row) => owns({ hashKey: row.hk, sortKey: row.sk });
 			},
+			tableName: () => baseTableName(this.fokos.identity().topology),
 			producerId: () => this.ctx.id.toString(),
 			checkPushTarget: (target) => {
 				pushTargetStub(this.env, target);

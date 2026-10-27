@@ -50,6 +50,11 @@ describe("FokosDBMaterializationDO — push targets", () => {
 
 		// The target read the tombstone, so the cleanup deletes it and each position.
 		await vi.waitFor(async () => expect(await materializationState(mat)).toMatchObject({ items: 0, positions: 0 }), TARGET_WAIT);
+		// Each call names the base table without the shard group prefix, and the target that sent it.
+		const tableName = ctx.topology.shardGroup.slice("fokos.p.".length);
+		const senders = await env.PUSH_SINK_DO.getByName("sink").senders(producerId);
+		expect(senders.length).toBeGreaterThan(0);
+		expect(senders).toEqual(senders.map(() => ({ tableName, targetId: "sink" })));
 		expect(await materializationState(mat)).toMatchObject({
 			targets: [{ target_id: "sink", kind: "push_sink", epoch: 1, is_batch_open: 0 }],
 			storedTargets: [{ kind: "push_sink", targetId: "sink", binding: "PUSH_SINK_DO", method: "push", objectName: "sink" }],
