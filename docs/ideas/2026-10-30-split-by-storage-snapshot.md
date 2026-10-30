@@ -43,7 +43,8 @@ The change is not free. Four facts decide the design:
    import costs one row write for each row. For `hashSplitN = 2` the two are equal. For `hashSplitN = 4` the prune
    costs 3 times more.
 3. **A restore takes effect only when the child restarts**, and a restart fails the call that asked for it. The
-   source cannot read the result of the restore call, so the protocol needs a separate confirmation.
+   child aborts with a sentinel message, and the source confirms with a separate call. That call pays the
+   restore: a cold start of the source's size plus one upload of the image.
 4. **Local `workerd` does not implement snapshots.** The storage back-end of `workerd` throws "This Durable
    Object's storage back-end does not implement snapshots." Thus `vitest` cannot run the new path.
 
@@ -69,9 +70,17 @@ compatibility flag `durable_object_snapshots` (experimental) in `compatibility-d
 - The local back-end (`ActorCacheInterface` in `io/actor-cache.h`) throws for both `captureBookmarkSnapshot` and
   `onNextSessionRestore`. Only the production back-end can implement them.
 
-Facts that the source does not state, and that the design must not assume (section 10): whether a restore
-replaces the alarm, how long a bookmark stays valid for `snapshot({ bookmark })`, whether a restore is cheap for a
-large database, and whether a pending restore survives `deleteAll()`.
+The design uses these facts, which the source does not state:
+
+- **A restore does not keep an alarm.** The restored child has no alarm until it arms one.
+- **A bookmark is valid for 30 days after the source generates it.** Each child must boot from its image before
+  that deadline.
+- **The child calls `ctx.abort(<sentinel>)` immediately after `onNextSessionRestore`.** No other request can run
+  between the two calls, so no `deleteAll()` or write can run between the schedule and the restart.
+- **A restore costs one download and one upload of the database.** The first session of the child is a cold start
+  of a database of the source's size, plus an upload of the image to the object storage of the child, under the
+  child's own key. After the restore the child's storage does not depend on the source. Thus each child holds a
+  full, separate copy until its prune ends: the platform does not share the pages.
 
 ## 3. The split today
 
@@ -104,8 +113,8 @@ cutover holds the same data rows as a snapshot at the cutover.
 
 ```
 source: (none) -> queued -> planned -> cutover -> completed -> cleaned          (unchanged)
-target row:  pending -> restore_sent -> restored                                 (replaces initialization)
-child:  (empty) -> restore scheduled -> restart -> adopt -> pruning -> pruned -> active
+target row:  pending -> restore_sent -> restore_scheduled -> restored            (replaces initialization)
+child:  (empty) -> restore scheduled + abort -> cold start with the image -> adopt -> pruning -> active
 ```
 
 ### 4.1 Source steps
@@ -116,8 +125,13 @@ child:  (empty) -> restore scheduled -> restart -> adopt -> pruning -> pruned ->
    A stub is not an RPC, so this costs no I/O.
 2. `fokosInit` goes. The child gets its identity from the clone (section 4.4). `beforeCutover` stays.
 3. The cutover moves the row to `cutover` in one transaction, as today. The source then reads
-   `await storage.getCurrentBookmark()` and stores it on the row (`snapshot_bookmark`). A crash between the two
-   writes is safe: the next step reads a new bookmark, and the data rows are frozen.
+   `await storage.getCurrentBookmark()` and stores it on the row (`snapshot_bookmark`, `snapshot_bookmark_at`). A
+   crash between the two writes is safe: the next step reads a new bookmark, and the data rows are frozen.
+   A bookmark is valid for 30 days. When a target is not `restored` 29 days after `snapshot_bookmark_at`, the
+   source reads a new bookmark and stores it. This is safe before `completed` for the same reason: the data rows
+   do not change after the cutover, and the cleanup deletes nothing before `completed`. The new bookmark only
+   changes the bookkeeping columns of the targets, which the adopt transaction does not read. The source logs
+   the refresh, because a split that waits for 29 days is a defect to look at.
 4. A new step `#restoreTargets` takes up to six due targets, as `#notifyStart` does. For each target it moves the
    row to `restore_sent`, then calls `storage.snapshot({ bookmark })` and `peer.fokosRestore(...)` with the handle.
    Every child gets an image of the same bookmark, so the retries and the siblings get identical images.
@@ -132,15 +146,36 @@ child:  (empty) -> restore scheduled -> restart -> adopt -> pruning -> pruned ->
 1. When the child has an identity, it does not restore. If its stored import record names this repartition and
    this source, it answers `restored`. Otherwise it throws `partition_context_mismatch`. This rule is the guard
    against the worst failure of the design: a second restore after the child accepted a write deletes that write.
-2. When the child has no identity, it calls `await storage.onNextSessionRestore(snapshot)` and then
-   `ctx.abort()`. The call fails at the source with the abort error.
+2. When the child has no identity but holds any other stored state (for example the destroy fence, see section 7),
+   it throws `partition_context_mismatch` and does not restore. A restore goes only into empty storage.
+3. When the storage is empty, the child runs, inside `blockConcurrencyWhile`:
+   `await storage.onNextSessionRestore(snapshot)` and then `ctx.abort(RESTORE_ABORT_SENTINEL)`. The
+   `blockConcurrencyWhile` keeps every other request out between the two calls. The abort is the restart that
+   applies the restore.
 
-The source treats every result of `fokosRestore` the same way: it calls `fokosStatus` on the child. A child that
-answers with its identity and an import record of this repartition is `restored`. A child with no identity gets a
-new `fokosRestore` after a backoff. A child with any other identity is a protocol defect: the source logs it and
-waits `nonRetryableRetryMs`, as `retryDelay` does today.
+The source reads the result of `fokosRestore` as `fokosDestroy` reads its own abort today
+(`DESTROY_ABORT_SENTINEL` in `shared/cf-utils.ts`):
+
+| Result | Meaning | Next |
+| --- | --- | --- |
+| Error with `RESTORE_ABORT_SENTINEL` | The child scheduled the restore and restarted. | Target `restore_scheduled`. Confirm. |
+| `restored` | An earlier attempt restored the child. | Target `restored`. |
+| Any other error | Unknown: the call can have failed before or after the schedule. | Confirm. |
+
+To confirm, the source calls `fokosStatus` on the child. This call starts the first session of the child, which
+applies the restore: a cold start of a database of the source's size plus the upload of the image (section 2).
+Thus the call needs a timeout of its own, much longer than an ordinary RPC timeout, and the source sends at most
+`REPARTITION_RPC_CONCURRENCY` of them at the same time. A child that answers with its identity and an import
+record of this repartition is `restored`. A child with empty storage gets a new `fokosRestore` after a backoff. A
+child with any other state is a protocol defect: the source logs it and waits `nonRetryableRetryMs`, as
+`retryDelay` does today. A confirm that times out is retried: the restore runs again only if the storage of the
+child is still empty.
 
 A repeated restore before the child accepted any write is harmless, because each image is the same bookmark.
+
+A restore keeps no alarm, so a restored child that nobody calls stays asleep. The confirm call of the source is
+what wakes it and runs the adopt transaction. The source keeps its own alarm on the restore step until each
+target is `restored`, so the child always gets that call.
 
 ### 4.3 The child finds its role
 
@@ -176,7 +211,8 @@ the object:
 6. Run a new host hook `adoptClone(slice, parentActorId)` in the same transaction. FokosDB calls
    `importExportFences(parentActorId, epoch, inherited)` there, with the export epoch that the cutover raised. The
    clone holds that epoch, so no page has to carry it.
-7. Arm the alarm, after the commit. Do not assume that the restore kept the alarm of the source.
+7. Arm the alarm for the prune job after the commit. A restore keeps no alarm, so this is the only alarm of the
+   child, and no alarm of the source can fire on the child before the adopt transaction.
 
 ### 4.5 The prune phases
 
@@ -342,15 +378,29 @@ Consequences:
 - **Write cost.** The children of one split delete `(hashSplitN - 1)` times the row count of the parent, and each
   delete also writes its index entries (`rowsWritten` was about 3 for each row moved in the measurement). A split
   source still keeps its own rows, as today.
-- **Storage held during the prune.** Each child holds a full image until its prune ends, so a split holds
-  `hashSplitN + 1` times the size of the source for some time.
+- **Storage held during the prune.** Each child holds a full, separate image until its prune ends, so a split
+  holds `hashSplitN + 1` times the size of the source for some time.
+- **The restore gap.** Between the cutover and the confirm of a child, no request of that child's slice can be
+  served: the source is a router, and the child is empty or in its first cold start. The gap is one cold start
+  plus one upload of the whole database, and it grows with `maxSizeMb`. Today a read is served through the source
+  during the whole import, and a write is refused during the whole import. With the clone, reads are also
+  refused, but for a shorter time (the restore and phase 1, not the whole copy). A smaller `maxSizeMb` makes the
+  gap shorter.
 - **CPU.** A prune of 700,000 rows needs many bounded steps (section 4.5). Each step holds the input gate while
   its transaction runs.
 - **The restore protocol.** The restore call fails by design, so the source confirms with `fokosStatus`. The
   child must refuse a restore once it has an identity. A missed guard deletes accepted writes.
-- **The destroy fence.** A destroy that runs while a restore is pending can delete the storage, and then the next
-  session restores the image again. `fokosPrepareDestroy` must refuse, or wait, while a target is
-  `restore_sent`. The walk must treat a `restore_sent` target as a node that can hold data.
+- **Destroy and restore.** The abort right after `onNextSessionRestore` closes the window inside the child. One
+  race stays: the destroy walk can reach an empty child before a `fokosRestore` of the source arrives there. The
+  child then restores after its destroy, and the data comes back. Two rules close it:
+  1. The source stops the restore step once its destroy fence is written (`isDestroying()`), as the import job
+     stops today.
+  2. `fokosDestroy` on a child with empty storage writes the destroy fence and leaves it, instead of leaving empty
+     storage. Rule 2 of section 4.2 then refuses a late restore. The cost is one stored key in a destroyed child
+     that never restored.
+
+  The walk treats a target in `restore_sent` or `restore_scheduled` as a node that can hold data, and confirms it
+  with `fokosStatus` before it destroys it.
 - **Role detection at boot.** Each constructor must compare `ctx.id` with the cloned rows before it serves a
   request. A defect here makes a child act as its parent, a router with no data.
 - **Testing.** Local `workerd` throws for both methods, and the project does not add a production hook for a
@@ -373,8 +423,7 @@ send) and the hash-child branch of `belongsToTarget`.
 
 ## 9. Recommendation
 
-1. **Ask Cloudflare the open questions** of section 10 before any code. The alarm and the destroy questions
-   decide whether the protocol is safe.
+1. **Close the open questions** of section 10 that still affect the step sizes and the cost figures.
 2. **Add the logical-size split decision first**, independent of the snapshot API. Make `SplitPlanner.evaluateSplit`
    read the sum of `key_size_estimates` together with `databaseSize`. This also helps today: a partition after
    heavy deletes keeps empty space inside its pages.
@@ -389,20 +438,26 @@ send) and the hash-child branch of `belongsToTarget`.
 
 ## 10. Open questions
 
-1. Does a restore replace the alarm of the target, keep the alarm of the target, or remove it? The design arms
-   the alarm after the adopt step in each case, but an alarm from the image of the source can fire on the child
-   before the adopt step if the platform restores it.
-2. How long does a bookmark stay valid for `snapshot({ bookmark })`? The point-in-time recovery window is a limit
-   on it. A split that stalls past the window must take a snapshot of the current state, which is safe only
-   because the source is frozen after the cutover.
-3. Does a pending restore survive `deleteAll()` in the same session? Can `onNextSessionRestore` with the undo
-   bookmark cancel a pending restore?
-4. What does a restore of a large database cost in time and in billed rows? Is the image shared copy-on-write
-   until the child writes?
+Answered (section 2 states them as facts):
+
+1. A restore does not keep the alarm. The adopt transaction arms the alarm of the child (section 4.4), and the
+   confirm call of the source wakes the restored child (section 4.2).
+2. A bookmark is valid for 30 days after it is generated. The source refreshes the bookmark at 29 days, before
+   `completed` (section 4.1).
+3. A pending restore does not need to survive `deleteAll()`: the child aborts immediately after
+   `onNextSessionRestore`, inside `blockConcurrencyWhile`, so nothing runs between the two. The race that stays is
+   on the source side, and section 7 closes it.
+4. A restore costs one download and one upload of the database: a cold start of that size plus the upload of the
+   image to the child's own key. The images are separate copies (sections 2 and 7).
+
+Still open:
+
 5. Can a snapshot handle travel through a second RPC hop, for example from the source to a router and then to
    the child? The design does not need it, but the handle is an `IoOwn` of the context that created it.
 6. Does `workerd` plan a local back-end for snapshots, so that `vitest` can run the flow?
-7. The Durable Objects limits and pricing pages were not reachable from the environment of this exploration.
+7. How long does the first session of a restored child take for a 500 MB image? The timeout of the confirm call
+   (section 4.2) and the restore gap (section 7) depend on it.
+8. The Durable Objects limits and pricing pages were not reachable from the environment of this exploration.
    Read the CPU limit, the storage limit per object and the billing of deleted rows from
    `/durable-objects/platform/limits/` and `/durable-objects/platform/pricing/` before the step sizes and the
    cost figures of sections 4.5 and 7 are final.
