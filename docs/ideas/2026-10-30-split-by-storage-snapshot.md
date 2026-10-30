@@ -19,6 +19,7 @@
   - [4.6 The write gate and the early split](#46-the-write-gate-and-the-early-split)
   - [4.7 Each table of the clone](#47-each-table-of-the-clone)
   - [4.8 The other two hosts](#48-the-other-two-hosts)
+  - [4.9 Restore time](#49-restore-time)
 - [5. Measurements: space after a prune](#5-measurements-space-after-a-prune)
 - [6. What gets simpler](#6-what-gets-simpler)
 - [7. What gets harder](#7-what-gets-harder)
@@ -44,7 +45,9 @@ The change is not free. Four facts decide the design:
    costs 3 times more.
 3. **A restore takes effect only when the child restarts**, and a restart fails the call that asked for it. The
    child aborts with a sentinel message, and the source confirms with a separate call. That call pays the
-   restore: a cold start of the source's size plus one upload of the image.
+   restore: a cold start of the source's size plus one upload of the image, 16 s to 160 s for 500 MB at the
+   planned 50 to 100 Mbit/s. During that time the source serves the reads of the slice, and the child takes
+   writes only after the source releases the slice to it.
 4. **Local `workerd` does not implement snapshots.** The storage back-end of `workerd` throws "This Durable
    Object's storage back-end does not implement snapshots." Thus `vitest` cannot run the new path.
 
@@ -113,8 +116,9 @@ cutover holds the same data rows as a snapshot at the cutover.
 
 ```
 source: (none) -> queued -> planned -> cutover -> completed -> cleaned          (unchanged)
-target row:  pending -> restore_sent -> restore_scheduled -> restored            (replaces initialization)
-child:  (empty) -> restore scheduled + abort -> cold start with the image -> adopt -> pruning -> active
+target row:  pending -> restore_sent -> restore_scheduled -> restored -> released (replaces initialization and ack)
+child:  (empty) -> restore scheduled + abort -> cold start with the image -> adopt -> pruning_meta
+        -> awaiting_release -> pruning -> active
 ```
 
 ### 4.1 Source steps
@@ -135,8 +139,9 @@ child:  (empty) -> restore scheduled + abort -> cold start with the image -> ado
 4. A new step `#restoreTargets` takes up to six due targets, as `#notifyStart` does. For each target it moves the
    row to `restore_sent`, then calls `storage.snapshot({ bookmark })` and `peer.fokosRestore(...)` with the handle.
    Every child gets an image of the same bookmark, so the retries and the siblings get identical images.
-5. A target becomes `restored` only when the child confirms it (section 4.2). The ack of today stays: the child
-   acknowledges when its adopt transaction is durable, and the last ack moves the source to `completed`.
+5. A target becomes `restored` only when the child confirms it (section 4.2), and `released` only when the source
+   accepts the release request of the child (section 4.2). The release replaces the ack of today: the last release
+   moves the source to `completed`.
 6. `cleanupSourceStep` stays as it is.
 
 ### 4.2 The restore call
@@ -146,9 +151,10 @@ child:  (empty) -> restore scheduled + abort -> cold start with the image -> ado
 1. When the child has an identity, it does not restore. If its stored import record names this repartition and
    this source, it answers `restored`. Otherwise it throws `partition_context_mismatch`. This rule is the guard
    against the worst failure of the design: a second restore after the child accepted a write deletes that write.
-2. When the child has no identity but holds any other stored state (for example the destroy fence, see section 7),
-   it throws `partition_context_mismatch` and does not restore. A restore goes only into empty storage.
-3. When the storage is empty, the child runs, inside `blockConcurrencyWhile`:
+2. When the child has no identity but holds the destroy fence (section 7), it throws `partition_context_mismatch`
+   and does not restore. The schema tables of an empty child do not count as state: each wake of the child runs
+   the schema migrations, and the restore replaces them.
+3. When the child has no identity and no destroy fence, it runs, inside `blockConcurrencyWhile`:
    `await storage.onNextSessionRestore(snapshot)` and then `ctx.abort(RESTORE_ABORT_SENTINEL)`. The
    `blockConcurrencyWhile` keeps every other request out between the two calls. The abort is the restart that
    applies the restore.
@@ -164,18 +170,42 @@ The source reads the result of `fokosRestore` as `fokosDestroy` reads its own ab
 
 To confirm, the source calls `fokosStatus` on the child. This call starts the first session of the child, which
 applies the restore: a cold start of a database of the source's size plus the upload of the image (section 2).
-Thus the call needs a timeout of its own, much longer than an ordinary RPC timeout, and the source sends at most
-`REPARTITION_RPC_CONCURRENCY` of them at the same time. A child that answers with its identity and an import
-record of this repartition is `restored`. A child with empty storage gets a new `fokosRestore` after a backoff. A
+Thus the call needs a timeout of its own, much longer than an ordinary RPC timeout (section 4.9 gives the
+numbers), and the source sends at most `REPARTITION_RPC_CONCURRENCY` of them at the same time. A child that answers
+with its identity and an import record of this repartition is `restored`. A child with no identity gets a new
+`fokosRestore` after a backoff. A
 child with any other state is a protocol defect: the source logs it and waits `nonRetryableRetryMs`, as
-`retryDelay` does today. A confirm that times out is retried: the restore runs again only if the storage of the
-child is still empty.
+`retryDelay` does today. A confirm that times out is retried: the restore runs again only if the child still has
+no identity.
 
 A repeated restore before the child accepted any write is harmless, because each image is the same bookmark.
 
 A restore keeps no alarm, so a restored child that nobody calls stays asleep. The confirm call of the source is
 what wakes it and runs the adopt transaction. The source keeps its own alarm on the restore step until each
 target is `restored`, so the child always gets that call.
+
+**The release.** The restore of a 500 MB image can take minutes (section 4.9). During that time the source
+serves the reads of the slice, so reads stay available as they are with the read-through today:
+
+1. While a target is not `released`, the source answers each read of that target's slice from its own rows, and
+   it does not forward the read. Its rows are complete and correct for the slice: the source is frozen after the
+   cutover, and no other partition can write the slice before the release. The source answers each write of the
+   slice with `partition_migrating`.
+2. After the adopt transaction and phase 1 (section 4.5), the child is `awaiting_release`. It serves reads, because
+   it holds the same rows as the source. It answers each write with `partition_migrating`.
+3. The child calls `fokosRelease({ repartitionId, target })` on the source, and retries it until the source
+   answers, as `sendAck` does today. The source moves the target to `released` in one transaction. From that
+   commit it forwards every request of the slice to the child.
+4. After the answer, the child writes `pruning` and accepts writes.
+
+The rule that makes this linearizable: the decision of the source to serve a read locally, and that read, run in
+one synchronous block, with no `await` between them. A local handler is synchronous today, so this holds when the
+release check runs inside the same block. Thus no local read of the source runs after the release commits, and
+the child takes no write before the release commits.
+
+A client that learned the route to the child and calls it directly gets the same answers: a child with no
+identity answers `hash_partition_not_initialized` or `range_partition_not_initialized` and writes nothing (only a root takes an identity from a request),
+a child in its first session waits for the restore and then answers as step 2.
 
 ### 4.3 The child finds its role
 
@@ -220,8 +250,8 @@ The prune runs as a runtime job (`target_prune`) with a bounded step, as `target
 hook `pruneStep(phase, slice, belongsToTarget, budget): boolean` deletes at most `budget` rows and returns true when
 the phase is complete. Ownership comes from `belongsToTarget`, the same predicate the import uses.
 
-**Phase 1 — before the child serves any request (state `pruning_meta`).** The small tables whose foreign rows can
-make a local decision wrong:
+**Phase 1 — before the release (state `pruning_meta`).** The small tables whose foreign rows can make a local
+decision wrong:
 
 - `pending_transactions` and `pending_tx_info` of the keys outside the slice. Delete by key, never by
   transaction ID alone, because a transaction can lock keys inside and outside the slice. Then delete each
@@ -233,15 +263,28 @@ make a local decision wrong:
 - `fokos_range_hierarchy` rows of the hash keys outside the slice.
 - `materialization_outbox` rows outside the slice.
 
-While phase 1 runs, every operation answers `partition_migrating`, as the import gate does today. In the normal
-case these tables are small, so the gate holds for one or two steps.
+While phase 1 runs, the child serves reads and answers writes with `partition_migrating`. The source does the
+same for the slice, so a client sees no change. In the normal case these tables are small, so phase 1 takes one
+or two steps.
 
 **Phase 2 — while the child serves requests (state `pruning`).** `items` and `key_size_estimates` outside the
-slice, in batches of `cleanupPromotedKeyRows` rows. Each batch is one transaction, and the job yields between
-batches. The local measurement (section 5) deleted about 20,000 rows of 100 B for each second of CPU. A 500 MB
-parent with 100 B items holds about 1.4 million rows, so the child of a 2-way split deletes about 700,000 rows,
-about 35 s of CPU in many steps. The step size must keep each step well under the CPU limit and must not hold the
-input gate for long.
+slice. The limits are 30 s of CPU for each invocation and 128 MB of memory for each isolate, and the prune must
+stay far below both:
+
+- **Step size.** The local measurement (section 5) deleted about 20,000 rows of 100 B for each second of CPU. A
+  500 MB parent with 100 B items holds about 1.4 million rows, so the child of a 2-way split deletes about
+  700,000 rows: about 35 s of CPU in total, more than one invocation can use. One step is one transaction of at
+  most about 5,000 rows (about 250 ms at the local rate), so a request waits at most about that long behind it.
+  The production rate can differ, so the step also stops at a time budget.
+- **Pass size.** One alarm pass runs steps for at most a few seconds of wall time and then arms the alarm for the
+  next pass, as the stale job stops at `alarmRecoveryBudgetMs` (10 s) today. A request between steps runs in
+  between, because each step yields.
+- **Memory.** The step reads keys, never item data. A hash child decides ownership by a hash of the hash key in
+  JavaScript, so it walks the hash keys one at a time, as the hash-key walk of the import does: one seek steps
+  past all rows of an owned key, and the step deletes the rows of each foreign key with one statement. A step
+  holds at most its batch of hash keys (each at most 1024 bytes), so it also stops at about 1 MiB of key bytes.
+  A range child decides ownership by the sort-key interval, so each step is one `DELETE` of the rows outside
+  `[start, end)` by a `rowid` subquery with a `LIMIT`. It reads no row into JavaScript.
 
 **Phase 3 — optional compaction (state `compacting`).** Section 5 shows that a move of each kept row to a new
 `item_id` frees about one third of the space that the delete leaves. It costs about 3 rows written for each kept
@@ -281,8 +324,9 @@ The gate:
    the child splits again at once. Each extra level duplicates the whole partition once more and leaves the same
    bloat.
 
-The answer to "how much must the child delete before it accepts writes" is therefore: nothing for correctness,
-phase 1 for the transaction and routing state, and the split decision must wait for the whole prune.
+The answer to "how much must the child delete before it accepts writes" is therefore: nothing for the size, phase
+1 for the transaction and routing state, the release for linearizability, and the split decision must wait for
+the whole prune.
 
 ### 4.7 Each table of the clone
 
@@ -315,6 +359,36 @@ phase 1 for the transaction and routing state, and the split decision must wait 
   writes nothing, but the job loops on it.
 - The materialization host prunes its own tables (`change_positions`, `materialization_targets`, `target_retry`,
   `target_index_keys`, `ancestor_fences`) by its own ownership function.
+
+### 4.9 Restore time
+
+A restore downloads the image and uploads it to the child's own key (section 2). The planning assumption is one
+stream for the download and one for the upload, one after the other, because each stream also encrypts. The time
+is `2 * size / throughput`, plus the cold start:
+
+| Throughput | 100 MB | 250 MB | 500 MB |
+| --- | ---: | ---: | ---: |
+| 50 Mbit/s (6.25 MB/s), worst case | 32 s | 80 s | 160 s |
+| 100 Mbit/s (12.5 MB/s), conservative | 16 s | 40 s | 80 s |
+| 400 Mbit/s (50 MB/s), expected in the same region | 4 s | 10 s | 20 s |
+
+The 400 Mbit/s row is not measured. A single stream to S3-compatible object storage in the same region usually
+does tens of MB/s, and AES-GCM with hardware support encrypts faster than one stream transfers, so 50 to
+100 Mbit/s is a safe lower bound. A source far from the bucket of its region is slower, because the latency limits
+one stream. A download and an upload that overlap halve the times.
+
+Consequences:
+
+- The timeout of the confirm call must be more than the worst row for `maxSizeMb`, with a margin: about 5 minutes
+  for the default of 500 MB.
+- Writes of the slice are refused for this time, and reads stay available (the release, section 4.2). Today a
+  write is refused for the whole import, which moves the same bytes over Workers RPC.
+- The children restore in parallel, at most `REPARTITION_RPC_CONCURRENCY` at a time, so a `hashSplitN` of 6 or
+  less takes about one restore time.
+- A smaller `maxSizeMb` shortens the gap linearly.
+
+The local `workerd` cannot measure any of these numbers: it has no snapshot back-end and no object storage
+between two objects. Only a test in production can measure them.
 
 ## 5. Measurements: space after a prune
 
@@ -360,9 +434,10 @@ Consequences:
   per-row rules that they carry today come for free: `deletion_metadata` (no `MAX` merge), `producer_fences`, the
   lock rows with their `guarded_at`, the export fences, and the exact `est_row_bytes` of each row.
 - **No overrides phase.** The terminal promotions of the slice are already in the clone.
-- **No read-through.** The child holds its whole slice from its first request, so `fokosExecuteLocal`,
-  `resolveCallerSlice` and the `read_source` path of `#whileImporting` go for splits. Reads and writes of the
-  slice are unavailable only during the restore and phase 1, not during the whole copy.
+- **No read-through RPC.** The child holds its whole slice from its first session, so `fokosExecuteLocal`,
+  `resolveCallerSlice` and the `read_source` path of `#whileImporting` go for splits. Until the release, the
+  source answers the reads of the slice itself, with no extra hop (section 4.2). Reads stay available for the
+  whole split, and writes are refused only until the release.
 - **No `fokosInit` and no `fokosStartImport`.** The child derives its identity and its slice from the clone.
 - **The in-flight transactions need no protocol.** The lock rows, their coordinator references and their
   quarantine marks are in the image at one bookmark. The `transactions in flight` concern of the copy reduces to
@@ -380,14 +455,12 @@ Consequences:
   source still keeps its own rows, as today.
 - **Storage held during the prune.** Each child holds a full, separate image until its prune ends, so a split
   holds `hashSplitN + 1` times the size of the source for some time.
-- **The restore gap.** Between the cutover and the confirm of a child, no request of that child's slice can be
-  served: the source is a router, and the child is empty or in its first cold start. The gap is one cold start
-  plus one upload of the whole database, and it grows with `maxSizeMb`. Today a read is served through the source
-  during the whole import, and a write is refused during the whole import. With the clone, reads are also
-  refused, but for a shorter time (the restore and phase 1, not the whole copy). A smaller `maxSizeMb` makes the
-  gap shorter.
-- **CPU.** A prune of 700,000 rows needs many bounded steps (section 4.5). Each step holds the input gate while
-  its transaction runs.
+- **The write gap.** Writes of a slice are refused from the cutover until the release: one restore (16 s to
+  160 s for 500 MB at 100 to 50 Mbit/s, section 4.9) plus phase 1. The source now has a second read path for the
+  slices it has not released, and the release check must run in the same synchronous block as the local read.
+- **CPU.** A prune of 700,000 rows needs about 35 s of CPU at the local rate, more than the 30 s of one
+  invocation, so it runs as many steps of about 5,000 rows over many alarm passes (section 4.5). Each step holds
+  the input gate while its transaction runs.
 - **The restore protocol.** The restore call fails by design, so the source confirms with `fokosStatus`. The
   child must refuse a restore once it has an identity. A missed guard deletes accepted writes.
 - **Destroy and restore.** The abort right after `onNextSessionRestore` closes the window inside the child. One
@@ -403,10 +476,17 @@ Consequences:
   with `fokosStatus` before it destroys it.
 - **Role detection at boot.** Each constructor must compare `ctx.id` with the cloned rows before it serves a
   request. A defect here makes a child act as its parent, a router with no data.
-- **Testing.** Local `workerd` throws for both methods, and the project does not add a production hook for a
-  test. The flow cannot run in `vitest` until `workerd` implements a local back-end. A storage-level fake inside the
-  test harness can cover the adopt and prune logic (start a DO, copy the rows of another DO in the test, restart
-  it), but not the snapshot call or the restart.
+- **Testing.** Local `workerd` throws for both methods, and the design cannot wait for a local back-end. Two
+  ways to test, and neither measures the transfer time:
+  1. **Copy the SQLite file.** Local storage keeps one SQLite file for each object under `.wrangler/state`. A
+     harness that runs in Node (not inside `vitest-pool-workers`, which cannot read the file system) can stop the
+     runtime, copy the file of the source to the file name of the child's ID, and start the runtime again. The
+     file name for an ID must be checked against the local storage layout. This tests the role detection, the
+     adopt transaction, the prune and the release with real storage.
+  2. **A snapshot adapter.** The runtime calls `snapshot` and `onNextSessionRestore` through one small object that
+     the host gives, as it gives `stub` today. The test host gives an adapter that copies the rows of the source
+     into the child. This puts the seam in the code that production runs, so it must be weighed against the rule
+     "do not add a production hook for a test".
 - **An experimental flag.** `durable_object_snapshots` is experimental. A deploy needs it, and the copy flow must
   stay until the API is stable.
 
@@ -423,7 +503,7 @@ send) and the hash-child branch of `belongsToTarget`.
 
 ## 9. Recommendation
 
-1. **Close the open questions** of section 10 that still affect the step sizes and the cost figures.
+1. **Measure the open items** of section 10 (the billing of deleted rows, the restore time and the prune rate).
 2. **Add the logical-size split decision first**, independent of the snapshot API. Make `SplitPlanner.evaluateSplit`
    read the sum of `key_size_estimates` together with `databaseSize`. This also helps today: a partition after
    heavy deletes keeps empty space inside its pages.
@@ -450,14 +530,17 @@ Answered (section 2 states them as facts):
 4. A restore costs one download and one upload of the database: a cold start of that size plus the upload of the
    image to the child's own key. The images are separate copies (sections 2 and 7).
 
+5. A snapshot handle can probably travel through a second RPC hop. This needs a test. The design does not need
+   it: the source calls the child directly.
+6. A local back-end for snapshots may come, but the design does not depend on it. Section 7 gives two ways to
+   test without it. The transfer and the copy times cannot be measured locally.
+7. The restore time depends on the distance from the object to the bucket of its region. Section 4.9 plans with
+   one stream each way at 50 to 100 Mbit/s.
+8. The CPU limit is 30 s for each invocation, and the memory limit is 128 MB for each isolate. The prune stays far
+   below both (section 4.5).
+
 Still open:
 
-5. Can a snapshot handle travel through a second RPC hop, for example from the source to a router and then to
-   the child? The design does not need it, but the handle is an `IoOwn` of the context that created it.
-6. Does `workerd` plan a local back-end for snapshots, so that `vitest` can run the flow?
-7. How long does the first session of a restored child take for a 500 MB image? The timeout of the confirm call
-   (section 4.2) and the restore gap (section 7) depend on it.
-8. The Durable Objects limits and pricing pages were not reachable from the environment of this exploration.
-   Read the CPU limit, the storage limit per object and the billing of deleted rows from
-   `/durable-objects/platform/limits/` and `/durable-objects/platform/pricing/` before the step sizes and the
-   cost figures of sections 4.5 and 7 are final.
+9. The billing of deleted rows. Section 7 assumes that each deleted row and each of its index entries counts as
+   a row written, as `rowsWritten` reports locally.
+10. The real restore time and prune rate in production, for a 500 MB image (section 9, step 6).
