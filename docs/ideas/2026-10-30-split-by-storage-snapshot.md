@@ -40,9 +40,10 @@ The change is not free. Four facts decide the design:
    `databaseSize` of its parent when items are 100 B to 500 B (section 5). A copy keeps 50%. Thus the size
    trigger of the split must not read `databaseSize` alone on a pruned child, or the child splits again soon, or
    at once.
-2. **The prune costs `(hashSplitN - 1)` row deletes for each row of the parent**, summed over all children. The
-   import costs one row write for each row. For `hashSplitN = 2` the two are equal. For `hashSplitN = 4` the prune
-   costs 3 times more.
+2. **The prune costs `(hashSplitN - 1)` row deletes for each row of the parent**, summed over all children, and a
+   delete is billed as a write. The import costs one row write for each row. For `hashSplitN = 2` the two are
+   equal. For `hashSplitN = 4`, and for a range split with the default `rangeSplitN = 4`, the prune costs 3 times
+   more.
 3. **A restore takes effect only when the child restarts**, and a restart fails the call that asked for it. The
    child aborts with a sentinel message, and the source confirms with a separate call. That call pays the
    restore: a cold start of the source's size plus one upload of the image, 16 s to 160 s for 500 MB at the
@@ -450,9 +451,19 @@ Consequences:
 
 - **Space after the prune** (section 5). The split trigger must read the logical size on a pruned child, or
   compaction must run, or both. Without one of them, a 2-way split with small items can split again at once.
-- **Write cost.** The children of one split delete `(hashSplitN - 1)` times the row count of the parent, and each
-  delete also writes its index entries (`rowsWritten` was about 3 for each row moved in the measurement). A split
-  source still keeps its own rows, as today.
+- **Write cost.** A deleted row is billed as a written row. The children of one split delete `(hashSplitN - 1)`
+  times the row count of the parent. The import of today inserts each row of the parent one time. An insert and a
+  delete touch the same table and index entries, so the two cost the same for each row. For a 500 MB parent with
+  100 B items (about 1.4 million rows):
+
+  | `hashSplitN` | Import (rows inserted) | Clone and prune (rows deleted) | Ratio |
+  | ---: | ---: | ---: | ---: |
+  | 2 | 1.4 million | 1.4 million | 1x |
+  | 4 | 1.4 million | 4.2 million | 3x |
+  | 8 | 1.4 million | 9.8 million | 7x |
+
+  The optional compaction adds about one more write for each kept row. A range split with `rangeSplitN = 4` (the
+  default) costs 3x, as a hash split with 4 children does. A split source still keeps its own rows, as today.
 - **Storage held during the prune.** Each child holds a full, separate image until its prune ends, so a split
   holds `hashSplitN + 1` times the size of the source for some time.
 - **The write gap.** Writes of a slice are refused from the cutover until the release: one restore (16 s to
@@ -503,16 +514,28 @@ send) and the hash-child branch of `belongsToTarget`.
 
 ## 9. Recommendation
 
-1. **Measure the open items** of section 10 (the billing of deleted rows, the restore time and the prune rate).
+1. **Measure the open items** of section 10 (the restore time and the prune rate).
 2. **Add the logical-size split decision first**, independent of the snapshot API. Make `SplitPlanner.evaluateSplit`
    read the sum of `key_size_estimates` together with `databaseSize`. This also helps today: a partition after
    heavy deletes keeps empty space inside its pages.
 3. **Build clone and prune for hash splits and range splits** behind a host option, with the copy flow as the
-   default until the flag is stable. Keep the source states. Replace the target initialization with
-   `pending -> restore_sent -> restored`, and the target import with `pruning_meta -> pruning -> active`.
+   default until the flag is stable. Keep the source states. Replace the target initialization and the ack with
+   `pending -> restore_sent -> restore_scheduled -> restored -> released`, and the target import with
+   `pruning_meta -> awaiting_release -> pruning -> active`.
 4. **Keep the copy flow for key promotions.**
-5. **Document `hashSplitN >= 4`** for new tables that use clone and prune with small items, because
-   `hashSplitN` cannot change later.
+5. **Choose `hashSplitN` with both costs in view**, because it cannot change later. A larger value leaves less
+   empty space after the prune, and costs more deletes:
+
+   | `hashSplitN` | Child size after the prune, 100 B to 500 B items (section 5) | Rows written against the import |
+   | ---: | ---: | ---: |
+   | 2 | 82% to 94% of the parent (61% to 73% compacted) | 1x |
+   | 4 | 37% to 40% of the parent (31% to 36% compacted) | 3x |
+
+   With `hashSplitN = 2` the split decision on the logical size (step 2) is required, not optional. Without it the
+   child splits again soon after the prune. With `hashSplitN = 4` the space is close to a copy, and each split
+   costs 3 times the writes of the import. The same 3x applies to a range split with `rangeSplitN = 4`. A range
+   split can lower its cost with a lower `rangeSplitN`, because `rangeSplitN` can change. For large items (2 KB
+   and more) `hashSplitN = 2` leaves almost no empty space, so it is the cheaper choice there.
 6. **Measure in production**: the time of a restore of a 500 MB image, the prune rate under load, and the
    `databaseSize` of the children after the prune.
 
@@ -539,8 +562,8 @@ Answered (section 2 states them as facts):
 8. The CPU limit is 30 s for each invocation, and the memory limit is 128 MB for each isolate. The prune stays far
    below both (section 4.5).
 
+9. A deleted row is billed as a written row (section 7).
+
 Still open:
 
-9. The billing of deleted rows. Section 7 assumes that each deleted row and each of its index entries counts as
-   a row written, as `rowsWritten` reports locally.
 10. The real restore time and prune rate in production, for a 500 MB image (section 9, step 6).
