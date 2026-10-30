@@ -534,7 +534,9 @@ send) and the hash-child branch of `belongsToTarget`.
    With `hashSplitN = 2` the split decision on the logical size (step 2) is required, not optional. Without it the
    child splits again soon after the prune. With `hashSplitN = 4` the space is close to a copy, and each split
    costs 3 times the writes of the import. The same 3x applies to a range split with `rangeSplitN = 4`. A range
-   split can lower its cost with a lower `rangeSplitN`, because `rangeSplitN` can change. For large items (2 KB
+   split can lower its cost with a lower `rangeSplitN`, because `rangeSplitN` can change. That works well for
+   sort keys written in order (for example time-ordered keys), because the prune then frees whole pages. For sort
+   keys written in random order, `rangeSplitN = 2` leaves the same half-full pages as `hashSplitN = 2`. For large items (2 KB
    and more) `hashSplitN = 2` leaves almost no empty space, so it is the cheaper choice there.
 6. **Measure in production**: the time of a restore of a 500 MB image, the prune rate under load, and the
    `databaseSize` of the children after the prune.
