@@ -7,6 +7,7 @@ import { KeyCodec } from "../src/sharding/key-codec.js";
 import { maybePromoted, parseHashBody, topologyAdminName } from "../src/sharding/topology-codec.js";
 import { TOPOLOGY_BLOOM_MIN_CAPACITY } from "../src/sharding/topology-encode.js";
 import type { FokosTopologyRead } from "../src/sharding/topology-keeper.js";
+import { TARGET_WAIT } from "./partition-do/helpers.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // maxSizeMb 0.25 is 262,144 bytes. The empty schema holds about 100 KB, so a few 50 KB items split a root.
@@ -164,6 +165,37 @@ describe("FokosDB — encoded topology", () => {
 			],
 		});
 		expect((await db.getItem({ hashKey: falsePositive! })).found).toBe(true);
+	});
+
+	it("destroy resets the topology of the coordinator, materialization, and GSI shard groups", async () => {
+		const tableName = `topotest.${crypto.randomUUID().replaceAll("-", "")}`;
+		const db = new FokosDB(
+			options(tableName, {
+				table: { ...options(tableName).table, nsMat: "GSI_MATERIALIZATION_DO" },
+				captureChanges: true,
+			}),
+		);
+		await db.putItem({ hashKey: "o1", sortKey: "s", data: { status: "OPEN", at: "t1", owner: "u" } });
+		await vi.waitFor(
+			async () => expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toHaveLength(1),
+			TARGET_WAIT,
+		);
+		await db.destroy();
+
+		const shardGroups = [
+			`fokos.p.${tableName}`,
+			`fokos.tc.${tableName}`,
+			`fokos.m.${tableName}`,
+			`fokos.gsiv1.${tableName.length}.${tableName}.byStatus`,
+		];
+		for (const shardGroup of shardGroups) {
+			const epoch = await runInDurableObject(
+				env.FOKOS_ADMIN_DO.getByName(topologyAdminName(shardGroup)),
+				(_: FokosDBAutoAdminDO, state) =>
+					state.storage.sql.exec<{ epoch: number }>(`SELECT epoch FROM fokos_topo_groups WHERE shard_group = ?1`, shardGroup).one().epoch,
+			);
+			expect(epoch, shardGroup).toBe(1);
+		}
 	});
 
 	it("refuses topologyEntrypoint without nsAdmin", () => {

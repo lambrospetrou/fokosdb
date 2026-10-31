@@ -150,7 +150,9 @@ import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expre
 import {
 	coordinatorShardGroup,
 	createTableConfig,
+	gsiShardGroup,
 	gsiTableConfig,
+	materializationShardGroup,
 	materializationTableConfig,
 	type FokosDBPolicy,
 	type FokosDBTableConfig,
@@ -1654,6 +1656,8 @@ export class FokosDB {
 		// The materialization partitions are fenced first, so that no GSI write follows the destroy of a
 		// GSI table, and they are deleted last, so that a destroy that stops halfway can read the GSI
 		// targets again.
+		const { topology } = this.#table;
+		const shardGroups = [topology.shardGroup, coordinatorShardGroup(topology)];
 		if (this.#table.policy.nsMat !== undefined) {
 			const materializations = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 				...materializationTableConfig(this.#table),
@@ -1664,13 +1668,13 @@ export class FokosDB {
 				await this.#gsiClient(indexName).destroy({ onDestroyed: (ref) => console.warn(`Destroyed GSI partition DO ${ref.doName}`) });
 			}
 			await materializations.destroy({ onDestroyed: (ref) => console.warn(`Destroyed materialization DO ${ref.doName}`) });
+			shardGroups.push(materializationShardGroup(topology), ...indexNames.map((indexName) => gsiShardGroup(topology, indexName)));
 		}
 		// The topology goes last: a partition that the traversal has not reached can still report a split.
 		// A report that completed before the reset is ignored.
 		const admin = topologyAdminAddress(this.#table);
 		if (admin !== undefined) {
-			const { topology } = this.#table;
-			for (const shardGroup of [topology.shardGroup, coordinatorShardGroup(topology)]) {
+			for (const shardGroup of shardGroups) {
 				await topologyAdminStub(env, admin, shardGroup).resetShardGroup(shardGroup);
 			}
 		}
