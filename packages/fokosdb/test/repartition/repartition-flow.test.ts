@@ -243,6 +243,31 @@ describe("Repartition — initialization and cutover", () => {
 		});
 	});
 
+	it("waits the non-retryable interval when an init answers a context conflict", async () => {
+		const c = makeCluster({ runtimeConfig: { nonRetryableRetryMs: 123_000 } });
+		const root = c.hashNode([0]);
+		await plan(root, { kind: "hash_split" });
+		const child = await firstChild(c, root);
+		const req = await initRequestFor(root, child);
+		// The child holds the import of a different repartition, so the init of r1 conflicts with it.
+		await child.peer.fokosInit({ ...req, repartitionId: "conflict" });
+
+		await root.enter(async ({ source, sharding }) => {
+			expect(await source.sourceStep(T0)).toBe("progressed");
+			const targets = sharding.listRepartitionTargets("r1", "hash_split");
+			const conflicted = targets.find((t) => t.doName === child.doName)!;
+			expect(conflicted.initialization).toBe("initializing");
+			expect(conflicted.attempts).toBe(1);
+			// A context conflict answers the same on every retry, so the wait is the long one.
+			expect(conflicted.nextAttemptAt).toBe(T0 + 123_000);
+			expect(targets.find((t) => t.doName !== child.doName)!.initialization).toBe("initialized");
+
+			// The repartition keeps its rows and follows the conflicted target's deadline.
+			expect(sharding.getRepartition("r1")!.state).toBe("planned");
+			expect(sharding.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 123_000);
+		});
+	});
+
 	it("cuts a locked key over with no hold, and keeps the lock as a copy", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);

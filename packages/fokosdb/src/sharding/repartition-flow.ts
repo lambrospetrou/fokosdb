@@ -1288,7 +1288,8 @@ function retryDelay(
 	// long enough that it costs nothing while an operator looks at the log.
 	if (
 		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_unknown) ||
-		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_target_unknown)
+		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_target_unknown) ||
+		FokosError.isCode(error, SHARDING_INTERNAL_CODES.partition_context_mismatch)
 	) {
 		return config.nonRetryableRetryMs;
 	}
