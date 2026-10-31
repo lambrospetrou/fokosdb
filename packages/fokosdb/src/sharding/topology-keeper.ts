@@ -35,12 +35,18 @@ import {
 export const TOPOLOGY_BODY_CHUNK_BYTES = 1024 * 1024;
 
 const DEFAULT_BUILD_DELAY_MS = 2_000;
+const DEFAULT_BUILD_ERROR_RETRY_MS = 60_000;
 const DEFAULT_MAX_RANGE_BODY_BYTES = 1024 * 1024;
 const DEFAULT_BUILD_STEP_ROWS = 100_000;
 
 export type FokosTopologyKeeperOptions = {
 	/** The time from the first report of a shard group to its next build. Default 2,000. */
 	buildDelayMs?: number;
+	/**
+	 * The time a build step of one shard group that failed waits until it runs again. A failed group
+	 * waits for its own retry, so it does not block the groups behind it. Default 60,000. Minimum 1.
+	 */
+	buildErrorRetryMs?: number;
 	/** The largest range body. A larger body drops its deepest boundaries. Default 1 MiB. */
 	maxRangeBodyBytes?: number;
 	/**
@@ -223,6 +229,8 @@ function decodePartitionId(partitionId: string): DecodedId {
 export class FokosTopologyKeeper {
 	readonly #storage: DurableObjectStorage;
 	readonly #buildDelayMs: number;
+	/** The wait of a failed build until its next step. The alarm uses it for its own retry as well. */
+	readonly buildErrorRetryMs: number;
 	readonly #maxRangeBodyBytes: number;
 	readonly #buildStepRows: number;
 	readonly #scheduleBuild: FokosTopologyKeeperOptions["scheduleBuild"];
@@ -232,6 +240,7 @@ export class FokosTopologyKeeper {
 	constructor(storage: DurableObjectStorage, opts: FokosTopologyKeeperOptions) {
 		this.#storage = storage;
 		this.#buildDelayMs = opts.buildDelayMs ?? DEFAULT_BUILD_DELAY_MS;
+		this.buildErrorRetryMs = Math.max(1, opts.buildErrorRetryMs ?? DEFAULT_BUILD_ERROR_RETRY_MS);
 		this.#maxRangeBodyBytes = opts.maxRangeBodyBytes ?? DEFAULT_MAX_RANGE_BODY_BYTES;
 		this.#buildStepRows = opts.buildStepRows ?? DEFAULT_BUILD_STEP_ROWS;
 		this.#scheduleBuild = opts.scheduleBuild;
@@ -384,6 +393,9 @@ export class FokosTopologyKeeper {
 	 * that is not complete stays due at `now`, so `nextBuildAt()` gives `now` and the host calls again.
 	 * The bound is in rows and not in time, because the clock of a Worker does not move while the code
 	 * runs with no I/O.
+	 *
+	 * A build step that throws defers only its own shard group to `buildErrorRetryMs`, so a group that
+	 * cannot build does not block the groups behind it.
 	 */
 	runDueBuilds(now = Date.now()): void {
 		// The names are read first, because each step writes to the table that the cursor reads.
@@ -399,7 +411,23 @@ export class FokosTopologyKeeper {
 			if (rows >= this.#buildStepRows) {
 				break;
 			}
-			rows += this.#buildStep(shardGroup, now, this.#buildStepRows - rows);
+			try {
+				rows += this.#buildStep(shardGroup, now, this.#buildStepRows - rows);
+			} catch (error) {
+				console.error({
+					message: "fokos/topology-keeper: the build of a shard group failed.",
+					shardGroup,
+					error: String(error),
+					errorProps: error,
+				});
+				this.#storage.transactionSync(() =>
+					this.#storage.sql.exec(
+						`UPDATE fokos_topo_groups SET build_due_at = ?2 WHERE shard_group = ?1`,
+						shardGroup,
+						now + this.buildErrorRetryMs,
+					),
+				);
+			}
 		}
 	}
 
@@ -881,12 +909,28 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 		// does not deliver an alarm that its own handler sets at the same time. So the builds that are
 		// due at the scheduled time run now.
 		const now = Math.max(Date.now(), info?.scheduledTime ?? 0);
-		this.keeper.runDueBuilds(now);
+		let failed = false;
+		try {
+			this.keeper.runDueBuilds(now);
+		} catch (error) {
+			console.error({ message: "fokos/topology-keeper: the due builds failed.", error: String(error), errorProps: error });
+			failed = true;
+		}
+		let next: number | null;
+		try {
+			next = this.keeper.nextBuildAt();
+		} catch (error) {
+			console.error({ message: "fokos/topology-keeper: the next build read failed.", error: String(error), errorProps: error });
+			next = null;
+			failed = true;
+		}
 		// A build that is not complete is due at `now`. The next alarm continues it, so each alarm
-		// blocks the object for one bounded step, and the reads run between two steps.
-		const next = this.keeper.nextBuildAt();
-		if (next !== null) {
-			await this.ctx.storage.setAlarm(Math.max(next, now + 1));
+		// blocks the object for one bounded step, and the reads run between two steps. When the pass
+		// or the read of it failed, the alarm falls back to the error retry, so the object never ends
+		// a failed alarm with due work and no armed alarm.
+		const at = next ?? (failed ? now + this.keeper.buildErrorRetryMs : null);
+		if (at !== null) {
+			await this.ctx.storage.setAlarm(Math.max(at, now + 1));
 		}
 	}
 }

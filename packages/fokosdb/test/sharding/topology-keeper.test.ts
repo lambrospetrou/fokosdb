@@ -2,6 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
+import type { FokosDBAutoAdminDO } from "../../src/server/do-auto-admin.js";
 import {
 	FokosTopologyKeeper,
 	KeyCodec,
@@ -202,6 +203,68 @@ describe("topology keeper — reports", () => {
 			const view = parseHashBody(body(keeper.getTopology(sg)));
 			expect(maybePromoted(view, KeyCodec.encode("u42"))).toBe(true);
 			expect(maybePromoted(view, KeyCodec.encode("u43"))).toBe(false);
+		});
+	});
+});
+
+describe("topology keeper — build failure", () => {
+	it("defers only the group whose build failed, at the error retry", async () => {
+		await withKeeper(
+			async (keeper, { sg, storage, newKeeper }) => {
+				const badSg = `bad_${sg}`;
+				await keeper.registerRepartition(hashSplitReport(badSg, T, 0, [], 1_000), 5_000);
+				keeper.runDueBuilds(LATER);
+				// The stored hash body is gone while `built_version` stays: the next build fails when it
+				// reads the body it must merge. `newKeeper` has no cached body, so it takes that path.
+				storage.sql.exec(`DELETE FROM fokos_topo_bodies WHERE shard_group = ?1`, badSg);
+				const again = newKeeper();
+				await again.registerRepartition(hashSplitReport(badSg, T, 1, [], 1_000), 5_100);
+				await again.registerRepartition(hashSplitReport(sg, T, 0, [], 1_000), 5_200);
+				const errors: unknown[] = [];
+				const error = console.error;
+				console.error = (e: unknown) => void errors.push(e);
+				try {
+					again.runDueBuilds(10_000);
+				} finally {
+					console.error = error;
+				}
+				expect(errors).toHaveLength(1);
+				expect(errors[0]).toMatchObject({ shardGroup: badSg });
+				const dueAt = (group: string) =>
+					storage.sql.exec(`SELECT build_due_at AS at FROM fokos_topo_groups WHERE shard_group = ?1`, group).one().at;
+				expect(dueAt(badSg)).toBe(17_000);
+				expect(dueAt(sg)).toBeNull();
+				expect(body(again.getTopology(sg)).length).toBeGreaterThan(0);
+				expect(again.nextBuildAt()).toBe(17_000);
+			},
+			{ buildErrorRetryMs: 7_000 },
+		);
+	});
+
+	it("leaves the alarm armed at the error retry when a build fails in the alarm", async () => {
+		const stub = env.TOPOLOGY_ADMIN_DO.getByName(`keeper-${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (instance: FokosDBAutoAdminDO, state) => {
+			const keeper = new FokosTopologyKeeper(state.storage, { buildDelayMs: 0, scheduleBuild: () => {} });
+			keeper.runMigrations();
+			const badSg = `sg_${crypto.randomUUID()}`;
+			await keeper.registerRepartition(hashSplitReport(badSg, T, 0, [], 1_000), 5_000);
+			keeper.runDueBuilds(LATER);
+			state.storage.sql.exec(`DELETE FROM fokos_topo_bodies WHERE shard_group = ?1`, badSg);
+			const again = new FokosTopologyKeeper(state.storage, { scheduleBuild: () => {} });
+			await again.registerRepartition(hashSplitReport(badSg, T, 1, [], 1_000), 5_100);
+			await instance.alarm();
+			const at = await state.storage.getAlarm();
+			expect(at).toBeGreaterThan(Date.now());
+			expect(at).toBeLessThanOrEqual(Date.now() + 60_000);
+		});
+	});
+
+	it("arms the error retry when the build pass itself fails", async () => {
+		const stub = env.TOPOLOGY_ADMIN_DO.getByName(`keeper-${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (instance: FokosDBAutoAdminDO, state) => {
+			state.storage.sql.exec(`DROP TABLE fokos_topo_groups`);
+			await instance.alarm();
+			expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now());
 		});
 	});
 });
