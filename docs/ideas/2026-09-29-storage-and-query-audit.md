@@ -6,7 +6,7 @@
 - **Partly done:** R4 (the override flag and the destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle
   and the request gate).
 - **Spec written, not built:** F5 (`docs/agent-plans/2026-10-03-max-deleted-version.md`).
-- **Fix in another RFC:** F7 (`docs/agent-plans/2026-09-30-item-size-facts-and-range-split.md`).
+- **Fix in another RFC:** F7 (`docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md`).
 - **Decided, no change:** F6, K3, K4, K7, and the `split_bucket` column of X1.
 - **Skipped:** C3.
 - **Postponed:** R9.
@@ -712,7 +712,7 @@ size of a value does not change the bill. The limit for a key and its value toge
   this request-path cost.
 - **Fix:** The decision does not need the boundaries. It uses only the fact that boundaries exist, and the scan finds
   only the `skewed_bytes` floor. That floor is a planner defect. The RFC
-  `docs/agent-plans/2026-09-30-item-size-facts-and-range-split.md` (sections 1.5 and 4.2.9) removes the floor. Then
+  `docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md` (sections 1.5 and 4.2.9) removes the floor. Then
   the decision checks only the item count, which reads at most N rows, and only `#plan` scans, one time for each
   split. The planner scan still blocks requests. Measure it before you scan in chunks over several alarm steps.
 
