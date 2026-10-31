@@ -91,7 +91,7 @@ import {
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
-import { materializationStubByName, partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName, tableFingerprint, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
 import { FokosShardingClient } from "../sharding/client.js";
 import { MaterializationExporter, type ExportCall, type ExportItemOutcome } from "../shared/partition/materialization-export.js";
 import type { MaterializationOps } from "./materialization/do-materialization.js";
@@ -456,7 +456,10 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			now: () => this.fokosNow(),
 			logParams: () => this.logParams(),
 		});
-		const topologyCache = new TopologyCacheMemo((promise) => ctx.waitUntil(promise));
+		const topologyCache = new TopologyCacheMemo(
+			(promise) => ctx.waitUntil(promise),
+			(policy) => policy.ns,
+		);
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
 			ctx,
@@ -466,7 +469,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
 			// The table options select both. The runtime asks only after this partition has its identity.
-			adminOutbox: () => adminOutboxFor(env, this.fokos.routeContext()),
+			adminOutbox: () => adminOutboxFor(this.fokos.routeContext(), this.fokos.routeContext().policy.ns),
 			topologyCache: () =>
 				topologyCache.get(this.fokos.routeContext(), {
 					refreshMs: this.config().topologyRefreshMs,
@@ -634,12 +637,10 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		if (this.#materialization?.routeCtx === self) {
 			return this.#materialization.client;
 		}
-		const table = materializationTableConfig({
-			topology: self.topology,
-			rangeConfig: self.rangeConfig,
-			policy: self.policy,
-			policyVersion: self.policyVersion,
-		});
+		const table = materializationTableConfig(
+			{ topology: self.topology, rangeConfig: self.rangeConfig, policy: self.policy, policyVersion: self.policyVersion },
+			tableFingerprint(this.env, self),
+		);
 		const client = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 			...table,
 			stub: (ctx, doName) => materializationStubByName(this.env, ctx, doName),

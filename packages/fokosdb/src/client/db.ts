@@ -28,15 +28,17 @@ import {
 import {
 	materializationStubByName,
 	partitionStubByName,
+	tableFingerprint,
 	topologyAdminAddress,
 	topologyAdminStub,
 	txCoordinatorStubByName,
+	type DataNamespaceKey,
 } from "../shared/do-stubs.js";
 import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
 import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
 import { topologyCacheFor } from "../shared/topology-hooks.js";
-import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
+import { FOKOS_HASH_PARTITIONS_MAX, FokosTopology } from "../sharding/route-context.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
@@ -611,7 +613,7 @@ export function resolveRetryOptions(retry: FokosDBRetryOptions | undefined): Req
 	return resolved;
 }
 
-const invalidOption = (option: string, value: number, message: string) =>
+const invalidOption = (option: string, value: number | string, message: string) =>
 	new FokosValidationError(VALIDATION_CODES.fokosdb_options_invalid, { message, attributes: { option, value } });
 
 function validateRetryOptions(retry: Required<FokosDBRetryOptions>): void {
@@ -637,7 +639,7 @@ export class FokosDB {
 	#limits: FokosDBLimits;
 	/** The partitions of the table. */
 	#partitions: FokosShardingClient<FokosDBPolicy, PartitionOps>;
-	/** The coordinator group of the table, `fokos.tc.<tableName>`. */
+	/** The coordinator group of the table, `fokos.tc.<tableName>.<fp>`. */
 	#coordinators: FokosShardingClient<FokosDBPolicy, CoordinatorOps>;
 	/** The client of each GSI table, by index name. */
 	#gsis = new Map<string, FokosShardingClient<FokosDBPolicy, PartitionOps>>();
@@ -681,38 +683,53 @@ export class FokosDB {
 				throw invalidOption(option, value, `${option} must be an integer of at least ${min}`);
 			}
 		}
-		// The imported `waitUntil` extends the request that runs the refresh, in a Worker and in a
-		// Durable Object.
-		const topologyCache =
-			options.useTopologyCache === false
-				? undefined
-				: topologyCacheFor(this.#table, waitUntil, {
-						refreshMs: options.topologyRefreshMs,
-						refreshTimeoutMs: options.topologyRefreshTimeoutMs,
-					});
-		const withTopologyCache = topologyCache === undefined ? {} : { topologyCache };
 		// The coordinators take the topology of the table except its shard group and its number of roots:
 		// the same hash split fan-out, and the same jurisdiction. The range config is not used, because
 		// a coordinator has no range tree.
+		// The namespace fingerprints read the `ns` and `nsTx` bindings below, so a wrong binding fails here
+		// with a clear error, and not as a TypeError.
+		for (const option of ["ns", "nsTx"] as const) {
+			const binding = (env as unknown as Record<string, { idFromName?: unknown } | undefined>)[policy[option]];
+			if (typeof binding?.idFromName !== "function") {
+				throw invalidOption(
+					`table.${option}`,
+					policy[option],
+					`table.${option} must name a Durable Object namespace binding of the Worker`,
+				);
+			}
+		}
+		const coordinatorTopology = {
+			...topology,
+			shardGroup: coordinatorShardGroup(topology, tableFingerprint(env, this.#table)),
+			rootTreesN: coordinatorRootsN,
+		};
+		// Each client reads the topology of its own shard group from its own admin Durable Object. The
+		// imported `waitUntil` extends the request that runs the refresh, in a Worker and in a Durable Object.
+		const withTopologyCache = (ctx: { topology: FokosTopology; policy: FokosDBPolicy }, binding: DataNamespaceKey) => {
+			const topologyCache =
+				options.useTopologyCache === false
+					? undefined
+					: topologyCacheFor(ctx, binding, waitUntil, {
+							refreshMs: options.topologyRefreshMs,
+							refreshTimeoutMs: options.topologyRefreshTimeoutMs,
+						});
+			return topologyCache === undefined ? {} : { topologyCache };
+		};
 		this.#partitions = new FokosShardingClient({
 			topology,
 			rangeConfig,
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
-			...withTopologyCache,
+			...withTopologyCache({ topology, policy }, policy.ns),
 		});
 		this.#coordinators = new FokosShardingClient({
-			topology: {
-				...topology,
-				shardGroup: coordinatorShardGroup(topology),
-				rootTreesN: coordinatorRootsN,
-			},
+			topology: coordinatorTopology,
 			rangeConfig,
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
-			...withTopologyCache,
+			...withTopologyCache({ topology: coordinatorTopology, policy }, policy.nsTx),
 		});
 	}
 
@@ -802,7 +819,19 @@ export class FokosDB {
 		return await withFokosErrors(async () => await this.#batchWriteItems(opts));
 	}
 
-	/** Stops at the first failure. A partial destroy stays partial, and a later call continues it. */
+	/**
+	 * Deletes all the Durable Objects of the table, and resets its topology in the admin Durable Objects.
+	 * Stops at the first failure. A partial destroy stays partial, and a later call continues it.
+	 *
+	 * Limitation: a new table with the same name on the same `ns` namespace uses the same admin Durable
+	 * Objects and the same topology cache entries. For a short time after the destroy, a topology cache
+	 * (in an isolate and in Workers Cache) can still give hints for partitions that the destroy deleted.
+	 * A read or a write of the new table falls back to the root after a hint misses. A transaction that a
+	 * coordinator drives has no such fallback, so a participant with a deleted partition as its hint
+	 * cancels the transaction. To prevent this, wait for the cache times to end (`max-age` 10 s and
+	 * `stale-while-revalidate` 600 s of Workers Cache, `topologyRefreshMs` of the isolate cache) before
+	 * you use the same table name again, or use a new table name.
+	 */
 	async destroy(): Promise<{ ok: true }> {
 		return await withFokosErrors(async () => await this.#destroy());
 	}
@@ -1656,11 +1685,16 @@ export class FokosDB {
 		// The materialization partitions are fenced first, so that no GSI write follows the destroy of a
 		// GSI table, and they are deleted last, so that a destroy that stops halfway can read the GSI
 		// targets again.
-		const { topology } = this.#table;
-		const shardGroups = [topology.shardGroup, coordinatorShardGroup(topology)];
-		if (this.#table.policy.nsMat !== undefined) {
+		const { topology, policy } = this.#table;
+		const fp = tableFingerprint(env, this.#table);
+		// Each shard group of the table, with the namespace that holds it.
+		const shardGroups: Array<[string, DataNamespaceKey]> = [
+			[topology.shardGroup, policy.ns],
+			[coordinatorShardGroup(topology, fp), policy.nsTx],
+		];
+		if (policy.nsMat !== undefined) {
 			const materializations = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
-				...materializationTableConfig(this.#table),
+				...materializationTableConfig(this.#table, fp),
 				stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
 			});
 			const indexNames = await this.#fenceMaterializations(materializations);
@@ -1668,14 +1702,18 @@ export class FokosDB {
 				await this.#gsiClient(indexName).destroy({ onDestroyed: (ref) => console.warn(`Destroyed GSI partition DO ${ref.doName}`) });
 			}
 			await materializations.destroy({ onDestroyed: (ref) => console.warn(`Destroyed materialization DO ${ref.doName}`) });
-			shardGroups.push(materializationShardGroup(topology), ...indexNames.map((indexName) => gsiShardGroup(topology, indexName)));
+			shardGroups.push(
+				[materializationShardGroup(topology, fp), policy.nsMat],
+				...indexNames.map((indexName): [string, DataNamespaceKey] => [gsiShardGroup(topology, indexName), policy.ns]),
+			);
 		}
 		// The topology goes last: a partition that the traversal has not reached can still report a split.
-		// A report that completed before the reset is ignored.
-		const admin = topologyAdminAddress(this.#table);
-		if (admin !== undefined) {
-			for (const shardGroup of shardGroups) {
-				await topologyAdminStub(env, admin, shardGroup).resetShardGroup(shardGroup);
+		// A report that completed before the reset is ignored. The reset does not clear the topology caches,
+		// so their old hints stay for a short time. `destroy()` tells the limitation.
+		for (const [shardGroup, binding] of shardGroups) {
+			const admin = topologyAdminAddress(env, { topology: { ...topology, shardGroup }, policy }, binding);
+			if (admin !== undefined) {
+				await topologyAdminStub(env, admin).resetShardGroup(shardGroup);
 			}
 		}
 

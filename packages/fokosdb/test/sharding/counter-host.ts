@@ -23,8 +23,12 @@ import {
 	type FokosStatusRequest,
 	type KeyBytes,
 	fokosTopologyEntrypointFetch,
-	topologyAdminName,
 } from "../../src/sharding/index-server.js";
+
+/** The admin Durable Object of a counter shard group. The generic library leaves this name to its host. */
+export function counterAdminName(shardGroup: string): string {
+	return `counter.topo.${shardGroup}`;
+}
 
 /**
  * An example host of `FokosShardingRuntime` that uses no FokosDB module. It imports only the
@@ -107,14 +111,14 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 			throw new Error("counter host: the admin outbox send fails");
 		}
 		const shardGroup = this.fokos.routeContext().topology.shardGroup;
-		await this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)).registerRepartition(entry.event);
+		await this.env.TOPOLOGY_ADMIN_DO.getByName(counterAdminName(shardGroup)).registerRepartition(entry.event);
 	}
 
 	/** The topology cache through the entrypoint helper. A short refresh, so a test waits little for a new topology. */
 	private readonly topologyCacheOptions = {
 		fetch: (path: string, signal: AbortSignal) =>
 			fokosTopologyEntrypointFetch(new Request(`http://topology${path}`, { signal }), {
-				admin: (shardGroup) => this.env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup)),
+				admin: (shardGroup) => this.env.TOPOLOGY_ADMIN_DO.getByName(counterAdminName(shardGroup)),
 				maxAgeS: 0,
 				staleWhileRevalidateS: 0,
 			}),

@@ -14,6 +14,7 @@ import {
 	MAX_RESPONSE_BYTES_PER_PAGE,
 } from "../shared/query/page-budget.js";
 import type { PartitionNamespaceKey } from "../shared/partition-context.js";
+import { namespaceFingerprint } from "../shared/do-stubs.js";
 import { FokosShardingClient } from "../sharding/client.js";
 import type { FokosOperationSpec } from "../sharding/runtime-types.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
@@ -1180,7 +1181,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				await expect(db.destroy()).resolves.toEqual({ ok: true });
 				const table = db.options().table.name;
 				expect(walked).toEqual([
-					{ shardGroup: `fokos.tc.${table}`, rootTreesN: 4 },
+					{ shardGroup: `fokos.tc.${table}.${namespaceFingerprint(env, ns, undefined)}`, rootTreesN: 4 },
 					{ shardGroup: `fokos.p.${table}`, rootTreesN: 2 },
 				]);
 			} finally {

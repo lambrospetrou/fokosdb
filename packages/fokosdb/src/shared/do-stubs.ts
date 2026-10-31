@@ -15,8 +15,14 @@ import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-c
 import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import invariant from "./invariant.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
-import { topologyAdminName } from "../sharding/topology-codec.js";
-import type { AdminNamespaceKey, FokosDBStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
+import {
+	NAMESPACE_FINGERPRINT_LENGTH,
+	topologyAdminName,
+	type AdminNamespaceKey,
+	type FokosDBPolicy,
+	type FokosDBStubContext,
+	type TransactionCoordinatorNamespaceKey,
+} from "./partition-context.js";
 
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.
@@ -119,26 +125,61 @@ export function pushTargetStub(
 	return stub as Record<string, (batch: unknown) => Promise<unknown>>;
 }
 
+/** The binding of a namespace that holds data of a table: `ns`, `nsTx`, or `nsMat`. */
+export type DataNamespaceKey = FokosDBPolicy["ns"] | FokosDBPolicy["nsTx"] | NonNullable<FokosDBPolicy["nsMat"]>;
+
+const fingerprints = new Map<string, string>();
+
 /**
- * The fields that select the admin Durable Objects of a table: the `nsAdmin` binding and the
- * jurisdiction of the table. The `FokosDBTopologyCache` entrypoint receives them as its `ctx.props`.
+ * The fingerprint of the namespace `binding` in `jurisdiction`: the ID of one fixed name, in base64url
+ * with no padding. Two namespaces give two different values, and a namespace that is deleted and made
+ * again gives a new value. The value does not change in an isolate, so each isolate computes it one time.
+ */
+export function namespaceFingerprint(env: Env, binding: DataNamespaceKey, jurisdiction: DurableObjectJurisdiction | undefined): string {
+	const key = `${binding}|${jurisdiction ?? ""}`;
+	let fp = fingerprints.get(key);
+	if (fp === undefined) {
+		const ns = (env as unknown as Record<string, DurableObjectNamespace>)[binding];
+		const id = (jurisdiction === undefined ? ns : ns.jurisdiction(jurisdiction)).idFromName("fokos.fingerprint");
+		fp = Uint8Array.fromHex(id.toString()).toBase64({ alphabet: "base64url", omitPadding: true });
+		invariant(fp.length === NAMESPACE_FINGERPRINT_LENGTH, "fokos/do-stubs: a Durable Object ID has 32 bytes");
+		fingerprints.set(key, fp);
+	}
+	return fp;
+}
+
+/** The fingerprint of the `ns` namespace of the table of `ctx`. The `tc` and `m` shard groups hold it. */
+export function tableFingerprint(env: Env, ctx: FokosDBStubContext): string {
+	return namespaceFingerprint(env, ctx.policy.ns, ctx.topology.jurisdiction);
+}
+
+/**
+ * The admin Durable Object of one shard group: the `nsAdmin` binding, the jurisdiction of the table, and
+ * the name. The `FokosDBTopologyCache` entrypoint receives it as its `ctx.props`.
  */
 export type TopologyAdminAddress = {
 	nsAdmin: AdminNamespaceKey;
 	jurisdiction?: DurableObjectJurisdiction;
+	name: string;
 };
 
-/** The admin address of the table of `ctx`, or undefined when the table has no `nsAdmin`. */
-export function topologyAdminAddress(ctx: FokosDBStubContext): TopologyAdminAddress | undefined {
+/**
+ * The admin address of the shard group of `ctx`, or undefined when the table has no `nsAdmin`. `binding`
+ * is the namespace that holds the shard group: `ns` for a partition or a GSI group, `nsTx` for a
+ * coordinator group, and `nsMat` for a materialization group.
+ */
+export function topologyAdminAddress(env: Env, ctx: FokosDBStubContext, binding: DataNamespaceKey): TopologyAdminAddress | undefined {
 	const { nsAdmin } = ctx.policy;
 	if (nsAdmin === undefined) {
 		return undefined;
 	}
-	return ctx.topology.jurisdiction === undefined ? { nsAdmin } : { nsAdmin, jurisdiction: ctx.topology.jurisdiction };
+	const { jurisdiction, shardGroup } = ctx.topology;
+	const name = topologyAdminName(shardGroup, namespaceFingerprint(env, binding, jurisdiction));
+	return jurisdiction === undefined ? { nsAdmin, name } : { nsAdmin, jurisdiction, name };
 }
 
-/** The stub of the admin Durable Object that holds the topology of `shardGroup`, `topologyAdminName(shardGroup)`. */
-export function topologyAdminStub(env: Env, address: TopologyAdminAddress, shardGroup: string): DurableObjectStub<FokosDBAutoAdminDO> {
+/** The stub of the admin Durable Object of `address`. */
+export function topologyAdminStub(env: Env, address: TopologyAdminAddress): DurableObjectStub<FokosDBAutoAdminDO> {
 	const ns: DurableObjectNamespace<FokosDBAutoAdminDO> = env[address.nsAdmin];
-	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(topologyAdminName(shardGroup));
+	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(address.name);
 }

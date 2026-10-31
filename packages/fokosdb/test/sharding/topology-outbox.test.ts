@@ -8,19 +8,18 @@ import {
 	hashChildIndex,
 	resolveDescendantHashPartitionContext,
 	fokosTopologyEntrypointFetch,
-	topologyAdminName,
 	type FokosTopologyRead,
 } from "../../src/sharding/index-server.js";
 import { parseHashBody } from "../../src/sharding/topology-codec.js";
 import type { FokosAdminOutbox } from "../../src/sharding/runtime-types.js";
-import type { CounterOps, CounterPolicy } from "./counter-host.js";
+import { counterAdminName, type CounterOps, type CounterPolicy } from "./counter-host.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
 import { hashSplitReport } from "./topology-events.js";
 
 const WAIT = { timeout: 20_000, interval: 50 };
 
 function admin(shardGroup: string) {
-	return env.TOPOLOGY_ADMIN_DO.getByName(topologyAdminName(shardGroup));
+	return env.TOPOLOGY_ADMIN_DO.getByName(counterAdminName(shardGroup));
 }
 
 /** The hash body that the admin of the shard group serves now. */

@@ -5,7 +5,7 @@ import { openedRpc } from "./partition-do/helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
 import { isFokosAnyError } from "../src/shared/errors-operations.js";
 import { KeyCodec } from "../src/sharding/key-codec.js";
-import type { PartitionNamespaceKey } from "../src/shared/partition-context.js";
+import type { AdminNamespaceKey, PartitionNamespaceKey, TransactionCoordinatorNamespaceKey } from "../src/shared/partition-context.js";
 import { MAX_ITEM_BYTES } from "../src/shared/transaction-limits.js";
 import { makeDB, partitionRouter } from "./transactions/tx-helpers.js";
 
@@ -107,19 +107,42 @@ describe("the public methods of FokosDB", () => {
 		const db = new FokosDB({
 			table: {
 				name: `unbound.${crypto.randomUUID()}`,
-				ns: "NO_SUCH_BINDING" as PartitionNamespaceKey,
+				ns: "PARTITION_DO",
 				nsTx: "TRANSACTION_COORDINATOR_DO",
 				rootTreesN: 1,
 				hashSplitN: 2,
 			},
 			hashSplitConditions: { maxSizeMb: 100 },
+			// The destroy resets the topology last, and reads this binding there.
+			nsAdmin: "NO_SUCH_BINDING" as AdminNamespaceKey,
 		});
 
-		const err = await errorOf(() => db.getItem({ hashKey: "k" }));
+		const err = await errorOf(() => db.destroy());
 
 		expect(FokosInternalError.is(err)).toBe(true);
 		expect(isFokosAnyError(err)).toBe(true);
 		expect(err).toMatchObject({ code: "foreign_error", origin: "internal", httpStatusHint: 500 });
 		expect(err.cause).toBeInstanceOf(TypeError);
+	});
+});
+
+describe("the FokosDB constructor", () => {
+	const table = { name: "unbound", ns: "PARTITION_DO" as const, nsTx: "TRANSACTION_COORDINATOR_DO" as const, rootTreesN: 1, hashSplitN: 2 };
+	// A table with a topology cache reads the fingerprint of nsTx in the constructor.
+	const withTopology = { nsAdmin: "FOKOS_ADMIN_DO" as const, topologyEntrypoint: "FokosDBTopologyCache" };
+
+	it("refuses a table whose ns or nsTx names no binding of the Worker", () => {
+		const missingNs = { ...table, ns: "NO_SUCH_BINDING" as PartitionNamespaceKey };
+		expect(() => new FokosDB({ table: missingNs })).toThrow(/table.ns must name a Durable Object namespace binding/);
+		const missingNsTx = { ...table, nsTx: "NO_SUCH_BINDING" as TransactionCoordinatorNamespaceKey };
+		expect(() => new FokosDB({ table: missingNsTx })).toThrow(/table.nsTx must name a Durable Object namespace binding/);
+		expect(() => new FokosDB({ table: missingNsTx, ...withTopology })).toThrow(/table.nsTx must name a Durable Object namespace binding/);
+	});
+
+	it("refuses a table whose ns or nsTx names a binding that is not a Durable Object namespace", () => {
+		const varNs = { ...table, ns: "FOKOS_SHOULD_FETCH_COLO_INFO" as unknown as PartitionNamespaceKey };
+		expect(() => new FokosDB({ table: varNs, ...withTopology })).toThrow(/table.ns must name a Durable Object namespace binding/);
+		const varNsTx = { ...table, nsTx: "FOKOS_SHOULD_FETCH_COLO_INFO" as unknown as TransactionCoordinatorNamespaceKey };
+		expect(() => new FokosDB({ table: varNsTx, ...withTopology })).toThrow(/table.nsTx must name a Durable Object namespace binding/);
 	});
 });

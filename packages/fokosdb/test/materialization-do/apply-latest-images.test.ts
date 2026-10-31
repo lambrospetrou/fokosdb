@@ -6,7 +6,7 @@ import type {
 	LatestImage,
 	FokosDBMaterializationDO,
 } from "../../src/server/materialization/do-materialization.js";
-import { materializationStubByName } from "../../src/shared/do-stubs.js";
+import { materializationStubByName, tableFingerprint } from "../../src/shared/do-stubs.js";
 import { createTableConfig, materializationTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
@@ -41,7 +41,7 @@ function makeMaterialization(opts: { rootTreesN?: number; maxSizeMb?: number; ke
 		captureChanges: true,
 		hashSplitConditions: { maxSizeMb: opts.maxSizeMb ?? 100 },
 	});
-	const mat = materializationTableConfig(table);
+	const mat = materializationTableConfig(table, tableFingerprint(env, table));
 	const router = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion);
 	const at = (hashKey: string) => {
 		const ctx = router.rootContext(kb(hashKey));

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { ApplyLatestImagesRequest, FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import type { LatestImage } from "../../src/server/materialization/materialization-store.js";
 import { materializationTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
-import { materializationStubByName } from "../../src/shared/do-stubs.js";
+import { materializationStubByName, tableFingerprint } from "../../src/shared/do-stubs.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
 import { kb, makeStub, type PartitionOptions } from "../partition-do/helpers.js";
@@ -19,12 +19,10 @@ type Mat = { ctx: FokosDBRouteContext; stub: DurableObjectStub<FokosDBMaterializ
 /** The materialization root of a new table whose materialization class has the push target `sink`. */
 function materializationRoot(opts: PartitionOptions): Mat {
 	const { ctx: base } = makeStub({ captureChanges: true, nsMat: "PUSH_MATERIALIZATION_DO", ...opts });
-	const mat = materializationTableConfig({
-		topology: base.topology,
-		rangeConfig: base.rangeConfig,
-		policy: base.policy,
-		policyVersion: base.policyVersion,
-	});
+	const mat = materializationTableConfig(
+		{ topology: base.topology, rangeConfig: base.rangeConfig, policy: base.policy, policyVersion: base.policyVersion },
+		tableFingerprint(env, base),
+	);
 	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion).rootContext(kb("any"));
 	return { ctx, stub: materializationStubByName(env, ctx, ctx.doName), ref: { partitionId: ctx.partitionId, doName: ctx.doName } };
 }

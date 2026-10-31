@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+	baseTableName,
 	coordinatorShardGroup,
 	createTableConfig,
+	gsiShardGroup,
 	materializationShardGroup,
 	materializationTableConfig,
+	topologyAdminName,
 	type FokosTableIdentity,
 	type FokosTableOptions,
 } from "./partition-context.js";
@@ -81,25 +84,31 @@ describe("createTableConfig — the split of one table configuration", () => {
 });
 
 describe("createTableConfig — the shard groups of a table", () => {
-	it("names the partitions fokos.p.<tableName> and the coordinators fokos.tc.<tableName>", () => {
+	const FP = "f".repeat(43);
+
+	it("names the partitions fokos.p.<tableName> and the coordinators fokos.tc.<tableName>.<fp>", () => {
 		const cfg = createTableConfig(makeOpts({ tableName: "orders" }));
 		expect(cfg.topology.shardGroup).toBe("fokos.p.orders");
-		expect(coordinatorShardGroup(cfg.topology)).toBe("fokos.tc.orders");
+		expect(coordinatorShardGroup(cfg.topology, FP)).toBe(`fokos.tc.orders.${FP}`);
 		const hk = KeyCodec.encode("hk");
 		const partitions = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy);
 		expect(partitions.rootContext(hk).doName).toMatch(/^fokos\.p\.orders~h\.\d+$/);
-		const coordinators = new FokosRouter({ ...cfg.topology, shardGroup: coordinatorShardGroup(cfg.topology) }, cfg.rangeConfig, cfg.policy);
-		expect(coordinators.rootContext(hk).doName).toMatch(/^fokos\.tc\.orders~h\.\d+$/);
+		const coordinators = new FokosRouter(
+			{ ...cfg.topology, shardGroup: coordinatorShardGroup(cfg.topology, FP) },
+			cfg.rangeConfig,
+			cfg.policy,
+		);
+		expect(coordinators.rootContext(hk).doName).toBe(`fokos.tc.orders.${FP}~h.0`);
 	});
 
-	it("names the materialization partitions fokos.m.<tableName>, with the topology and the policy of the table", () => {
+	it("names the materialization partitions fokos.m.<tableName>.<fp>, with the topology and the policy of the table", () => {
 		const cfg = createTableConfig(makeOpts({ tableName: "orders", nsMat: "MATERIALIZATION_DO", captureChanges: true, rootTreesN: 3 }));
-		expect(materializationShardGroup(cfg.topology)).toBe("fokos.m.orders");
-		const mat = materializationTableConfig(cfg);
-		expect(mat).toEqual({ ...cfg, topology: { ...cfg.topology, shardGroup: "fokos.m.orders" } });
+		expect(materializationShardGroup(cfg.topology, FP)).toBe(`fokos.m.orders.${FP}`);
+		const mat = materializationTableConfig(cfg, FP);
+		expect(mat).toEqual({ ...cfg, topology: { ...cfg.topology, shardGroup: `fokos.m.orders.${FP}` } });
 		expect(mat.policy).toMatchObject({ nsMat: "MATERIALIZATION_DO", captureChanges: true });
 		expect(new FokosRouter(mat.topology, mat.rangeConfig, mat.policy).rootContext(KeyCodec.encode("hk")).doName).toMatch(
-			/^fokos\.m\.orders~h\.\d+$/,
+			new RegExp(`^fokos\\.m\\.orders\\.${FP}~h\\.\\d+$`),
 		);
 	});
 
@@ -109,6 +118,30 @@ describe("createTableConfig — the shard groups of a table", () => {
 			/captureChanges must be a boolean/,
 		);
 		expect(createTableConfig(makeOpts({ captureChanges: false })).policy).not.toHaveProperty("captureChanges");
+	});
+
+	it("gives each pair of table name and index name one GSI shard group, also when the names hold dots", () => {
+		const groups = [
+			["a.b", "c"],
+			["a", "b.c"],
+		].map(([name, index]) => gsiShardGroup(createTableConfig(makeOpts({ tableName: name })).topology, index));
+		expect(groups).toEqual(["fokos.gsiv1.3.a.b.c", "fokos.gsiv1.1.a.b.c"]);
+	});
+
+	it("reads the table name of a materialization group with a fingerprint", () => {
+		const cfg = createTableConfig(makeOpts({ tableName: "or.ders" }));
+		const mat = materializationTableConfig(cfg, FP);
+		expect(baseTableName(mat.topology)).toBe("or.ders");
+		expect(gsiShardGroup(mat.topology, "byStatus")).toBe(gsiShardGroup(cfg.topology, "byStatus"));
+	});
+
+	it("names the admin Durable Object fokos.topo.<shard group without fokos.>~<fp>", () => {
+		const cfg = createTableConfig(makeOpts({ tableName: "orders" }));
+		const tx = "t".repeat(43);
+		expect(topologyAdminName(cfg.topology.shardGroup, FP)).toBe(`fokos.topo.p.orders~${FP}`);
+		expect(topologyAdminName(coordinatorShardGroup(cfg.topology, FP), tx)).toBe(`fokos.topo.tc.orders.${FP}~${tx}`);
+		expect(() => topologyAdminName("orders", FP)).toThrow(/invariant_failed/);
+		expect(() => topologyAdminName(cfg.topology.shardGroup, "short")).toThrow(/invariant_failed/);
 	});
 });
 

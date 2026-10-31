@@ -1,10 +1,10 @@
 # RFC — Namespace fingerprints in the names of the admin, coordinator, and materialization Durable Objects
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-10-31
 **Author:** Lambros Petrou
 
-**Status:** Not built.
+**Status:** M1 and M2 are built. Section 6.6 lists the known limits.
 
 ## Table of contents
 
@@ -60,8 +60,12 @@ Example: table `users` on `NS_A` and table `users` on `NS_B`, both with `nsAdmin
 reports to `fokos.topo.fokos.p.users`, and the object stores them as one shard group.
 
 - When `rootTreesN` and `hashSplitN` are equal, the two topologies merge. A hint can point to a partition that exists
-  only in the other namespace. That partition has no identity, so the caller removes the hint and falls back. The data
-  stays correct. Each cache refresh brings the hint back, so some requests keep an extra round trip.
+  only in the other namespace. That partition has no identity.
+  - A `FokosDB` client and a forward inside a Durable Object remove the hint and fall back. The data stays correct.
+    Each cache refresh brings the hint back, so some requests keep an extra round trip.
+  - A coordinator resolves its participants with `speculative: false` and has no fallback, because it sends `txPrepare`
+    from another client instance. A participant with no identity fails the prepare, and the coordinator cancels the
+    transaction. The caller gets `transaction_cancelled`.
 - When `rootTreesN` or `hashSplitN` is different, `registerRepartition` in `src/sharding/topology-keeper.ts` rejects
   each report of the second table. The second table never gets a topology.
 
@@ -95,8 +99,16 @@ GSI of one table gets the entries of the other table.
 ### 1.4 Gap in `destroy()`
 
 `destroy()` in `src/client/db.ts` resets only the partition shard group and the coordinator shard group in the admin
-object. The GSI partitions and the materialization partitions also report their splits, because their policy keeps
-`nsAdmin`. No code resets their shard groups.
+object. The GSI partitions also report their splits, because their policy keeps `nsAdmin`. No code resets their shard
+groups.
+
+The materialization partitions use the sharding runtime and split, but `FokosDBMaterializationDO` gives no
+`adminOutbox` hook and no `topologyCache` hook to its runtime. Thus the `m` shard group gets no reports today, and no
+caller reads its topology.
+
+The GSI partitions report their splits and read their own topology when they forward a request, because their policy
+keeps `nsAdmin` and `topologyEntrypoint`. The callers outside the GSI partitions have no topology cache, so they enter
+at the root: the export client in `FokosDBPartitionDO`, `GsiWriter`, and the GSI clients in `src/client/db.ts`.
 
 ### 1.5 Names that break the prefix rule
 
@@ -120,6 +132,9 @@ object. The GSI partitions and the materialization partitions also report their 
 - The names of partitions and GSI partitions do not change. Their namespace separates them already.
 - Push targets do not change. The user selects their binding and their `objectName`.
 - The generic sharding library does not learn the FokosDB prefixes. FokosDB builds the admin object name.
+- The topology of the materialization partitions and of the GSI readers stays as it is (section 1.4). A later change can
+  give `FokosDBMaterializationDO` the `adminOutbox` and `topologyCache` hooks, and give a topology cache to the export
+  client, `GsiWriter`, and the GSI clients. The admin object names of this document already support that change.
 
 ### Requirements
 
@@ -140,6 +155,7 @@ Two milestones. Each one ships on its own.
 2. **M2 — Namespace fingerprints.** The fingerprint helper, the new `tc` and `m` shard groups, the new admin object
    names, the admin outbox, and the topology read path (sections 4.2.1 to 4.2.6), with the documentation and the tests.
    These parts ship together, because a writer and a reader of one admin object must compute the same name.
+   `destroy()` uses the new admin object names.
 
 ## 4. Proposed solution
 
@@ -231,34 +247,53 @@ are always different namespaces.
 
 - `coordinatorShardGroup` and `materializationShardGroup` in `src/shared/partition-context.ts` take `fp(ns)` and return
   `fokos.tc.<table>.<fp>` and `fokos.m.<table>.<fp>`.
-- `tableNameOf` and `baseTableName` remove the 44-character `.<fp>` suffix when they read a `tc` or `m` group.
+- `baseTableName` removes the 44-character `.<fp>` suffix when it reads an `m` group. No code reads the table name of a
+  `tc` group.
 - The callers that build these groups have `env` and `policy.ns`, so they compute `fp(ns)` with the helper.
+- The `FokosDB` constructor computes `fp(ns)`, and `fp(nsTx)` when the table has a topology cache. Thus the constructor
+  checks that `ns` and `nsTx` each name a Durable Object namespace binding of the Worker. A wrong binding throws
+  `fokosdb_options_invalid`.
 
 #### 4.2.4 Admin object name
 
-- FokosDB builds the admin object name in `src/shared/do-stubs.ts`. The name builder moves out of
-  `src/sharding/topology-codec.ts`, so the generic sharding library does not know the FokosDB prefixes.
-- `topologyAdminStub` takes the fingerprint of the namespace that holds the shard group:
-  - `fp(ns)` for `p` and `gsiv1`
-  - `fp(nsTx)` for `tc`
-  - `fp(nsMat)` for `m`
+- FokosDB builds the admin object name in `src/shared/do-stubs.ts`. `topologyAdminName` moves out of
+  `src/sharding/topology-codec.ts`, so the generic sharding library does not name admin objects. A host of the generic
+  library names its own admin objects.
+- The caller of each admin object knows the shard group and the namespace that holds it. Thus the caller computes the
+  admin object name, and no code finds the namespace from the shard group prefix.
+
+| Caller | Shard group | Namespace of the fingerprint |
+| --- | --- | --- |
+| `FokosDB`, the partitions client | `p` | `ns` |
+| `FokosDB`, the coordinators client | `tc` | `nsTx` |
+| `FokosDB.destroy()` | `p`, `tc`, `m`, `gsiv1` | `ns`, `nsTx`, `nsMat`, `ns` |
+| `FokosDBTransactionCoordinatorDO`, the participant client | `p` | `ns` |
+| `FokosDBPartitionDO`, its runtime hooks | `p` or `gsiv1` | `ns` |
+| `FokosDBTransactionCoordinatorDO`, its runtime hooks | `tc` | `nsTx` |
+
+- `TopologyAdminAddress` holds `nsAdmin`, the jurisdiction, and the admin object name. `topologyAdminStub` calls
+  `getByName` with that name.
 - The removal of the leading `fokos.` is safe. `FokosDBAutoAdminDO` receives only FokosDB shard groups, and each one
   starts with `fokos.`.
 - The `admin(shardGroup)` callback of the sharding library does not change.
 
 #### 4.2.5 Admin outbox
 
-`adminOutboxFor` in `src/shared/topology-hooks.ts` computes the fingerprint of the namespace that holds the shard group
-of the sender. A partition, a GSI partition, a coordinator, and a materialization partition each know that namespace
-from their policy.
+`adminOutboxFor` in `src/shared/topology-hooks.ts` takes the binding of the namespace that holds the shard group of the
+sender, from the table in section 4.2.4. It computes the admin object name one time.
 
 #### 4.2.6 Topology read path
 
-- `topologyGetPath` and `topologyGetForRangePath` in `src/sharding/topology-cache.ts` add `fp=<fp>`, the fingerprint of
-  the namespace that holds the group.
-- `FokosDBTopologyCache` in `src/server/topology-entrypoint.ts` builds the admin object name from `sg` and `fp`.
-- Workers Cache keys an entry by the props and the path. The path holds `fp`, so each namespace gets its own entries.
-- The isolate cache scope in `topologyCacheFor` adds the fingerprint, so each namespace gets its own isolate entries.
+- Each `FokosShardingClient` reads the topology of one shard group. Thus each topology cache options object holds one
+  admin object name. `FokosDB` makes one options object for its partitions client and one for its coordinators client.
+- `topologyCacheFor` takes the binding of the namespace that holds the shard group, and computes the address one time.
+- The entrypoint props are the address: `nsAdmin`, the jurisdiction, and the admin object name.
+  `FokosDBTopologyCache` in `src/server/topology-entrypoint.ts` calls the admin object with that name.
+- The entrypoint answers 503 when the `sg` of the path does not belong to the admin object name of the props.
+- Workers Cache keys an entry by the props and the path. The props hold the fingerprint, so a namespace that an operator
+  makes again gets new entries.
+- The isolate cache scope in `topologyCacheFor` holds `nsAdmin`, the jurisdiction, and the admin object name.
+- The paths and the generic library do not change.
 
 #### 4.2.7 `destroy()`
 
@@ -283,15 +318,17 @@ Update the name descriptions in `src/server/do-auto-admin.ts`, `src/shared/parti
 
 #### 4.2.11 Tests
 
-1. Two tables named `users` on two `ns` bindings share `nsTx`, `nsMat`, and `nsAdmin`. Split each table. Then check:
-   - Each table has its own admin object and its own topology.
+1. Two tables named `users` on two `ns` bindings share `nsTx`, `nsMat`, and `nsAdmin`. Then check:
+   - After a split of the first table, the admin object of the second table has no split.
    - A transaction with the same token and the same items applies its writes in both tables.
    - The GSI writes of each table stay in its own `ns`.
 2. `destroy()` resets the admin state of the `p`, `tc`, `m`, and `gsiv1` shard groups.
 3. A unit test of the name builders shows that table names and index names with `.` do not collide. Example: table
    `a.b` with index `c`, against table `a` with index `b.c`.
-4. A unit test shows that `tableNameOf` and `baseTableName` return the table name of a `tc` and an `m` group with a
-   fingerprint.
+4. A unit test shows that `baseTableName` returns the table name of an `m` group with a fingerprint, and that the GSI
+   shard group from the `m` group is equal to the GSI shard group from the `p` group.
+5. The `FokosDB` constructor rejects an `ns` or an `nsTx` that names no binding, or a binding that is not a Durable
+   Object namespace.
 
 ## 5. Alternative options
 
@@ -356,6 +393,16 @@ objects.
 
 No. Cloudflare hashes the name for routing. `ctx.id.name` holds the first 1024 bytes, and FokosDB reads it only for
 diagnostic fields.
+
+### 6.6 What are the known limits?
+
+- After `destroy()`, a new table with the same name on the same `ns` uses the same admin objects and the same topology
+  cache entries. For a short time, a cache can give hints for partitions that the destroy deleted. A read or a write
+  falls back to the root. A transaction that a coordinator drives is cancelled. The doc comment of `destroy()` in
+  `src/client/db.ts` gives this limit.
+- A coordinator has no fallback when `txPrepare` misses at a participant address from a topology hint. A `FIXME` in
+  `src/server/do-transaction-coordinator.ts`, at the `txPrepare` send, gives the fix: store the root context of the
+  participant, and send the prepare again to the root.
 
 ## 7. References
 

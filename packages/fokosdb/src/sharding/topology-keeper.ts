@@ -894,7 +894,7 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 // ─── the topology entrypoint ─────────────────────────────────────────────────
 
 export type FokosTopologyEntrypointOptions = {
-	/** Host code: the stub of `topologyAdminName(shardGroup)`. */
+	/** Host code: the stub of the admin Durable Object that the host names for `shardGroup`. */
 	admin(this: void, shardGroup: string): FokosTopologyAdminRpc;
 	/** `max-age` of a topology answer. 0 makes every request revalidate against the admin Durable Object. */
 	maxAgeS: number;

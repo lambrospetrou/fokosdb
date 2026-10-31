@@ -367,6 +367,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 ### Performance and Reliability
 
 - Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
+- Enable cached topology for the GSI writers and `db.gsi()` client.
 - Extend the topology caching in clients from responses.
 - Revamp the item size statistics for better boundary calculations and choosing keys to promote.
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.

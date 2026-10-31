@@ -89,7 +89,7 @@ type MaterializationRpc = FokosShardingRpc & {
 };
 
 /**
- * The latest image of each changed base item of a table, in the shard group `fokos.m.<tableName>`. It
+ * The latest image of each changed base item of a table, in the shard group `fokos.m.<tableName>.<fp(ns)>`. It
  * routes by the base key `(hashKey, sortKey)`, so a split of the base table does not change the owner
  * of an item here. Each base partition exports its changes with `applyLatestImages`.
  *

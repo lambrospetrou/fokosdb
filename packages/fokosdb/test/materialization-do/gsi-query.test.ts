@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { FokosDB } from "../../src/client/db.js";
-import { materializationStubByName, partitionStubByName } from "../../src/shared/do-stubs.js";
+import { materializationStubByName, partitionStubByName, tableFingerprint } from "../../src/shared/do-stubs.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";
 import { createTableConfig, gsiTableConfig, materializationTableConfig } from "../../src/shared/partition-context.js";
 import { FokosShardingClient } from "../../src/sharding/client.js";
@@ -121,7 +121,7 @@ describe("db.gsi(indexName).queryItems", () => {
 		const table = { topology, rangeConfig, policy, policyVersion };
 		await new FokosShardingClient({ ...table, stub: (ctx, doName) => partitionStubByName(env, ctx, doName) }).destroy();
 		const materializations = new FokosShardingClient({
-			...materializationTableConfig(table),
+			...materializationTableConfig(table, tableFingerprint(env, table)),
 			stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
 		});
 		for await (const node of materializations.walk()) {

@@ -398,7 +398,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			doStorage: ctx.storage,
 			keyNameTrackingLastMigrationID: "__fokosdb/tc/sql_schema_version",
 		});
-		const topologyCache = new TopologyCacheMemo((promise) => ctx.waitUntil(promise));
+		const topologyCache = new TopologyCacheMemo(
+			(promise) => ctx.waitUntil(promise),
+			(policy) => policy.nsTx,
+		);
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
 			ctx,
@@ -407,7 +410,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
 			// The table options select both. The runtime asks only after this coordinator has its identity.
-			adminOutbox: () => adminOutboxFor(env, this.fokos.routeContext()),
+			adminOutbox: () => adminOutboxFor(this.fokos.routeContext(), this.fokos.routeContext().policy.nsTx),
 			topologyCache: () => topologyCache.get(this.fokos.routeContext(), this.topologyRefreshSettings()),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
@@ -1195,7 +1198,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
 	private partitionClient(ctx: FokosDBTableConfig): FokosShardingClient<FokosDBPolicy, PartitionOps> {
 		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
-		const topologyCache = topologyCacheFor(ctx, (promise) => this.ctx.waitUntil(promise), this.topologyRefreshSettings());
+		const topologyCache = topologyCacheFor(ctx, ctx.policy.ns, (promise) => this.ctx.waitUntil(promise), this.topologyRefreshSettings());
 		return new FokosShardingClient<FokosDBPolicy, PartitionOps>({
 			topology: ctx.topology,
 			rangeConfig: ctx.rangeConfig,
@@ -1293,6 +1296,30 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						{ retry: prepareRetry(retry, retry.prepareMaxAttempts) },
 					)
 					.catch((err: unknown) => {
+						// FIXME: a participant address from a wrong topology hint cancels the transaction. Fall back
+						// to the root of the participant instead.
+						//
+						// The participant address comes from `resolveAll` with a topology hint. This send uses
+						// another client instance, so the client cannot fall back after a miss. A miss is
+						// `hash_partition_not_initialized` or `range_partition_not_initialized` with
+						// `attributes.doName === p.context.doName`. The partition refuses it before any handler
+						// runs, so nothing is prepared there. Today the miss uses all the prepare attempts, and
+						// then the transaction is cancelled.
+						//
+						// Example: `db.destroy()` deletes `fokos.p.users~h.0.0`, and the application makes table
+						// `users` again on the same `ns`. For some seconds, the topology cache of this coordinator
+						// still names `h.0.0` for key "bob". `initiateWrite` stores `fokos.p.users~h.0.0` as the
+						// address of the participant of "bob". Each `txPrepare` to it misses, and the caller gets
+						// `transaction_cancelled`, although the root `fokos.p.users~h.0` can serve "bob".
+						//
+						// The fix, on a miss at `p.context.doName`:
+						// 1. Compute the root context of the participant from the hash key of its first item. All
+						//    the keys of one participant are under one root.
+						// 2. In one SQL transaction, while `prepare_outcome IS NULL`, write the root context to
+						//    `partition_context_json` of the participant row. `partition_do_name` stays the key.
+						// 3. Set `p.context` to the root context, and send `txPrepare` again.
+						// The commit, the cancel, and the recovery read `partition_context_json`, so they also
+						// go to the root. Two drives that miss at the same time write the same root context.
 						this.storePrepareError(transactionId, p.doName, err);
 						throw err;
 					});

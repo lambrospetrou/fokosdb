@@ -16,7 +16,7 @@ import {
 	type FokosTableIdentity,
 	type FokosTableOptions,
 } from "../../src/shared/partition-context.js";
-import { materializationStubByName } from "../../src/shared/do-stubs.js";
+import { materializationStubByName, tableFingerprint } from "../../src/shared/do-stubs.js";
 import type { FokosDBMaterializationDO } from "../../src/server/materialization/do-materialization.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
@@ -168,12 +168,10 @@ export function captureConsoleError() {
 
 /** The materialization root that owns `hashKey`, from the route context of a base partition of the same table. */
 export function materializationOf(base: FokosDBRouteContext, hashKey: string): DurableObjectStub<FokosDBMaterializationDO> {
-	const mat = materializationTableConfig({
-		topology: base.topology,
-		rangeConfig: base.rangeConfig,
-		policy: base.policy,
-		policyVersion: base.policyVersion,
-	});
+	const mat = materializationTableConfig(
+		{ topology: base.topology, rangeConfig: base.rangeConfig, policy: base.policy, policyVersion: base.policyVersion },
+		tableFingerprint(env, base),
+	);
 	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion).rootContext(kb(hashKey));
 	return materializationStubByName(env, ctx, ctx.doName);
 }

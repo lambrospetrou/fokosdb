@@ -15,6 +15,7 @@ import {
 	createTableConfig,
 } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow, type FokosDBLimitOverrides } from "../../src/shared/transaction-limits.js";
+import { tableFingerprint } from "../../src/shared/do-stubs.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import type { PartitionMeta } from "../../src/shared/types.js";
 import { recordedTxCalls, type ControlledPartitionDO, type TxOp, type TxRequest } from "../controlled-partition-do.js";
@@ -230,11 +231,12 @@ export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op)
 	return (await Promise.all([...partitions.values()].map((p) => recordedTxCalls(p, op)))).flat();
 }
 
-/** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<tableName>`. */
+/** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<tableName>.<fp>`. */
 export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDBPolicy> {
 	const { coordinatorRootsN } = db.options().table;
 	const { topology, rangeConfig, policy } = createTableConfig(db.options());
-	return new FokosRouter({ ...topology, shardGroup: coordinatorShardGroup(topology), rootTreesN: coordinatorRootsN }, rangeConfig, policy);
+	const shardGroup = coordinatorShardGroup(topology, tableFingerprint(env, { topology, policy }));
+	return new FokosRouter({ ...topology, shardGroup, rootTreesN: coordinatorRootsN }, rangeConfig, policy);
 }
 
 /** The test controls of the one root coordinator of a `controlled` table. */

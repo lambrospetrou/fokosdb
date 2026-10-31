@@ -79,29 +79,61 @@ export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
 
 /**
  * FokosDB names its own shard groups with this prefix, so a table name must not start with it. The
- * partition group of a table is `fokos.p.<tableName>`, and its coordinator group is `fokos.tc.<tableName>`.
+ * partition group of a table is `fokos.p.<tableName>`, and its coordinator group is
+ * `fokos.tc.<tableName>.<fp>`.
  */
 export const RESERVED_SHARD_GROUP_PREFIX = "fokos.";
+
+/**
+ * The length of a namespace fingerprint: the base64url form, with no padding, of the 32 bytes of a
+ * Durable Object ID. The alphabet has no "." and no "~".
+ */
+export const NAMESPACE_FINGERPRINT_LENGTH = 43;
 
 const PARTITION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}p.`;
 const MATERIALIZATION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}m.`;
 
-/** The coordinator group of a table, `fokos.tc.<tableName>`, from the partition group of the table. */
-export function coordinatorShardGroup(topology: FokosTopology): string {
-	return `${RESERVED_SHARD_GROUP_PREFIX}tc.${tableNameOf(topology)}`;
+/**
+ * The coordinator group of a table, `fokos.tc.<tableName>.<fp>`, from the partition group of the table.
+ * `fp` is the fingerprint of the `ns` namespace of the table. Two tables with the same name on two `ns`
+ * namespaces thus get different coordinators, also when they share one `nsTx` namespace.
+ */
+export function coordinatorShardGroup(topology: FokosTopology, fp: string): string {
+	return `${RESERVED_SHARD_GROUP_PREFIX}tc.${tableNameOf(topology)}.${checkedFingerprint(fp)}`;
 }
 
-/** The materialization group of a table, `fokos.m.<tableName>`, from the partition group of the table. */
-export function materializationShardGroup(topology: FokosTopology): string {
-	return `${MATERIALIZATION_SHARD_GROUP_PREFIX}${tableNameOf(topology)}`;
+/**
+ * The materialization group of a table, `fokos.m.<tableName>.<fp>`, from the partition group of the
+ * table. `fp` is the fingerprint of the `ns` namespace of the table, as in `coordinatorShardGroup`.
+ */
+export function materializationShardGroup(topology: FokosTopology, fp: string): string {
+	return `${MATERIALIZATION_SHARD_GROUP_PREFIX}${tableNameOf(topology)}.${checkedFingerprint(fp)}`;
 }
 
 /**
  * The configuration of the materialization group of a table. It has the topology, the range
  * configuration, and the policy of the partition group, with its own shard group name.
  */
-export function materializationTableConfig(table: FokosDBTableConfig): FokosDBTableConfig {
-	return { ...table, topology: { ...table.topology, shardGroup: materializationShardGroup(table.topology) } };
+export function materializationTableConfig(table: FokosDBTableConfig, fp: string): FokosDBTableConfig {
+	return { ...table, topology: { ...table.topology, shardGroup: materializationShardGroup(table.topology, fp) } };
+}
+
+/**
+ * The name of the admin Durable Object that holds the topology of `shardGroup`:
+ * `fokos.topo.<shardGroup without "fokos.">~<fp>`. `fp` is the fingerprint of the namespace that holds
+ * the shard group. A shard group has no "~", so the name has one form for each pair of values.
+ */
+export function topologyAdminName(shardGroup: string, fp: string): string {
+	invariant(
+		shardGroup.startsWith(RESERVED_SHARD_GROUP_PREFIX),
+		`fokos/partition-context: a FokosDB shard group must start with "${RESERVED_SHARD_GROUP_PREFIX}"`,
+	);
+	return `${RESERVED_SHARD_GROUP_PREFIX}topo.${shardGroup.slice(RESERVED_SHARD_GROUP_PREFIX.length)}~${checkedFingerprint(fp)}`;
+}
+
+function checkedFingerprint(fp: string): string {
+	invariant(fp.length === NAMESPACE_FINGERPRINT_LENGTH, "fokos/partition-context: a namespace fingerprint has 43 characters");
+	return fp;
 }
 
 /**
@@ -147,7 +179,7 @@ export function gsiTableConfig(table: FokosDBTableConfig, indexName: string): Fo
 /** The table name, from the partition group or the materialization group of the table. */
 export function baseTableName(topology: FokosTopology): string {
 	return topology.shardGroup.startsWith(MATERIALIZATION_SHARD_GROUP_PREFIX)
-		? topology.shardGroup.slice(MATERIALIZATION_SHARD_GROUP_PREFIX.length)
+		? topology.shardGroup.slice(MATERIALIZATION_SHARD_GROUP_PREFIX.length, -(NAMESPACE_FINGERPRINT_LENGTH + 1))
 		: tableNameOf(topology);
 }
 

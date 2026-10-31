@@ -4,7 +4,9 @@ import { describe, expect, it, vi } from "vitest";
 import { FokosDB, type FokosDBOptions } from "../src/client/db.js";
 import type { FokosDBAutoAdminDO } from "../src/server/do-auto-admin.js";
 import { KeyCodec } from "../src/sharding/key-codec.js";
-import { maybePromoted, parseHashBody, topologyAdminName } from "../src/sharding/topology-codec.js";
+import { namespaceFingerprint, type DataNamespaceKey } from "../src/shared/do-stubs.js";
+import { topologyAdminName } from "../src/shared/partition-context.js";
+import { maybePromoted, parseHashBody } from "../src/sharding/topology-codec.js";
 import { TOPOLOGY_BLOOM_MIN_CAPACITY } from "../src/sharding/topology-encode.js";
 import type { FokosTopologyRead } from "../src/sharding/topology-keeper.js";
 import { TARGET_WAIT } from "./partition-do/helpers.js";
@@ -25,8 +27,13 @@ function options(tableName: string, extra: Partial<FokosDBOptions> = {}): FokosD
 	};
 }
 
+/** The admin Durable Object of `shardGroup`, which the namespace `binding` holds. */
+function adminOf(shardGroup: string, binding: DataNamespaceKey = "PARTITION_DO") {
+	return env.FOKOS_ADMIN_DO.getByName(topologyAdminName(shardGroup, namespaceFingerprint(env, binding, undefined)));
+}
+
 async function servedBitCount(shardGroup: string): Promise<number> {
-	const read = (await env.FOKOS_ADMIN_DO.getByName(topologyAdminName(shardGroup)).getTopology(shardGroup)) as FokosTopologyRead;
+	const read = (await adminOf(shardGroup).getTopology(shardGroup)) as FokosTopologyRead;
 	return parseHashBody((read as { body: Uint8Array }).body).bitCount;
 }
 
@@ -120,7 +127,7 @@ describe("FokosDB — encoded topology", () => {
 		const shardGroup = `fokos.p.${tableName}`;
 		// Fill the promoted-key Bloom filter to its capacity, as a table with 16,384 promoted keys has it.
 		// The test writes the range roots into the keeper tables, because 16,384 reports take too long.
-		const admin = env.FOKOS_ADMIN_DO.getByName(topologyAdminName(shardGroup));
+		const admin = adminOf(shardGroup);
 		await runInDurableObject(admin, async (instance: FokosDBAutoAdminDO, state) => {
 			state.storage.transactionSync(() => {
 				for (let i = 0; i < TOPOLOGY_BLOOM_MIN_CAPACITY; i++) {
@@ -182,15 +189,16 @@ describe("FokosDB — encoded topology", () => {
 		);
 		await db.destroy();
 
-		const shardGroups = [
-			`fokos.p.${tableName}`,
-			`fokos.tc.${tableName}`,
-			`fokos.m.${tableName}`,
-			`fokos.gsiv1.${tableName.length}.${tableName}.byStatus`,
+		const fp = namespaceFingerprint(env, "PARTITION_DO", undefined);
+		const shardGroups: Array<[string, DataNamespaceKey]> = [
+			[`fokos.p.${tableName}`, "PARTITION_DO"],
+			[`fokos.tc.${tableName}.${fp}`, "TRANSACTION_COORDINATOR_DO"],
+			[`fokos.m.${tableName}.${fp}`, "GSI_MATERIALIZATION_DO"],
+			[`fokos.gsiv1.${tableName.length}.${tableName}.byStatus`, "PARTITION_DO"],
 		];
-		for (const shardGroup of shardGroups) {
+		for (const [shardGroup, binding] of shardGroups) {
 			const epoch = await runInDurableObject(
-				env.FOKOS_ADMIN_DO.getByName(topologyAdminName(shardGroup)),
+				adminOf(shardGroup, binding),
 				(_: FokosDBAutoAdminDO, state) =>
 					state.storage.sql.exec<{ epoch: number }>(`SELECT epoch FROM fokos_topo_groups WHERE shard_group = ?1`, shardGroup).one().epoch,
 			);
@@ -200,5 +208,53 @@ describe("FokosDB — encoded topology", () => {
 
 	it("refuses topologyEntrypoint without nsAdmin", () => {
 		expect(() => new FokosDB(options("topotest.x", { nsAdmin: undefined }))).toThrow(/topologyEntrypoint needs nsAdmin/);
+	});
+});
+
+describe("FokosDB — two tables with the same name on two ns namespaces", () => {
+	// Both tables share nsTx, nsMat, and nsAdmin. Only the ns namespace is different.
+	function sameNameTables() {
+		const tableName = `topotest.${crypto.randomUUID().replaceAll("-", "")}`;
+		const make = (ns: "PARTITION_DO" | "CUSTOM_PARTITION_DO") =>
+			new FokosDB(
+				options(tableName, {
+					table: { ...options(tableName).table, ns, nsMat: "GSI_MATERIALIZATION_DO" },
+					captureChanges: true,
+				}),
+			);
+		return { tableName, a: make("PARTITION_DO"), b: make("CUSTOM_PARTITION_DO") };
+	}
+
+	it("each table reports its splits to its own admin Durable Object", async () => {
+		const { tableName, a } = sameNameTables();
+		const shardGroup = `fokos.p.${tableName}`;
+		await splitRoot(a);
+		await vi.waitFor(async () => expect(await servedBitCount(shardGroup)).toBeGreaterThanOrEqual(1 + 2), WAIT);
+		const read = (await adminOf(shardGroup, "CUSTOM_PARTITION_DO").getTopology(shardGroup)) as FokosTopologyRead;
+		expect(parseHashBody((read as { body: Uint8Array }).body).bitCount).toBe(0);
+	});
+
+	it("one idempotency token with the same items applies the writes of each table", async () => {
+		const { a, b } = sameNameTables();
+		const items = [{ hashKey: "k1", operation: "put" as const, data: "v" }];
+		await a.transactWriteItems({ items, clientRequestToken: "same-token" });
+		await b.transactWriteItems({ items, clientRequestToken: "same-token" });
+		expect((await a.getItem({ hashKey: "k1" })).found).toBe(true);
+		expect((await b.getItem({ hashKey: "k1" })).found).toBe(true);
+	});
+
+	it("the GSI entries of each table stay in its own ns namespace", async () => {
+		const { a, b } = sameNameTables();
+		await a.putItem({ hashKey: "oa", sortKey: "s", data: { status: "OPEN", at: "t1", owner: "a" } });
+		await b.putItem({ hashKey: "ob", sortKey: "s", data: { status: "OPEN", at: "t1", owner: "b" } });
+		for (const [db, baseHashKey] of [
+			[a, "oa"],
+			[b, "ob"],
+		] as const) {
+			await vi.waitFor(async () => {
+				const { items } = await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] });
+				expect(items.map((item) => item.baseHashKey)).toEqual([baseHashKey]);
+			}, TARGET_WAIT);
+		}
 	});
 });
