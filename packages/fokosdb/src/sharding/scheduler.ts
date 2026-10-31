@@ -48,7 +48,7 @@ export class FokosScheduler {
 	 */
 	runDueWork(): Promise<void> {
 		if (!this.#inFlight) {
-			this.#inFlight = this.#pass().finally(() => {
+			this.#inFlight = this.#run().finally(() => {
 				this.#inFlight = null;
 			});
 			return this.#inFlight;
@@ -130,8 +130,34 @@ export class FokosScheduler {
 	}
 
 	/**
-	 * One pass. Job errors are caught and logged, so one failing job never stops another. An
-	 * alarm-storage error escapes, so the platform retries the alarm.
+	 * One pass whose error never reaches the caller. The platform retries a failed alarm a bounded
+	 * number of times and then drops it until the next `setAlarm`, so an uncaught pass error can leave
+	 * the object without any armed alarm. The catch logs the error and arms the fallback alarm.
+	 */
+	async #run(): Promise<void> {
+		try {
+			await this.#pass();
+		} catch (error) {
+			console.error({
+				...this.#deps.logParams(),
+				message: "fokos/scheduler: the pass failed.",
+				error: String(error),
+				errorProps: error,
+			});
+			try {
+				if (!this.#deps.isFenced()) {
+					await this.ensureAlarmAtMost(Date.now() + this.#deps.fallbackAlarmMs());
+				}
+			} catch {
+				// The storage the alarm needs is the same storage the pass just failed on.
+			}
+		}
+	}
+
+	/**
+	 * One pass. Job errors are caught and logged, so one failing job never stops another. Everything
+	 * else — the deadline reads, the lifecycle check, and the alarm writes — propagates to `#run`,
+	 * which logs it and arms the fallback alarm.
 	 */
 	async #pass(): Promise<void> {
 		if (this.#deps.isFenced()) {
@@ -161,6 +187,7 @@ export class FokosScheduler {
 				return;
 			}
 			let nextRunAt: number | null;
+			let failed = false;
 			try {
 				nextRunAt = (await job.runStep()).nextRunAt;
 			} catch (error) {
@@ -171,6 +198,7 @@ export class FokosScheduler {
 					errorProps: error,
 				});
 				nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
+				failed = true;
 			}
 			// Written right after the step, and from a fresh read: a request can call `scheduleJob` for
 			// another job while the step awaits, and a batch write at the end would put stale values over it.
@@ -182,10 +210,11 @@ export class FokosScheduler {
 					}
 					delete record[job.name];
 				} else {
-					if (record[job.name]?.nextRunAt === nextRunAt) {
+					const entry = record[job.name];
+					if (entry?.nextRunAt === nextRunAt && (entry.failed === true) === failed) {
 						return;
 					}
-					record[job.name] = { nextRunAt };
+					record[job.name] = failed ? { nextRunAt, failed: true } : { nextRunAt };
 				}
 				this.#deps.store.putJobs(record);
 			});
@@ -217,7 +246,19 @@ export class FokosScheduler {
 	 */
 	#runnable(): FokosJob[] {
 		const lifecycle = this.#deps.lifecycle();
-		return this.#deps.jobs().filter((job) => job.canRun(lifecycle));
+		return this.#deps.jobs().filter((job) => {
+			try {
+				return job.canRun(lifecycle);
+			} catch (error) {
+				console.error({
+					...this.#deps.logParams(),
+					message: `fokos/scheduler: the ${job.name} canRun check failed.`,
+					error: String(error),
+					errorProps: error,
+				});
+				return false;
+			}
+		});
 	}
 
 	/** The earliest durable deadline of each runnable job: its scheduled run, or its own durable work. */
@@ -225,14 +266,45 @@ export class FokosScheduler {
 		const record = this.#deps.store.getJobs();
 		const out: Array<{ job: FokosJob; at: number }> = [];
 		for (const job of runnable) {
-			const scheduled = record[job.name]?.nextRunAt ?? null;
-			const own = job.deadline?.() ?? null;
-			const at = scheduled === null ? own : own === null ? scheduled : Math.min(scheduled, own);
-			if (at !== null) {
+			const entry = record[job.name];
+			let own: number | null = null;
+			// A failed step leaves its durable deadline where it was, often in the past. Counting it
+			// here would rerun the same failing step at once instead of after the backoff the failure
+			// entry sets, so only the scheduled run counts while the `failed` flag stands. A deadline
+			// read that throws marks the job failed the same way: without the mark, one bad job would
+			// end every pass before any step runs.
+			if (entry?.failed !== true) {
+				try {
+					own = job.deadline?.() ?? null;
+				} catch (error) {
+					console.error({
+						...this.#deps.logParams(),
+						message: `fokos/scheduler: the ${job.name} deadline read failed.`,
+						error: String(error),
+						errorProps: error,
+					});
+					this.#failJob(job.name);
+				}
+			}
+			const at = Math.min(entry?.nextRunAt ?? Infinity, own ?? Infinity);
+			if (Number.isFinite(at)) {
 				out.push({ job, at });
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * Marks one job as failed at the fallback, like a thrown step. An earlier scheduled run stays,
+	 * because `scheduleJob` promises to move the run earlier and never later.
+	 */
+	#failJob(name: string): void {
+		this.#deps.store.transactionSync(() => {
+			const record = this.#deps.store.getJobs();
+			const nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
+			record[name] = { nextRunAt: Math.min(record[name]?.nextRunAt ?? nextRunAt, nextRunAt), failed: true };
+			this.#deps.store.putJobs(record);
+		});
 	}
 }
 

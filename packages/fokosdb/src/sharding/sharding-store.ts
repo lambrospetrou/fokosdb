@@ -47,8 +47,13 @@ export const FOKOS_KV_KEYS = {
 	planHead: (repartitionId: string) => `__fokos/repartition/${repartitionId}/plan/00000001`,
 } as const;
 
-/** `__fokos/jobs`: the next durable run of each job by name. A job without an entry has no scheduled run. */
-export type FokosJobsRecord = Record<string, { nextRunAt: number }>;
+/**
+ * `__fokos/jobs`: the next durable run of each job by name. A job without an entry has no scheduled run.
+ * `failed` marks the last step as thrown: while it stands, only `nextRunAt` counts for the job, because its
+ * own durable deadline still points where the failed step left it. Any write that is not the failure write
+ * drops the flag, so a successful step makes the durable deadline authoritative again.
+ */
+export type FokosJobsRecord = Record<string, { nextRunAt: number; failed?: true }>;
 
 // ---------------------------------------------------------------------------
 // Row and cursor types

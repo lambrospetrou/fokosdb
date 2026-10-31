@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
-import { FokosScheduler } from "./scheduler.js";
+import { FokosScheduler, type FokosSchedulerDeps } from "./scheduler.js";
 import { FokosShardingStore } from "./sharding-store.js";
 import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 
@@ -20,6 +20,7 @@ function ownerLifecycle(): FokosLifecycle {
 async function withScheduler(
 	job: Omit<FokosJob, "deadline" | "canRun"> & { deadline: () => number | null },
 	fn: (scheduler: FokosScheduler, state: DurableObjectState, deadlineReads: () => number) => Promise<void>,
+	deps: Partial<FokosSchedulerDeps> = {},
 ): Promise<void> {
 	const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
@@ -43,6 +44,7 @@ async function withScheduler(
 			lifecycle: ownerLifecycle,
 			jobs: () => [counted],
 			logParams: () => ({}),
+			...deps,
 		});
 		try {
 			await fn(scheduler, state, () => reads);
@@ -90,6 +92,208 @@ describe("FokosScheduler - deadline reads", () => {
 
 				expect(deadlineReads()).toBe(1);
 				expect(await state.storage.getAlarm()).toBe(at);
+			},
+		);
+	});
+});
+
+describe("FokosScheduler - failure backoff", () => {
+	it("runs a failed step again at the fallback, not at its stale durable deadline", async () => {
+		let runs = 0;
+		await withScheduler(
+			{
+				name: "work",
+				// The step throws before it moves its durable deadline, so the deadline stays due.
+				deadline: () => 0,
+				runStep: () => {
+					runs++;
+					throw new Error("the step failed");
+				},
+			},
+			async (scheduler, state, deadlineReads) => {
+				await scheduler.runDueWork();
+
+				const jobs = new FokosShardingStore(state.storage).getJobs();
+				expect(jobs["work"]?.failed).toBe(true);
+				expect(jobs["work"]?.nextRunAt).toBeGreaterThan(Date.now() + FALLBACK_MS - 5_000);
+				expect(await state.storage.getAlarm()).toBe(jobs["work"]?.nextRunAt);
+				// The deadline read after the step skipped the durable deadline the flag suppresses.
+				expect(deadlineReads()).toBe(1);
+
+				// A pass before the scheduled run does not rerun the step or read its deadline.
+				await scheduler.runDueWork();
+				expect(runs).toBe(1);
+				expect(deadlineReads()).toBe(1);
+			},
+		);
+	});
+
+	it("quarantines a job whose deadline read throws, and still runs the others", async () => {
+		const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
+			const store = new FokosShardingStore(state.storage);
+			store.runMigrations();
+			let badReads = 0;
+			let badRuns = 0;
+			let goodRuns = 0;
+			let goodPending = true;
+			const jobs: FokosJob[] = [
+				{
+					name: "bad",
+					canRun: () => true,
+					deadline: () => {
+						badReads++;
+						throw new Error("the deadline read failed");
+					},
+					runStep: () => {
+						badRuns++;
+						return { nextRunAt: null };
+					},
+				},
+				{
+					name: "good",
+					canRun: () => true,
+					deadline: () => (goodPending ? 0 : null),
+					runStep: () => {
+						goodRuns++;
+						goodPending = false;
+						return { nextRunAt: null };
+					},
+				},
+			];
+			const scheduler = new FokosScheduler({
+				storage: state.storage,
+				store,
+				fallbackAlarmMs: () => FALLBACK_MS,
+				fastPathDelayMs: () => 0,
+				isFenced: () => false,
+				lifecycle: ownerLifecycle,
+				jobs: () => jobs,
+				logParams: () => ({}),
+			});
+			try {
+				await scheduler.runDueWork();
+
+				const record = store.getJobs();
+				expect(record["bad"]?.failed).toBe(true);
+				expect(record["bad"]?.nextRunAt).toBeGreaterThan(Date.now() + FALLBACK_MS - 5_000);
+				// The quarantined job never ran, the other job did, and the flag stopped the second
+				// deadline read of the pass.
+				expect(badRuns).toBe(0);
+				expect(goodRuns).toBe(1);
+				expect(badReads).toBe(1);
+
+				// A pass before the scheduled run does not read the throwing deadline again.
+				await scheduler.runDueWork();
+				expect(badReads).toBe(1);
+				expect(badRuns).toBe(0);
+			} finally {
+				await state.storage.deleteAlarm();
+			}
+		});
+	});
+
+	it("excludes a job whose canRun check throws, and still runs the others", async () => {
+		const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
+			const store = new FokosShardingStore(state.storage);
+			store.runMigrations();
+			let badRuns = 0;
+			let goodRuns = 0;
+			const jobs: FokosJob[] = [
+				{
+					name: "bad",
+					canRun: () => {
+						throw new Error("the canRun check failed");
+					},
+					deadline: () => 0,
+					runStep: () => {
+						badRuns++;
+						return { nextRunAt: null };
+					},
+				},
+				{
+					name: "good",
+					canRun: () => true,
+					deadline: () => null,
+					runStep: () => {
+						goodRuns++;
+						return { nextRunAt: null };
+					},
+				},
+			];
+			store.putJobs({ good: { nextRunAt: 0 } });
+			const scheduler = new FokosScheduler({
+				storage: state.storage,
+				store,
+				fallbackAlarmMs: () => FALLBACK_MS,
+				fastPathDelayMs: () => 0,
+				isFenced: () => false,
+				lifecycle: ownerLifecycle,
+				jobs: () => jobs,
+				logParams: () => ({}),
+			});
+			try {
+				await scheduler.runDueWork();
+
+				expect(badRuns).toBe(0);
+				expect(goodRuns).toBe(1);
+			} finally {
+				await state.storage.deleteAlarm();
+			}
+		});
+	});
+
+	it("resolves with the fallback alarm armed when the pass itself throws", async () => {
+		await withScheduler(
+			{
+				name: "work",
+				deadline: () => 0,
+				runStep: () => ({ nextRunAt: null }),
+			},
+			async (scheduler, state) => {
+				await scheduler.runDueWork();
+
+				const alarm = await state.storage.getAlarm();
+				expect(alarm).toBeGreaterThanOrEqual(Date.now() + FALLBACK_MS - 5_000);
+				expect(alarm).toBeLessThanOrEqual(Date.now() + FALLBACK_MS + 5_000);
+			},
+			{
+				jobs: () => {
+					throw new Error("the jobs list failed");
+				},
+			},
+		);
+	});
+
+	it("clears the failure entry after a step succeeds, and the durable deadline drives again", async () => {
+		let pending = true;
+		let failOnce = true;
+		await withScheduler(
+			{
+				name: "work",
+				deadline: () => (pending ? 0 : null),
+				runStep: () => {
+					if (failOnce) {
+						failOnce = false;
+						throw new Error("the first step failed");
+					}
+					pending = false;
+					return { nextRunAt: null };
+				},
+			},
+			async (scheduler, state) => {
+				await scheduler.runDueWork();
+				expect(new FokosShardingStore(state.storage).getJobs()["work"]?.failed).toBe(true);
+
+				// An earlier scheduled run drops the flag, so the durable deadline counts again and the
+				// step runs now. Its success deletes the entry.
+				await scheduler.scheduleJob("work", Date.now());
+				await scheduler.runDueWork();
+
+				expect(pending).toBe(false);
+				expect("work" in new FokosShardingStore(state.storage).getJobs()).toBe(false);
+				expect(await state.storage.getAlarm()).toBeNull();
 			},
 		);
 	});
