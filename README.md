@@ -10,7 +10,7 @@ FokosDB is a strongly consistent, distributed database with bottomless storage, 
 - **ACID transactions.** Write up to 100 items (4 MB in total) atomically across partitions, or read up to 100 items as one consistent snapshot.
 - **SQLite expressions.** Conditions, updates, filters, and projections use JSON paths, arithmetic, and the SQLite core and math functions.
 - **GSIs and push targets.** Add up to 10 global secondary indexes to a table, and send each change to your own Worker or Durable Object.
-- **Small client.** `fokosdb/client` is 37.8 kB minified and gzipped.
+- **Small client.** `fokosdb/client` is less than 50 KB minified and gzipped.
 - **Your Cloudflare account.** All data stays in Durable Objects of your account, and one option keeps a table in the EU, the US, or FedRAMP.
 
 ```ts
@@ -366,10 +366,12 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
+- Implement the splits with the new Durable Object Snapshot API.
 - Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
 - Enable cached topology for the GSI writers and `db.gsi()` client.
 - Extend the topology caching in clients from responses.
-- Revamp the item size statistics for better boundary calculations and choosing keys to promote.
+- Decide if we will keep the hash key promotion to a range partition tree, or if we will adopt mixed-key range partitions at some hash depth.
+- Revamp the item size statistics for better boundary calculations and choosing keys to promote (`docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md`).
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Optimize the transactions RTTs by having the Worker send the Transaction Coordinator (TC) request in parallel to the partitions prepare() and handing off the driving to the TC. Partitions reply to the TC directly, not the Worker. It has some nuances if partitions RPC the TC before the initial call arrives, but with some wait timeout it might worth it.
@@ -380,23 +382,23 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- Better support for binary blobs in GSI/push target projections for "data".
 - Allow online configuration (adding/removing/changing) global eventual indexes (DynamoDB GSIs) and push targets.
 - Add operation hooks that run during request forwarding and on the final serving partition (before, after, etc).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.
 - Allow custom split conditions in user-provided function of the FokosDB partition DO class.
+- Better support for binary blobs in GSI/push target projections for "data", or at least propagating the entire item.
 - Allow custom FokosDB partition classes to add their own migration hooks in addition to the FokosDB items, so that custom data also moves to child partitions.
+- Add custom jobs to run on alarms, with their own best-effort interval.
+- Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions.
+- Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
+- Think about backups and export in a consistent fashion using Durable Object bookmarks.
 - Add automatic hashing of the item and signature comparison, similar to the managed "v".
 - Add external version in each write operation, to complement the partition driven "v" version.
-- Add custom jobs to run on alarms, with their own best-effort interval.
-- Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
-- Transactions across tables, think of a nice API due to how we handle PartitionContext.
-- Think about backups and export in a consistent fashion using Durable Object bookmarks.
 - User provided code running inside the DO for N+1 operations.
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
-- Expose an RPC/API to trigger a manual split.
+- Expose an RPC/API to trigger a manual split, or ensure specific partitions are N levels deep, or for range partitions to split at specific boundaries.
 - Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
 - Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
