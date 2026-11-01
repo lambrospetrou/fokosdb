@@ -14,8 +14,9 @@ import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import invariant from "../shared/invariant.js";
 import { one, tryOne } from "../shared/sql-cursor.js";
-import { FokosValidationError } from "../shared/errors.js";
-import { SHARDING_VALIDATION_CODES } from "./errors.js";
+import { FokosInternalError, FokosValidationError } from "../shared/errors.js";
+import { SHARDING_INTERNAL_CODES, SHARDING_VALIDATION_CODES } from "./errors.js";
+import { INIT_RETRY_ALARM_MS } from "./scheduler.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { validateTopology } from "./route-context.js";
@@ -868,6 +869,11 @@ function sweepRangeIntervals(rows: Iterable<IntervalRow>, maxKeptRank: number): 
  */
 export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> {
 	protected readonly keeper: FokosTopologyKeeper;
+	/**
+	 * The error of the migrations. While it stands, the RPCs answer `partition_init_failed` and the
+	 * alarm re-arms at `INIT_RETRY_ALARM_MS`.
+	 */
+	#initError?: unknown;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -880,7 +886,20 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 				}
 			},
 		});
-		void ctx.blockConcurrencyWhile(async () => this.keeper.runMigrations());
+		void ctx.blockConcurrencyWhile(async () => {
+			try {
+				this.keeper.runMigrations();
+			} catch (error) {
+				this.#initError = error;
+				console.error({
+					actorId: ctx.id.toString(),
+					actorName: ctx.id.name,
+					message: "fokos/topology-keeper: the migrations failed.",
+					error: String(error),
+					errorProps: error,
+				});
+			}
+		});
 	}
 
 	/** The options of the keeper. The constructor reads them once. */
@@ -888,19 +907,33 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 		return {};
 	}
 
+	/** The gate of every RPC that reads the schema: a failed initialization answers typed. */
+	#checkInit(operation: string): void {
+		if (this.#initError !== undefined) {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_init_failed, {
+				message: "the initialization of the admin object failed",
+				attributes: { operation },
+			});
+		}
+	}
+
 	async registerRepartition(event: unknown): Promise<void> {
+		this.#checkInit("registerRepartition");
 		await this.keeper.registerRepartition(event);
 	}
 
 	async resetShardGroup(shardGroup: string): Promise<void> {
+		this.#checkInit("resetShardGroup");
 		this.keeper.resetShardGroup(shardGroup);
 	}
 
 	async getTopology(shardGroup: string, ifNoneMatch?: string): Promise<FokosTopologyRead> {
+		this.#checkInit("getTopology");
 		return this.keeper.getTopology(shardGroup, ifNoneMatch);
 	}
 
 	async getRangeTopology(shardGroup: string, hashKey: Uint8Array, ifNoneMatch?: string): Promise<FokosTopologyRead> {
+		this.#checkInit("getRangeTopology");
 		return this.keeper.getRangeTopology(shardGroup, hashKey, ifNoneMatch);
 	}
 
@@ -909,6 +942,19 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 		// does not deliver an alarm that its own handler sets at the same time. So the builds that are
 		// due at the scheduled time run now.
 		const now = Math.max(Date.now(), info?.scheduledTime ?? 0);
+		if (this.#initError !== undefined) {
+			console.error({
+				actorId: this.ctx.id.toString(),
+				actorName: this.ctx.id.name,
+				message: "fokos/topology-keeper: the initialization failed; the alarm retries it at the init interval.",
+				error: String(this.#initError as Error),
+				errorProps: this.#initError,
+			});
+			try {
+				await this.ctx.storage.setAlarm(now + INIT_RETRY_ALARM_MS);
+			} catch {}
+			return;
+		}
 		let failed = false;
 		try {
 			this.keeper.runDueBuilds(now);

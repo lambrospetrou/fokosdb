@@ -24,6 +24,8 @@ import {
 	type RangeTopologyView,
 } from "../../src/sharding/topology-codec.js";
 import { hashSplitReport, promotionReport, rangeSplitReport } from "./topology-events.js";
+import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
+import { fokosErrorWith } from "../errors-matchers.js";
 
 const LATER = Number.MAX_SAFE_INTEGER;
 
@@ -564,5 +566,30 @@ describe("topology entrypoint", () => {
 		} finally {
 			console.error = error;
 		}
+	});
+});
+
+describe("topology keeper — failed initialization", () => {
+	it("answers partition_init_failed when the schema is broken, and the alarm re-arms at the init interval", async () => {
+		const name = `keeper-${crypto.randomUUID()}`;
+		// The next construction re-runs the migrations, and one needs the column that is gone. The
+		// constructor catches the failure instead of rejecting the object. The writes and the abort run
+		// in separate calls: an abort rolls back what its own call wrote, so the poison must land first.
+		await runInDurableObject(env.TOPOLOGY_ADMIN_DO.getByName(name), (_i: FokosDBAutoAdminDO, state) => {
+			state.storage.sql.exec(`DROP INDEX idx_fokos_topo_hash_nodes_seq`);
+			state.storage.sql.exec(`ALTER TABLE fokos_topo_hash_nodes RENAME COLUMN seq TO seq_broken`);
+			state.storage.kv.delete("__fokos/topo_sql_schema_version");
+		});
+		await runInDurableObject(env.TOPOLOGY_ADMIN_DO.getByName(name), (_i: FokosDBAutoAdminDO, state) => {
+			state.abort();
+		}).catch(() => {});
+
+		await runInDurableObject(env.TOPOLOGY_ADMIN_DO.getByName(name), async (instance: FokosDBAutoAdminDO, state) => {
+			await expect(instance.getTopology("sg_any")).rejects.toThrow(fokosErrorWith("partition_init_failed"));
+			await instance.alarm();
+			const alarmAt = await state.storage.getAlarm();
+			expect(alarmAt).toBeGreaterThan(Date.now() + INIT_RETRY_ALARM_MS - 60_000);
+			expect(alarmAt).toBeLessThanOrEqual(Date.now() + INIT_RETRY_ALARM_MS);
+		});
 	});
 });

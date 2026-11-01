@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { baseTableName, type FokosDBPolicy, type FokosDBRouteContext } from "../../shared/partition-context.js";
 import { FokosShardingRuntime } from "../../sharding/runtime.js";
+import { INIT_RETRY_ALARM_MS } from "../../sharding/scheduler.js";
 import type { FokosRuntimeConfigOverrides } from "../../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosLifecycle, FokosLocalCall, FokosOperations, FokosShardingHooks } from "../../sharding/runtime-types.js";
 import type {
@@ -22,7 +23,15 @@ import { materializationStubByName, partitionStubByName, pushTargetStub } from "
 import { resolveLimits } from "../../shared/transaction-limits.js";
 import { GsiWriter } from "./gsi-writer.js";
 import { checkGsiPlans, desiredGsiEntry, type GsiPlans } from "./gsi-target.js";
-import { CONFLICT_CODES, FokosConflictError, FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../shared/errors.js";
+import {
+	CONFLICT_CODES,
+	FokosConflictError,
+	FokosError,
+	FokosInternalError,
+	FokosUnavailableError,
+	UNAVAILABLE_CODES,
+} from "../../shared/errors.js";
+import { SHARDING_INTERNAL_CODES } from "../../sharding/errors.js";
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
 import { mergeBatchParts, withOffset, type BatchFailure } from "../../shared/batch-merge.js";
 import { ADMISSION_MARGIN } from "../../shared/transaction-limits.js";
@@ -115,6 +124,11 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	readonly #gsiPlans = new Map<string, GsiPlans>();
 	/** The stored target list, read one time for each instance. */
 	#targetList: readonly FokosTargetDefinition[] | undefined;
+	/**
+	 * The error of the migrations or of a config read of this host. While it stands, the dispatch
+	 * entries answer `partition_init_failed` and `alarm` re-arms at `INIT_RETRY_ALARM_MS`.
+	 */
+	#initError?: unknown;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -180,10 +194,22 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
+			hostInitError: () => this.#initError,
 		});
 		void ctx.blockConcurrencyWhile(async () => {
-			this.#store.runMigrations();
-			this.#checkStoredTargets();
+			try {
+				this.#store.runMigrations();
+				this.#checkStoredTargets();
+			} catch (error) {
+				this.#initError = error;
+				console.error({
+					actorId: ctx.id.toString(),
+					actorName: ctx.id.name,
+					message: "fokos/mat: the migrations of the host failed.",
+					error: String(error),
+					errorProps: error,
+				});
+			}
 		});
 	}
 
@@ -227,7 +253,18 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 
 	// ═══ the RPC surface: one dispatch per method ════════════════════════════
 
+	/** The gate of every host entry that reads the schema: a failed initialization answers typed. */
+	#checkInit(operation: string): void {
+		if (this.#initError !== undefined) {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_init_failed, {
+				message: "the initialization of the materialization partition failed",
+				attributes: { operation },
+			});
+		}
+	}
+
 	applyLatestImages(ctx: FokosDBRouteContext, req: ApplyLatestImagesRequest): Promise<FokosEnvelope<ApplyLatestImagesResponse>> {
+		this.#checkInit("applyLatestImages");
 		return this.fokos.dispatch("applyLatestImages", ctx, req);
 	}
 
@@ -265,10 +302,24 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	}
 	/** The `targetId` of each GSI target of the stored target list, or null when this partition has no list. */
 	fokosGsiTargetIds(): string[] | null {
+		this.#checkInit("fokosGsiTargetIds");
 		return this.#store.storedTargets()?.flatMap((target) => (target.kind === "gsi" ? [target.targetId] : [])) ?? null;
 	}
 
 	async alarm(info: AlarmInvocationInfo): Promise<void> {
+		if (this.#initError !== undefined) {
+			console.error({
+				actorId: this.ctx.id.toString(),
+				actorName: this.ctx.id.name,
+				message: "fokos/mat: the initialization failed; the alarm retries it at the init interval.",
+				error: String(this.#initError as Error),
+				errorProps: this.#initError,
+			});
+			try {
+				await this.ctx.storage.setAlarm(Date.now() + INIT_RETRY_ALARM_MS);
+			} catch {}
+			return;
+		}
 		await this.fokos.alarm(info);
 	}
 
@@ -507,7 +558,14 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	private __cachedConfig?: MaterializationDOConfig;
 	private config(): MaterializationDOConfig {
 		if (!this.__cachedConfig) {
-			this.__cachedConfig = resolveMaterializationConfig(this.fokosConfig());
+			try {
+				this.__cachedConfig = resolveMaterializationConfig(this.fokosConfig());
+			} catch (error) {
+				// A config that cannot resolve behaves as a failed initialization: the dispatch entries
+				// answer it and the alarm retries it, so a fixed deploy heals the object.
+				this.#initError = error;
+				throw error;
+			}
 		}
 		return this.__cachedConfig;
 	}

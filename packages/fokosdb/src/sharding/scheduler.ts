@@ -11,6 +11,12 @@
 import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 import type { FokosShardingStore } from "./sharding-store.js";
 
+/**
+ * The alarm interval of a Durable Object whose initialization failed. It is a fixed constant and
+ * not a setting, so the arm does not read the config that can be the failure.
+ */
+export const INIT_RETRY_ALARM_MS = 300_000;
+
 export type FokosSchedulerDeps = {
 	storage: DurableObjectStorage;
 	store: FokosShardingStore;

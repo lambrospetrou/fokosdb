@@ -3,6 +3,7 @@ import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migra
 import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
+import { INIT_RETRY_ALARM_MS } from "../sharding/scheduler.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
 import type {
 	FokosEnvelope,
@@ -25,7 +26,7 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusRequest,
 } from "../sharding/repartition-types.js";
-import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
+import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "./do-partition.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
@@ -390,6 +391,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	#migrations: SQLSchemaMigrations;
 	/** True after the split floor was logged. Every refused transaction runs the decision, so it logs once. */
 	#splitFloorLogged = false;
+	/**
+	 * The error of the migrations of this host. While it stands, the dispatch entries answer
+	 * `partition_init_failed` and `alarm` re-arms at `INIT_RETRY_ALARM_MS`.
+	 */
+	#initError?: unknown;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -409,23 +415,47 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
+			hostInitError: () => this.#initError,
 			// The table options select both. The runtime asks only after this coordinator has its identity.
 			adminOutbox: () => adminOutboxFor(this.fokos.routeContext(), this.fokos.routeContext().policy.nsTx),
 			topologyCache: () => topologyCache.get(this.fokos.routeContext(), this.topologyRefreshSettings()),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
-			this.#migrations.runAllSync();
+			try {
+				this.#migrations.runAllSync();
+			} catch (error) {
+				this.#initError = error;
+				console.error({
+					actorId: ctx.id.toString(),
+					actorName: ctx.id.name,
+					message: "fokos/coordinator: the migrations of the host failed.",
+					error: String(error),
+					errorProps: error,
+				});
+			}
 		});
 	}
 
 	// ═══ the RPC surface: one dispatch per method ════════════════════════════
 
+	/** The gate of every host entry that reads the schema: a failed initialization answers typed. */
+	#checkInit(operation: string): void {
+		if (this.#initError !== undefined) {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_init_failed, {
+				message: "the initialization of the coordinator failed",
+				attributes: { operation },
+			});
+		}
+	}
+
 	initiateWrite(ctx: FokosDBRouteContext, req: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>> {
+		this.#checkInit("initiateWrite");
 		return this.fokos.dispatch("initiateWrite", ctx, req);
 	}
 
 	/** The routed operation. A coordinator that has split forwards the call to the child that owns the token. */
 	recoverTransaction(ctx: FokosDBRouteContext, req: RecoverTransactionRequest): Promise<FokosEnvelope<RecoverTransactionResult>> {
+		this.#checkInit("recoverTransaction");
 		return this.fokos.dispatch("recoverTransaction", ctx, req);
 	}
 
@@ -435,6 +465,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * with no identity has no ledger, so it has no record of the transaction.
 	 */
 	async recoverTransactionForParticipant(req: RecoverTransactionRequest): Promise<RecoverTransactionResult> {
+		this.#checkInit("recoverTransactionForParticipant");
 		if (!this.fokos.initialized()) {
 			return { state: "not_found" };
 		}
@@ -480,6 +511,19 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/** The runtime owns the alarm. The host work runs as the jobs `tx_recovery` and `idempotency_sweep`. */
 	async alarm(info: AlarmInvocationInfo): Promise<void> {
+		if (this.#initError !== undefined) {
+			console.error({
+				actorId: this.ctx.id.toString(),
+				actorName: this.ctx.id.name,
+				message: "fokos/coordinator: the initialization failed; the alarm retries it at the init interval.",
+				error: String(this.#initError as Error),
+				errorProps: this.#initError,
+			});
+			try {
+				await this.ctx.storage.setAlarm(Date.now() + INIT_RETRY_ALARM_MS);
+			} catch {}
+			return;
+		}
 		await this.fokos.alarm(info);
 	}
 
@@ -668,7 +712,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/** The active settings: the overrides of `fokosConfig()` over the defaults, validated. */
 	private config(): TransactionCoordinatorDOConfig {
-		return resolveCoordinatorConfig(this.fokosConfig());
+		try {
+			return resolveCoordinatorConfig(this.fokosConfig());
+		} catch (error) {
+			// A config that cannot resolve behaves as a failed initialization: the dispatch entries
+			// answer it and the alarm retries it, so a fixed deploy heals the object.
+			this.#initError = error;
+			throw error;
+		}
 	}
 
 	//////////////////////////////

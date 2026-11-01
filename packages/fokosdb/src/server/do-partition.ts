@@ -53,6 +53,7 @@ import { promotedKeyOf } from "../sharding/repartition-slice.js";
 import { resolvePartitionConfig, type PartitionDOConfig, type PartitionDOConfigOverrides } from "./host-config.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
+import { INIT_RETRY_ALARM_MS } from "../sharding/scheduler.js";
 import type { FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
 import type {
 	FokosEnvelope,
@@ -109,6 +110,7 @@ import {
 	CONFLICT_CODES,
 	FokosConflictError,
 	FokosError,
+	FokosInternalError,
 	FokosRoutingError,
 	FokosUnavailableError,
 	newErrorId,
@@ -396,9 +398,16 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	/** The client of the materialization partitions, and the route context that it was made from. */
 	#materialization: { routeCtx: FokosDBRouteContext; client: FokosShardingClient<FokosDBPolicy, MaterializationOps> } | undefined;
 	#splitPlanner: SplitPlanner;
-	// Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
-	// non-blocking from the constructor, so it may be undefined for the first few
-	// requests after the DO wakes. Never gate correctness on it.
+	/**
+	 * The error of the migrations or of a config read of this host. While it stands, `#api` answers
+	 * `partition_init_failed` and `alarm` re-arms at `INIT_RETRY_ALARM_MS`.
+	 */
+	#initError?: unknown;
+	/**
+	 * Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
+	 * non-blocking from the constructor, so it may be undefined for the first few
+	 * requests after the DO wakes. Never gate correctness on it.
+	 */
 	#_coloInfo?: ColoInfo;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -468,6 +477,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
+			hostInitError: () => this.#initError,
 			// The table options select both. The runtime asks only after this partition has its identity.
 			adminOutbox: () => adminOutboxFor(this.fokos.routeContext(), this.fokos.routeContext().policy.ns),
 			topologyCache: () =>
@@ -476,8 +486,22 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					refreshTimeoutMs: this.config().topologyRefreshTimeoutMs,
 				}),
 		});
-		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
-		this.#ttl.arm(this.config().ttlSweep.ttlSweepDelayMs);
+		void ctx.blockConcurrencyWhile(async () => {
+			try {
+				this.#store.runMigrations();
+			} catch (error) {
+				this.#initError = error;
+				console.error({
+					actorId: ctx.id.toString(),
+					actorName: ctx.id.name,
+					message: "fokos/partition: the migrations of the host failed.",
+					error: String(error),
+					errorProps: error,
+				});
+			}
+		});
+		// The TTL sweep does not arm here: `config()` can throw, and the constructor must stay live.
+		// `#api` and `alarm` arm it at their first use.
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
 		// It swallows the errors, because telemetry must never affect the lifecycle of the DO.
@@ -604,9 +628,53 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * runs first, so the state the sweep reads is the state the pass left.
 	 */
 	async alarm(info: AlarmInvocationInfo): Promise<void> {
+		if (this.#initError !== undefined) {
+			await this.#armInitRetry();
+			return;
+		}
 		await this.fokos.alarm(info);
-		if (!this.fokos.isFenced()) {
-			this.#ttl.arm();
+		if (this.#initError !== undefined) {
+			// A host job can resolve `config()` inside the pass and land here with the failure stored.
+			await this.#armInitRetry();
+			return;
+		}
+		try {
+			if (!this.fokos.isFenced()) {
+				this.#ttl.arm();
+			}
+		} catch (error) {
+			// `config()` stores a throw into `#initError`; the next alarm takes the init retry.
+			if (this.#initError === undefined) {
+				throw error;
+			}
+			await this.#armInitRetry();
+		}
+	}
+
+	/** The long retry of a failed host initialization. The alarm is the only clock the object has left. */
+	async #armInitRetry(): Promise<void> {
+		let logParams: Record<string, unknown> = {};
+		try {
+			logParams = this.logParams();
+		} catch {}
+		console.error({
+			...logParams,
+			message: "fokos/partition: the initialization failed; the alarm retries it at the init interval.",
+			error: String(this.#initError as Error),
+			errorProps: this.#initError,
+		});
+		try {
+			await this.ctx.storage.setAlarm(Date.now() + INIT_RETRY_ALARM_MS);
+		} catch {}
+	}
+
+	/** The gate of every host entry that reads the schema: a failed initialization answers typed. */
+	#checkInit(operation: string): void {
+		if (this.#initError !== undefined) {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_init_failed, {
+				message: "the initialization of the partition failed",
+				attributes: { operation },
+			});
 		}
 	}
 
@@ -616,9 +684,15 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * between the fence and `fokosDestroy` must not start the timer again.
 	 */
 	#api<K extends keyof PartitionOps>(op: K, ctx: FokosDBRouteContext, req: PartitionOps[K]["req"]) {
-		if (!this.fokos.isFenced()) {
-			this.#ttl.arm();
+		this.#checkInit(op);
+		try {
+			if (!this.fokos.isFenced()) {
+				this.#ttl.arm();
+			}
+		} catch {
+			// A config read that throws lands in `#initError`, which the check below answers.
 		}
+		this.#checkInit(op);
 		return this.fokos.dispatch(op, ctx, req);
 	}
 
@@ -737,7 +811,14 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	private __cachedConfig?: PartitionDOConfig;
 	private config(): PartitionDOConfig {
 		if (!this.__cachedConfig) {
-			this.__cachedConfig = resolvePartitionConfig(this.fokosConfig());
+			try {
+				this.__cachedConfig = resolvePartitionConfig(this.fokosConfig());
+			} catch (error) {
+				// A config that cannot resolve behaves as a failed initialization: `#api` answers it
+				// and the alarm retries it, so a fixed deploy heals the object.
+				this.#initError = error;
+				throw error;
+			}
 		}
 		return this.__cachedConfig;
 	}

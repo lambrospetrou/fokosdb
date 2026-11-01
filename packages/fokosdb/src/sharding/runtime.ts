@@ -81,7 +81,7 @@ import type {
 	FokosShardingHooks,
 	FokosSignals,
 } from "./runtime-types.js";
-import { FokosScheduler } from "./scheduler.js";
+import { FokosScheduler, INIT_RETRY_ALARM_MS } from "./scheduler.js";
 import { jitterBackoff } from "durable-utils/retries";
 import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
@@ -196,7 +196,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #configOverrides: FokosRuntimeOptions<TPolicy>["config"];
 	readonly #adminOutbox: FokosRuntimeOptions<TPolicy>["adminOutbox"];
 	readonly #topologyCache: FokosRuntimeOptions<TPolicy>["topologyCache"];
+	readonly #hostInitError: FokosRuntimeOptions<TPolicy>["hostInitError"];
 
+	/**
+	 * The error of the storage step of the constructor, or of a config read. While it stands,
+	 * `#guard` answers `partition_init_failed` and `runDueWork` re-arms at `INIT_RETRY_ALARM_MS`.
+	 */
+	#initError?: unknown;
 	/** The immutable identity, from `__fokos/identity`. Absent until the first request or `fokosInit`. */
 	#identity?: FokosPartitionIdentity;
 	/** The mutable part of the last route context this partition received, from `__fokos/policy`. */
@@ -221,8 +227,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#configOverrides = opts.config;
 		this.#adminOutbox = opts.adminOutbox;
 		this.#topologyCache = opts.topologyCache;
-		// A configuration that is not valid fails the construction.
-		this.#config();
+		this.#hostInitError = opts.hostInitError;
+		// The config is validated at its first read, not here: a throw degrades the object instead of
+		// bricking the constructor.
 		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: () => this.#config().rangeHierarchyMaxRows });
 
 		const deps: RepartitionCommonDeps = {
@@ -254,15 +261,26 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		void opts.ctx.blockConcurrencyWhile(async () => {
 			// The sharding store migrates first, before the host runs its own migrations.
-			this.#store.runMigrations();
-			const identity = this.#store.getIdentity();
-			const stored = this.#store.getPolicy<TPolicy>();
-			if (identity && stored) {
-				this.#setIdentity(identity, stored);
-			}
-			const bloom = this.#store.getPromotionBloom();
-			if (bloom) {
-				this.#bloom = PartialRangeTopology.fromSnapshot(bloom);
+			try {
+				this.#store.runMigrations();
+				const identity = this.#store.getIdentity();
+				const stored = this.#store.getPolicy<TPolicy>();
+				if (identity && stored) {
+					this.#setIdentity(identity, stored);
+				}
+				const bloom = this.#store.getPromotionBloom();
+				if (bloom) {
+					this.#bloom = PartialRangeTopology.fromSnapshot(bloom);
+				}
+			} catch (error) {
+				this.#initError = error;
+				console.error({
+					actorId: this.#ctx.id.toString(),
+					actorName: this.#ctx.id.name,
+					message: "fokos/runtime: the initialization of the partition failed.",
+					error: String(error),
+					errorProps: error,
+				});
 			}
 		});
 	}
@@ -1205,6 +1223,21 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** One background pass. `alarm(info)` calls this and nothing else. */
 	async runDueWork(): Promise<void> {
+		if (this.#initError !== undefined) {
+			// The interval is the constant: the read of the config that can be the failure does not run.
+			try {
+				await this.#scheduler.ensureAlarmAtMost(Date.now() + INIT_RETRY_ALARM_MS);
+			} catch {}
+			try {
+				console.error({
+					...this.#logParams(),
+					message: "fokos/runtime: the initialization failed; the alarm retries it at the init interval.",
+					error: String(this.#initError as Error),
+					errorProps: this.#initError,
+				});
+			} catch {}
+			return;
+		}
 		await this.#scheduler.runDueWork();
 	}
 
@@ -1489,9 +1522,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		//
 		// NOTE: This shouldn't happen in production, but it happens in workerd/miniflare/vitest environments
 		// due to clock discrepancies and going back in time occasionally.
-		const earlyMs = Math.min((info?.scheduledTime ?? 0) - Date.now(), this.#config().fallbackAlarmMs);
-		if (earlyMs > 0) {
-			await scheduler.wait(earlyMs);
+		try {
+			const earlyMs = Math.min((info?.scheduledTime ?? 0) - Date.now(), this.#config().fallbackAlarmMs);
+			if (earlyMs > 0) {
+				await scheduler.wait(earlyMs);
+			}
+		} catch {
+			// A config throw landed in `#initError`, which `runDueWork` answers. Any other read failure
+			// meets the pass-level catch of the scheduler and its fallback re-arm.
 		}
 		await this.runDueWork();
 	}
@@ -2222,7 +2260,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** The active settings: the host overrides over the defaults, validated. Read at each use. */
 	#config(): FokosRuntimeConfig {
-		return resolveRuntimeConfig(this.#configOverrides?.());
+		try {
+			return resolveRuntimeConfig(this.#configOverrides?.());
+		} catch (error) {
+			// A config that cannot resolve behaves as a failed initialization: the gate answers it and
+			// the alarm retries it, so a fixed deploy heals the object.
+			this.#initError = error;
+			throw error;
+		}
 	}
 
 	#builtinJobs(): FokosJob[] {
@@ -2406,6 +2451,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 					message: "partition destroy in progress, please retry later",
 					attributes: { operation: name },
+				});
+			}
+			// A failed initialization degrades every storage path. `fokosDestroy` and
+			// `fokosPrepareDestroy` stay live: they are the way out of a poisoned object. `fokosStatus`
+			// stays live too: it is the diagnosis path, and it reads KV before it reads any table. A failed
+			// host initialization degrades the same paths, because the runtime RPCs read the host tables.
+			const initError = this.#initError ?? this.#hostInitError?.();
+			if (initError !== undefined && name !== "fokosStatus" && name !== "fokosPrepareDestroy" && name !== "fokosDestroy") {
+				throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_init_failed, {
+					message: "the initialization of the partition failed",
+					attributes: { operation: name, ...causeAttributes(initError) },
 				});
 			}
 			return await fn();

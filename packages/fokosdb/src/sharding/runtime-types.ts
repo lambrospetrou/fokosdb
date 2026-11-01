@@ -32,12 +32,18 @@ export type FokosRuntimeOptions<TPolicy> = {
 	/**
 	 * The runtime settings that the host overrides. The runtime merges them with
 	 * `DEFAULT_RUNTIME_CONFIG`, validates the result, and throws on a value that is not valid. The
-	 * runtime calls this in its constructor and again at each use of a setting, so the callback must
-	 * return valid values at any time. During the construction of the host, the runtime field of the
-	 * host is not assigned yet, and the identity and the policy of a new partition do not exist before
-	 * its first request. Absent: every setting takes its default.
+	 * runtime calls this at each use of a setting, so the callback must return valid values at any
+	 * time. A throw degrades the object: every entry point except `fokosStatus`, `fokosPrepareDestroy`,
+	 * and `fokosDestroy` answers `partition_init_failed`. The identity and the policy of a new
+	 * partition do not exist before its first request. Absent: every setting takes its default.
 	 */
 	config?(this: void): FokosRuntimeConfigOverrides;
+	/**
+	 * Host code. The error of the host initialization, or undefined when it succeeded. The runtime
+	 * calls this at each entry point and degrades the object the same way as for its own failed
+	 * initialization. Absent: the host initialization cannot fail.
+	 */
+	hostInitError?(this: void): unknown;
 	/**
 	 * Host code. The admin outbox, or undefined when it is off. The runtime calls this at each use, after
 	 * the partition has its identity, so the answer can depend on the policy. With an outbox, the

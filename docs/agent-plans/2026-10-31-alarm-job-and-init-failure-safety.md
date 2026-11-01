@@ -1,10 +1,10 @@
 # RFC — Bounded failure behavior for alarms, background jobs, and Durable Object initialization
 
-**State:** Draft
+**State:** Implemented as of 2026-11-01
 **Date:** 2026-10-31
 **Author:** Lambros Petrou
 
-**Status:** Nothing is built. Section 3 lists the milestones.
+**Status:** Implemented: the four milestones of section 3.
 
 ## Table of contents
 

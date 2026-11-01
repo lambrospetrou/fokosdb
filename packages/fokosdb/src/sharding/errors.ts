@@ -44,6 +44,8 @@ export const SHARDING_UNAVAILABLE_CODES = defineCodes("FokosUnavailableError", "
 export const SHARDING_INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {
 	/** The route context disagrees with the stored identity. */
 	partition_context_mismatch: "8hv63q",
+	/** The storage initialization of the object failed; the destroy and status RPCs still answer. */
+	partition_init_failed: "k4w8nq",
 	/** An `attempt_all` group had a failed remote group. */
 	partition_fanout_failed: "f3aqhc",
 	/** The named repartition does not exist on this partition. */
