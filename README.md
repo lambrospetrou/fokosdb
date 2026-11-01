@@ -366,11 +366,11 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
+- Implement clustered rows with the key range intervals `docs/agent-plans/2026-11-01-hash-key-buckets.md`.
 - Implement the splits with the new Durable Object Snapshot API.
 - Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
 - Enable cached topology for the GSI writers and `db.gsi()` client.
 - Extend the topology caching in clients from responses.
-- Decide if we will keep the hash key promotion to a range partition tree, or if we will adopt mixed-key range partitions at some hash depth.
 - Revamp the item size statistics for better boundary calculations and choosing keys to promote (`docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md`).
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
