@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { GOLDEN_RATIO, hashChildIndex, hashRootIndex } from "./hash-primitives.js";
+import {
+	GOLDEN_RATIO,
+	GOLDEN_RATIO_BIGINT,
+	hash64,
+	hashChildIndex,
+	hashPrefixBucket,
+	hashPrefixBucketSeedOf,
+	hashRootIndex,
+} from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
@@ -72,5 +80,33 @@ describe("distribution is roughly uniform", () => {
 			expect(c).toBeGreaterThan(expected * 0.4);
 			expect(c).toBeLessThan(expected * 2.5);
 		}
+	});
+});
+
+describe("hashPrefixBucket", () => {
+	const hex = (bytes: Uint8Array) => bytes.toHex();
+
+	it("gives 8 bytes, most significant byte first, equal to xxh64 of the key bytes", () => {
+		const seed = BigInt(`0x${hashPrefixBucketSeedOf("fokos.p.orders")}`);
+		for (const k of KEYS.slice(0, 50)) {
+			const bucket = hashPrefixBucket(k, seed);
+			expect(bucket).toHaveLength(8);
+			expect(BigInt(`0x${hex(bucket)}`)).toBe(hash64(k, seed));
+		}
+	});
+
+	it("pins the seed of a shard group and the hashPrefixBucket of a key", () => {
+		const seed = hashPrefixBucketSeedOf("fokos.p.orders");
+		expect(seed).toMatch(/^[0-9a-f]{16}$/);
+		expect(seed).toBe("3291cf945f451beb");
+		expect(hex(hashPrefixBucket(kb("user#42"), BigInt(`0x${seed}`)))).toBe("79ea4b6db710a9a9");
+	});
+
+	it("derives the seed of a shard group from a base seed, which defaults to GOLDEN_RATIO_BIGINT", () => {
+		expect(hashPrefixBucketSeedOf("fokos.p.orders", GOLDEN_RATIO_BIGINT)).toBe("3291cf945f451beb");
+		const custom = hashPrefixBucketSeedOf("fokos.p.orders", 42n);
+		expect(custom).toMatch(/^[0-9a-f]{16}$/);
+		expect(custom).not.toBe("3291cf945f451beb");
+		expect(BigInt(`0x${custom}`)).toBe(hash64("fokos.p.orders", 42n));
 	});
 });

@@ -1,7 +1,12 @@
 import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } from "./route-context.js";
-import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
+import {
+	GOLDEN_RATIO as _GOLDEN_RATIO,
+	hashChildIndex as _hashChildIndex,
+	hashPrefixBucketSeedOf,
+	hashRootIndex as _hashRootIndex,
+} from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
 
@@ -235,6 +240,7 @@ export function partitionIdentityFrom(
 			kind: "hash",
 			hash: { rootIndex: decoded.rootIdx, path: Array.from(bytes.subarray(4, 4 + decoded.depth)) },
 			topology: ctx.topology,
+			hashPrefixBucketSeed: hashPrefixBucketSeedOf(ctx.topology.shardGroup),
 		};
 	}
 	invariant(range, "fokos/topology.partitionIdentityFrom: a range partition needs its depth and ancestors");
@@ -244,6 +250,7 @@ export function partitionIdentityFrom(
 		kind: "range",
 		range: { hashKey: decoded.hashKey, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
 		topology: ctx.topology,
+		hashPrefixBucketSeed: hashPrefixBucketSeedOf(ctx.topology.shardGroup),
 	};
 }
 

@@ -68,7 +68,7 @@ function isUnlistedShared(id: string): boolean {
 const CLIENT_MAX_BYTES = 120 * 1024;
 
 /** Upper bound for the sharding client entry and every chunk that it imports, in MINIFIED bytes. */
-const SHARDING_CLIENT_MAX_BYTES = 42 * 1024;
+const SHARDING_CLIENT_MAX_BYTES = 44 * 1024;
 
 export default defineConfig({
 	entry: {

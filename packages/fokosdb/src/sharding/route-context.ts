@@ -74,6 +74,12 @@ export type FokosPartitionIdentity = {
 		ancestors: RangeAncestorInfo[];
 	};
 	topology: FokosTopology;
+	/**
+	 * `hashPrefixBucketSeedOf(topology.shardGroup)` when the identity was written. A partition whose
+	 * stored seed differs from the seed that the code computes now refuses all work, because its
+	 * stored rows and its routes use the stored seed.
+	 */
+	hashPrefixBucketSeed: string;
 };
 
 /** The mutable part of the last route context a partition received, under `__fokos/policy`. */

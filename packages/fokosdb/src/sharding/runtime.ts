@@ -16,7 +16,7 @@ import { throttleTrailing } from "../shared/tsutils.js";
 import { AddResult } from "../shared/bloom-filter.js";
 import { attachRouting, envelope, RouteCollector, routedError } from "./envelope.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
-import { hashChildIndex, hashRootIndex } from "./hash-primitives.js";
+import { hashChildIndex, hashPrefixBucketSeedOf, hashRootIndex } from "./hash-primitives.js";
 import { HashTopology } from "./hash-topology.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
@@ -267,6 +267,11 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				const stored = this.#store.getPolicy<TPolicy>();
 				if (identity && stored) {
 					this.#setIdentity(identity, stored);
+					// The identity stays in memory, so `fokosStatus` and the destroy RPCs still work.
+					const seed = hashPrefixBucketSeedOf(identity.topology.shardGroup);
+					if (identity.hashPrefixBucketSeed !== seed) {
+						throw contextMismatch({ doName: identity.ref.doName, hashPrefixBucketSeed: identity.hashPrefixBucketSeed, expected: seed });
+					}
 				}
 				const bloom = this.#store.getPromotionBloom();
 				if (bloom) {

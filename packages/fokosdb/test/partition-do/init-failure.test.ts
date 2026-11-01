@@ -8,6 +8,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
+import { hashPrefixBucketSeedOf } from "../../src/sharding/hash-primitives.js";
+import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
 import { isDestroyAbortError } from "../../src/shared/cf-utils.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -106,6 +108,32 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 			await expect(instance.fokosPromotions({ cursor: null })).rejects.toThrow(fokosErrorWith("partition_init_failed"));
 			await instance.alarm({ ...ALARM_INFO, scheduledTime: Date.now() });
 			expectInitRetry(await state.storage.getAlarm());
+		});
+		const err = await broken.stub.fokosDestroy().then(
+			() => null,
+			(e) => e,
+		);
+		expect(isDestroyAbortError(err)).toBe(true);
+	});
+
+	it("refuses all work when the stored hashPrefixBucket seed differs from the seed of the code, and keeps status and destroy live", async ({
+		expect,
+	}) => {
+		const partition = makePartition();
+		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" });
+
+		const broken = await breakAndRestart(partition, (state) => {
+			const identity = state.storage.kv.get<FokosPartitionIdentity>(FOKOS_KV_KEYS.IDENTITY)!;
+			expect(identity.hashPrefixBucketSeed).toBe(hashPrefixBucketSeedOf(partition.ctx.topology.shardGroup));
+			state.storage.kv.put(FOKOS_KV_KEYS.IDENTITY, { ...identity, hashPrefixBucketSeed: "0000000000000000" });
+		});
+
+		await runInDurableObject(broken.stub, async (instance: FokosDBPartitionDO) => {
+			await expect(instance.apiGetItem(broken.ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).rejects.toThrow(
+				fokosErrorWith("partition_init_failed"),
+			);
+			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true, destroying: false });
+			await instance.fokosPrepareDestroy({});
 		});
 		const err = await broken.stub.fokosDestroy().then(
 			() => null,

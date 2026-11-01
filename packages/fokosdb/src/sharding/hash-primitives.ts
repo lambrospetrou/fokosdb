@@ -9,6 +9,7 @@ import type { KeyBytes } from "./key-codec.js";
 // Golden Ratio constant for better hash scattering.
 // See https://softwareengineering.stackexchange.com/a/402543
 export const GOLDEN_RATIO = 0x9e3779b1;
+// The default base seed of `hashPrefixBucketSeedOf`, so a change moves every stored hashPrefixBucket. It must never change.
 export const GOLDEN_RATIO_BIGINT = BigInt(0x9e3779b1);
 
 // Odd 32-bit constant used to derive a distinct hash seed per tree depth. Oddness makes
@@ -52,6 +53,22 @@ export function hash64(data: string | Uint8Array, seed?: bigint): bigint {
 		return hashers.h64(data, seed ?? GOLDEN_RATIO_BIGINT);
 	}
 	return hashers.h64Raw(data, seed ?? GOLDEN_RATIO_BIGINT);
+}
+
+/**
+ * The xxHash64 seed of the hashPrefixBuckets of a shard group, as 16 lowercase hex characters: xxh64
+ * of its UTF-8 name with `baseSeed`. A platform can give its own `baseSeed`, and must then keep it for
+ * the life of its data.
+ */
+export function hashPrefixBucketSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string {
+	return hash64(shardGroup, baseSeed).toString(16).padStart(16, "0");
+}
+
+/** The hashPrefixBucket of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
+export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): Uint8Array {
+	const out = new Uint8Array(8);
+	new DataView(out.buffer).setBigUint64(0, hashers.h64Raw(hashKey, seed), false);
+	return out;
 }
 
 export function hash32(data: string | Uint8Array, seed?: number): number {

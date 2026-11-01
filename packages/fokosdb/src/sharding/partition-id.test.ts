@@ -12,6 +12,7 @@ import {
 	resolveRangePartitionContext,
 } from "./partition-id.js";
 import { FokosRouter } from "./router.js";
+import { hashPrefixBucketSeedOf } from "./hash-primitives.js";
 import { validateTopology, type FokosRouteContext } from "./route-context.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
 
@@ -682,6 +683,7 @@ describe("partitionIdentityFrom", () => {
 			kind: "hash",
 			hash: { rootIndex: 2, path: [3, 1] },
 			topology: root.topology,
+			hashPrefixBucketSeed: hashPrefixBucketSeedOf(base),
 		});
 		expect(identityDepth(identity)).toBe(2);
 		expect(identityDepth(partitionIdentityFrom(root))).toBe(0);
@@ -703,6 +705,7 @@ describe("partitionIdentityFrom", () => {
 		expect(identity.kind).toBe("range");
 		expect(identity.hash).toBeUndefined();
 		expect(identity.range).toEqual({ hashKey: kb("alice"), start: kb("b1"), end: null, depth: 1, ancestors });
+		expect(identity.hashPrefixBucketSeed).toBe(hashPrefixBucketSeedOf(base));
 		expect(identityDepth(identity)).toBe(1);
 		expect(() => partitionIdentityFrom(range)).toThrow(invariantFailure(/needs its depth and ancestors/));
 	});

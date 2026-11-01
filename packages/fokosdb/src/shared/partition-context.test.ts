@@ -4,6 +4,7 @@ import {
 	coordinatorShardGroup,
 	createTableConfig,
 	gsiShardGroup,
+	gsiTableConfig,
 	materializationShardGroup,
 	materializationTableConfig,
 	topologyAdminName,
@@ -11,6 +12,7 @@ import {
 	type FokosTableOptions,
 } from "./partition-context.js";
 import { structurallyEqual } from "../sharding/route-context.js";
+import { hashPrefixBucketSeedOf } from "../sharding/hash-primitives.js";
 import { FokosRouter } from "../sharding/router.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 
@@ -126,6 +128,17 @@ describe("createTableConfig — the shard groups of a table", () => {
 			["a", "b.c"],
 		].map(([name, index]) => gsiShardGroup(createTableConfig(makeOpts({ tableName: name })).topology, index));
 		expect(groups).toEqual(["fokos.gsiv1.3.a.b.c", "fokos.gsiv1.1.a.b.c"]);
+	});
+
+	it("gives the partition, coordinator, materialization, and GSI groups of one table four different seeds", () => {
+		const cfg = createTableConfig(makeOpts({ tableName: "orders", nsMat: "MATERIALIZATION_DO", captureChanges: true }));
+		const groups = [
+			cfg.topology.shardGroup,
+			coordinatorShardGroup(cfg.topology, FP),
+			materializationTableConfig(cfg, FP).topology.shardGroup,
+			gsiTableConfig(cfg, "byStatus").topology.shardGroup,
+		];
+		expect(new Set(groups.map((group) => hashPrefixBucketSeedOf(group))).size).toBe(4);
 	});
 
 	it("reads the table name of a materialization group with a fingerprint", () => {

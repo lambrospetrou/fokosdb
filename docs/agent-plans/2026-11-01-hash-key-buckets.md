@@ -72,7 +72,8 @@ this RFC.
 | Term | Meaning in this document |
 | --- | --- |
 | hashPrefixBucket | The 64-bit xxHash64 of the encoded hash key, with the seed of the shard group. It is 8 bytes. |
-| seed | The xxHash64 seed of the hashPrefixBuckets of one shard group. |
+| seed | The xxHash64 seed of the hashPrefixBuckets of one shard group: `xxh64(shardGroup, baseSeed)`. |
+| base seed | The xxHash64 seed that derives the seed of each shard group. The default is `GOLDEN_RATIO_BIGINT`. |
 | digit | One child index of a hashPrefixBucket: the root digit in base `rootTreesN`, then base `hashSplitN`. |
 | node interval | The half-open hashPrefixBucket interval `[start, end)` that one hash partition owns. |
 | storage prefix | The first primary-key column of an ordered table. In FokosDB it is the hashPrefixBucket. |
@@ -145,8 +146,9 @@ duplicate check of `insertItemIfAbsent`). `deleteExpiredItems` deletes its victi
 
 ### 2.1 In scope
 
-1. Each shard group has one hashPrefixBucket function and one seed. The seed comes from the shard group name. The
-   immutable topology stores it, and each request validates it.
+1. Each shard group has one hashPrefixBucket function and one seed. The code derives the seed from the shard group
+   name. The topology and the requests do not carry it. Each partition stores it in its identity, and refuses all work
+   when the stored seed differs from the derived seed.
 2. The hash tree maps a hashPrefixBucket to a partition by its digits. Each hash partition computes its node
    interval, depth, root index, and child path from its partition ID and the immutable topology.
 3. `items` is a `WITHOUT ROWID` table with `PRIMARY KEY (hash_prefix_bucket, hk, sk)`. The other key-ordered tables
@@ -175,8 +177,12 @@ duplicate check of `insertItemIfAbsent`). `deleteExpiredItems` deletes its victi
   (the `FIXME` there). The split by storage snapshot decides it.
 - **A redesign of the materialization change log and its linked tables.** M7 clusters `latest_items` and keeps its
   links. `change_positions`, `target_retry`, and `target_index_keys` keep their layouts and behavior.
-- **A hashPrefixBucket width of 16 bytes.** The field `hashPrefixBucketBytes` leaves room for it. It needs another
-  hash function, and after the release it needs its own migration plan.
+- **A hashPrefixBucket width of 16 bytes.** The width is the code constant `HASH_PREFIX_BUCKET_BYTES` (8). A width
+  of 16 needs another hash function, and after the release it needs its own migration plan.
+- **A configurable base seed in the options of `FokosDB`, `FokosShardingClient`, or the runtime.**
+  `hashPrefixBucketSeedOf` accepts a base seed, so a platform can use its own. FokosDB uses the default. A follow-up
+  spec must give one option that reaches the client, the router, the runtime, and the identity check together. The
+  option must not travel in the topology.
 - **Splits below the hash depth limit.** The limit is at most 64 (Section 4.2.5). A hash leaf at the limit can still
   promote a hashPrefixBucket, but it cannot hash-split. A follow-up spec must define range splits after the hash
   splits reach the limit.
@@ -194,8 +200,8 @@ This RFC changes the routing, the unit of a promotion, the storage layout, and t
 
 The constraints on the solution:
 
-1. **The hashPrefixBucket function and the seed of a table never change** (I1). A change makes data unreachable. A
-   rename of a table makes a new shard group, so it is a new table.
+1. **The hashPrefixBucket function, the base seed, and the seed of a table never change** (I1). A change makes data
+   unreachable. A rename of a table makes a new shard group, so it is a new table.
 2. **The hashPrefixBucket is never an item identity** (I9). Two hash keys can have one hashPrefixBucket. `KeyPairMap`
    stays the identity of an item in memory.
 3. **A topology hint never changes a result.** The rules of
@@ -225,8 +231,8 @@ Each milestone ships alone and keeps `pnpm check` and `pnpm test` green (run `pn
 release, each milestone edits the schema migrations in place (Section 4.2.2), so the data of an earlier milestone does
 not carry over.
 
-1. **M1 — The hashPrefixBucket and the seed** (Section 4.2.4). The function `hashPrefixBucket`, the topology fields
-   `hashPrefixBucketSeed` and `hashPrefixBucketBytes`, and their validation. Routing does not change yet.
+1. **M1 — The hashPrefixBucket and the seed** (Section 4.2.4). The functions `hashPrefixBucket` and
+   `hashPrefixBucketSeedOf`, the seed in the partition identity, and its check. Routing does not change yet.
 2. **M2 — Hash routing by digits** (Section 4.2.5). Every hash route uses the digits of the hashPrefixBucket. Each
    hash partition knows its node interval. The depth limit is a split floor. Storage does not change yet.
 3. **M3 — The storage layout** (Section 4.2.6). `items` is `WITHOUT ROWID` on `(hash_prefix_bucket, hk, sk)`, with
@@ -251,7 +257,8 @@ not carry over.
 ### 4.1 High-level overview
 
 **The hashPrefixBucket.** Each hash key gets a 64-bit hashPrefixBucket: `xxh64(encodedHashKey, seed)`. The seed is
-`xxh64(shardGroup)`, so each table, GSI, coordinator group, and materialization group has its own seed. The sort key
+`xxh64(shardGroup, baseSeed)`, so each table, GSI, coordinator group, and materialization group has its own seed. The
+code derives the seed, and each partition stores it in its identity to detect a change. The sort key
 is not part of the hashPrefixBucket, so all items of one hash key have one hashPrefixBucket.
 
 **The digits.** Read the hashPrefixBucket as a fraction `x` in `[0, 1)`. The root is the first digit of `x` in base
@@ -300,11 +307,15 @@ the storage interval of each migration target. The host does not calculate hashe
 
 Each invariant has its rule, then its mechanism, then the milestones that add it.
 
-- **I1 — `hashSplitN`, `rootTreesN`, `hashPrefixBucketSeed`, and `hashPrefixBucketBytes` never change after
-  initialization.** All four are in `FokosTopology`. `validateTopology` checks the seed against `xxh64(shardGroup)`
-  and the width against 8. `topologiesEqual` compares all four. (M1)
+- **I1 — `hashSplitN`, `rootTreesN`, and the seed of a shard group never change after initialization.**
+  `hashSplitN` and `rootTreesN` are in `FokosTopology`, and `topologiesEqual` compares them. The seed is
+  `hashPrefixBucketSeedOf(shardGroup)`. `partitionIdentityFrom` stores it in `FokosPartitionIdentity`. When a
+  partition loads its identity, it compares the stored seed with the derived seed. A difference fails the
+  initialization: every operation answers `partition_init_failed`, and `fokosStatus` and the destroy RPCs stay
+  available. A pinned test of the seed and of one hashPrefixBucket catches a change of the derivation before a
+  deployment. (M1)
 - **I2 — A table has one hashPrefixBucket width, and a partition never mixes widths.** `storagePrefix` returns
-  exactly `hashPrefixBucketBytes` bytes in every partition. (M1, M3)
+  exactly `HASH_PREFIX_BUCKET_BYTES` bytes in every partition. (M1, M3)
 - **I3 — The digits are exact up to the depth limit, and no hash partition exists below it.** The limit is
   `R * K^d <= 2^64` and `d <= MAX_HASH_DEPTH`. Validation refuses a deeper partition ID. The split decision returns
   the floor at the limit. (M2)
@@ -381,74 +392,77 @@ Each milestone below lists only its new test cases: the behavior that no current
 
 #### 4.2.4 M1 — The hashPrefixBucket and the seed
 
-**The function.** In `sharding/hash-primitives.ts`:
+**The functions.** In `sharding/hash-primitives.ts`:
 
 ```ts
-/** The xxHash64 seed of the hashPrefixBuckets of a shard group: xxh64 of its UTF-8 name, with the default seed. */
-export function hashPrefixBucketSeedOf(shardGroup: string): string; // 16 lowercase hex characters
+/**
+ * The xxHash64 seed of the hashPrefixBuckets of a shard group, as 16 lowercase hex characters: xxh64
+ * of its UTF-8 name with `baseSeed`. A platform can give its own `baseSeed`, and must then keep it for
+ * the life of its data.
+ */
+export function hashPrefixBucketSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string;
 
 /** The hashPrefixBucket of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
 export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): Uint8Array;
 ```
 
-- `hashPrefixBucketSeedOf` is `hash64(shardGroup)` with its default seed `GOLDEN_RATIO_BIGINT`. That constant must
-  never change.
+- `hashPrefixBucketSeedOf` is `hash64(shardGroup, baseSeed)`. The default base seed `GOLDEN_RATIO_BIGINT` must never
+  change.
+- The seed is a hex string, so it stays JSON-safe in the stored identity. A caller that hashes parses it to a
+  `bigint` once for each shard group (M2).
 - The hashPrefixBucket is `hashers.h64Raw(hashKey, seed)`, written big-endian with
   `DataView.setBigUint64(0, h, false)`. Thus the unsigned byte order of the BLOB is the numeric order of the hash,
   with no sign-bit change.
 - The input is the `KeyCodec` bytes of the hash key: the bytes that the partition stores in `hk`.
+- The width is the code constant `HASH_PREFIX_BUCKET_BYTES` (8). No type, request, or stored record holds it.
 - `xxhash-wasm` is already a dependency of `hash-primitives.ts`, so no package is added.
 
-**The topology fields.** In `sharding/route-context.ts`:
+**The topology does not change.** `FokosTopology`, `validateTopology`, `topologiesEqual`, the topology event, the
+keeper tables, the headers of the topology encodings, and the cache keys do not get a seed or a width. Each derived
+shard group (the coordinator group, the materialization group, and each GSI) still makes its topology with
+`{ ...table.topology, shardGroup }`. The seed comes from the shard group name, so the spread is correct.
+
+**The seed in the partition identity.** In `sharding/route-context.ts`:
 
 ```ts
-export type FokosTopology = {
-	shardGroup: string;
-	rootTreesN: number;
-	hashSplitN: number;
-	jurisdiction?: DurableObjectJurisdiction;
-	/** `hashPrefixBucketSeedOf(shardGroup)`. Stored, so a change of the derivation shows as a mismatch. */
+export type FokosPartitionIdentity = {
+	// ... the fields of today ...
+	/**
+	 * `hashPrefixBucketSeedOf(topology.shardGroup)` when the identity was written. A partition whose
+	 * stored seed differs from the seed that the code computes now refuses all work, because its
+	 * stored rows and its routes use the stored seed.
+	 */
 	hashPrefixBucketSeed: string;
-	/** The byte count of a stored hashPrefixBucket. 8 is the only value. */
-	hashPrefixBucketBytes: 8;
 };
 ```
 
-- The seed is a hex string, so the topology stays JSON-safe in the topology event, the headers of the topology
-  encodings, and the cache keys. The code parses it to a `bigint` once for each identity.
-- `validateTopology` refuses a `hashPrefixBucketBytes` other than 8, and a `hashPrefixBucketSeed` other than
-  `hashPrefixBucketSeedOf(shardGroup)`. The user never gives a seed.
-- `topologiesEqual` compares the two fields. Its `satisfies Record<keyof FokosTopology, boolean>` makes a field that
-  it does not compare a compile error.
+- `partitionIdentityFrom` sets the field for a hash partition and for a range partition. A partition writes its
+  identity once, at bootstrap or at `fokosInit`.
+- When the runtime loads the identity in its constructor, it puts the identity in memory, then compares the stored
+  seed with `hashPrefixBucketSeedOf(identity.topology.shardGroup)`. A difference raises
+  `partition_context_mismatch` into the initialization error of the runtime. Every operation then answers
+  `partition_init_failed`, the alarm retries at `INIT_RETRY_ALARM_MS`, and `fokosStatus`, `fokosPrepareDestroy`, and
+  `fokosDestroy` stay available. A deployment of the old derivation heals the object.
+- The coordinator and the materialization partitions host the same runtime, so they get the same check.
+- An identity without the field fails the check. Section 4.2.2 deploys to new namespaces, so no such identity
+  exists.
 
-**Each derived shard group gets its own seed.** Today `materializationTableConfig`, `gsiTableConfig` (in
-`shared/partition-context.ts`), and the coordinator topology in `client/db.ts` make a topology with
-`{ ...table.topology, shardGroup }`. The spread keeps the seed of the partition group, and `validateTopology` then
-refuses it. A new helper, `withShardGroup(topology, shardGroup)`, sets the shard group and its seed. Each of these
-sites uses it. `createTableConfig` sets the fields of the partition group.
-
-**The topology event and the keeper.** `FokosTopologyEvent` (`topology-codec.ts`) carries `hashPrefixBucketSeed` and
-`hashPrefixBucketBytes`. `FokosTopologyKeeper.registerRepartition` validates them with `validateTopology`.
-`fokos_topo_groups` stores them in two more columns beside `root_trees_n` and `hash_split_n`, set by the first report
-after a reset. A report with other values fails, as a report with another `rootTreesN` fails today. The header of the
-hash topology encoding carries the two fields. A caller drops a hash topology encoding whose fields differ from its own
-`FokosTopology`, as it drops one with another `rootTreesN` today.
-
-**Code that changes.** `sharding/hash-primitives.ts`, `sharding/route-context.ts`, `shared/partition-context.ts`,
-`client/db.ts` (the coordinator topology), `sharding/topology-codec.ts`, `sharding/topology-encode.ts`
-(`topologyEventFromWire`, `encodeHashBody`), `sharding/topology-keeper.ts`, and `sharding/exports-client.ts` (it
-exports `hashPrefixBucket` and `hashPrefixBucketSeedOf`).
+**Code that changes.** `sharding/hash-primitives.ts`, `sharding/route-context.ts` (the identity type),
+`sharding/partition-id.ts` (`partitionIdentityFrom`), `sharding/runtime.ts` (the check at load), and
+`sharding/exports-client.ts` (it exports `hashPrefixBucket` and `hashPrefixBucketSeedOf`).
 
 **Invariants.** I1, I2 (the width).
 
 **New tests.**
 
-- `hashPrefixBucket` gives 8 bytes, big-endian, equal to `h64Raw` of the key bytes. A fixed key and seed give a
-  pinned value, so a change of the function fails the test.
-- The partition, coordinator, materialization, and GSI groups of one table get four different seeds. Each seed is
-  `hashPrefixBucketSeedOf` of its group.
-- `validateTopology` refuses a wrong width and a wrong seed, also a seed that a spread copied. A partition answers a
-  request with another seed with `partition_context_mismatch`. The keeper refuses a report with another seed.
+- `hashPrefixBucket` gives 8 bytes, big-endian, equal to `h64Raw` of the key bytes. A fixed shard group and a fixed
+  key give a pinned seed and a pinned hashPrefixBucket, so a change of the derivation or of the function fails the
+  test.
+- A custom base seed gives `hash64(shardGroup, baseSeed)`, and the default equals `GOLDEN_RATIO_BIGINT`.
+- The partition, coordinator, materialization, and GSI groups of one table get four different seeds.
+- `partitionIdentityFrom` stores the seed of the shard group, for a hash identity and for a range identity.
+- A partition whose stored seed was changed answers `partition_init_failed`, still answers `fokosStatus`, and can
+  still be destroyed.
 
 #### 4.2.5 M2 — Hash routing by digits
 
@@ -535,8 +549,9 @@ hashPrefixBucket:
 | `sharding/partition-id.ts` | the re-exports go; `PartitionIdHelper` gets `hashInterval(partitionId, topology)` |
 | `sharding/exports-client.ts` | adds `hashPrefixBucketDigits` and `hashInterval`; drops the two old functions |
 
-`seedForDepth`, `SEED_DEPTH_PRIME`, and the per-depth seeds go. Each resolve computes the hashPrefixBucket of a key
-once and passes it to each step. `RouteKey` can carry it for the length of one call. The runtime must not keep it
+`seedForDepth`, `SEED_DEPTH_PRIME`, and the per-depth seeds go. The router, the client, and the runtime get the seed
+from `hashPrefixBucketSeedOf(topology.shardGroup)`, and keep its `bigint` form for each shard group. The topology does
+not carry it (Section 4.2.4). Each resolve computes the hashPrefixBucket of a key once and passes it to each step. `RouteKey` can carry it for the length of one call. The runtime must not keep it
 across calls, because the key bytes of a later call can differ.
 
 **The runtime identity.** `FokosPartitionIdentity.hash` becomes `{ rootIndex, path, depth, start, end }`. `depth`
@@ -1460,9 +1475,11 @@ bits above `N`.
 
 #### 4.2.13 Crafted hash keys
 
-The seed is public and deterministic, and xxHash64 is not a cryptographic hash. For short binary keys, a caller can
-invert its operations and construct inputs for a chosen full output. The design must not assume a brute-force cost of
-2^64 trials, and must not treat the seed as protection against chosen keys.
+The default base seed is public, so the seed of each shard group is public and deterministic. xxHash64 is not a
+cryptographic hash. For short binary keys, a caller can invert its operations and construct inputs for a chosen full
+output. The design must not assume a brute-force cost of 2^64 trials, and must not treat the seed as protection
+against chosen keys. A platform can give a secret base seed (Section 4.2.4). xxHash64 is not a keyed hash, so the
+design does not treat a secret base seed as protection either.
 
 The RFC accepts this availability risk:
 
@@ -1530,6 +1547,10 @@ RFC accepts the cost. A later RFC can examine it again. A switch to a migration 
 - **Promotions of a hash key, with storage by hashPrefixBucket.** A range tree then owns one hash key inside one
   hashPrefixBucket, which is still one interval. But the names, the overrides, and the topology keep the
   variable-length hash key, which this RFC removes from the topology.
+- **The seed and the width in `FokosTopology`, validated on each request.** Each RPC, the topology event, the keeper,
+  and the hash topology encoding then carry them. `validateTopology` always passes for a topology that the client
+  derives, and each derived shard group needs a helper in place of a spread. The stored seed in the partition
+  identity gives the same guard at run time with none of these costs (Section 4.2.4).
 - **A Bloom filter for every count of promoted hashPrefixBuckets** (today). It gives false positives also for a small
   set, where an exact list costs little.
 - **Elias-Fano or delta-coded sorted fingerprints above `N`.** About `log2(1/ε) + 2` bits for each hashPrefixBucket,
@@ -1567,10 +1588,16 @@ They always go to the same hash partition, and a promotion moves both. Inside a 
 intervals. Each read and write names `hk` and `sk`, so their items stay apart (I9). With 2^64 values, the chance of a
 collision among `n` hash keys is about `n^2 / 2^65`.
 
-**Why is the seed stored when the code can derive it?**
-The stored value pins the hashPrefixBucket function. If a later code change derives another seed, `validateTopology`
-refuses every request of the table, and no write goes to the wrong partition. The check also catches a derived shard
-group that copies the seed of its parent with a spread.
+**Why does the topology not carry the seed?**
+No routing step needs the seed in a request: the code derives it from the shard group name. A seed in the topology
+adds bytes to each RPC, a field to the topology event, the keeper, and the topology encodings, and a check that always
+passes, because the client derives the seed with the same function that checks it. It also makes a spread of a
+derived shard group wrong.
+
+**Then why does a partition store the seed?**
+The stored rows and the routes of a partition use the seed of the day the partition was written. If a later code
+change derives another seed, the partition refuses all work, and no write goes to the wrong place. The pinned test
+catches the same change in CI. The stored seed is the guard at run time, and it costs nothing on a request.
 
 **Why does the last interval of a level have no upper bound?**
 Its upper bound is 2^64, which has no 8-byte form. Its statements use only `hash_prefix_bucket >= start`.

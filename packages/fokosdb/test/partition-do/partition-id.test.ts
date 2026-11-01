@@ -2,6 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { hashPrefixBucketSeedOf } from "../../src/sharding/hash-primitives.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
@@ -57,6 +58,7 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 			kind: "hash",
 			hash: { rootIndex: 0, path: [] },
 			topology: partition.ctx.topology,
+			hashPrefixBucketSeed: hashPrefixBucketSeedOf(partition.ctx.topology.shardGroup),
 		});
 
 		// Split so children are initialized through fokosInit. splitHash drains the whole tree, rather
