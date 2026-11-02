@@ -9,7 +9,7 @@
  */
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
+import { childDigit } from "../hash-digits.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
@@ -544,7 +544,7 @@ describe("FokosDBPartitionDO — the locks on a hash split router", () => {
 	function keyForChild(partition: TestPartition, childIndex: number): string {
 		for (let i = 0; i < 10_000; i++) {
 			const key = `k-${i}`;
-			if (hashChildIndex(kb(key), 0, partition.ctx.topology.hashSplitN) === childIndex) {
+			if (childDigit(partition.ctx.topology, kb(key), 0) === childIndex) {
 				return key;
 			}
 		}

@@ -5,7 +5,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { hashChildIndex } from "../../src/sharding/partition-id.js";
+import { childDigit } from "../hash-digits.js";
 import { updateTree } from "../../src/shared/expression/test-fixtures.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import type { PrepareRequest, TransactionItem, TransactionItemKey } from "../../src/shared/transaction-wire-types.js";
@@ -178,8 +178,8 @@ describe("FokosDBPartitionDO — a lock row of an item with more than one operat
 
 	it("moves each lock row to its child in a hash split, and each child applies its own entries", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		const left = findKey("ordered-split", (k) => hashChildIndex(kb(k), 0, 2) === 0);
-		const right = findKey("ordered-split", (k) => hashChildIndex(kb(k), 0, 2) === 1);
+		const left = findKey("ordered-split", (k) => childDigit(partition.ctx.topology, kb(k), 0) === 0);
+		const right = findKey("ordered-split", (k) => childDigit(partition.ctx.topology, kb(k), 0) === 1);
 		const request = prepareOf([
 			put(left, "s", { n: 1 }),
 			del(right, "s"),

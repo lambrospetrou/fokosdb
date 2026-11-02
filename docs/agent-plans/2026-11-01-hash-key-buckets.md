@@ -35,6 +35,7 @@
     - [4.2.12 Performance and cost](#4212-performance-and-cost)
     - [4.2.13 Crafted hash keys](#4213-crafted-hash-keys)
   - [4.3 Decisions](#43-decisions)
+  - [4.4 Follow-ups](#44-follow-ups)
 - [5. Alternative options](#5-alternative-options)
 - [6. Frequently asked questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
@@ -1522,6 +1523,33 @@ counter and the lineage rules prevent normal collisions, and the constraint keep
 
 The index costs one key copy and one index write compared with a clustered table without it (Section 4.2.12). This
 RFC accepts the cost. A later RFC can examine it again. A switch to a migration by clone does not remove it.
+
+### 4.4 Follow-ups
+
+These changes do less work on the route path. They do not change a result, and no milestone needs them.
+
+**Measured cost.** Node, `xxhash-wasm`, keys of about 16 bytes:
+
+| Step | Time |
+| --- | ---: |
+| One `h32Raw` and a modulo (one level before M2) | 34 ns |
+| `h64Raw`, which returns a `bigint` | 81 ns |
+| `hashPrefixBucket` (the hash and one 8-byte array) | 90 ns |
+| `HashPrefixBucketDigitCursor`, the root and 4 levels | 13 ns to 16 ns |
+
+The digit walk costs little. The hash is the cost, so each follow-up removes a repeated hash or an array:
+
+1. **`FokosShardingRuntime#resolve`** hashes a key in `#ownsByTopology` and again in `#hashTopologyOwner` on a router.
+   Compute the hashPrefixBucket once and give it to both.
+2. **`FokosShardingRuntime#learn`** hashes each key again for each node of the envelope. Compute the hashPrefixBucket
+   of each key once for the call.
+3. **`FokosShardingRuntime#hashDescendant`** makes the digit array from the root, then removes the levels of the
+   partition with `slice`. Step the cursor past the depth of the partition, and collect only the levels below it.
+4. **`hashKeyInSlice`** (`repartition-slice.ts`) makes a digit array for each row that a migration reads. Step the
+   cursor to the digit at `slice.depth - 1`, with no array.
+5. **`FokosShardingClient#resolveKey`** hashes a key in `FokosRouter.rootContext` and again for `findLeaf`. Removing
+   the second hash needs a router method that takes a hashPrefixBucket, which adds to the public API of the sharding
+   client.
 
 ## 5. Alternative options
 

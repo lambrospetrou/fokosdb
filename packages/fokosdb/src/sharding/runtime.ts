@@ -16,7 +16,13 @@ import { throttleTrailing } from "../shared/tsutils.js";
 import { AddResult } from "../shared/bloom-filter.js";
 import { attachRouting, envelope, RouteCollector, routedError } from "./envelope.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
-import { hashChildIndex, hashPrefixBucketSeedOf, hashRootIndex } from "./hash-primitives.js";
+import {
+	HashPrefixBucketDigitCursor,
+	hashPrefixBucketDigits,
+	hashPrefixBucketOf,
+	hashPrefixBucketSeedOf,
+	inHashPrefixBucketInterval,
+} from "./hash-primitives.js";
 import { HashTopology } from "./hash-topology.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
@@ -543,7 +549,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				cutTopologyHint(resolution.topologyHint.entry, resolution.topologyHint.pos);
 			}
 			const arena = this.#arena();
-			if (arena?.invalidate(hashKey, resolution.relDepth!)) {
+			if (arena?.invalidate(this.#bucket(hashKey), resolution.relDepth!)) {
 				this.#store.putHashArena(arena.toSnapshot());
 			}
 			return retry(HINTED);
@@ -1300,12 +1306,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				attributes: { operation: req.op },
 			});
 		}
-		const hashSplitN = this.identity().topology.hashSplitN;
+		const topology = this.identity().topology;
 		const routeCtx = this.routeContext();
 
 		if (descriptor.shape === "point") {
 			const key = descriptor.key(req.request);
-			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, hashSplitN)) {
+			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, topology)) {
 				throw misrouted(req.op, "key outside the caller slice");
 			}
 			// A promoted key's rows live in the range tree; the local copies are stale or already
@@ -1328,7 +1334,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const groups: Groups = { local: [], remote: new Map() };
 			for (const entry of descriptor.items(req.request)) {
 				const { hashKey, sortKey } = entry.key;
-				if (!sliceIncludesItem(slice, hashKey, sortKey, hashSplitN)) {
+				if (!sliceIncludesItem(slice, hashKey, sortKey, topology)) {
 					throw misrouted(req.op, "key outside the caller slice");
 				}
 				const promoted = slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(hashKey);
@@ -1341,7 +1347,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		invariant(descriptor.shape === "range", "fokos/runtime: read_source is allowed for point, group and range operations only");
 		const input = descriptor.range(req.request);
-		if (!sliceIncludesHashKey(slice, input.hashKey, hashSplitN)) {
+		if (!sliceIncludesHashKey(slice, input.hashKey, topology)) {
 			throw misrouted(req.op, "hash key outside the caller slice");
 		}
 		let request = req.request;
@@ -1697,12 +1703,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	#hashesHere(hashKey: KeyBytes, identity: FokosPartitionIdentity): boolean {
-		const hash = identity.hash!;
-		const { rootTreesN, hashSplitN } = identity.topology;
-		if (hashRootIndex(hashKey, rootTreesN) !== hash.rootIndex) {
-			return false;
-		}
-		return hash.path.every((idx, depth) => hashChildIndex(hashKey, depth, hashSplitN) === idx);
+		const { start, end } = identity.hash!;
+		return inHashPrefixBucketInterval(this.#bucket(hashKey), start, end);
+	}
+
+	/** The hashPrefixBucket of a hash key in the shard group of this partition. It is not kept after the call. */
+	#bucket(hashKey: KeyBytes): Uint8Array {
+		return hashPrefixBucketOf(hashKey, this.identity().topology.shardGroup);
 	}
 
 	/** `view` is read here when the caller does not give one. A hash key with a cut-over override does not need it. */
@@ -1750,13 +1757,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (!router) {
 			return { kind: "local" };
 		}
-		let relDepth = Math.max(1, this.#arena()?.findLeaf(hashKey) ?? 0);
+		const bucket = this.#bucket(hashKey);
+		let relDepth = Math.max(1, this.#arena()?.findLeaf(bucket) ?? 0);
 		let topologyHint: RemoteResolution["topologyHint"];
 		const cacheOptions = this.#topologyCache?.();
 		const entry = cacheOptions && cachedHashTopology(cacheOptions, this.identity().topology);
 		if (entry) {
 			const { rootTreesN, hashSplitN } = this.identity().topology;
-			const leaf = findLeaf(entry.view, rootTreesN, hashSplitN, hashKey, entry.cut);
+			const leaf = findLeaf(entry.view, rootTreesN, hashSplitN, bucket, entry.cut);
 			const topologyDepth = leaf.path.length - identityDepth(this.identity());
 			if (topologyDepth >= relDepth) {
 				relDepth = topologyDepth;
@@ -1765,7 +1773,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		return {
 			kind: "remote",
-			target: this.#hashDescendant(hashKey, relDepth),
+			target: this.#hashDescendant(bucket, relDepth),
 			speculative: false,
 			via: "hash",
 			relDepth,
@@ -1791,11 +1799,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return { kind: "remote", target, speculative, via, learned: jump };
 	}
 
-	/** The hash descendant `relDepth` levels below this partition that owns `hashKey`. */
-	#hashDescendant(hashKey: KeyBytes, relDepth: number): FokosPartitionRef {
+	/** The hash descendant `relDepth` levels below this partition that owns a hashPrefixBucket. */
+	#hashDescendant(hashPrefixBucket: Uint8Array, relDepth: number): FokosPartitionRef {
 		const identity = this.identity();
+		const { rootTreesN, hashSplitN } = identity.topology;
 		const depth = identityDepth(identity);
-		const idxs = Array.from({ length: relDepth }, (_, i) => hashChildIndex(hashKey, depth + i, identity.topology.hashSplitN));
+		const idxs = hashPrefixBucketDigits(hashPrefixBucket, rootTreesN, hashSplitN, depth + relDepth).path.slice(depth);
 		return refOf(resolveDescendantHashPartitionContext(this.routeContext(), idxs));
 	}
 
@@ -1824,7 +1833,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const opts = { budgetBytes: this.#config().hashArenaBytes };
 		this.#hashArena = snapshot
 			? HashTopology.fromSnapshot(snapshot, opts)
-			: HashTopology.create(identity.topology.hashSplitN, identityDepth(identity), opts);
+			: HashTopology.create(identity.topology.rootTreesN, identity.topology.hashSplitN, identityDepth(identity), opts);
 		return this.#hashArena;
 	}
 
@@ -1847,8 +1856,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				bases = [{ target: root, start: null, end: null, speculative: true }];
 				learned = this.#store.listLearnedRangeSlices(input.hashKey);
 			} else if (this.#source.routerRole()) {
-				const relDepth = Math.max(1, this.#arena()?.findLeaf(input.hashKey) ?? 0);
-				bases = [{ target: this.#hashDescendant(input.hashKey, relDepth), start: null, end: null, speculative: false }];
+				const bucket = this.#bucket(input.hashKey);
+				const relDepth = Math.max(1, this.#arena()?.findLeaf(bucket) ?? 0);
+				bases = [{ target: this.#hashDescendant(bucket, relDepth), start: null, end: null, speculative: false }];
 			} else {
 				bases = [{ target: "local", start: null, end: null, speculative: false }];
 			}
@@ -2026,7 +2036,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const learnDepth = (hashKey: KeyBytes, hashDepth: number) => {
 			const relDepth = hashDepth - myDepth;
 			if (arena && relDepth > 0) {
-				arenaChanged = arena.updateFromHint(hashKey, relDepth) || arenaChanged;
+				arenaChanged = arena.updateFromHint(this.#bucket(hashKey), relDepth) || arenaChanged;
 			}
 		};
 		for (const node of nodes) {
@@ -2075,7 +2085,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			const bytes = Uint8Array.fromHex(node.ref.partitionId);
 			for (const hashKey of hashKeys) {
-				if (hashPathOwns(bytes, hashKey, identity.topology)) {
+				if (hashPathOwns(bytes, this.#bucket(hashKey), identity.topology)) {
 					learnDepth(hashKey, node.hashDepth);
 				}
 			}
@@ -2551,17 +2561,18 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 	return typeof value === "object" && value !== null && typeof (value as { then?: unknown }).then === "function";
 }
 
-/** True when `hashKey` hashes along the whole path a hash partition id encodes: the root index, then one child index per level. */
-function hashPathOwns(idBytes: Uint8Array, hashKey: KeyBytes, topology: { rootTreesN: number; hashSplitN: number }): boolean {
+/** True when the digits of a hashPrefixBucket follow the whole path a hash partition id encodes: the root index, then one child index per level. */
+function hashPathOwns(idBytes: Uint8Array, hashPrefixBucket: Uint8Array, topology: { rootTreesN: number; hashSplitN: number }): boolean {
 	const decoded = PartitionIdHelper.decode(idBytes);
 	if (decoded.schema !== PartitionIdHelper.SCHEMA_HASH_V1) {
 		return false;
 	}
-	if (hashRootIndex(hashKey, topology.rootTreesN) !== decoded.rootIdx) {
+	const digits = new HashPrefixBucketDigitCursor(hashPrefixBucket, topology.rootTreesN);
+	if (digits.root !== decoded.rootIdx) {
 		return false;
 	}
 	for (let d = 0; d < decoded.depth; d++) {
-		if (hashChildIndex(hashKey, d, topology.hashSplitN) !== idBytes[4 + d]) {
+		if (digits.next(topology.hashSplitN) !== idBytes[4 + d]) {
 			return false;
 		}
 	}

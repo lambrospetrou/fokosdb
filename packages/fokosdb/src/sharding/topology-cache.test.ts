@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { FokosRoutingError } from "../shared/errors.js";
 import { FokosShardingClient } from "./client.js";
 import { SHARDING_ROUTING_CODES } from "./errors.js";
-import { hashChildIndex, hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
 import type { FokosRouteContext } from "./route-context.js";
@@ -18,6 +17,8 @@ import {
 } from "./topology-cache.js";
 import { findLeaf } from "./topology-codec.js";
 import { encodeHashBitmap, encodeHashBody, encodeRangeBody, hashNodeKey, promotedKeysBloom } from "./topology-encode.js";
+import { hashDigits } from "../../test/hash-digits.js";
+import { hashPrefixBucketOf } from "./hash-primitives.js";
 
 type Ops = { op: { req: { n: number }; res: string } };
 
@@ -47,8 +48,8 @@ function setup(
 	bodies: Map<string, () => Uint8Array>,
 	failAt: (doName: string) => FokosRoutingError | null = () => null,
 	overrides: Partial<FokosTopologyCacheOptions> = {},
+	shardGroup = newShardGroup(),
 ) {
-	const shardGroup = `tc_${crypto.randomUUID()}`;
 	const pending: Promise<unknown>[] = [];
 	const fetched: string[] = [];
 	const sent: string[] = [];
@@ -91,9 +92,15 @@ function shardGroupB64(shardGroup: string): string {
 	return new TextEncoder().encode(shardGroup).toBase64({ alphabet: "base64url", omitPadding: true });
 }
 
-/** The path key of the hash child of `hashKey` below the root, with R 2 and K 2. */
-function childOf(hashKey: KeyBytes): { root: number; child: number } {
-	return { root: hashRootIndex(hashKey, 2), child: hashChildIndex(hashKey, 0, 2) };
+/** A new shard group, so no two tests share a cache entry. */
+function newShardGroup(): string {
+	return `tc_${crypto.randomUUID()}`;
+}
+
+/** The root and the hash child of `hashKey` below the root, with R 2 and K 2. */
+function childOf(shardGroup: string, hashKey: KeyBytes): { root: number; child: number } {
+	const { root, path } = hashDigits({ shardGroup, rootTreesN: 2, hashSplitN: 2 }, hashKey, 1);
+	return { root, child: path[0] };
 }
 
 const GET = topologyGetPath("SG");
@@ -106,8 +113,9 @@ function rootId(root: number): Uint8Array {
 describe("topology cache — hash entries", () => {
 	it("starts one fetch through waitUntil, keeps no promise, and enters at the leaf after the fetch", async () => {
 		const key = { hashKey: KeyCodec.encode("alpha"), sortKey: NO_SORT_KEY };
-		const { root, child } = childOf(key.hashKey);
-		const t = setup(new Map([[GET, () => hashBody({ version: 1, splits: [rootId(root)] })]]));
+		const shardGroup = newShardGroup();
+		const { root, child } = childOf(shardGroup, key.hashKey);
+		const t = setup(new Map([[GET, () => hashBody({ version: 1, splits: [rootId(root)] })]]), undefined, {}, shardGroup);
 		const first = t.client.resolve(key);
 		expect(first.doName).toBe(PartitionIdHelper.hashId(t.shardGroup, root).doName);
 		// The refresh is in flight, so a second read starts no fetch.
@@ -145,9 +153,10 @@ describe("topology cache — hash entries", () => {
 
 	it("refuses an older version", async () => {
 		const key = { hashKey: KeyCodec.encode("beta"), sortKey: NO_SORT_KEY };
-		const { root, child } = childOf(key.hashKey);
+		const shardGroup = newShardGroup();
+		const { root, child } = childOf(shardGroup, key.hashKey);
 		let version = 5;
-		const t = setup(new Map([[GET, () => hashBody({ version, splits: version === 5 ? [rootId(root)] : [] })]]));
+		const t = setup(new Map([[GET, () => hashBody({ version, splits: version === 5 ? [rootId(root)] : [] })]]), undefined, {}, shardGroup);
 		t.client.resolve(key);
 		await t.settle();
 		version = 3;
@@ -159,10 +168,8 @@ describe("topology cache — hash entries", () => {
 	it("drops a body of another hashSplitN, and a body larger than the budget", async () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const key = { hashKey: KeyCodec.encode("gamma"), sortKey: NO_SORT_KEY };
-		const { root } = childOf(key.hashKey);
-		const rootName = PartitionIdHelper.hashId("", root).doName;
 		for (const body of [
-			() => hashBody({ version: 1, K: 3, splits: [rootId(root)] }),
+			(root: number) => hashBody({ version: 1, K: 3, splits: [rootId(root)] }),
 			// 17 MiB of bitmap, with the number of splits that this bit count needs.
 			() => {
 				const bits = new Uint8Array(17 * 1024 * 1024);
@@ -179,10 +186,12 @@ describe("topology cache — hash entries", () => {
 				});
 			},
 		]) {
-			const t = setup(new Map([[GET, body]]));
+			const shardGroup = newShardGroup();
+			const { root } = childOf(shardGroup, key.hashKey);
+			const t = setup(new Map([[GET, () => body(root)]]), undefined, {}, shardGroup);
 			t.client.resolve(key);
 			await t.settle();
-			expect(t.client.resolve(key).doName).toBe(t.shardGroup + rootName);
+			expect(t.client.resolve(key).doName).toBe(PartitionIdHelper.hashId(shardGroup, root).doName);
 		}
 		const errors = warn.mock.calls.map(([entry]) => String((entry as { error: string }).error));
 		expect(errors.some((e) => e.includes("hashSplitN 3"))).toBe(true);
@@ -191,15 +200,18 @@ describe("topology cache — hash entries", () => {
 
 	it("after a miss at a topology entry, sends again to the parent and cuts the hint", async () => {
 		const key = { hashKey: KeyCodec.encode("delta"), sortKey: NO_SORT_KEY };
-		const { root, child } = childOf(key.hashKey);
+		const shardGroup = newShardGroup();
+		const { root, child } = childOf(shardGroup, key.hashKey);
 		const deep = (sg: string) => PartitionIdHelper.hashId(sg, root, [child]).doName;
-		let shardGroup = "";
-		const t = setup(new Map([[GET, () => hashBody({ version: 1, splits: [rootId(root)] })]]), (doName) =>
-			doName === deep(shardGroup)
-				? new FokosRoutingError(SHARDING_ROUTING_CODES.hash_partition_not_initialized, { message: "no identity", attributes: { doName } })
-				: null,
+		const t = setup(
+			new Map([[GET, () => hashBody({ version: 1, splits: [rootId(root)] })]]),
+			(doName) =>
+				doName === deep(shardGroup)
+					? new FokosRoutingError(SHARDING_ROUTING_CODES.hash_partition_not_initialized, { message: "no identity", attributes: { doName } })
+					: null,
+			{},
+			shardGroup,
 		);
-		shardGroup = t.shardGroup;
 		t.client.resolve(key);
 		await t.settle();
 		const result = await t.client.point("op", key, { n: 1 });
@@ -242,20 +254,26 @@ describe("topology cache — scope", () => {
 
 describe("topology cache — bounded fallback", () => {
 	const key = { hashKey: KeyCodec.encode("stale"), sortKey: NO_SORT_KEY };
-	const { root } = childOf(key.hashKey);
 	const missing = (doName: string) =>
 		new FokosRoutingError(SHARDING_ROUTING_CODES.hash_partition_not_initialized, {
 			message: "no identity",
 			attributes: { doName },
 		});
-	const chain = (depth: number) => {
-		const path = Array.from({ length: depth }, (_, d) => hashChildIndex(key.hashKey, d, 2));
-		return Array.from({ length: depth }, (_, d) => path.slice(0, d));
-	};
+	/**
+	 * A client of a new shard group, with a topology of the split nodes that `makePaths` gives under the
+	 * root of the key. `chain(depth)` is the path of the key and each of its ancestors, `depth` levels.
+	 */
 	const setupTree = (
-		paths: number[][],
-		failAt = (doName: string): FokosRoutingError | null => (doName.includes(`~h.${root}.`) ? missing(doName) : null),
+		makePaths: (chain: (depth: number) => number[][]) => number[][],
+		failAt?: (doName: string) => FokosRoutingError | null,
 	) => {
+		const shardGroup = newShardGroup();
+		const chain = (depth: number) => {
+			const { path } = hashDigits({ shardGroup, rootTreesN: 2, hashSplitN: 2 }, key.hashKey, depth);
+			return Array.from({ length: depth }, (_, d) => path.slice(0, d));
+		};
+		const { root } = childOf(shardGroup, key.hashKey);
+		const paths = makePaths(chain);
 		const nodes = paths.map((path) => hashNodeKey(PartitionIdHelper.fromHashIdxs("sg", [root, ...path]).encode(false).bytes));
 		const bytes = encodeHashBody({
 			epoch: 1,
@@ -265,7 +283,12 @@ describe("topology cache — bounded fallback", () => {
 			bitmap: encodeHashBitmap(2, 2, nodes.length, () => nodes),
 			bloom: promotedKeysBloom(0, () => []),
 		});
-		const t = setup(new Map([[GET, () => bytes]]), failAt, { refreshMs: Number.MAX_SAFE_INTEGER });
+		const t = setup(
+			new Map([[GET, () => bytes]]),
+			failAt ?? ((doName) => (doName.includes(`~h.${root}.`) ? missing(doName) : null)),
+			{ refreshMs: Number.MAX_SAFE_INTEGER },
+			shardGroup,
+		);
 		return { ...t, rootName: PartitionIdHelper.hashId(t.shardGroup, root).doName };
 	};
 
@@ -273,12 +296,12 @@ describe("topology cache — bounded fallback", () => {
 		const paths = Array.from({ length: 11 }, (_, depth) =>
 			Array.from({ length: 2 ** depth }, (_, n) => Array.from({ length: depth }, (_, d) => (n >>> (depth - d - 1)) & 1)),
 		).flat();
-		const t = setupTree(paths);
+		const t = setupTree(() => paths);
 		t.client.resolve(key);
 		await t.settle();
 		const target = t.client.resolve(key);
 		const entry = cachedHashTopology(t.cache, target.topology)!;
-		const leaf = findLeaf(entry.view, 2, 2, key.hashKey, entry.cut);
+		const leaf = findLeaf(entry.view, 2, 2, hashPrefixBucketOf(key.hashKey, t.shardGroup), entry.cut);
 		for (let pos = 2048; entry.cut.size < TOPOLOGY_CUT_MAX; pos++) {
 			if (pos !== leaf.pos) {
 				cutTopologyHint(entry, pos);
@@ -292,7 +315,7 @@ describe("topology cache — bounded fallback", () => {
 	});
 
 	it.each([17, 32])("enters at the root after bounded fallback through %i stale levels", async (depth) => {
-		const t = setupTree(chain(depth));
+		const t = setupTree((chain) => chain(depth));
 		t.client.resolve(key);
 		await t.settle();
 		const result = await t.client.point("op", key, { n: 1 });
@@ -303,7 +326,7 @@ describe("topology cache — bounded fallback", () => {
 	});
 
 	it("propagates a miss at the root after the final fallback", async () => {
-		const t = setupTree(chain(32), missing);
+		const t = setupTree((chain) => chain(32), missing);
 		t.client.resolve(key);
 		await t.settle();
 		await expect(t.client.point("op", key, { n: 1 })).rejects.toMatchObject({ attributes: { doName: t.rootName } });
@@ -314,7 +337,10 @@ describe("topology cache — bounded fallback", () => {
 
 	it("does not fall back after a nested miss at the fallback bound", async () => {
 		let calls = 0;
-		const t = setupTree(chain(32), (doName) => missing(++calls === 17 ? "another-partition" : doName));
+		const t = setupTree(
+			(chain) => chain(32),
+			(doName) => missing(++calls === 17 ? "another-partition" : doName),
+		);
 		t.client.resolve(key);
 		await t.settle();
 		await expect(t.client.point("op", key, { n: 1 })).rejects.toMatchObject({ attributes: { doName: "another-partition" } });
@@ -382,7 +408,7 @@ describe("topology cache — range entries", () => {
 		t.client.resolve({ hashKey, sortKey: k("h") });
 		await t.settle();
 		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toBe(
-			PartitionIdHelper.hashId(t.shardGroup, hashRootIndex(hashKey, 2)).doName,
+			PartitionIdHelper.hashId(t.shardGroup, childOf(t.shardGroup, hashKey).root).doName,
 		);
 	});
 
@@ -398,6 +424,6 @@ describe("topology cache — range entries", () => {
 		await t.settle();
 		const result = await t.client.point("op", { hashKey, sortKey: k("h") }, { n: 1 });
 		expect(result.clientRpcs).toBe(2);
-		expect(result.value).toBe(PartitionIdHelper.hashId(t.shardGroup, hashRootIndex(hashKey, 2)).doName);
+		expect(result.value).toBe(PartitionIdHelper.hashId(t.shardGroup, childOf(t.shardGroup, hashKey).root).doName);
 	});
 });

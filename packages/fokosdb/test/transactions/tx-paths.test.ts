@@ -72,7 +72,7 @@ describe("transactions - single-partition fast path", () => {
 		const db = sharedDb;
 		const slowDb = sharedSlowDb;
 
-		const keys = keysInOnePartition(db, 3, "fast-read");
+		const keys = keysInOnePartition([db, slowDb], 3, "fast-read");
 		expect(countDistinctPartitions(db, keys)).toBe(1);
 		// Only two of the three are written, so an absent key is checked on both paths as well.
 		for (const key of keys.slice(0, 2)) {
@@ -98,7 +98,7 @@ describe("transactions - single-partition fast path", () => {
 		const db = sharedDb;
 		const slowDb = sharedSlowDb;
 
-		const keys = keysInOnePartition(db, 2, "fast-read-proj");
+		const keys = keysInOnePartition([db, slowDb], 2, "fast-read-proj");
 		expect(countDistinctPartitions(db, keys)).toBe(1);
 		for (const key of keys) {
 			await db.putItem({ ...key, data: { n: 1, tag: key.hashKey } });

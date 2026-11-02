@@ -63,8 +63,11 @@ export type FokosPartitionIdentity = {
 	schema: 1;
 	ref: FokosPartitionRef;
 	kind: "hash" | "range";
-	/** Hash: the root index and the child path, decoded from `ref.partitionId`. */
-	hash?: { rootIndex: number; path: number[] };
+	/**
+	 * Hash: the root index and the child path, decoded from `ref.partitionId`, and the hashPrefixBucket
+	 * interval `[start, end)` of the node. `depth` is `path.length`, and a null `end` has no upper bound.
+	 */
+	hash?: { rootIndex: number; path: number[]; depth: number; start: Uint8Array; end: Uint8Array | null };
 	range?: {
 		hashKey: KeyBytes;
 		start: KeyBytes | null;

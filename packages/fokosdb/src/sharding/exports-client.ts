@@ -27,10 +27,9 @@ export {
 	GOLDEN_RATIO_BIGINT,
 	hash32,
 	hash64,
-	hashChildIndex,
 	hashPrefixBucket,
+	hashPrefixBucketDigits,
 	hashPrefixBucketSeedOf,
-	hashRootIndex,
 } from "./hash-primitives.js";
 
 // ─── Identity and context ─────────────────────────────────────────────────────

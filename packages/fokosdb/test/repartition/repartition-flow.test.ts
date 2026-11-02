@@ -9,7 +9,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
-import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
+import { childDigit, type DigitTopology } from "../hash-digits.js";
 import {
 	kb,
 	keySizeEstimate,
@@ -40,10 +40,10 @@ function expectBackoffWindow(actual: number, now: number, attempt: number, base 
 }
 
 /** A hash key each test can point at a known child of the root. */
-function keyForChild(childIndex: number, hashSplitN: number, prefix = "k"): string {
+function keyForChild(childIndex: number, topology: DigitTopology, prefix = "k"): string {
 	for (let i = 0; i < 100_000; i++) {
 		const key = `${prefix}-${i}`;
-		if (hashChildIndex(kb(key), 0, hashSplitN) === childIndex) {
+		if (childDigit(topology, kb(key), 0) === childIndex) {
 			return key;
 		}
 	}
@@ -419,7 +419,7 @@ describe("Repartition — the migration protocol", () => {
 			expect(pulls.pending_tx, `${child.doName}: the lock stream took one page`).toBeGreaterThan(1);
 
 			// Each row and each lock that the child owns arrived exactly once, and nothing else arrived.
-			const owned = ({ hk }: { hk: KeyBytes }) => hashChildIndex(hk, 0, hashSplitN) === childIndex;
+			const owned = ({ hk }: { hk: KeyBytes }) => childDigit(c.base.topology, hk, 0) === childIndex;
 			const imported = await child.enter(rows);
 			expect(imported.items).toEqual(source.items.filter(owned));
 			expect(imported.locks).toEqual(source.locks.filter(owned));
@@ -429,8 +429,8 @@ describe("Repartition — the migration protocol", () => {
 	it("runs a hash split end to end: pages, imported, ack, completed, cleaned", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const keyA = keyForChild(0, c.base.topology.hashSplitN, "a");
-		const keyB = keyForChild(1, c.base.topology.hashSplitN, "b");
+		const keyA = keyForChild(0, c.base.topology, "a");
+		const keyB = keyForChild(1, c.base.topology, "b");
 
 		await root.enter(({ source, store }) => {
 			putItem(store, keyA, "s1");
@@ -561,7 +561,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -571,7 +571,7 @@ describe("Repartition — the migration protocol", () => {
 		await child.enter(async ({ target, store }) => {
 			expect(target.importState()).toBe("imported");
 			// A user delete lands on the finished copy.
-			store.deleteItem({ hk: kb(keyForChild(0, c.base.topology.hashSplitN, "a")), sk: kb("s1"), txOrderTs: 99 });
+			store.deleteItem({ hk: kb(keyForChild(0, c.base.topology, "a")), sk: kb("s1"), txOrderTs: 99 });
 			// A page that arrives now must not put the row back: the record says the import is over, and
 			// the ingest inserts an absent row rather than failing on it.
 			expect(await target.importOnePage()).toBe("idle");
@@ -583,7 +583,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -613,7 +613,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -643,7 +643,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -880,9 +880,8 @@ describe("Repartition — promotions", () => {
 		// Each page scans at most 5 entries. A key of the sibling is one entry, whatever its row count.
 		const c = makeCluster({ runtimeConfig: { migrationScanRows: 5 } });
 		const root = c.hashNode([0]);
-		const { hashSplitN } = c.base.topology;
-		const own = ["a", "b", "c"].map((prefix) => keyForChild(0, hashSplitN, prefix));
-		const sibling = Array.from({ length: 10 }, (_, i) => keyForChild(1, hashSplitN, `p${i}`));
+		const own = ["a", "b", "c"].map((prefix) => keyForChild(0, c.base.topology, prefix));
+		const sibling = Array.from({ length: 10 }, (_, i) => keyForChild(1, c.base.topology, `p${i}`));
 		await root.enter(({ source, store }) => {
 			for (const key of own) {
 				putItem(store, key, "s1");
@@ -899,7 +898,7 @@ describe("Repartition — promotions", () => {
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
-		const owned = ({ hk }: { hk: KeyBytes }) => hashChildIndex(hk, 0, hashSplitN) === 0;
+		const owned = ({ hk }: { hk: KeyBytes }) => childDigit(c.base.topology, hk, 0) === 0;
 		const rows = ({ store }: NodeEnv) => ({
 			items: [...store.queryItemsPage(null, 10_000, null)].map(({ hk, sk }) => ({ hk, sk })),
 			locks: [...store.queryPendingTxPage(null, 10_000, null)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
@@ -980,7 +979,7 @@ describe("Repartition — promotions", () => {
 	it("names each quarantined lock that a hash child imports, with the name of the child", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const key = keyForChild(1, c.base.topology.hashSplitN, "q");
+		const key = keyForChild(1, c.base.topology, "q");
 		await root.enter(({ source, store }) => {
 			putItem(store, key, "s1");
 			store.insertPendingLock({ ...lockRow(key, "s1", "tx-g"), guarded_at: 77 });
@@ -1070,7 +1069,7 @@ describe("Repartition — promotions", () => {
 				pages.locks += added.locks > 0 ? 1 : 0;
 			}
 
-			const owned = ({ hk }: { hk: KeyBytes }) => hashChildIndex(hk, 0, hashSplitN) === childIndex;
+			const owned = ({ hk }: { hk: KeyBytes }) => childDigit(c.base.topology, hk, 0) === childIndex;
 			const imported = await child.enter(rows);
 			expect(imported.items).toEqual(source.items.filter(owned));
 			expect(imported.locks).toEqual(source.locks.filter(owned));
@@ -1083,8 +1082,8 @@ describe("Repartition — promotions", () => {
 	it("hands a finished promotion to the hash child that inherits the key, with no item copy", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const promoted = keyForChild(0, c.base.topology.hashSplitN, "p");
-		const plain = keyForChild(0, c.base.topology.hashSplitN, "q");
+		const promoted = keyForChild(0, c.base.topology, "p");
+		const plain = keyForChild(0, c.base.topology, "q");
 
 		await root.enter(({ source, store, sharding }) => {
 			putItem(store, promoted, "s1");
@@ -1120,8 +1119,8 @@ describe("Repartition — promotions", () => {
 	it("gives a hash child only the overrides inside its own slice", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const mine = keyForChild(0, c.base.topology.hashSplitN, "m");
-		const sibling = keyForChild(1, c.base.topology.hashSplitN, "s");
+		const mine = keyForChild(0, c.base.topology, "m");
+		const sibling = keyForChild(1, c.base.topology, "s");
 
 		await root.enter(({ source, sharding }) => {
 			source.queue({ kind: "key_promotion", hashKey: kb(mine) });

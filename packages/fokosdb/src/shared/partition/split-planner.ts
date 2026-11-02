@@ -1,3 +1,4 @@
+import { maxHashDepth } from "../../sharding/hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import type { FokosPartitionIdentity } from "../../sharding/route-context.js";
 import type { FokosShardingHooks } from "../../sharding/runtime-types.js";
@@ -23,8 +24,11 @@ export type SplitSource = {
 	sortKeySizes(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Iterable<{ sk: KeyBytes; bytes: number }>;
 };
 
-/** Why no repartition can make a partition smaller. */
-export type SplitFloor = "no_hash_key" | "fewer_items" | "skewed_bytes";
+/**
+ * Why no repartition can make a partition smaller. `max_depth`: a hash leaf at the depth limit of its
+ * topology has no large key to promote, and cannot hash-split.
+ */
+export type SplitFloor = "no_hash_key" | "fewer_items" | "skewed_bytes" | "max_depth";
 
 /**
  * The range split of one slice: its boundaries, or why it has none.
@@ -140,7 +144,8 @@ export class SplitPlanner {
 	 *
 	 * A hash leaf probes for two hash keys. With two or more keys, the leaf promotes its keys at or
 	 * above the promotion threshold, up to `PROMOTION_CANDIDATES_MAX` and largest first, and splits
-	 * when it has none. One key is promoted whatever its estimate: the limit reads the physical file,
+	 * when it has none. At the hash depth limit it cannot split, so with no large key it is at the
+	 * floor. One key is promoted whatever its estimate: the limit reads the physical file,
 	 * which can be much larger than the estimate. A range leaf splits when the planner finds its
 	 * boundaries, from the same arguments that the `computeRangeBoundaries` hook gets.
 	 */
@@ -169,7 +174,12 @@ export class SplitPlanner {
 		// promotion that cannot finish blocks the split, and a refused write signals no promotion.
 		// So the large keys are promoted first, and each promotion answers independently.
 		const large = this.#opts.keySizes.largestAtLeast(maxSizeBytes * this.#opts.promotionFraction(), PROMOTION_CANDIDATES_MAX);
-		return { answer: large.length > 0 ? { promote: large } : {} };
+		if (large.length > 0) {
+			return { answer: { promote: large } };
+		}
+		invariant(identity.hash, "fokos/split-planner: hash identity must have a hash");
+		const { rootTreesN, hashSplitN } = identity.topology;
+		return identity.hash.depth >= maxHashDepth(rootTreesN, hashSplitN) ? { floor: "max_depth", maxSizeBytes } : { answer: {} };
 	}
 
 	/**

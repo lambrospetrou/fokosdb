@@ -5,48 +5,13 @@ import xxhash from "xxhash-wasm";
 const hashers = await xxhash();
 
 import type { KeyBytes } from "./key-codec.js";
+import invariant from "../shared/invariant.js";
 
 // Golden Ratio constant for better hash scattering.
 // See https://softwareengineering.stackexchange.com/a/402543
 export const GOLDEN_RATIO = 0x9e3779b1;
 // The default base seed of `hashPrefixBucketSeedOf`, so a change moves every stored hashPrefixBucket. It must never change.
 export const GOLDEN_RATIO_BIGINT = BigInt(0x9e3779b1);
-
-// Odd 32-bit constant used to derive a distinct hash seed per tree depth. Oddness makes
-// `d ↦ d·PRIME mod 2^32` a bijection, so no two depths share a seed (no per-depth collisions).
-const SEED_DEPTH_PRIME = 0x85ebca77;
-
-/**
- * Per-depth hash seed (see docs/ideas/key-ordering-utf8-convergence.md). Every tree level hashes the
- * SAME key bytes and varies the xxHash seed by depth, so each level is an independent hash stream.
- * This decorrelates the levels and allocates nothing per level (no input concat, no temp buffer).
- *
- * `seedForDepth(0) === GOLDEN_RATIO`, so root selection (depth 0) and child selection share one rule.
- * Computed in defined 32-bit space (`Math.imul` = true 32-bit multiply, `>>> 0` = unsigned) to avoid
- * JS float/bitwise footguns; depths are tiny so overflow is irrelevant to correctness.
- */
-function seedForDepth(d: number): number {
-	return (GOLDEN_RATIO ^ Math.imul(d, SEED_DEPTH_PRIME)) >>> 0;
-}
-
-/**
- * Given an encoded hash key and a parent's absolute depth, compute which child slot (0..K-1) the key
- * routes to. Single source of truth for hash-based child selection.
- *
- * The seed is `seedForDepth(parentAbsDepth + 1)` — the child's own depth — so each tree level uses a
- * distinct seed and siblings never cluster regardless of the key distribution.
- */
-export function hashChildIndex(hashKey: KeyBytes, parentAbsDepth: number, K: number): number {
-	return hashers.h32Raw(hashKey, seedForDepth(parentAbsDepth + 1)) % K;
-}
-
-/**
- * Compute the root partition index for an encoded hash key across rootTreesN root partitions.
- * Separate from hashChildIndex because root selection is depth 0 (`seedForDepth(0) === GOLDEN_RATIO`).
- */
-export function hashRootIndex(hashKey: KeyBytes, rootTreesN: number): number {
-	return hashers.h32Raw(hashKey, seedForDepth(0)) % rootTreesN;
-}
 
 export function hash64(data: string | Uint8Array, seed?: bigint): bigint {
 	if (typeof data === "string") {
@@ -66,9 +31,153 @@ export function hashPrefixBucketSeedOf(shardGroup: string, baseSeed: bigint = GO
 
 /** The hashPrefixBucket of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
 export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): Uint8Array {
-	const out = new Uint8Array(8);
-	new DataView(out.buffer).setBigUint64(0, hashers.h64Raw(hashKey, seed), false);
-	return out;
+	return bucketBytes(hashers.h64Raw(hashKey, seed));
+}
+
+/** The seed of each shard group that this isolate hashed for. A shard group is a table, a GSI, or a derived group. */
+const shardGroupSeeds = new Map<string, bigint>();
+const SHARD_GROUP_SEEDS_MAX = 1024;
+
+/** The hashPrefixBucket of an encoded hash key in `shardGroup`, with the seed `hashPrefixBucketSeedOf(shardGroup)`. */
+export function hashPrefixBucketOf(hashKey: KeyBytes, shardGroup: string): Uint8Array {
+	let seed = shardGroupSeeds.get(shardGroup);
+	if (seed === undefined) {
+		// The oldest seed goes. A hit stays one lookup, and a seed is cheap to compute again.
+		if (shardGroupSeeds.size >= SHARD_GROUP_SEEDS_MAX) {
+			shardGroupSeeds.delete(shardGroupSeeds.keys().next().value!);
+		}
+		seed = hash64(shardGroup);
+		shardGroupSeeds.set(shardGroup, seed);
+	}
+	return hashPrefixBucket(hashKey, seed);
+}
+
+/** The deepest hash partition of any topology. It bounds a lopsided branch, the hash arena, and the depth byte of a partition ID. */
+export const MAX_HASH_DEPTH = 64;
+const maxDepths = new Map<number, number>();
+
+const TWO_64 = 1n << 64n;
+const TWO_32 = 0x1_0000_0000;
+
+/**
+ * A cursor over the digits of a hashPrefixBucket `x`, read as the fraction `x / 2^64`: the root digit
+ * in base `rootTreesN`, then one digit for each `next(base)`. The value is two 32-bit limbs
+ * `hi * 2^32 + lo`. One step multiplies it by `base` (at most 65,000), so each product is below 2^53
+ * and exact in a number. The digit is the part above 2^64, and the rest stays in the limbs.
+ */
+export class HashPrefixBucketDigitCursor {
+	#hi: number;
+	#lo: number;
+	readonly root: number;
+
+	constructor(hashPrefixBucket: Uint8Array, rootTreesN: number) {
+		// Read the bytes directly: a `DataView` for each cursor costs more than the whole walk.
+		const b = hashPrefixBucket;
+		this.#hi = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+		this.#lo = ((b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]) >>> 0;
+		this.root = this.next(rootTreesN);
+	}
+
+	next(base: number): number {
+		const a = this.#lo * base;
+		const carry = Math.floor(a / TWO_32);
+		const b = this.#hi * base + carry;
+		const digit = Math.floor(b / TWO_32);
+		this.#hi = b - digit * TWO_32;
+		this.#lo = a - carry * TWO_32;
+		return digit;
+	}
+}
+
+/** The digits of a hashPrefixBucket: the root digit, then one digit for each level, `depth` levels. */
+export function hashPrefixBucketDigits(
+	hashPrefixBucket: Uint8Array,
+	rootTreesN: number,
+	hashSplitN: number,
+	depth: number,
+): { root: number; path: number[] } {
+	const cursor = new HashPrefixBucketDigitCursor(hashPrefixBucket, rootTreesN);
+	const path: number[] = [];
+	for (let d = 0; d < depth; d++) {
+		path.push(cursor.next(hashSplitN));
+	}
+	return { root: cursor.root, path };
+}
+
+/**
+ * The deepest hash partition of a topology: at most `MAX_HASH_DEPTH`, and the largest `d` with
+ * `rootTreesN * hashSplitN^d <= 2^64`. Down to that depth each node interval holds at least one
+ * hashPrefixBucket, so the digits of a hashPrefixBucket are exact.
+ */
+export function maxHashDepth(rootTreesN: number, hashSplitN: number): number {
+	const memoKey = rootTreesN * 256 + hashSplitN;
+	let depth = maxDepths.get(memoKey);
+	if (depth === undefined) {
+		depth = 0;
+		let nodes = BigInt(rootTreesN);
+		while (depth < MAX_HASH_DEPTH && nodes * BigInt(hashSplitN) <= TWO_64) {
+			nodes *= BigInt(hashSplitN);
+			depth += 1;
+		}
+		maxDepths.set(memoKey, depth);
+	}
+	return depth;
+}
+
+/**
+ * The hashPrefixBucket interval `[start, end)` of the hash node at `root` and `path`. A null `end` has
+ * no upper bound: the last node of a level ends at 2^64, which has no 8-byte form. A hashPrefixBucket
+ * is in the interval exactly when its digits give `root` and `path`, because both are
+ * `floor(x * D / 2^64)` with `D = rootTreesN * hashSplitN^depth`.
+ */
+export function hashPrefixBucketInterval(
+	rootTreesN: number,
+	hashSplitN: number,
+	root: number,
+	path: ArrayLike<number>,
+): { start: Uint8Array; end: Uint8Array | null } {
+	invariant(root < rootTreesN, "fokos/hash-primitives: the hash node is outside the topology");
+	const k = BigInt(hashSplitN);
+	let numer = BigInt(root);
+	let nodes = BigInt(rootTreesN);
+	for (let d = 0; d < path.length; d++) {
+		invariant(path[d] < hashSplitN, "fokos/hash-primitives: the hash node is outside the topology");
+		numer = numer * k + BigInt(path[d]);
+		nodes *= k;
+	}
+	const start = bucketBytes(ceilDiv(numer << 64n, nodes));
+	return { start, end: numer + 1n === nodes ? null : bucketBytes(ceilDiv((numer + 1n) << 64n, nodes)) };
+}
+
+function ceilDiv(a: bigint, b: bigint): bigint {
+	return (a + b - 1n) / b;
+}
+
+// One view for every write. A `DataView` for each hashPrefixBucket made a route resolve several times
+// slower. The write and the copy have no `await` between them, so no other call can use the view.
+const scratchView = new DataView(new ArrayBuffer(8));
+const scratchBytes = new Uint8Array(scratchView.buffer);
+
+/** The 8 bytes of `value`, most significant byte first, in a new array. */
+function bucketBytes(value: bigint): Uint8Array {
+	scratchView.setBigUint64(0, value, false);
+	return scratchBytes.slice();
+}
+
+/** The unsigned byte order of two hashPrefixBuckets, which is their numeric order. */
+export function compareHashPrefixBuckets(a: Uint8Array, b: Uint8Array): number {
+	invariant(a.length === 8 && b.length === 8, "fokos/hash-primitives: hashPrefixBuckets must be 8 bytes");
+	for (let i = 0; i < 8; i++) {
+		if (a[i] !== b[i]) {
+			return a[i] - b[i];
+		}
+	}
+	return 0;
+}
+
+/** True when `hashPrefixBucket` is in `[start, end)`. A null `end` has no upper bound. */
+export function inHashPrefixBucketInterval(hashPrefixBucket: Uint8Array, start: Uint8Array, end: Uint8Array | null): boolean {
+	return compareHashPrefixBuckets(hashPrefixBucket, start) >= 0 && (end === null || compareHashPrefixBuckets(hashPrefixBucket, end) < 0);
 }
 
 export function hash32(data: string | Uint8Array, seed?: number): number {

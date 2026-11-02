@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
+import { maxHashDepth } from "../sharding/hash-primitives.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import { INIT_RETRY_ALARM_MS } from "../sharding/scheduler.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
@@ -560,7 +561,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		return {
 			// The coordinator splits above the hash split threshold of its table. It also splits above
 			// its own size limit, when that limit is smaller. A hash split moves whole tokens, so it
-			// cannot make a coordinator with one token or none smaller: that is the floor.
+			// cannot make a coordinator with one token or none smaller: that is the floor. A coordinator
+			// at the hash depth limit of its topology cannot split either.
 			evaluateSplit: ({ identity, policy }) => {
 				const databaseSize = sql.databaseSize;
 				const maxSizeBytes = maxBytes(policy);
@@ -568,7 +570,9 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					this.#splitFloorLogged = false;
 					return false;
 				}
-				if (this.hasAtLeastTwoTransactions()) {
+				const { rootTreesN, hashSplitN } = identity.topology;
+				const atDepthLimit = (identity.hash?.depth ?? 0) >= maxHashDepth(rootTreesN, hashSplitN);
+				if (!atDepthLimit && this.hasAtLeastTwoTransactions()) {
 					this.#splitFloorLogged = false;
 					return {};
 				}
@@ -577,7 +581,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					console.error({
 						message: "fokos/tc: over the split threshold, but a split cannot make this coordinator smaller",
 						...identity.ref,
-						reason: "fewer than two idempotency tokens",
+						reason: atDepthLimit ? "the hash depth limit" : "fewer than two idempotency tokens",
 						databaseSize,
 						maxSizeBytes,
 					});

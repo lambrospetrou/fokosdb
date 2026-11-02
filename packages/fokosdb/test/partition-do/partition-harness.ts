@@ -13,7 +13,6 @@ import type { FokosDBRouteContext } from "../../src/shared/partition-context.js"
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
 	PartitionIdHelper,
-	hashChildIndex,
 	isHashPartition,
 	isRangePartition,
 	resolveHashChildPartitionContexts,
@@ -21,6 +20,7 @@ import {
 	resolveRangePartitionContext,
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
+import { childDigit, hashDigits } from "../hash-digits.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
@@ -156,7 +156,7 @@ export class TestPartition {
 	async childOwning(hashKey: string): Promise<TestPartition> {
 		const children = await this.children();
 		const idBytes = Uint8Array.fromHex(this.ctx.partitionId);
-		const idx = hashChildIndex(kb(hashKey), PartitionIdHelper.depth(idBytes), this.ctx.topology.hashSplitN);
+		const idx = childDigit(this.ctx.topology, kb(hashKey), PartitionIdHelper.depth(idBytes));
 		const expected = this.hashChildren()[idx];
 		const owner = children.find((c) => c.doName === expected?.doName);
 		invariant(owner, `${this.doName}: no child owns "${hashKey}"`);
@@ -275,8 +275,8 @@ export class TestPartition {
 	 * its own context — routing is the caller's contract, not enforced on write — so filler keys
 	 * must be owned or the test stores items that production routing could never deliver here.
 	 * Reads routed through the tree would then look in a different leaf and miss them. Each
-	 * candidate is resolved through the full path (root → this node) by replaying the child index
-	 * at every depth, and kept only when it lands here. Spread: the `emitted % hashSplitN` check
+	 * candidate is resolved through the full path (root → this node) by the digits of its
+	 * hashPrefixBucket, and kept only when it lands here. Spread: the `emitted % hashSplitN` check
 	 * admits keys in round-robin order over this partition's children, so the split leaves every
 	 * child with a roughly equal share and none of them immediately crosses the threshold again.
 	 */
@@ -289,9 +289,9 @@ export class TestPartition {
 		for (let i = 0; i < 1_000_000; i++) {
 			const key = `${prefix}_${i}`;
 			const root = router.rootContext(kb(key));
-			const indices = Array.from({ length: depth }, (_, d) => hashChildIndex(kb(key), d, hashSplitN));
-			const owner = resolveDescendantHashPartitionContext(root, indices);
-			if (owner.partitionId !== this.ctx.partitionId || hashChildIndex(kb(key), depth, hashSplitN) !== emitted % hashSplitN) {
+			const { path } = hashDigits(this.ctx.topology, kb(key), depth + 1);
+			const owner = resolveDescendantHashPartitionContext(root, path.slice(0, depth));
+			if (owner.partitionId !== this.ctx.partitionId || path[depth] !== emitted % hashSplitN) {
 				continue;
 			}
 			emitted++;

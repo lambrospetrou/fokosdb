@@ -16,7 +16,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
-import { PartitionIdHelper, hashChildIndex } from "../../src/sharding/partition-id.js";
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { childDigit } from "../hash-digits.js";
 import type { MigrationStream } from "../controlled-partition-do.js";
 import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
@@ -69,7 +70,7 @@ async function moveImportOn(target: TestPartition, change: Partial<FokosImportRe
  */
 function ownerOf(parent: TestPartition, hashKey: string): TestPartition {
 	const depth = PartitionIdHelper.depth(Uint8Array.fromHex(parent.ctx.partitionId));
-	return parent.hashChildren()[hashChildIndex(kb(hashKey), depth, parent.ctx.topology.hashSplitN)];
+	return parent.hashChildren()[childDigit(parent.ctx.topology, kb(hashKey), depth)];
 }
 
 /** A parent holding one item under `HELD_KEY`, ready to split, plus the child that will own the key. */

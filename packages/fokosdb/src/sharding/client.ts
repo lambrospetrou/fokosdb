@@ -5,6 +5,7 @@ import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
+import { hashPrefixBucketOf } from "./hash-primitives.js";
 import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
 import { isRangePartition, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
@@ -214,7 +215,8 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 				}
 			}
 		}
-		const leaf = findLeaf(hash.view, topology.rootTreesN, topology.hashSplitN, hashKey, hash.cut);
+		const bucket = hashPrefixBucketOf(hashKey, topology.shardGroup);
+		const leaf = findLeaf(hash.view, topology.rootTreesN, topology.hashSplitN, bucket, hash.cut);
 		if (leaf.path.length === 0) {
 			return root;
 		}

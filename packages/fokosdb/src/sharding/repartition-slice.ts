@@ -1,5 +1,6 @@
-import { hashChildIndex } from "./hash-primitives.js";
+import { hashPrefixBucketDigits, hashPrefixBucketOf } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import type { FokosTopology } from "./route-context.js";
 import invariant from "../shared/invariant.js";
 
 /**
@@ -9,7 +10,7 @@ import invariant from "../shared/invariant.js";
  * the slice it handed that target. Without the slice the source would serve any key the target
  * asked for, including keys a sibling target owns and keys the source has already promoted away.
  *
- * - `hash_child`: the keys that hash to `childIndex` at `depth`, over the whole sort-key axis.
+ * - `hash_child`: the keys whose hashPrefixBucket has the digit `childIndex` at `depth`, over the whole sort-key axis.
  * - `range`: one hash key and one immutable `[start, end)` sort-key interval (null = unbounded edge).
  * - `promoted_key`: one hash key over the whole sort-key axis.
  */
@@ -23,15 +24,22 @@ function sliceStart(start: KeyBytes | null): KeyBytes {
 	return start ?? KeyCodec.encodeOptional(undefined);
 }
 
+/** The topology fields that the digits of a hashPrefixBucket need. */
+export type SliceTopology = Pick<FokosTopology, "shardGroup" | "rootTreesN" | "hashSplitN">;
+
 /**
  * Says whether `hashKey` falls in the slice. Sort keys never change the answer for a hash-child or a
  * promoted-key slice, and a range slice checks its interval separately.
  */
-function hashKeyInSlice(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number): boolean {
+function hashKeyInSlice(slice: FokosSlice, hashKey: KeyBytes, topology: SliceTopology): boolean {
 	switch (slice.kind) {
-		case "hash_child":
-			// A child at depth D owns the keys its parent (at D-1) hashes into its own bucket.
-			return hashChildIndex(hashKey, slice.depth - 1, hashSplitN) === slice.childIndex;
+		case "hash_child": {
+			// A child at depth D owns the keys of its parent whose digit at level D is its index.
+			const bucket = hashPrefixBucketOf(hashKey, topology.shardGroup);
+			return (
+				hashPrefixBucketDigits(bucket, topology.rootTreesN, topology.hashSplitN, slice.depth).path[slice.depth - 1] === slice.childIndex
+			);
+		}
 		case "range":
 		case "promoted_key":
 			return KeyCodec.compare(hashKey, slice.hashKey) === 0;
@@ -42,8 +50,8 @@ function hashKeyInSlice(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number
  * Says whether one stored item belongs to the slice. Migration filters its source rows with it, so a
  * target receives exactly the rows it owns and nothing a sibling owns.
  */
-export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey: KeyBytes, hashSplitN: number): boolean {
-	if (!hashKeyInSlice(slice, hashKey, hashSplitN)) {
+export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey: KeyBytes, topology: SliceTopology): boolean {
+	if (!hashKeyInSlice(slice, hashKey, topology)) {
 		return false;
 	}
 	if (slice.kind !== "range") {
@@ -53,8 +61,8 @@ export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey:
 }
 
 /** Says whether one hash key belongs to the slice, ignoring the sort-key axis. */
-export function sliceIncludesHashKey(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number): boolean {
-	return hashKeyInSlice(slice, hashKey, hashSplitN);
+export function sliceIncludesHashKey(slice: FokosSlice, hashKey: KeyBytes, topology: SliceTopology): boolean {
+	return hashKeyInSlice(slice, hashKey, topology);
 }
 
 /** The one key of a promotion plan: its single target carries a `promoted_key` slice. */

@@ -14,7 +14,7 @@ import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { hashChildIndex } from "../../src/sharding/partition-id.js";
+import { childDigit, type DigitTopology } from "../hash-digits.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
 import { captureConsoleError, kb, lockKeys, withOpIndex } from "./helpers.js";
@@ -54,11 +54,11 @@ async function lowHashCap(partition: TestPartition): Promise<TestPartition> {
 }
 
 /** `count` hash keys that the root sends to `childIndex`, balanced over the children of that child. */
-function keysForChild(prefix: string, childIndex: number, count: number): string[] {
+function keysForChild(topology: DigitTopology, prefix: string, childIndex: number, count: number): string[] {
 	const keys: string[] = [];
 	for (let i = 0; keys.length < count; i++) {
 		const key = `${prefix}-${i}`;
-		if (hashChildIndex(kb(key), 0, 2) === childIndex && hashChildIndex(kb(key), 1, 2) === keys.length % 2) {
+		if (childDigit(topology, kb(key), 0) === childIndex && childDigit(topology, kb(key), 1) === keys.length % 2) {
 			keys.push(key);
 		}
 	}
@@ -127,7 +127,7 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 
 	it.each(["apiPutItem", "txPrepare"] as const)("queues a hash split when it refuses %s, and a later request succeeds", async (op) => {
 		const partition = makePartition({ hashSplitN: 2 });
-		const keys = [...keysForChild("refused", 0, 8), ...keysForChild("refused", 1, 8)];
+		const keys = [...keysForChild(partition.ctx.topology, "refused", 0, 8), ...keysForChild(partition.ctx.topology, "refused", 1, 8)];
 		for (const key of keys) {
 			await putRows(partition, key, 2, 16 * 1024);
 		}
@@ -149,11 +149,11 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 
 	it("splits a child that its import leaves over the cap, at the first write that the child refuses", async () => {
 		const partition = makePartition({ hashSplitN: 2 });
-		const heavy = keysForChild("born-over", 0, 8);
+		const heavy = keysForChild(partition.ctx.topology, "born-over", 0, 8);
 		for (const key of heavy) {
 			await putRows(partition, key, 4, 16 * 1024);
 		}
-		const light = keysForChild("born-over", 1, 1)[0];
+		const light = keysForChild(partition.ctx.topology, "born-over", 1, 1)[0];
 		await putRows(partition, light, 1, 1024);
 		const low = await lowHashCap(partition);
 
@@ -201,7 +201,7 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 		// One cleanup step, then a long pause: the promotion stays `completed` for the test.
 		await partition.controlled.testRuntimeConfig({ cleanupRetryMs: 60_000 });
 		await putRows(partition, "large", 40, 12 * 1024);
-		const small = [...keysForChild("small", 0, 4), ...keysForChild("small", 1, 4)];
+		const small = [...keysForChild(partition.ctx.topology, "small", 0, 4), ...keysForChild(partition.ctx.topology, "small", 1, 4)];
 		for (const key of small) {
 			await putRows(partition, key, 2, 12 * 1024);
 		}
@@ -284,8 +284,8 @@ describe("FokosDBPartitionDO - a hash leaf that holds pending payloads only", ()
 	it.each([false, true])("splits between two pending keys, and each child imports its locks (quarantined: %s)", async (quarantined) => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2 });
 		await keepTestLocks(partition, ...partition.hashChildren());
-		const [first] = keysForChild("pending", 0, 1);
-		const [second] = keysForChild("pending", 1, 1);
+		const [first] = keysForChild(partition.ctx.topology, "pending", 0, 1);
+		const [second] = keysForChild(partition.ctx.topology, "pending", 1, 1);
 		const transactions = [
 			await prepare(partition, first, ["p0", "p1", "p2", "p3"]),
 			await prepare(partition, second, ["p0", "p1", "p2", "p3"]),

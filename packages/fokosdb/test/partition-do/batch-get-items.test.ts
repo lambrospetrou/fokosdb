@@ -9,6 +9,7 @@ import { FokosDBStd } from "../../src/client/fokos-std.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { controlledPartition, keysAcrossPartitions, makeDB, partitionNameOf } from "../transactions/tx-helpers.js";
 import { kb } from "./helpers.js";
+import { childDigit } from "../hash-digits.js";
 import { makePartition, makeRangeRoot, type TestPartition } from "./partition-harness.js";
 
 const NAME = [{ expr: { ref: "data" as const, path: "$.name" }, as: "name" }];
@@ -84,7 +85,15 @@ describe.concurrent("FokosDBPartitionDO — apiBatchGetItems", () => {
 
 	it("reads each key on the child that owns it after a hash split", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const keys = ["k-0", "k-1", "k-2", "k-3", "k-4", "k-5"];
+		// Three keys for each child. The digits come from the seed of the shard group of this test.
+		const keys: string[] = [];
+		for (let i = 0, counts = [0, 0]; keys.length < 6; i++) {
+			const child = childDigit(partition.ctx.topology, kb(`k-${i}`), 0);
+			if (counts[child] < 3) {
+				counts[child]++;
+				keys.push(`k-${i}`);
+			}
+		}
 		for (const key of keys) {
 			await put(partition, key, "sk", `v-${key}`);
 		}

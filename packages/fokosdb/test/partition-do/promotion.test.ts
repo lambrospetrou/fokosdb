@@ -6,7 +6,9 @@ import { FokosError } from "../../src/shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
 import { HashTopology } from "../../src/sharding/hash-topology.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { hashChildIndex, resolveDescendantHashPartitionContext } from "../../src/sharding/partition-id.js";
+import { resolveDescendantHashPartitionContext } from "../../src/sharding/partition-id.js";
+import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import { childDigit, hashDigits } from "../hash-digits.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { recordedTxCalls } from "../controlled-partition-do.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -356,7 +358,7 @@ describe.concurrent("FokosDBPartitionDO — a range root before its first page",
 		const key = findKey(
 			"false-positive",
 			(k) =>
-				hashChildIndex(kb(k), 0, 2) === hashChildIndex(kb("bob"), 0, 2) &&
+				childDigit(partition.ctx.topology, kb(k), 0) === childDigit(partition.ctx.topology, kb("bob"), 0) &&
 				rootBloom.maybePromoted(kb(k)) &&
 				ownerBloom.maybePromoted(kb(k)),
 		);
@@ -539,7 +541,7 @@ describe.concurrent("FokosDBPartitionDO — a transaction through a hash jump to
 		// Two hash keys with the same child index at depths 0 and 1: one hash leaf owns both, and a
 		// depth-2 hint for one of them names the same grandchild for the other. The filter of the root
 		// reports h1 as promoted and h2 as not promoted, and no promotion moved either key.
-		const path = (key: string) => [0, 1].map((depth) => hashChildIndex(kb(key), depth, hashSplitN));
+		const path = (key: string) => hashDigits(partition.ctx.topology, kb(key), 2).path;
 		const h1 = findKey("tx-path", (k) => rootBloom.maybePromoted(kb(k)));
 		const h2 = findKey("tx-path", (k) => path(k).join() === path(h1).join() && k !== h1 && !rootBloom.maybePromoted(kb(k)));
 		const owner = await partition.childOwning(h1);
@@ -568,8 +570,8 @@ describe.concurrent("FokosDBPartitionDO — a transaction through a hash jump to
 		const plantMissingGrandchild = async (): Promise<TestPartition> => {
 			const root = TestPartition.at(partition.ctx);
 			await runInDurableObject(root.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-				const arena = HashTopology.create(hashSplitN, 0);
-				arena.updateFromHint(kb(h1), 2);
+				const arena = HashTopology.create(partition.ctx.topology.rootTreesN, hashSplitN, 0);
+				arena.updateFromHint(hashPrefixBucketOf(kb(h1), partition.ctx.topology.shardGroup), 2);
 				new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
 			});
 			await runInDurableObject(root.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {

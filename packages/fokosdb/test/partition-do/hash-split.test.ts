@@ -6,7 +6,8 @@ import { testControlledPartitionStub, testPartitionStub } from "../stub-helpers.
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { hashChildIndex, PartitionIdHelper, resolveHashChildPartitionContexts } from "../../src/sharding/partition-id.js";
+import { PartitionIdHelper, resolveHashChildPartitionContexts } from "../../src/sharding/partition-id.js";
+import { childDigit } from "../hash-digits.js";
 import { refOf } from "../../src/sharding/route-context.js";
 import { conditionTree, expectSplitStatus, kb, makeStub, opened, openedRpc } from "./helpers.js";
 import { projectionTree } from "../../src/shared/expression/test-fixtures.js";
@@ -406,7 +407,7 @@ describe("FokosDBPartitionDO - splitting", () => {
 		const probeKey = (slot: number) => {
 			for (let i = 0; ; i++) {
 				const key = `probe-${slot}-${i}`;
-				if (hashChildIndex(kb(key), 0, HASH_SPLIT_N) === slot) {
+				if (childDigit(partition.ctx.topology, kb(key), 0) === slot) {
 					return key;
 				}
 			}

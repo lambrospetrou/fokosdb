@@ -851,9 +851,9 @@ export class RepartitionSource {
 	 * pointer in the overrides phase and no data copy.
 	 */
 	belongsToTarget(slice: FokosSlice): (key: RouteKey) => boolean {
-		const n = this.deps.identity().ctx.topology.hashSplitN;
+		const topology = this.deps.identity().ctx.topology;
 		return (key) =>
-			sliceIncludesItem(slice, key.hashKey, key.sortKey, n) &&
+			sliceIncludesItem(slice, key.hashKey, key.sortKey, topology) &&
 			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(key.hashKey));
 	}
 
@@ -866,12 +866,12 @@ export class RepartitionSource {
 			return { phase: "overrides", overrides: [], nextCursor: { phase: "host", inner: null } };
 		}
 
-		const n = this.deps.identity().ctx.topology.hashSplitN;
+		const topology = this.deps.identity().ctx.topology;
 		const config = this.deps.config();
 		const { rows, nextCursor } = collectBatch<{ hashKey: KeyBytes }, PromotedKeyCursor>({
 			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize),
 			advanceCursor: (r) => ({ hashKey: r.hashKey }),
-			include: (r) => sliceIncludesHashKey(slice, r.hashKey, n),
+			include: (r) => sliceIncludesHashKey(slice, r.hashKey, topology),
 			estimateBytes: (r) => r.hashKey.byteLength + 64,
 			budgetBytes: config.migrationPageBytes,
 			maxItems: config.migrationPageRows,
@@ -950,8 +950,8 @@ export class RepartitionTarget {
 		}
 		// A row outside the slice of this target belongs to a sibling or to the source, and two partitions
 		// would then own it.
-		const n = this.deps.identity().ctx.topology.hashSplitN;
-		if (page.phase === "overrides" && !page.overrides.every((o) => sliceIncludesHashKey(rec.slice, o.hashKey, n))) {
+		const topology = this.deps.identity().ctx.topology;
+		if (page.phase === "overrides" && !page.overrides.every((o) => sliceIncludesHashKey(rec.slice, o.hashKey, topology))) {
 			this.#deferImport(rec, now, new Error("the overrides page holds a hash key outside the slice of this target"));
 			return "stopped";
 		}
@@ -961,7 +961,7 @@ export class RepartitionTarget {
 					requested.inner,
 					page.page,
 					page.nextCursor?.phase === "host" ? page.nextCursor.inner : null,
-					(key) => sliceIncludesItem(rec.slice, key.hashKey, key.sortKey, n),
+					(key) => sliceIncludesItem(rec.slice, key.hashKey, key.sortKey, topology),
 				);
 			} catch (error) {
 				this.#deferImport(rec, now, error);

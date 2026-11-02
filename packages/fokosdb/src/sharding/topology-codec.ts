@@ -11,7 +11,7 @@
  * in `topology-encode.ts`, so a caller does not ship it.
  */
 import { layerHas } from "../shared/bloom-filter.js";
-import { hashChildIndex, hashRootIndex } from "./hash-primitives.js";
+import { HashPrefixBucketDigitCursor } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
@@ -211,21 +211,22 @@ export function hashRank1(view: HashTopologyView, pos: number): number {
 }
 
 /**
- * The deepest known hash partition of `hashKey`: its bitmap position, its root index, and its child
- * path from the root. The walk stops before a position in `cut`.
+ * The deepest known hash partition of a hashPrefixBucket: its bitmap position, its root index, and
+ * its child path from the root. The walk stops before a position in `cut`.
  */
 export function findLeaf(
 	view: HashTopologyView,
 	rootTreesN: number,
 	hashSplitN: number,
-	hashKey: KeyBytes,
+	hashPrefixBucket: Uint8Array,
 	cut: ReadonlySet<number>,
 ): { pos: number; root: number; path: number[] } {
-	const root = hashRootIndex(hashKey, rootTreesN);
+	const digits = new HashPrefixBucketDigitCursor(hashPrefixBucket, rootTreesN);
+	const root = digits.root;
 	const path: number[] = [];
 	let pos = root;
 	while (hashBit(view, pos)) {
-		const child = hashChildIndex(hashKey, path.length, hashSplitN);
+		const child = digits.next(hashSplitN);
 		const next = rootTreesN + hashSplitN * hashRank1(view, pos) + child;
 		if (cut.has(next)) {
 			break;

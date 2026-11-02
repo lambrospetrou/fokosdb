@@ -1,14 +1,11 @@
 import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
-import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } from "./route-context.js";
-import {
-	GOLDEN_RATIO as _GOLDEN_RATIO,
-	hashChildIndex as _hashChildIndex,
-	hashPrefixBucketSeedOf,
-	hashRootIndex as _hashRootIndex,
-} from "./hash-primitives.js";
+import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext, FokosTopology } from "./route-context.js";
+import { hashPrefixBucketInterval, hashPrefixBucketSeedOf, maxHashDepth } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
+import { FokosValidationError } from "../shared/errors.js";
+import { SHARDING_VALIDATION_CODES } from "./errors.js";
 
 /**
  * Pure partition-identity codec: the opaque partition ID wire formats and DO naming. A route context
@@ -234,11 +231,15 @@ export function partitionIdentityFrom(
 			ctx.doName === PartitionIdHelper.doName(ctx.topology.shardGroup, bytes),
 			"fokos/topology.partitionIdentityFrom: the DO name does not match the partition ID",
 		);
+		checkHashDepth(decoded.depth, ctx.topology);
+		const path = Array.from(bytes.subarray(4, 4 + decoded.depth));
+		const { rootTreesN, hashSplitN } = ctx.topology;
+		const interval = hashPrefixBucketInterval(rootTreesN, hashSplitN, decoded.rootIdx, path);
 		return {
 			schema: 1,
 			ref,
 			kind: "hash",
-			hash: { rootIndex: decoded.rootIdx, path: Array.from(bytes.subarray(4, 4 + decoded.depth)) },
+			hash: { rootIndex: decoded.rootIdx, path, depth: decoded.depth, ...interval },
 			topology: ctx.topology,
 			hashPrefixBucketSeed: hashPrefixBucketSeedOf(ctx.topology.shardGroup),
 		};
@@ -354,10 +355,16 @@ function rangeBytesToPartitionId(bytes: Uint8Array): string {
 	return PartitionIdHelper.SCHEMA_RANGE_V1_STR + toBase64Url(bytes.subarray(1, split)) + "." + toBase64Url(bytes.subarray(split));
 }
 
-// Re-exported from hash-primitives.ts (lives there to break the circular dependency with hash-topology.ts).
-export const GOLDEN_RATIO = _GOLDEN_RATIO;
-export const hashChildIndex = _hashChildIndex;
-export const hashRootIndex = _hashRootIndex;
+/** Refuses a hash partition below the depth limit of its topology, where the digits of a hashPrefixBucket are not exact. */
+function checkHashDepth(depth: number, topology: Pick<FokosTopology, "rootTreesN" | "hashSplitN">): void {
+	const limit = maxHashDepth(topology.rootTreesN, topology.hashSplitN);
+	if (depth > limit) {
+		throw new FokosValidationError(SHARDING_VALIDATION_CODES.partition_context_options_invalid, {
+			message: `a hash partition must not be deeper than the depth limit ${limit} of its topology`,
+			attributes: { option: "partitionId", value: depth, limit },
+		});
+	}
+}
 
 /**
  * The first byte of a partition ID names its schema. Both wire formats start with the schema byte
@@ -481,9 +488,13 @@ export class PartitionIdHelper {
 	 * They are equal to the result of `new PartitionIdHelper(shardGroup, parentBytes).appendHashIdx(childIdxs).encode(true)`,
 	 * but this function decodes nothing: it adds to the DO name of the parent, and it replaces the depth
 	 * byte of the parent ID and adds to it. Thus `parent.doName` must be the DO name of `parent.partitionId`,
-	 * as `partitionIdentityFrom` makes sure for the identity of a partition.
+	 * as `partitionIdentityFrom` makes sure for the identity of a partition. A descendant below the depth
+	 * limit of the topology is refused.
 	 */
-	static hashDescendantId(parent: FokosPartitionRef, childIdxs: readonly number[]): { doName: string; opaque: string } {
+	static hashDescendantId(
+		parent: FokosPartitionRef & { topology: Pick<FokosTopology, "rootTreesN" | "hashSplitN"> },
+		childIdxs: readonly number[],
+	): { doName: string; opaque: string } {
 		const parentId = parent.partitionId;
 		const parentDepth = (parentId.length - 8) / 2;
 		const depth = parentDepth + childIdxs.length;
@@ -496,7 +507,7 @@ export class PartitionIdHelper {
 				parentId.charCodeAt(7) === BYTE_HEX[parentDepth].charCodeAt(1),
 			"fokos/topology.hashDescendantId: the parent must be a hash partition ID",
 		);
-		invariant(depth <= 0xff, "fokos/topology.hashDescendantId: the depth must be a u8");
+		checkHashDepth(depth, parent.topology);
 		let doName = parent.doName;
 		let opaque = parentId.slice(0, 6) + BYTE_HEX[depth] + parentId.slice(8);
 		for (const idx of childIdxs) {
@@ -542,6 +553,21 @@ export class PartitionIdHelper {
 		invariant(id[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${id[0]}`);
 		return id[3];
 	}
+	/** The hashPrefixBucket interval `[start, end)` of a hash partition. A null `end` has no upper bound. */
+	static hashInterval(
+		partitionId: PartitionNodeId,
+		topology: Pick<FokosTopology, "rootTreesN" | "hashSplitN">,
+	): { start: Uint8Array; end: Uint8Array | null } {
+		const bytes = PartitionIdHelper.partitionIdToBytes(partitionId);
+		const depth = PartitionIdHelper.depth(bytes);
+		return hashPrefixBucketInterval(
+			topology.rootTreesN,
+			topology.hashSplitN,
+			PartitionIdHelper.rootIdx(bytes),
+			bytes.subarray(4, 4 + depth),
+		);
+	}
+
 	// The last child index is this partition's slot among its siblings (only valid when depth >= 1).
 	static lastChildIdx(bytes: Uint8Array): number {
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${bytes[0]}`);

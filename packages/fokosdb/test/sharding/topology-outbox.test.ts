@@ -5,12 +5,12 @@ import {
 	FokosShardingClient,
 	FokosShardingRuntime,
 	KeyCodec,
-	hashChildIndex,
 	resolveDescendantHashPartitionContext,
 	fokosTopologyEntrypointFetch,
 	type FokosTopologyRead,
 } from "../../src/sharding/index-server.js";
 import { parseHashBody } from "../../src/sharding/topology-codec.js";
+import { childDigit, type DigitTopology } from "../hash-digits.js";
 import type { FokosAdminOutbox } from "../../src/sharding/runtime-types.js";
 import { counterAdminName, type CounterOps, type CounterPolicy } from "./counter-host.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
@@ -97,7 +97,7 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 		await withRootTopologyCache(table);
 		await splitRoot(table);
 		// The writes go directly to the child, so the root never forwards through it and its arena knows depth 1 only.
-		const [inside, outside] = keysByChild(0);
+		const [inside, outside] = keysByChild(table.root.topology, 0);
 		const child = resolveDescendantHashPartitionContext(table.root, [0]);
 		for (const key of inside) {
 			await table.client.send("increment", child, { hashKey: KeyCodec.encode(key), amount: 1 }, [counterKey(key)]);
@@ -118,7 +118,7 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 		// A report of a split that did not occur: the children of child 0 do not exist.
 		await admin(shardGroup).registerRepartition(hashSplitReport(shardGroup, table.root.topology, 0, [0]));
 		await vi.waitFor(async () => expect((await servedTopology(shardGroup)).bitCount).toBe(1 + 4 + 4), WAIT);
-		const [inside, outside] = keysByChild(0);
+		const [inside, outside] = keysByChild(table.root.topology, 0);
 		await refreshRootTopology(table, outside);
 
 		for (const key of inside.slice(0, 2)) {
@@ -438,12 +438,12 @@ async function withRootTopologyCache(table: ReturnType<typeof makeCounterTable>)
 }
 
 /** Six keys under the hash child `c` of the root, and six keys under the other children. */
-function keysByChild(c: number): [string[], string[]] {
+function keysByChild(topology: DigitTopology, c: number): [string[], string[]] {
 	const inside: string[] = [];
 	const outside: string[] = [];
 	for (let i = 0; inside.length < 6 || outside.length < 6; i++) {
 		const key = `t-${i}`;
-		(hashChildIndex(KeyCodec.encode(key), 0, 4) === c ? inside : outside).push(key);
+		(childDigit(topology, KeyCodec.encode(key), 0) === c ? inside : outside).push(key);
 	}
 	return [inside.slice(0, 6), outside.slice(0, 6)];
 }

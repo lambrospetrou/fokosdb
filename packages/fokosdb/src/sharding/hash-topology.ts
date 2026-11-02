@@ -1,11 +1,11 @@
-import { hashChildIndex } from "./hash-primitives.js";
-import type { KeyBytes } from "./key-codec.js";
+import { HashPrefixBucketDigitCursor, maxHashDepth } from "./hash-primitives.js";
 
 export type HashTopologySnapshot = {
 	// Zero-copy Uint8Array view over the used portion of the arena buffer (nextFree * 4 bytes).
 	// The actual copy happens inside kv.put (structured clone).
 	arena: Uint8Array;
 	nextFree: number;
+	rootTreesN: number;
 	K: number;
 	// Absolute depth of the partition that owns this topology in the hash tree.
 	// The arena slot indices are computed from (ownerAbsDepth + relDepth), so restoring the
@@ -28,54 +28,80 @@ export class HashTopology {
 	// Root block always occupies slots [0, K). New blocks are appended at nextFree.
 	private arena: Uint32Array;
 	private nextFree: number;
+	private rootTreesN: number;
 	private K: number;
 	private ownerAbsDepth: number;
 	private maxDepth: number;
 	private maxSlots: number;
 
-	private constructor(arena: Uint32Array, nextFree: number, K: number, ownerAbsDepth: number, maxDepth: number, maxSlots: number) {
+	private constructor(
+		arena: Uint32Array,
+		nextFree: number,
+		rootTreesN: number,
+		K: number,
+		ownerAbsDepth: number,
+		maxDepth: number,
+		maxSlots: number,
+	) {
 		this.arena = arena;
 		this.nextFree = nextFree;
+		this.rootTreesN = rootTreesN;
 		this.K = K;
 		this.ownerAbsDepth = ownerAbsDepth;
 		this.maxDepth = maxDepth;
 		this.maxSlots = maxSlots;
 	}
 
-	static create(K: number, ownerAbsDepth: number, opts?: { maxDepth?: number; budgetBytes?: number }): HashTopology {
+	/**
+	 * `maxDepth` is relative to the owner. It never goes below the depth limit of the topology, where
+	 * no hash partition exists.
+	 */
+	static create(rootTreesN: number, K: number, ownerAbsDepth: number, opts?: { maxDepth?: number; budgetBytes?: number }): HashTopology {
 		const maxSlots = Math.floor((opts?.budgetBytes ?? DEFAULT_BUDGET_BYTES) / 4);
-		const maxDepth = opts?.maxDepth ?? defaultMaxDepth(K, maxSlots);
+		const maxDepth = arenaMaxDepth(rootTreesN, K, ownerAbsDepth, maxSlots, opts?.maxDepth);
 		const arena = new Uint32Array(maxSlots);
-		return new HashTopology(arena, K /* root block pre-allocated */, K, ownerAbsDepth, maxDepth, maxSlots);
+		return new HashTopology(arena, K /* root block pre-allocated */, rootTreesN, K, ownerAbsDepth, maxDepth, maxSlots);
 	}
 
 	static fromSnapshot(snapshot: HashTopologySnapshot, opts?: { maxDepth?: number; budgetBytes?: number }): HashTopology {
-		const { K, nextFree, ownerAbsDepth } = snapshot;
+		const { rootTreesN, K, nextFree, ownerAbsDepth } = snapshot;
 		const maxSlots = Math.floor((opts?.budgetBytes ?? DEFAULT_BUDGET_BYTES) / 4);
-		const maxDepth = opts?.maxDepth ?? defaultMaxDepth(K, maxSlots);
+		const maxDepth = arenaMaxDepth(rootTreesN, K, ownerAbsDepth, maxSlots, opts?.maxDepth);
 		const arena = new Uint32Array(maxSlots);
 		new Uint8Array(arena.buffer).set(snapshot.arena);
-		return new HashTopology(arena, nextFree, K, ownerAbsDepth, maxDepth, maxSlots);
+		return new HashTopology(arena, nextFree, rootTreesN, K, ownerAbsDepth, maxDepth, maxSlots);
+	}
+
+	/** The digits of `hashPrefixBucket` below the owner: the owner owns the bucket, so its own digits are skipped. */
+	private digitsBelowOwner(hashPrefixBucket: Uint8Array): HashPrefixBucketDigitCursor {
+		const cursor = new HashPrefixBucketDigitCursor(hashPrefixBucket, this.rootTreesN);
+		for (let d = 0; d < this.ownerAbsDepth; d++) {
+			cursor.next(this.K);
+		}
+		return cursor;
 	}
 
 	toSnapshot(): HashTopologySnapshot {
 		return {
 			arena: new Uint8Array(this.arena.buffer, 0, this.nextFree * 4),
 			nextFree: this.nextFree,
+			rootTreesN: this.rootTreesN,
 			K: this.K,
 			ownerAbsDepth: this.ownerAbsDepth,
 		};
 	}
 
 	/**
-	 * Traverse the cache for hashKey. Returns the relative depth of the deepest known descendant.
+	 * Traverse the cache for a hashPrefixBucket that the owner owns. Returns the relative depth of the
+	 * deepest known descendant.
 	 * @return relative depth (0 = immediate child is the target; no deeper split recorded yet)
 	 */
-	findLeaf(hashKey: KeyBytes): number {
+	findLeaf(hashPrefixBucket: Uint8Array): number {
+		const digits = this.digitsBelowOwner(hashPrefixBucket);
 		let block = 0;
 		let relDepth = 0;
 		while (true) {
-			const childIdx = hashChildIndex(hashKey, this.ownerAbsDepth + relDepth, this.K);
+			const childIdx = digits.next(this.K);
 			const ptr = this.arena[block + childIdx];
 			if (ptr === 0) {
 				break;
@@ -88,15 +114,16 @@ export class HashTopology {
 
 	/**
 	 * Learn topology from a forwarded response.
-	 * @param hashKey The hash key to look up.
+	 * @param hashPrefixBucket The hashPrefixBucket of the hash key to look up.
 	 * @param actualRelDepth The actual relative depth of the target partition that served the request (non-split leaf).
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	updateFromHint(hashKey: KeyBytes, actualRelDepth: number): boolean {
+	updateFromHint(hashPrefixBucket: Uint8Array, actualRelDepth: number): boolean {
+		const digits = this.digitsBelowOwner(hashPrefixBucket);
 		let block = 0;
 		let updated = false;
 		for (let rd = 0; rd < actualRelDepth; rd++) {
-			const childIdx = hashChildIndex(hashKey, this.ownerAbsDepth + rd, this.K);
+			const childIdx = digits.next(this.K);
 			if (this.arena[block + childIdx] !== 0) {
 				// Level already known — descend without allocating.
 				block = this.arena[block + childIdx];
@@ -126,19 +153,20 @@ export class HashTopology {
 	 * ancestor. The orphaned block keeps its slots: the arena never frees, and the loss is bounded.
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	invalidate(hashKey: KeyBytes, relDepth: number): boolean {
+	invalidate(hashPrefixBucket: Uint8Array, relDepth: number): boolean {
 		if (relDepth < 1) {
 			return false;
 		}
+		const digits = this.digitsBelowOwner(hashPrefixBucket);
 		let block = 0;
 		for (let rd = 0; rd < relDepth - 1; rd++) {
-			const ptr = this.arena[block + hashChildIndex(hashKey, this.ownerAbsDepth + rd, this.K)];
+			const ptr = this.arena[block + digits.next(this.K)];
 			if (ptr === 0) {
 				return false;
 			}
 			block = ptr;
 		}
-		const slot = block + hashChildIndex(hashKey, this.ownerAbsDepth + relDepth - 1, this.K);
+		const slot = block + digits.next(this.K);
 		if (this.arena[slot] === 0) {
 			return false;
 		}
@@ -169,6 +197,11 @@ export class HashTopology {
 			ownerAbsDepth: this.ownerAbsDepth,
 		};
 	}
+}
+
+/** The depth cap of an arena: the configured or default cap, and never below the depth limit of the topology. */
+function arenaMaxDepth(rootTreesN: number, K: number, ownerAbsDepth: number, maxSlots: number, maxDepth: number | undefined): number {
+	return Math.min(maxDepth ?? defaultMaxDepth(K, maxSlots), maxHashDepth(rootTreesN, K) - ownerAbsDepth);
 }
 
 /**

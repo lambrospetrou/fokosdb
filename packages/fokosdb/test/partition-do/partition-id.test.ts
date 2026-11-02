@@ -43,7 +43,7 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 				childIndex: PartitionIdHelper.lastChildIdx(idBytes),
 				depth: PartitionIdHelper.depth(idBytes),
 			};
-			expect(sliceIncludesHashKey(slice, kb(hashKey), child.ctx.topology.hashSplitN)).toBe(child.doName === ownerName);
+			expect(sliceIncludesHashKey(slice, kb(hashKey), child.ctx.topology)).toBe(child.doName === ownerName);
 		}
 	});
 
@@ -56,7 +56,8 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 			schema: 1,
 			ref: { partitionId: partition.ctx.partitionId, doName: partition.ctx.doName },
 			kind: "hash",
-			hash: { rootIndex: 0, path: [] },
+			// One root: its interval is the whole hashPrefixBucket space.
+			hash: { rootIndex: 0, path: [], depth: 0, start: new Uint8Array(8), end: null },
 			topology: partition.ctx.topology,
 			hashPrefixBucketSeed: hashPrefixBucketSeedOf(partition.ctx.topology.shardGroup),
 		});
@@ -65,11 +66,13 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 		// than only the parent's alarm, so no child is still migrating when this file ends: background
 		// migration work that outlives the test worker breaks its teardown.
 		const children = await partition.splitHash();
+		// The root is a router now, and keeps its interval, root index, path, and depth.
+		expect((await partition.status()).identityStored).toEqual(rootState.identityStored);
 		for (let i = 0; i < children.length; i++) {
 			const childState = await children[i].status();
 			expect(childState.identityStored).toMatchObject({
 				kind: "hash",
-				hash: { rootIndex: 0, path: [i] },
+				hash: { rootIndex: 0, path: [i], depth: 1, ...PartitionIdHelper.hashInterval(children[i].ctx.partitionId, partition.ctx.topology) },
 				ref: { doName: children[i].doName },
 			});
 			expect(childState.depth).toBe(1);

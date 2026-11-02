@@ -177,26 +177,41 @@ export function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: stri
 	return names.size;
 }
 
-/** Return `count` keys that resolve to DISTINCT partitions, so a transaction over them fans out. */
-export function keysAcrossPartitions(db: FokosDB, count: number, prefix: string): Key[] {
-	const byPartition = new Map<string, Key>();
-	for (let i = 0; byPartition.size < count; i++) {
+/**
+ * Return `count` keys that resolve to DISTINCT partitions, so a transaction over them fans out. With
+ * more than one table, the keys are on distinct partitions in each table: each table has its own seed,
+ * so the same keys can be laid out differently in two tables.
+ */
+export function keysAcrossPartitions(db: FokosDB | FokosDB[], count: number, prefix: string): Key[] {
+	const dbs = Array.isArray(db) ? db : [db];
+	const seen = dbs.map(() => new Set<string>());
+	const keys: Key[] = [];
+	for (let i = 0; keys.length < count; i++) {
 		const key = { hashKey: `${prefix}-${i}`, sortKey: "sk" };
-		byPartition.set(partitionNameOf(db, key), key);
+		const names = dbs.map((d) => partitionNameOf(d, key));
+		if (names.every((name, t) => !seen[t].has(name))) {
+			names.forEach((name, t) => seen[t].add(name));
+			keys.push(key);
+		}
 	}
-	return [...byPartition.values()];
+	return keys;
 }
 
-/** Return `count` keys that all route to the SAME partition, so the fast path applies to the whole set. */
-export function keysInOnePartition(db: FokosDB, count: number, prefix: string): Key[] {
-	const MAX_CANDIDATES = 2_000;
+/**
+ * Return `count` keys that all route to the SAME partition, so the fast path applies to the whole set.
+ * With more than one table, the keys share one partition in each table.
+ */
+export function keysInOnePartition(db: FokosDB | FokosDB[], count: number, prefix: string): Key[] {
+	const dbs = Array.isArray(db) ? db : [db];
+	const MAX_CANDIDATES = 2_000 * dbs.length ** 2;
 	const buckets = new Map<string, Key[]>();
 	for (let i = 0; ; i++) {
 		expect(i, `no partition held ${count} keys within ${MAX_CANDIDATES} candidates`).toBeLessThan(MAX_CANDIDATES);
 		const key = { hashKey: `${prefix}-${i}`, sortKey: "sk" };
-		const bucket = buckets.get(partitionNameOf(db, key)) ?? [];
+		const id = dbs.map((d) => partitionNameOf(d, key)).join("|");
+		const bucket = buckets.get(id) ?? [];
 		bucket.push(key);
-		buckets.set(partitionNameOf(db, key), bucket);
+		buckets.set(id, bucket);
 		if (bucket.length === count) {
 			return bucket;
 		}

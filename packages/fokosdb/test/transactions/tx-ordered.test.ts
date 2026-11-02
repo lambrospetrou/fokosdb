@@ -159,8 +159,8 @@ async function expectSameOnBothPaths(build: (keys: Key[]) => TransactWriteItem[]
 	const tables = [makeDB({ rootTreesN: 4 }), makeDB({ rootTreesN: 4, singlePartitionFastPath: false }), makeDB({ rootTreesN: 4 })];
 	const prefix = `paths-${crypto.randomUUID()}`;
 	const keys = spread
-		? [...keysAcrossPartitions(tables[0], 2, prefix), ...keysInOnePartition(tables[0], 2, `${prefix}-x`)]
-		: keysInOnePartition(tables[0], 4, prefix);
+		? [...keysAcrossPartitions(tables, 2, prefix), ...keysInOnePartition(tables, 2, `${prefix}-x`)]
+		: keysInOnePartition(tables, 4, prefix);
 	const items = build(keys);
 	const results: Snapshot[] = [];
 	for (const [i, db] of tables.entries()) {

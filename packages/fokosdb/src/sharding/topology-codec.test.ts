@@ -1,7 +1,7 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { hashChildIndex, hashRootIndex } from "./hash-primitives.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { hashPrefixBucketDigits, hashPrefixBucketOf } from "./hash-primitives.js";
+import { KeyCodec } from "./key-codec.js";
 import { findLeaf, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import {
@@ -45,12 +45,15 @@ function positions(forest: Forest): Map<string, number> {
 	return out;
 }
 
-/** The reference walk: follow the hash of the key through the split nodes, and stop before a cut node. */
-function referenceLeaf(forest: Forest, hashKey: KeyBytes, cut: ReadonlySet<string>): { node: string; path: number[] } {
-	let node = String(hashRootIndex(hashKey, forest.R));
+/** The hashPrefixBucket of a test key. */
+const bk = (key: string) => hashPrefixBucketOf(KeyCodec.encode(key), "codec-test");
+
+/** The reference walk: follow the digits of the hashPrefixBucket through the split nodes, and stop before a cut node. */
+function referenceLeaf(forest: Forest, bucket: Uint8Array, cut: ReadonlySet<string>): { node: string; path: number[] } {
+	let node = String(hashPrefixBucketDigits(bucket, forest.R, forest.K, 0).root);
 	const path: number[] = [];
 	while (forest.children.has(node)) {
-		const child = hashChildIndex(hashKey, path.length, forest.K);
+		const child = hashPrefixBucketDigits(bucket, forest.R, forest.K, path.length + 1).path[path.length];
 		const next = `${node}.${child}`;
 		if (cut.has(next)) {
 			break;
@@ -90,7 +93,7 @@ describe("topology codec — hash body", () => {
 				fc.integer({ min: 1, max: 5 }),
 				fc.integer({ min: 2, max: 4 }),
 				fc.array(fc.nat(), { maxLength: 60 }),
-				fc.array(fc.uint8Array({ minLength: 1, maxLength: 12 }), { minLength: 1, maxLength: 30 }),
+				fc.array(fc.uint8Array({ minLength: 8, maxLength: 8 }), { minLength: 1, maxLength: 30 }),
 				fc.array(fc.nat(), { maxLength: 4 }),
 				(R, K, picks, keys, cutPicks) => {
 					const forest = buildForest(R, K, picks);
@@ -99,14 +102,13 @@ describe("topology codec — hash body", () => {
 					const nonRoots = [...pos.keys()].filter((node) => node.includes("."));
 					const cutNodes = new Set(nonRoots.length === 0 ? [] : cutPicks.map((p) => nonRoots[p % nonRoots.length]));
 					const cutPositions = new Set([...cutNodes].map((node) => pos.get(node)!));
-					for (const raw of keys) {
-						const hashKey = KeyCodec.asKeyBytes(raw);
+					for (const bucket of keys) {
 						for (const [cut, cutPos] of [
 							[new Set<string>(), new Set<number>()],
 							[cutNodes, cutPositions],
 						] as const) {
-							const expected = referenceLeaf(forest, hashKey, cut);
-							const leaf = findLeaf(view, R, K, hashKey, cutPos);
+							const expected = referenceLeaf(forest, bucket, cut);
+							const leaf = findLeaf(view, R, K, bucket, cutPos);
 							expect(leaf.path).toEqual(expected.path);
 							expect(leaf.pos).toBe(pos.get(expected.node));
 						}
@@ -122,8 +124,9 @@ describe("topology codec — hash body", () => {
 			encodeHashBody({ epoch: 0, version: 0, rootTreesN: 0, hashSplitN: 0, bitmap: { bits: new Uint8Array(0), bitCount: 0 }, bloom: null }),
 		);
 		expect(view.bitCount).toBe(0);
-		const hashKey = KeyCodec.encode("k");
-		expect(findLeaf(view, 8, 4, hashKey, new Set())).toEqual({ pos: hashRootIndex(hashKey, 8), root: hashRootIndex(hashKey, 8), path: [] });
+		const bucket = bk("k");
+		const root = hashPrefixBucketDigits(bucket, 8, 4, 0).root;
+		expect(findLeaf(view, 8, 4, bucket, new Set())).toEqual({ pos: root, root, path: [] });
 	});
 
 	it("reads the splits of a deep chain across the 512-bit blocks of the rank index", () => {
@@ -137,9 +140,9 @@ describe("topology codec — hash body", () => {
 		expect(view.bitCount).toBe(3 + 2 * 300);
 		const pos = positions(forest);
 		for (let i = 0; i < 200; i++) {
-			const hashKey = KeyCodec.encode(`key-${i}`);
-			const expected = referenceLeaf(forest, hashKey, new Set());
-			expect(findLeaf(view, 3, 2, hashKey, new Set()).pos).toBe(pos.get(expected.node));
+			const bucket = bk(`key-${i}`);
+			const expected = referenceLeaf(forest, bucket, new Set());
+			expect(findLeaf(view, 3, 2, bucket, new Set()).pos).toBe(pos.get(expected.node));
 		}
 	});
 
@@ -294,7 +297,7 @@ describe("topology codec — body framing", () => {
 		);
 		const view = parseHashBody(body);
 		expect(view.version).toBe(9n);
-		expect(findLeaf(view, 1, 2, KeyCodec.encode("x"), new Set()).path).toHaveLength(1);
+		expect(findLeaf(view, 1, 2, bk("x"), new Set()).path).toHaveLength(1);
 	});
 
 	it("refuses another magic, another schema, a section outside the body, and an offset that is not a multiple of 8", () => {

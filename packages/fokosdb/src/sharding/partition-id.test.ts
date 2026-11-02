@@ -12,14 +12,16 @@ import {
 	resolveRangePartitionContext,
 } from "./partition-id.js";
 import { FokosRouter } from "./router.js";
-import { hashPrefixBucketSeedOf } from "./hash-primitives.js";
+import { hashPrefixBucketSeedOf, MAX_HASH_DEPTH } from "./hash-primitives.js";
 import { validateTopology, type FokosRouteContext } from "./route-context.js";
-import { invariantFailure } from "../../test/errors-matchers.js";
+import { fokosErrorWith, invariantFailure } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
 const base = "iddb";
 const HASH_SPLIT_N = 4;
+// The topology with the deepest depth limit, MAX_HASH_DEPTH.
+const DEEPEST = { rootTreesN: 1, hashSplitN: 2 };
 
 function makeRouter(): FokosRouter<{ tier: string }> {
 	return new FokosRouter(
@@ -124,13 +126,13 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	});
 
 	it("hashDescendantId gives the ID and the DO name of appendHashIdx", () => {
-		const parents = [[0], [7], [4097], [0xffff], [3, 0], [3, 15, 16, 255], [1, ...Array.from({ length: 253 }, (_, i) => i % 256)]];
+		const parents = [[0], [7], [4097], [0xffff], [3, 0], [3, 15, 16, 255], [1, ...Array.from({ length: 61 }, (_, i) => i % 256)]];
 		const childPaths = [[], [0], [3], [255], [1, 2], [16, 15, 0]];
 		for (const parentIdxs of parents) {
 			const parent = PartitionIdHelper.fromHashIdxs(base, parentIdxs).encode(true);
-			const ref = { partitionId: parent.opaque, doName: parent.doName! };
+			const ref = { partitionId: parent.opaque, doName: parent.doName!, topology: DEEPEST };
 			for (const childIdxs of childPaths) {
-				if (parentIdxs.length - 1 + childIdxs.length > 0xff) {
+				if (parentIdxs.length - 1 + childIdxs.length > MAX_HASH_DEPTH) {
 					continue;
 				}
 				const { opaque, doName } = new PartitionIdHelper(base, parent.bytes).appendHashIdx(childIdxs).encode(true);
@@ -141,14 +143,14 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 
 	it("hashDescendantId rejects a parent that is not a hash ID, a child index or a depth out of range", () => {
 		const root = PartitionIdHelper.fromHashIdxs(base, [1]).encode(true);
-		const ref = { partitionId: root.opaque, doName: root.doName! };
+		const ref = { partitionId: root.opaque, doName: root.doName!, topology: DEEPEST };
 		const range = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(true);
 		const notHash = [
-			{ partitionId: range.opaque, doName: range.doName! },
+			{ partitionId: range.opaque, doName: range.doName!, topology: DEEPEST },
 			// The depth byte says 1, but the ID has no child index.
-			{ partitionId: "00000101", doName: "iddb~h.1" },
-			{ partitionId: "000001", doName: "iddb~h.1" },
-			{ partitionId: "000001000", doName: "iddb~h.1" },
+			{ partitionId: "00000101", doName: "iddb~h.1", topology: DEEPEST },
+			{ partitionId: "000001", doName: "iddb~h.1", topology: DEEPEST },
+			{ partitionId: "000001000", doName: "iddb~h.1", topology: DEEPEST },
 		];
 		for (const parent of notHash) {
 			expect(() => PartitionIdHelper.hashDescendantId(parent, [0])).toThrow(invariantFailure(/the parent must be a hash partition ID/));
@@ -156,10 +158,29 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 		for (const childIdx of [256, -1, 1.5]) {
 			expect(() => PartitionIdHelper.hashDescendantId(ref, [0, childIdx])).toThrow(invariantFailure(/a child index must be a u8/));
 		}
-		const deep = PartitionIdHelper.fromHashIdxs(base, [1, ...Array.from({ length: 255 }, () => 0)]).encode(true);
-		expect(() => PartitionIdHelper.hashDescendantId({ partitionId: deep.opaque, doName: deep.doName! }, [0])).toThrow(
-			invariantFailure(/the depth must be a u8/),
+		const deep = PartitionIdHelper.fromHashIdxs(base, [1, ...Array.from({ length: MAX_HASH_DEPTH }, () => 0)]).encode(true);
+		expect(() => PartitionIdHelper.hashDescendantId({ partitionId: deep.opaque, doName: deep.doName!, topology: DEEPEST }, [0])).toThrow(
+			fokosErrorWith("partition_context_options_invalid", { option: "partitionId", value: MAX_HASH_DEPTH + 1, limit: MAX_HASH_DEPTH }),
 		);
+	});
+
+	it("refuses a hash partition deeper than the depth limit of its topology", () => {
+		// rootTreesN 65,000 and hashSplitN 255 have the depth limit 6.
+		const topology = { ...makeRouter().topology, rootTreesN: 65_000, hashSplitN: 255 };
+		const at = (depth: number) => {
+			const { opaque, doName } = PartitionIdHelper.hashId(
+				base,
+				0,
+				Array.from({ length: depth }, () => 0),
+			);
+			return { ...makeRouter().allRoots()[0], topology, partitionId: opaque, doName };
+		};
+		expect(partitionIdentityFrom(at(6)).hash!.depth).toBe(6);
+		expect(() => partitionIdentityFrom(at(7))).toThrow(
+			fokosErrorWith("partition_context_options_invalid", { option: "partitionId", value: 7, limit: 6 }),
+		);
+		expect(PartitionIdHelper.hashDescendantId(at(5), [254]).doName).toBe(`${base}~h.0.0.0.0.0.0.254`);
+		expect(() => PartitionIdHelper.hashDescendantId(at(6), [0])).toThrow(fokosErrorWith("partition_context_options_invalid", { limit: 6 }));
 	});
 
 	it("calculateHashChildPartitionIds produces hashSplitN distinct children one level deeper", () => {
@@ -681,7 +702,14 @@ describe("partitionIdentityFrom", () => {
 			schema: 1,
 			ref: { partitionId: child.partitionId, doName: `${base}~h.2.3.1` },
 			kind: "hash",
-			hash: { rootIndex: 2, path: [3, 1] },
+			// R 4 and K 4: the node 2.3.1 is (2 * 4 + 3) * 4 + 1 = 45 of 64, so its interval is [45, 46) * 2^58.
+			hash: {
+				rootIndex: 2,
+				path: [3, 1],
+				depth: 2,
+				start: Uint8Array.fromHex("b400000000000000"),
+				end: Uint8Array.fromHex("b800000000000000"),
+			},
 			topology: root.topology,
 			hashPrefixBucketSeed: hashPrefixBucketSeedOf(base),
 		});
