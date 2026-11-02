@@ -12,9 +12,36 @@ import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
 import { SHARD_GROUP_SEPARATOR } from "./partition-id.js";
 
+/**
+ * The immutable topology of a shard group. `shardGroup`, `rootTreesN`, and `hashSplitN` must never
+ * change after initialization, because they decide the partition of each stored hash key.
+ *
+ * Each hash key maps to a 64-bit hashPrefixBucket. Read as a fraction in `[0, 1)`, its first digit
+ * in base `rootTreesN` selects the root, and each next digit in base `hashSplitN` selects the child
+ * at one level. Thus each hash partition owns one interval of hashPrefixBuckets.
+ *
+ * Use a power of two for both `rootTreesN` and `hashSplitN`. Then each node interval is an exact
+ * binary fraction of 2^64: all siblings have the same size, and the interval edges need no rounding.
+ * Other values are correct, but sibling sizes can differ by one hashPrefixBucket. Also, at the depth
+ * limit some leaves can hold two hashPrefixBuckets, and such a leaf cannot split.
+ */
 export type FokosTopology = {
+	/**
+	 * The name of the shard group, for example a table, a GSI, or a coordinator group. It names the
+	 * Durable Objects of the group and gives the seed of its hashPrefixBucket
+	 * (`hashPrefixBucketSeedOf`). It must not be empty and must not contain `SHARD_GROUP_SEPARATOR`.
+	 */
 	shardGroup: string;
+	/**
+	 * The number of root partitions, from 1 to `FOKOS_HASH_PARTITIONS_MAX`. All roots exist from the
+	 * start, so set it for the write load before the first split. A power of two is best (see above).
+	 */
 	rootTreesN: number;
+	/**
+	 * The number of children of each hash split, from 2 to 255. The depth limit is the largest
+	 * depth `d` with `rootTreesN * hashSplitN^d <= 2^64`, and at most `MAX_HASH_DEPTH`
+	 * (`maxHashDepth`). A power of two is best (see above).
+	 */
 	hashSplitN: number;
 	/**
 	 * The Durable Object jurisdiction of every partition of this shard group. It is part of the
