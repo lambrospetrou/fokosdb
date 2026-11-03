@@ -12,14 +12,12 @@ async function paged(s: RunScope, opts: QueryItemsOptions, maxPages: number) {
 	let pages = 0;
 	let items = 0;
 	let scanned = 0;
-	let ms = 0;
 	let forwards = 0;
 	let partitions = 0;
 	let outcome = "ok";
 	let cursor: string | undefined;
 	do {
 		const page = await s.op(() => s.db.queryItems({ ...opts, cursor }));
-		ms += page.ms;
 		forwards += page.stats.forwards;
 		partitions += page.stats.partitions;
 		if (page.outcome !== "ok") {
@@ -31,13 +29,13 @@ async function paged(s: RunScope, opts: QueryItemsOptions, maxPages: number) {
 		scanned += page.result!.scannedCount;
 		cursor = page.result!.cursor;
 	} while (cursor !== undefined && pages < maxPages);
-	return { pages, items, scanned, ms, forwards, partitions, outcome };
+	return { pages, items, scanned, forwards, partitions, outcome };
 }
 
 /**
  * Paginated `queryItems` over a seeded dataset: 8 hash keys x 250 sort keys, so a request that names
- * several hash keys crosses partitions. Iterations cycle through five patterns in blob6.
- * `iter` doubles: pages, items, ms_total, forwards, partition_visits.
+ * several hash keys crosses partitions. Iterations cycle through five patterns in blob10.
+ * `iter` doubles: total_ms, pages_n, items_n, forwards_n, visits_n.
  */
 export const query: Workload = {
 	defaults: { iterations: 30, concurrency: 3, budgetMs: 35_000 },
@@ -62,6 +60,7 @@ export const query: Workload = {
 	},
 	async tick(s) {
 		const iterationsDone = await s.runIterations(async (i) => {
+			const start = Date.now();
 			const hk = hashKey(i % HASH_KEYS);
 			let totals;
 			let pattern: string;
@@ -108,7 +107,7 @@ export const query: Workload = {
 						3,
 					);
 			}
-			s.iter([totals.pages, totals.items, totals.ms, totals.forwards, totals.partitions], totals.outcome, [pattern]);
+			s.iter([Date.now() - start, totals.pages, totals.items, totals.forwards, totals.partitions], totals.outcome, [pattern]);
 		});
 		return { iterationsDone };
 	},

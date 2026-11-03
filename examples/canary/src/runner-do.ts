@@ -50,11 +50,11 @@ async function runIterative(params: WorkloadParams, fn: (i: number) => Promise<v
  */
 export class WorkloadRunnerDO extends DurableObject<Env> {
 	#names: DemoNames;
-	#bootedAt = Date.now();
 	#busy = false;
 	#tracker?: PartitionTracker;
 	#colo = "";
 	#loc = "";
+	#location?: Promise<void>;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -63,20 +63,13 @@ export class WorkloadRunnerDO extends DurableObject<Env> {
 			throw new Error(`the runner object needs a name of the form wl:<workload>:<placement>:<instance>, got ${ctx.id.name}`);
 		}
 		this.#names = names;
-		// Best-effort, non-blocking: record the colo this isolate lives in for placement verification.
-		setTimeout(() => {
-			void fetchRunnerColo()
-				.then(({ colo, loc }) => {
-					this.#colo = colo;
-					this.#loc = loc;
-				})
-				.catch(() => {});
-		}, 0);
 	}
 
 	async setup(req: PhaseRequest): Promise<PhaseResult> {
 		const { workload, name } = this.#resolve(req);
+		await this.#ensureLocation();
 		if (this.#busy) {
+			this.#metrics().point("busy", []);
 			return { ok: false, workload: name, reason: "busy" };
 		}
 		this.#busy = true;
@@ -92,21 +85,22 @@ export class WorkloadRunnerDO extends DurableObject<Env> {
 
 	async tick(req: PhaseRequest): Promise<PhaseResult> {
 		const { workload, name } = this.#resolve(req);
+		await this.#ensureLocation();
 		if (this.#busy) {
-			new Metrics(this.env, this.#names).point("busy", []);
+			this.#metrics().point("busy", []);
 			return { ok: false, workload: name, reason: "busy" };
 		}
 		this.#busy = true;
-		const metrics = new Metrics(this.env, this.#names);
+		const metrics = this.#metrics();
 		try {
-			metrics.point("runner", [Date.now() - this.#bootedAt], [this.#colo, this.#loc]);
+			metrics.point("runner", []);
 			const { scope, counts } = this.#scope(workload, req.params, metrics);
 			await this.#ensureSeeded(workload, scope);
 			const start = Date.now();
 			const { iterationsDone } = await workload.tick(scope);
 			const elapsedMs = Date.now() - start;
 			this.#tracker?.save();
-			metrics.point("tick", [iterationsDone, elapsedMs, counts.ops, counts.errors, metrics.dropped]);
+			metrics.point("tick", [elapsedMs, iterationsDone, counts.ops, counts.errors, metrics.dropped]);
 			return {
 				ok: true,
 				workload: name,
@@ -123,11 +117,13 @@ export class WorkloadRunnerDO extends DurableObject<Env> {
 
 	async cleanup(req: PhaseRequest): Promise<PhaseResult> {
 		const { name } = this.#resolve(req);
+		await this.#ensureLocation();
 		if (this.#busy) {
+			this.#metrics().point("busy", []);
 			return { ok: false, workload: name, reason: "busy" };
 		}
 		this.#busy = true;
-		const metrics = new Metrics(this.env, this.#names);
+		const metrics = this.#metrics();
 		try {
 			const start = Date.now();
 			await makeFokosDB(this.#names).destroy();
@@ -152,12 +148,40 @@ export class WorkloadRunnerDO extends DurableObject<Env> {
 		return { workload: WORKLOADS[name], name };
 	}
 
+	/**
+	 * Resolves the isolate's region on the first phase call, so every point carries a location.
+	 * The fallback bounds the wait so a hung trace fetch cannot stall a phase; a failed resolve
+	 * clears the cache and the next call retries.
+	 */
+	#ensureLocation(): Promise<void> {
+		this.#location ??= (async () => {
+			const empty = { colo: "", loc: "" };
+			const fallback = new Promise<typeof empty>((resolve) => setTimeout(() => resolve(empty), 5_000));
+			const { colo, loc } = await Promise.race([fetchRunnerColo().catch(() => empty), fallback]);
+			this.#colo = colo;
+			this.#loc = loc;
+			if (!colo) {
+				this.#location = undefined;
+			}
+		})();
+		return this.#location;
+	}
+
+	#metrics(): Metrics {
+		return new Metrics(this.env, this.#names, {
+			id: String(this.ctx.id),
+			name: this.#names.doName,
+			colo: this.#colo,
+			loc: this.#loc,
+		});
+	}
+
 	#scope(
 		workload: Workload,
 		params: Partial<WorkloadParams> | undefined,
 		metrics?: Metrics,
 	): { scope: RunScope; counts: { ops: number; errors: number } } {
-		metrics ??= new Metrics(this.env, this.#names);
+		metrics ??= this.#metrics();
 		this.#tracker ??= new PartitionTracker(this.ctx.storage.kv);
 		const tracker = this.#tracker;
 		const resolved = resolveParams(workload.defaults, params);
@@ -197,7 +221,7 @@ export class WorkloadRunnerDO extends DurableObject<Env> {
 		const start = Date.now();
 		const seeded = (await workload.setup?.(scope)) ?? {};
 		this.ctx.storage.kv.put(key, Date.now());
-		scope.metrics.point("seed", [seeded.seededItems ?? 0, Date.now() - start]);
+		scope.metrics.point("seed", [Date.now() - start, seeded.seededItems ?? 0]);
 		return { already: false, items: seeded.seededItems ?? 0 };
 	}
 }
