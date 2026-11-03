@@ -618,10 +618,11 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		// production. A coordinator with no identity answers `not_found`.
 		await tcStub.recoverTransaction(coordinator, { transactionId: "no-such-transaction", idempotencyToken: `stale-${transactionId}` });
 
-		await runInDurableObject(tcStub, async (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+		await runInDurableObject(tcStub, async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, operations_hash)
-				 VALUES (?, ?, 'COMMITTED', ?, ?, ?, ?)`,
+				`INSERT INTO tc_state (hash_prefix_bucket, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, operations_hash)
+				 VALUES (?, ?, ?, 'COMMITTED', ?, ?, ?, ?)`,
+				instance.fokos.storagePrefix(KeyCodec.encode(`stale-${transactionId}`)),
 				`stale-${transactionId}`,
 				transactionId,
 				transactionTimestamp,

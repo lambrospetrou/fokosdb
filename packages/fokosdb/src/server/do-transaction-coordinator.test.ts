@@ -32,7 +32,9 @@ import type {
 } from "../shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 import type { FokosMigrationPageBudget } from "../sharding/runtime-config.js";
-import type { FokosEnvelope, FokosShardingHooks } from "../sharding/runtime-types.js";
+import type { FokosEnvelope, FokosShardingHooks, FokosStorageInterval } from "../sharding/runtime-types.js";
+import { asHashPrefixBucket, compareHashPrefixBuckets, type HashPrefixBucket } from "../sharding/hash-primitives.js";
+import { hashStorageInterval } from "../sharding/repartition-slice.js";
 import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
@@ -66,6 +68,14 @@ const TX_ID = "tx-1";
 const TOKEN = "tok-1";
 const BASE_TIME = 2_000_000_000_000;
 
+/** The position of a migration page of the coordinator. */
+type MigrationCursor = { prefix: HashPrefixBucket; transactionId: string };
+
+/** The storage prefix of the rows of a token in `tc`. */
+function P(tc: CoordinatorInternals, token = TOKEN): HashPrefixBucket {
+	return tc.fokos.storagePrefix(KeyCodec.encode(token));
+}
+
 afterEach(() => {
 	vi.restoreAllMocks();
 });
@@ -80,47 +90,71 @@ type CoordinatorInternals = {
 	fokosNow(): number;
 	hooks(): FokosShardingHooks<FokosDBPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
-	recoverTransactionLocal(transactionId: string): Promise<unknown>;
+	recoverTransactionLocal(prefix: HashPrefixBucket, transactionId: string): Promise<unknown>;
 	/** The step of the `tx_recovery` job. */
 	recoverStaleTransactions(): Promise<void>;
-	driveTransaction(transactionId: string, idempotencyToken: string, state: TCState, budgetMs: number): Promise<void>;
+	driveTransaction(
+		prefix: HashPrefixBucket,
+		transactionId: string,
+		idempotencyToken: string,
+		state: TCState,
+		budgetMs: number,
+	): Promise<void>;
 	earliestRecoveryAt(): number | null;
 	/** The step of the `idempotency_sweep` job. */
 	sweepExpiredTransactions(): number | null;
 	earliestCompletedAt(): number | null;
 	buildMigrationPage(
-		cursor: string | null,
+		cursor: MigrationCursor | null,
 		belongsToTarget: (key: { hashKey: Uint8Array }) => boolean,
 		budget: FokosMigrationPageBudget,
+		interval: FokosStorageInterval,
 	): {
 		page: Array<{
-			state: { transaction_id: string };
+			state: { transaction_id: string; idempotency_token: string };
 			items: Array<{ op_index: number; data: unknown; data_kind: unknown; conditions_json: unknown }>;
 		}>;
-		nextCursor: string | null;
+		nextCursor: MigrationCursor | null;
 	};
 	applyMigrationPage(page: unknown[]): void;
-	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
-	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
-	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
-	storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void;
-	markCommitting(transactionId: string, idempotencyToken: string): void;
-	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
-	runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	stripPayload(transactionId: string): void;
-	completeTransaction(transactionId: string, idempotencyToken: string, terminalState: "COMMITTED" | "CANCELLED"): Promise<void>;
+	loadFinalResponse(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
+	cancelTransactionInStore(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): void;
+	storePrepareAnswer(prefix: HashPrefixBucket, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
+	storePrepareError(prefix: HashPrefixBucket, transactionId: string, partitionDoName: string, err: unknown): void;
+	markCommitting(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): void;
+	drivePrepare(
+		prefix: HashPrefixBucket,
+		transactionId: string,
+		idempotencyToken: string,
+		requestBudgetMs: number,
+	): Promise<InitiateWriteResponseEncoded>;
+	runPrepareRecovery(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCommit(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCancel(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	stripPayload(prefix: HashPrefixBucket, transactionId: string): void;
+	completeTransaction(
+		prefix: HashPrefixBucket,
+		transactionId: string,
+		idempotencyToken: string,
+		terminalState: "COMMITTED" | "CANCELLED",
+	): Promise<void>;
 };
 
-function seed(state: DurableObjectState, tcState: TCState, results?: TransactWriteOperationResultEncoded[], createdAt?: number): void {
+function seed(
+	tc: CoordinatorInternals,
+	state: DurableObjectState,
+	tcState: TCState,
+	results?: TransactWriteOperationResultEncoded[],
+	createdAt?: number,
+): void {
 	state.storage.sql.exec(`DELETE FROM tc_state`);
 	state.storage.sql.exec(`DELETE FROM tc_participants`);
 	state.storage.sql.exec(`DELETE FROM tc_items`);
 	const now = createdAt ?? Date.now() - 10_000;
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tc_state (hash_prefix_bucket, idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		P(tc),
 		TOKEN,
 		TX_ID,
 		tcState,
@@ -134,15 +168,17 @@ function seed(state: DurableObjectState, tcState: TCState, results?: TransactWri
 	// A realistic item set, one row with a sort key and one without. The response must not depend on
 	// it: a committed transaction reports no items.
 	state.storage.sql.exec(
-		`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
-		 VALUES (?, ?, ?, 0, 'put', 'v', 1, NULL, 'p1')`,
+		`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
+		 VALUES (?, ?, ?, ?, 0, 'put', 'v', 1, NULL, 'p1')`,
+		P(tc),
 		TX_ID,
 		kb("hk1"),
 		kb("sk1"),
 	);
 	state.storage.sql.exec(
-		`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
-		 VALUES (?, ?, ?, 1, 'delete', NULL, NULL, NULL, 'p1')`,
+		`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
+		 VALUES (?, ?, ?, ?, 1, 'delete', NULL, NULL, NULL, 'p1')`,
+		P(tc),
 		TX_ID,
 		kb("hk2"),
 		ABSENT_SK,
@@ -154,6 +190,7 @@ function countRows(state: DurableObjectState, table: string): number {
 }
 
 function insertState(
+	tc: CoordinatorInternals,
 	state: DurableObjectState,
 	options: {
 		token: string;
@@ -163,12 +200,15 @@ function insertState(
 		completedAt?: number | null;
 		results?: TransactWriteOperationResultEncoded[];
 		operationsHash?: string;
+		/** A bucket other than the token's, to seed two transactions into one hashPrefixBucket. */
+		hashPrefixBucket?: HashPrefixBucket;
 	},
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_state
-			(idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(hash_prefix_bucket, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		options.hashPrefixBucket ?? P(tc, options.token),
 		options.token,
 		options.transactionId,
 		options.state,
@@ -182,13 +222,15 @@ function insertState(
 }
 
 function insertParticipant(
+	tc: CoordinatorInternals,
 	state: DurableObjectState,
 	outcome: { prepare?: string; commit?: string; cancel?: string; name?: string; answer?: PrepareOutcome; error?: FokosErrorWire },
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_participants
-			(transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		P(tc),
 		TX_ID,
 		outcome.name ?? "p1",
 		// A valid route context, because the coordinator builds its partition client from it.
@@ -201,10 +243,18 @@ function insertParticipant(
 	);
 }
 
-function insertImage(state: DurableObjectState, transactionId: string, opIndex: number, data: string): void {
+function insertImage(
+	tc: CoordinatorInternals,
+	state: DurableObjectState,
+	transactionId: string,
+	opIndex: number,
+	data: string,
+	token = TOKEN,
+): void {
 	state.storage.sql.exec(
-		`INSERT INTO tc_results (transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
-		 VALUES (?, ?, 1, 1, NULL, ?)`,
+		`INSERT INTO tc_results (hash_prefix_bucket, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+		 VALUES (?, ?, ?, 1, 1, NULL, ?)`,
+		P(tc, token),
 		transactionId,
 		opIndex,
 		data,
@@ -262,9 +312,9 @@ async function runJobs(tc: CoordinatorInternals): Promise<void> {
 describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only after every participant confirmed", () => {
 	it("reports committed in state COMMITTED", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, "COMMITTED");
+			seed(tc, state, "COMMITTED");
 			// toEqual, not toMatchObject: an item echo reappearing here is a failure, not an extra.
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -278,10 +328,10 @@ describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only af
 	// value from it. The answer must be the retryable commit-pending error, never "committed".
 	it.each(["PREPARED", "COMMITTING"] as const)("throws the commit-pending error in state %s", async (tcState) => {
 		await withCoordinator((tc, state) => {
-			seed(state, tcState);
+			seed(tc, state, tcState);
 			let err: unknown;
 			try {
-				tc.loadFinalResponse(TX_ID, TOKEN);
+				tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			} catch (e) {
 				err = e;
 			}
@@ -299,8 +349,8 @@ describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only af
 				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" } },
 				{ outcome: "passed" },
 			];
-			seed(state, tcState, results);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+			seed(tc, state, tcState, results);
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toEqual({
 				outcome: "cancelled",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -312,8 +362,8 @@ describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only af
 
 	it("raises unexpected_transaction_state when a CANCELLING row has no stored results", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, "CANCELLING");
-			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(
+			seed(tc, state, "CANCELLING");
+			expect(() => tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toThrow(
 				expect.objectContaining({ code: "unexpected_transaction_state", attributes: expect.objectContaining({ state: "CANCELLING" }) }),
 			);
 		});
@@ -322,10 +372,10 @@ describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only af
 	// The only states where the outcome can still go either way, and so the only other retryable answer.
 	it.each(["CREATED", "PREPARING"] as const)("throws the undecided error in state %s", async (tcState) => {
 		await withCoordinator((tc, state) => {
-			seed(state, tcState);
+			seed(tc, state, tcState);
 			let err: unknown;
 			try {
-				tc.loadFinalResponse(TX_ID, TOKEN);
+				tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			} catch (e) {
 				err = e;
 			}
@@ -427,9 +477,15 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		async (hashSplitConditions) => {
 			await withCoordinator(async (tc, state, ctx) => {
 				const policy = { ...ctx.policy, hashSplitConditions };
-				// A split needs two tokens.
+				// A split needs two hashPrefixBuckets.
 				for (const token of ["tok-a", "tok-b"]) {
-					insertState(state, { token, transactionId: `tx-${token}`, state: "COMMITTED", createdAt: Date.now(), completedAt: Date.now() });
+					insertState(tc, state, {
+						token,
+						transactionId: `tx-${token}`,
+						state: "COMMITTED",
+						createdAt: Date.now(),
+						completedAt: Date.now(),
+					});
 				}
 				// One byte above the size limit of a coordinator. Each policy has no size threshold, or a
 				// threshold that is larger than this limit. Thus only the limit of the coordinator applies.
@@ -443,15 +499,25 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		},
 	);
 
-	it("does not split above the limit with fewer than two tokens, because a split moves whole tokens", async () => {
+	it("does not split above the limit with fewer than two hashPrefixBuckets, because a split moves whole hashPrefixBuckets", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(console, "error").mockImplementation(() => {});
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 			const evaluate = () => tc.hooks().evaluateSplit({ identity: tc.fokos.identity(), policy: ctx.policy });
 			expect(evaluate()).toBe(false);
-			insertState(state, { token: "tok-a", transactionId: "tx-a", state: "COMMITTED", createdAt: Date.now(), completedAt: Date.now() });
+			insertState(tc, state, { token: "tok-a", transactionId: "tx-a", state: "COMMITTED", createdAt: Date.now(), completedAt: Date.now() });
 			expect(evaluate()).toBe(false);
-			insertState(state, { token: "tok-b", transactionId: "tx-b", state: "PREPARING", createdAt: Date.now() });
+			// A second transaction in the same hashPrefixBucket can still not leave for another child.
+			insertState(tc, state, {
+				token: "tok-c",
+				hashPrefixBucket: P(tc, "tok-a"),
+				transactionId: "tx-c",
+				state: "COMMITTED",
+				createdAt: Date.now(),
+				completedAt: Date.now(),
+			});
+			expect(evaluate()).toBe(false);
+			insertState(tc, state, { token: "tok-b", transactionId: "tx-b", state: "PREPARING", createdAt: Date.now() });
 			expect(evaluate()).toEqual({});
 		});
 	});
@@ -470,7 +536,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	it("answers a replay when the coordinator is above its database size guard", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			const items: InitiateWriteRequest["items"] = [];
-			insertState(state, {
+			insertState(tc, state, {
 				token: TOKEN,
 				transactionId: TX_ID,
 				state: "COMMITTED",
@@ -500,14 +566,18 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				["tx-earlier", now - 60_000],
 				["tx-new", now],
 			] as const) {
-				insertState(state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt });
+				insertState(tc, state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt });
 			}
 			const drives: { transactionId: string; budgetMs: number }[] = [];
-			vi.spyOn(tc, "driveTransaction").mockImplementation(async (transactionId, _token, _state, budgetMs) => {
+			const prefixMatches: boolean[] = [];
+			vi.spyOn(tc, "driveTransaction").mockImplementation(async (prefix, transactionId, token, _state, budgetMs) => {
+				// Each claimed row keeps the hashPrefixBucket of its own token.
+				prefixMatches.push(compareHashPrefixBuckets(prefix, P(tc, token)) === 0);
 				drives.push({ transactionId, budgetMs });
 			});
 
 			await tc.recoverStaleTransactions();
+			expect(prefixMatches).toEqual([true, true]);
 
 			expect(drives).toEqual([
 				{ transactionId: "tx-earlier", budgetMs: DEFAULT_COORDINATOR_CONFIG.fanoutRequestBudgetMs },
@@ -527,7 +597,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(drives).toHaveLength(2);
 
 			// A recovery call makes its own transaction due now, before the others.
-			await expect(tc.recoverTransactionLocal("tx-later")).resolves.toEqual({ state: "driving" });
+			await expect(tc.recoverTransactionLocal(P(tc, "token-tx-later"), "tx-later")).resolves.toEqual({ state: "driving" });
 			expect(nextRecoveryAt("tx-later")).toBe(now);
 			await tc.recoverStaleTransactions();
 			expect(drives.map((drive) => drive.transactionId)).toEqual(["tx-earlier", "tx-later", "tx-later"]);
@@ -540,8 +610,8 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			const now = Date.now();
 			const clock = vi.spyOn(tc, "fokosNow").mockReturnValue(now);
 			state.storage.sql.exec(`DELETE FROM tc_state`);
-			insertState(state, { token: "token-first", transactionId: "tx-first", state: "COMMITTING", createdAt: now - 60_000 });
-			insertState(state, { token: "token-second", transactionId: "tx-second", state: "COMMITTING", createdAt: now - 50_000 });
+			insertState(tc, state, { token: "token-first", transactionId: "tx-first", state: "COMMITTING", createdAt: now - 60_000 });
+			insertState(tc, state, { token: "token-second", transactionId: "tx-second", state: "COMMITTING", createdAt: now - 50_000 });
 			const before = state.storage.sql
 				.exec<{ next_recovery_at: number }>(`SELECT next_recovery_at FROM tc_state WHERE transaction_id = 'tx-second'`)
 				.one().next_recovery_at;
@@ -552,7 +622,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 			await tc.recoverStaleTransactions();
 
-			expect(drive.mock.calls.map(([transactionId]) => transactionId)).toEqual(["tx-first"]);
+			expect(drive.mock.calls.map(([, transactionId]) => transactionId)).toEqual(["tx-first"]);
 			expect(
 				state.storage.sql
 					.exec<{ next_recovery_at: number }>(`SELECT next_recovery_at FROM tc_state WHERE transaction_id = 'tx-second'`)
@@ -563,11 +633,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("still answers a recovery call and runs its recovery job above the database size guard", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
 
-			await expect(tc.recoverTransactionLocal(TX_ID)).resolves.toEqual({ state: "driving" });
+			await expect(tc.recoverTransactionLocal(P(tc), TX_ID)).resolves.toEqual({ state: "driving" });
 			await tc.recoverStaleTransactions();
 
 			expect(recover).toHaveBeenCalledTimes(1);
@@ -578,12 +648,12 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// job drives the transaction.
 	it("answers a recovery call for an incomplete transaction at once, and makes the tx_recovery job due", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
 			const now = Date.now();
 			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
 
-			await expect(tc.recoverTransactionLocal(TX_ID)).resolves.toEqual({ state: "driving" });
+			await expect(tc.recoverTransactionLocal(P(tc), TX_ID)).resolves.toEqual({ state: "driving" });
 
 			expect(recover).not.toHaveBeenCalled();
 			expect(state.storage.kv.get<Record<string, { nextRunAt: number }>>(FOKOS_KV_KEYS.JOBS)?.tx_recovery?.nextRunAt).toBeLessThanOrEqual(
@@ -618,7 +688,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(deadline).toContain("USING INDEX idx_tc_state_recovery");
 			expect(deadline).not.toContain("TEMP B-TREE");
 			const due = plan(
-				`SELECT transaction_id, idempotency_token, created_at FROM tc_state
+				`SELECT hash_prefix_bucket, transaction_id, idempotency_token, state, created_at FROM tc_state
 				  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
 				1,
 				10,
@@ -628,18 +698,58 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		});
 	});
 
-	it("keys tc_state by transaction_id and enforces unique idempotency_token", async () => {
-		await withCoordinator((_tc, state) => {
-			const columns = state.storage.sql.exec<{ name: string; pk: number }>(`PRAGMA table_info(tc_state)`).toArray();
-			const pkColumn = columns.find((c) => c.pk > 0);
-			expect(pkColumn?.name).toBe("transaction_id");
+	// The sweep reads the expired keys in the order of the completed-at index, with no sort, and deletes
+	// each key with a seek of the primary key.
+	it("reads the expired transactions from the completed-at index and deletes them by primary key", async () => {
+		await withCoordinator((tc, state) => {
+			const plan = (sql: string, ...params: unknown[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			const expired = plan(
+				`SELECT hash_prefix_bucket, transaction_id FROM tc_state WHERE completed_at < ?
+				  ORDER BY completed_at, hash_prefix_bucket, transaction_id LIMIT ?`,
+				1,
+				10,
+			);
+			expect(expired).toContain("USING COVERING INDEX idx_tc_state_completed_at (completed_at<?)");
+			expect(expired).not.toContain("TEMP B-TREE");
+			for (const table of ["tc_state", "tc_results"]) {
+				const remove = plan(
+					`DELETE FROM ${table} WHERE (hash_prefix_bucket, transaction_id) IN (VALUES (?, ?), (?, ?))`,
+					P(tc, "a"),
+					"tx-a",
+					P(tc, "b"),
+					"tx-b",
+				);
+				expect(remove).toContain("USING PRIMARY KEY (hash_prefix_bucket=? AND transaction_id=?)");
+			}
+		});
+	});
+
+	it("keys each tc_* table by the hashPrefixBucket and the transaction, and enforces a unique idempotency_token", async () => {
+		await withCoordinator((tc, state) => {
+			const primaryKey = (table: string) =>
+				state.storage.sql
+					.exec<{ name: string; pk: number }>(`PRAGMA table_info(${table})`)
+					.toArray()
+					.filter((c) => c.pk > 0)
+					.sort((a, b) => a.pk - b.pk)
+					.map((c) => c.name);
+			expect(primaryKey("tc_state")).toEqual(["hash_prefix_bucket", "transaction_id"]);
+			expect(primaryKey("tc_participants")).toEqual(["hash_prefix_bucket", "transaction_id", "partition_do_name"]);
+			expect(primaryKey("tc_items")).toEqual(["hash_prefix_bucket", "transaction_id", "op_index"]);
+			expect(primaryKey("tc_results")).toEqual(["hash_prefix_bucket", "transaction_id", "op_index"]);
 
 			const indexes = state.storage.sql.exec<{ name: string; unique: number }>(`PRAGMA index_list(tc_state)`).toArray();
 			const tokenIndex = indexes.find((idx) => idx.name === "tc_state_idempotency_token");
 			expect(tokenIndex).toBeDefined();
 			expect(tokenIndex?.unique).toBe(1);
 
-			insertState(state, {
+			insertState(tc, state, {
 				token: "unique-token",
 				transactionId: "tx-unique-1",
 				state: "CREATED",
@@ -647,7 +757,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			});
 
 			expect(() => {
-				insertState(state, {
+				insertState(tc, state, {
 					token: "unique-token",
 					transactionId: "tx-unique-2",
 					state: "CREATED",
@@ -659,11 +769,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("keeps the payload in the COMMITTING transition", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
 			vi.spyOn(tc, "runCommit").mockResolvedValue();
 
-			await expect(tc.drivePrepare(TX_ID, TOKEN, 0)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
+			await expect(tc.drivePrepare(P(tc), TX_ID, TOKEN, 0)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
 
 			const stateRow = state.storage.sql
 				.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN)
@@ -687,8 +797,8 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("the recovery job keeps PREPARING payload until prepare receives it", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, {});
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, {});
 			const txPrepare = vi.fn(async (_pCtx: unknown, request: { items: Array<{ data?: string | Uint8Array }> }) => {
 				expect(request.items[0].data).toBe("v");
 				return enveloped({ outcome: "accepted" as const });
@@ -710,9 +820,9 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// participant answers. Cancelling on it would turn transient trouble into a lost transaction.
 	it("leaves a transaction PREPARING when a participant still has no answer and none rejected", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, { prepare: "accepted", name: "p1" });
-			insertParticipant(state, { name: "p2" });
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, { prepare: "accepted", name: "p1" });
+			insertParticipant(tc, state, { name: "p2" });
 			const txPrepare = vi.fn(async () => {
 				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_over_size, {
 					message: "partition exceeded its limits, please retry later",
@@ -720,12 +830,12 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			});
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(
 				state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN).toArray()[0].state,
 			).toBe("PREPARING");
-			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(fokosErrorWith("transaction_undecided"));
+			expect(() => tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toThrow(fokosErrorWith("transaction_undecided"));
 		});
 	});
 
@@ -733,7 +843,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// the condition rejection of another, and that rejection keeps its image.
 	it("reports each participant's answer for its own operations, and keeps the image of a rejection", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 			const clockSkew = {
 				code: "clock_skew" as const,
@@ -742,12 +852,12 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				serverTimestampMicros: 10,
 				transactionTimestampMicros: 99,
 			};
-			insertParticipant(state, {
+			insertParticipant(tc, state, {
 				name: "p1",
 				prepare: "rejected",
 				answer: { outcome: "rejected", results: [{ opIndex: 0, outcome: "rejected", reason: clockSkew }] },
 			});
-			insertParticipant(state, {
+			insertParticipant(tc, state, {
 				name: "p2",
 				prepare: "rejected",
 				answer: {
@@ -755,11 +865,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 					results: [{ opIndex: 1, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" }, imageBytes: 6 }],
 				},
 			});
-			insertImage(state, TX_ID, 1, "image-1");
+			insertImage(tc, state, TX_ID, 1, "image-1");
 
-			tc.cancelTransactionInStore(TX_ID, TOKEN);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
 
-			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toEqual([
@@ -778,21 +888,21 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// other drive has stored CANCELLING and deleted the images that the cap dropped.
 	it("ignores a prepare answer that arrives after the cancel, and does not add an image again", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			insertParticipant(state, { name: "p1" });
-			insertParticipant(state, { name: "p2" });
+			insertParticipant(tc, state, { name: "p1" });
+			insertParticipant(tc, state, { name: "p2" });
 			// The first image fills the whole cap, so the cap drops the second image.
-			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX));
-			tc.storePrepareAnswer(TX_ID, "p2", rejection(1, "hk2", 6));
-			tc.cancelTransactionInStore(TX_ID, TOKEN);
-			const before = tc.loadFinalResponse(TX_ID, TOKEN);
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX));
+			tc.storePrepareAnswer(P(tc), TX_ID, "p2", rejection(1, "hk2", 6));
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			const before = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			const answersBefore = state.storage.sql.exec(`SELECT * FROM tc_participants ORDER BY partition_do_name`).toArray();
 			expect(countRows(state, "tc_results")).toBe(1);
 
-			tc.storePrepareAnswer(TX_ID, "p2", rejection(1, "hk2", 6));
+			tc.storePrepareAnswer(P(tc), TX_ID, "p2", rejection(1, "hk2", 6));
 
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual(before);
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toEqual(before);
 			expect(state.storage.sql.exec(`SELECT * FROM tc_participants ORDER BY partition_do_name`).toArray()).toEqual(answersBefore);
 			expect(countRows(state, "tc_results")).toBe(1);
 		});
@@ -802,11 +912,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// participant that arrives later is an old answer.
 	it("keeps an accepted answer when a rejection of the same participant arrives later", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, { name: "p1" });
 
-			tc.storePrepareAnswer(TX_ID, "p1", { outcome: "accepted" });
-			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", 7));
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", { outcome: "accepted" });
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", rejection(0, "hk1", 7));
 
 			const row = state.storage.sql
 				.exec<{ prepare_outcome: string | null; answer_json: string | null }>(`SELECT prepare_outcome, answer_json FROM tc_participants`)
@@ -820,11 +930,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// stored answer never changes, so the stored images of a transaction only grow until the decision.
 	it("keeps the first rejection when a later answer of the same participant arrives", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, { name: "p1" });
 
-			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", 7));
-			tc.storePrepareAnswer(TX_ID, "p1", { outcome: "accepted" });
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", rejection(0, "hk1", 7));
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", { outcome: "accepted" });
 
 			expect(state.storage.sql.exec<{ prepare_outcome: string | null }>(`SELECT prepare_outcome FROM tc_participants`).one()).toEqual({
 				prepare_outcome: "rejected",
@@ -837,15 +947,16 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// A PREPARING transaction then held more images than the RPC limit of one migration page.
 	it("stores at most the combined image cap while the transaction is PREPARING", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`DELETE FROM tc_items`);
 			const imageBytes = 390 * 1024;
 			const data = "x".repeat(imageBytes);
 			for (let p = 0; p < 9; p++) {
-				insertParticipant(state, { name: `p${p}` });
+				insertParticipant(tc, state, { name: `p${p}` });
 				for (let i = p * 10; i < p * 10 + 10; i++) {
 					state.storage.sql.exec(
-						`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 'check', ?)`,
+						`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, ?, 'check', ?)`,
+						P(tc),
 						TX_ID,
 						kb(`hk${i}`),
 						ABSENT_SK,
@@ -855,7 +966,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				}
 			}
 			for (let p = 0; p < 9; p++) {
-				tc.storePrepareAnswer(TX_ID, `p${p}`, {
+				tc.storePrepareAnswer(P(tc), TX_ID, `p${p}`, {
 					outcome: "rejected",
 					results: Array.from({ length: 10 }, (_, k) => {
 						const opIndex = p * 10 + k;
@@ -883,20 +994,20 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		const answerInOrder = async (order: string[]) => {
 			let response: unknown;
 			await withCoordinator(async (tc, state) => {
-				seed(state, "PREPARING");
+				seed(tc, state, "PREPARING");
 				state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-				insertParticipant(state, { name: "p1" });
-				insertParticipant(state, { name: "p2" });
+				insertParticipant(tc, state, { name: "p1" });
+				insertParticipant(tc, state, { name: "p2" });
 				const answers: Record<string, PrepareOutcome> = {
 					p1: rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX - 5),
 					p2: rejection(1, "hk2", 10),
 				};
 				for (const name of order) {
-					tc.storePrepareAnswer(TX_ID, name, answers[name]);
+					tc.storePrepareAnswer(P(tc), TX_ID, name, answers[name]);
 				}
 				expect(countRows(state, "tc_results")).toBe(1);
-				tc.cancelTransactionInStore(TX_ID, TOKEN);
-				response = tc.loadFinalResponse(TX_ID, TOKEN);
+				tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+				response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			});
 			return response;
 		};
@@ -915,10 +1026,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("does not store a prepare error after the decision", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			insertParticipant(tc, state, { name: "p1" });
 
-			tc.storePrepareError(TX_ID, "p1", new Error("late failure"));
+			tc.storePrepareError(P(tc), TX_ID, "p1", new Error("late failure"));
 
 			expect(state.storage.sql.exec<{ error_json: string | null }>(`SELECT error_json FROM tc_participants`).one().error_json).toBeNull();
 		});
@@ -926,11 +1037,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("does not move to COMMITTING while a participant has no stored accepted answer", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, { name: "p1", prepare: "accepted" });
-			insertParticipant(state, { name: "p2" });
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, { name: "p1", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p2" });
 
-			tc.markCommitting(TX_ID, TOKEN);
+			tc.markCommitting(P(tc), TX_ID, TOKEN);
 
 			expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("PREPARING");
 		});
@@ -940,13 +1051,13 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// can drive and decide the transaction in that time.
 	it("sends no prepare when another drive has already decided the transaction", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			insertParticipant(tc, state, { name: "p1" });
 			const txPrepare = vi.fn(async (_pCtx: unknown, _request: { transactionId: string }) => enveloped({ outcome: "accepted" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
-			await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await expect(tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			// The coordinator is shared with other tests, so only the calls for this transaction count.
 			expect(txPrepare.mock.calls.filter(([, request]) => request.transactionId === TX_ID)).toEqual([]);
@@ -957,10 +1068,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// the operations of the other participant keep what that participant answered.
 	it("reports the stored cause of a thrown prepare on its own operations, and keeps the other answer", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			insertParticipant(state, { name: "p1" });
-			insertParticipant(state, { name: "p2" });
+			insertParticipant(tc, state, { name: "p1" });
+			insertParticipant(tc, state, { name: "p2" });
 			const throwingPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
@@ -987,7 +1098,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			const response = await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
+			const response = await tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
@@ -1013,10 +1124,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// with no item and no itemOmitted, which reads as "the item does not exist".
 	it("keeps the images of a recovered participant when another has not answered yet", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			insertParticipant(state, { name: "p1" });
-			insertParticipant(state, { name: "p2" });
+			insertParticipant(tc, state, { name: "p1" });
+			insertParticipant(tc, state, { name: "p2" });
 			const acceptingPrepare = vi.fn(async () => enveloped({ outcome: "accepted" as const }));
 			const rejectingPrepare = vi.fn(async () =>
 				enveloped({
@@ -1041,9 +1152,9 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
-			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results[0]).toEqual({ outcome: "passed" });
@@ -1059,9 +1170,9 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// participant's answer and the decision still reports what that participant actually said.
 	it("recovers a persisted clock_skew as clock_skew", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			const clockSkew = { code: "clock_skew" as const, hashKey: "hk1", serverTimestampMicros: 5, transactionTimestampMicros: 500 };
-			insertParticipant(state, {
+			insertParticipant(tc, state, {
 				name: "p1",
 				prepare: "rejected",
 				answer: {
@@ -1073,12 +1184,12 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 					})),
 				},
 			});
-			insertParticipant(state, { name: "p2", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p2", prepare: "accepted" });
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
-			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toEqual([
@@ -1091,12 +1202,12 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("keeps the payload in the CANCELLING transition", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
-			insertParticipant(state, { prepare: "rejected" });
+			insertParticipant(tc, state, { prepare: "rejected" });
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(
 				state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN).toArray()[0].state,
@@ -1116,7 +1227,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		"the recovery claim removes the payload of a %s transaction and keeps its keys",
 		async (tcState) => {
 			await withCoordinator(async (tc, state) => {
-				seed(state, tcState);
+				seed(tc, state, tcState);
 				state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
 				const drive = vi.spyOn(tc, "driveTransaction").mockResolvedValue();
 
@@ -1141,10 +1252,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("sets completed_at, deletes per-transaction rows, and keeps the committed replay", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "COMMITTING");
-			insertParticipant(state, { prepare: "accepted", commit: "committed" });
+			seed(tc, state, "COMMITTING");
+			insertParticipant(tc, state, { prepare: "accepted", commit: "committed" });
 
-			await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{
@@ -1155,7 +1266,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(row).toMatchObject({ state: "COMMITTED", completed_at: expect.any(Number) });
 			expect(countRows(state, "tc_items")).toBe(0);
 			expect(countRows(state, "tc_participants")).toBe(0);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -1169,10 +1280,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			const results: TransactWriteOperationResultEncoded[] = [
 				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1" } },
 			];
-			seed(state, "CANCELLING", results);
-			insertParticipant(state, { prepare: "rejected", cancel: "cancelled" });
+			seed(tc, state, "CANCELLING", results);
+			insertParticipant(tc, state, { prepare: "rejected", cancel: "cancelled" });
 
-			await tc.runCancel(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runCancel(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{
@@ -1183,7 +1294,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(row).toMatchObject({ state: "CANCELLED", completed_at: expect.any(Number) });
 			expect(countRows(state, "tc_items")).toBe(0);
 			expect(countRows(state, "tc_participants")).toBe(0);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toMatchObject({
 				outcome: "cancelled",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -1194,11 +1305,12 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("stores images in tc_results only and keeps tc_state.results_json and answer_json free of item data", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			const largeData = "A".repeat(50_000);
 			state.storage.sql.exec(
-				`INSERT INTO tc_participants (transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
-				 VALUES (?, 'p1', '{}', 'rejected', ?)`,
+				`INSERT INTO tc_participants (hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
+				P(tc),
 				TX_ID,
 				JSON.stringify({
 					outcome: "rejected",
@@ -1216,13 +1328,14 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				}),
 			);
 			state.storage.sql.exec(
-				`INSERT INTO tc_results (transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
-				 VALUES (?, 0, 1, 1, NULL, ?)`,
+				`INSERT INTO tc_results (hash_prefix_bucket, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+				 VALUES (?, ?, 0, 1, 1, NULL, ?)`,
+				P(tc),
 				TX_ID,
 				largeData,
 			);
 
-			tc.cancelTransactionInStore(TX_ID, TOKEN);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
 
 			const stateRow = state.storage.sql
 				.exec<{ results_json: string }>(`SELECT results_json FROM tc_state WHERE transaction_id = ?`, TX_ID)
@@ -1231,7 +1344,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(stateRow.results_json).not.toContain(largeData);
 			expect(stateRow.results_json).not.toContain('"item"');
 
-			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toHaveLength(2);
@@ -1248,10 +1361,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	// shift every later operation onto its neighbour's outcome, and its neighbour's image with it.
 	it("reports an operation no participant answered as not_evaluated, without shifting the array", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(
-				`INSERT INTO tc_participants (transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
-				 VALUES (?, 'p1', '{}', 'rejected', ?)`,
+				`INSERT INTO tc_participants (hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
+				P(tc),
 				TX_ID,
 				JSON.stringify({
 					outcome: "rejected",
@@ -1260,9 +1374,9 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				}),
 			);
 
-			tc.cancelTransactionInStore(TX_ID, TOKEN);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
 
-			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toHaveLength(2);
@@ -1274,11 +1388,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	it("retains item and participant rows while a commit is unconfirmed", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "COMMITTING");
-			tc.stripPayload(TX_ID);
-			insertParticipant(state, { prepare: "accepted" });
+			seed(tc, state, "COMMITTING");
+			tc.stripPayload(P(tc), TX_ID);
+			insertParticipant(tc, state, { prepare: "accepted" });
 
-			await tc.runCommit(TX_ID, TOKEN, -1);
+			await tc.runCommit(P(tc), TX_ID, TOKEN, -1);
 
 			const row = state.storage.sql
 				.exec<{
@@ -1294,15 +1408,16 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 	describe("an item with more than one operation", () => {
 		/** Adds operation 2 on the key of operation 0, so that hk1/sk1 has two tc_items rows. */
-		function seedRepeatedItem(state: DurableObjectState, tcState: TCState) {
-			seed(state, tcState);
+		function seedRepeatedItem(tc: CoordinatorInternals, state: DurableObjectState, tcState: TCState) {
+			seed(tc, state, tcState);
 			state.storage.sql.exec(
-				`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, 2, 'check', 'p1')`,
+				`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 2, 'check', 'p1')`,
+				P(tc),
 				TX_ID,
 				kb("hk1"),
 				kb("sk1"),
 			);
-			insertParticipant(state, { prepare: tcState === "COMMITTING" ? "accepted" : undefined });
+			insertParticipant(tc, state, { prepare: tcState === "COMMITTING" ? "accepted" : undefined });
 		}
 
 		function mockKeys() {
@@ -1318,19 +1433,19 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		}
 
 		it("stores one tc_items row for each operation", async () => {
-			await withCoordinator(async (_tc, state) => {
-				seedRepeatedItem(state, "PREPARING");
+			await withCoordinator(async (tc, state) => {
+				seedRepeatedItem(tc, state, "PREPARING");
 				expect(countRows(state, "tc_items")).toBe(3);
 			});
 		});
 
 		it("sends each key one time in the commit", async () => {
 			await withCoordinator(async (tc, state) => {
-				seedRepeatedItem(state, "COMMITTING");
+				seedRepeatedItem(tc, state, "COMMITTING");
 				const sent = mockKeys();
 				vi.spyOn(tc, "completeTransaction").mockResolvedValue();
 
-				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+				await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 				expect(sent).toHaveLength(1);
 				expect(sent[0].op).toBe("txCommit");
@@ -1340,10 +1455,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 		it("sends each key one time in the cancel", async () => {
 			await withCoordinator(async (tc, state) => {
-				seedRepeatedItem(state, "CANCELLING");
+				seedRepeatedItem(tc, state, "CANCELLING");
 				const sent = mockKeys();
 
-				await tc.runCancel(TX_ID, TOKEN, BUDGET_MS);
+				await tc.runCancel(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 				expect(sent).toHaveLength(1);
 				expect(sent[0].op).toBe("txCancel");
@@ -1353,11 +1468,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	});
 
 	describe("commit outcomes", () => {
-		function twoParticipants(state: DurableObjectState, tcState: TCState) {
-			seed(state, tcState);
+		function twoParticipants(tc: CoordinatorInternals, state: DurableObjectState, tcState: TCState) {
+			seed(tc, state, tcState);
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			insertParticipant(state, { name: "p1", prepare: "accepted" });
-			insertParticipant(state, { name: "p2", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p1", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p2", prepare: "accepted" });
 		}
 
 		function mockCommits(failing: Set<string>) {
@@ -1389,13 +1504,13 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 		it("writes no commit outcome when every participant confirms", async () => {
 			await withCoordinator(async (tc, state) => {
-				twoParticipants(state, "COMMITTING");
+				twoParticipants(tc, state, "COMMITTING");
 				mockCommits(new Set());
 				const complete = vi.spyOn(tc, "completeTransaction").mockResolvedValue();
 
-				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+				await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
-				expect(complete).toHaveBeenCalledWith(TX_ID, TOKEN, "COMMITTED");
+				expect(complete).toHaveBeenCalledWith(P(tc), TX_ID, TOKEN, "COMMITTED");
 				expect(commitOutcomes(state)).toEqual([
 					{ partition_do_name: "p1", commit_outcome: null },
 					{ partition_do_name: "p2", commit_outcome: null },
@@ -1405,11 +1520,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 		it("stores the confirmed outcomes when a participant does not confirm, and sends only the missing commit later", async () => {
 			await withCoordinator(async (tc, state) => {
-				twoParticipants(state, "COMMITTING");
+				twoParticipants(tc, state, "COMMITTING");
 				mockCommits(new Set(["p2"]));
 
 				// A short budget: the fan-out retries p2 until the deadline.
-				await tc.runCommit(TX_ID, TOKEN, 300);
+				await tc.runCommit(P(tc), TX_ID, TOKEN, 300);
 
 				expect(commitOutcomes(state)).toEqual([
 					{ partition_do_name: "p1", commit_outcome: "committed" },
@@ -1418,7 +1533,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTING");
 
 				const committedBy = mockCommits(new Set());
-				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+				await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 				expect(committedBy).toEqual(["p2"]);
 				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTED");
@@ -1427,10 +1542,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 		it("moves a PREPARED row from older code to COMMITTING, and completes it", async () => {
 			await withCoordinator(async (tc, state) => {
-				twoParticipants(state, "PREPARED");
+				twoParticipants(tc, state, "PREPARED");
 				mockCommits(new Set());
 
-				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+				await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTED");
 			});
@@ -1438,11 +1553,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 
 		it("fails an invariant and sends no commit when a participant has no items", async () => {
 			await withCoordinator(async (tc, state) => {
-				twoParticipants(state, "COMMITTING");
-				insertParticipant(state, { name: "p3", prepare: "accepted" });
+				twoParticipants(tc, state, "COMMITTING");
+				insertParticipant(tc, state, { name: "p3", prepare: "accepted" });
 				const committedBy = mockCommits(new Set());
 
-				await expect(tc.runCommit(TX_ID, TOKEN, BUDGET_MS)).rejects.toThrow(fokosErrorWith("invariant_failed"));
+				await expect(tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS)).rejects.toThrow(fokosErrorWith("invariant_failed"));
 
 				expect(committedBy).toEqual([]);
 			});
@@ -1455,7 +1570,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		await withCoordinator(async (tc, state) => {
 			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
 			for (let i = 0; i < DEFAULT_COORDINATOR_CONFIG.sweepBatchRows + 3; i++) {
-				insertState(state, {
+				insertState(tc, state, {
 					token: `expired-${i}`,
 					transactionId: `tx-expired-${i}`,
 					state: "COMMITTED",
@@ -1472,28 +1587,29 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
-	// tc_results is keyed by transaction_id, and the sweep selects one batch of ids and deletes both
-	// tables by it. A tc_results row that outlived its tc_state row would be unreachable and unswept.
+	// tc_results is keyed by (hash_prefix_bucket, transaction_id), and the sweep selects one batch of keys
+	// and deletes both tables by it. A tc_results row that outlived its tc_state row would be unreachable
+	// and unswept.
 	it("deletes the images of every transaction it sweeps, and leaves the rest alone", async () => {
 		await withCoordinator(async (tc, state) => {
 			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
-			insertState(state, {
+			insertState(tc, state, {
 				token: "expired-token",
 				transactionId: "tx-expired",
 				state: "CANCELLED",
 				createdAt: BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1,
 				completedAt: BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1,
 			});
-			insertImage(state, "tx-expired", 0, "expired-image-0");
-			insertImage(state, "tx-expired", 1, "expired-image-1");
-			insertState(state, {
+			insertImage(tc, state, "tx-expired", 0, "expired-image-0", "expired-token");
+			insertImage(tc, state, "tx-expired", 1, "expired-image-1", "expired-token");
+			insertState(tc, state, {
 				token: "live-token",
 				transactionId: "tx-live",
 				state: "CANCELLED",
 				createdAt: BASE_TIME,
 				completedAt: BASE_TIME,
 			});
-			insertImage(state, "tx-live", 0, "live-image-0");
+			insertImage(tc, state, "tx-live", 0, "live-image-0", "live-token");
 
 			tc.sweepExpiredTransactions();
 
@@ -1506,11 +1622,51 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
+	// The primary key is (hash_prefix_bucket, transaction_id). Two tokens in two hashPrefixBuckets with
+	// one transaction ID show that each scan changes only the row it selected.
+	it("uses the full transaction key of each row that the recovery and the sweep scans select", async () => {
+		await withCoordinator(async (tc, state) => {
+			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
+			state.storage.sql.exec(`DELETE FROM tc_state`);
+			const [due, notDue, expired, live] = ["due-token", "not-due-token", "expired-token", "live-token"];
+			expect(new Set([due, notDue, expired, live].map((token) => P(tc, token).join())).size).toBe(4);
+			insertState(tc, state, { token: due, transactionId: "tx-recover", state: "COMMITTING", createdAt: BASE_TIME - 60_000 });
+			insertState(tc, state, { token: notDue, transactionId: "tx-recover", state: "COMMITTING", createdAt: BASE_TIME });
+			for (const [token, completedAt] of [
+				[expired, BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1],
+				[live, BASE_TIME],
+			] as const) {
+				insertState(tc, state, { token, transactionId: "tx-sweep", state: "CANCELLED", createdAt: completedAt, completedAt });
+				insertImage(tc, state, "tx-sweep", 0, `image-${token}`, token);
+			}
+			const nextRecoveryAt = (token: string) =>
+				state.storage.sql
+					.exec<{ next_recovery_at: number }>(`SELECT next_recovery_at FROM tc_state WHERE idempotency_token = ?`, token)
+					.one().next_recovery_at;
+			const notDueAt = nextRecoveryAt(notDue);
+			const drives: string[] = [];
+			vi.spyOn(tc, "driveTransaction").mockImplementation(async (_prefix, _transactionId, token) => {
+				drives.push(token);
+			});
+
+			await tc.recoverStaleTransactions();
+			tc.sweepExpiredTransactions();
+
+			expect(drives).toEqual([due]);
+			expect(nextRecoveryAt(due)).toBe(BASE_TIME + 30_000);
+			expect(nextRecoveryAt(notDue)).toBe(notDueAt);
+			expect(state.storage.sql.exec(`SELECT idempotency_token FROM tc_state WHERE transaction_id = 'tx-sweep'`).toArray()).toEqual([
+				{ idempotency_token: live },
+			]);
+			expect(state.storage.sql.exec(`SELECT image_data FROM tc_results`).toArray()).toEqual([{ image_data: `image-${live}` }]);
+		});
+	});
+
 	it("reports the next expiry as the deadline of the sweep until the last completed row expires", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
 			vi.spyOn(tc, "fokosNow").mockImplementation(() => now);
-			insertState(state, {
+			insertState(tc, state, {
 				token: "idle-token",
 				transactionId: "idle-tx",
 				state: "COMMITTED",
@@ -1533,7 +1689,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
 			const oldTransactionId = "expired-replay-tx";
-			insertState(state, {
+			insertState(tc, state, {
 				token: TOKEN,
 				transactionId: oldTransactionId,
 				state: "COMMITTED",
@@ -1557,7 +1713,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 			state.storage.sql.exec(`DELETE FROM tc_state`);
 			const ids = Array.from({ length: 10 }, (_, i) => `tx-${i}`);
 			ids.forEach((transactionId, i) =>
-				insertState(state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt: now - 60_000 + i }),
+				insertState(tc, state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt: now - 60_000 + i }),
 			);
 			let release!: () => void;
 			const stuck = new Promise<void>((resolve) => {
@@ -1566,7 +1722,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 			let inFlight = 0;
 			let maxInFlight = 0;
 			const finished: string[] = [];
-			vi.spyOn(tc, "driveTransaction").mockImplementation(async (transactionId) => {
+			vi.spyOn(tc, "driveTransaction").mockImplementation(async (_prefix, transactionId) => {
 				inFlight++;
 				maxInFlight = Math.max(maxInFlight, inFlight);
 				// The earliest transaction waits, as for a participant that does not answer. It continues
@@ -1591,19 +1747,19 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
 			vi.spyOn(tc, "fokosNow").mockImplementation(() => now);
-			insertState(state, {
+			insertState(tc, state, {
 				token: "recover-1",
 				transactionId: "recover-tx-1",
 				state: "PREPARING",
 				createdAt: BASE_TIME - 10_000,
 			});
-			insertState(state, {
+			insertState(tc, state, {
 				token: "recover-2",
 				transactionId: "recover-tx-2",
 				state: "PREPARING",
 				createdAt: BASE_TIME - 9_000,
 			});
-			insertState(state, {
+			insertState(tc, state, {
 				token: "expired-during-recovery",
 				transactionId: "expired-during-recovery-tx",
 				state: "COMMITTED",
@@ -1628,15 +1784,15 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 	it("cancels with the stored cause and marks every operation not_evaluated when older than MAX_PREPARING_HOLD_MS and participant throws", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING", undefined, Date.now() - 30_000);
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "PREPARING", undefined, Date.now() - 30_000);
+			insertParticipant(tc, state, { name: "p1" });
 			const txPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
 			const txCancel = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
@@ -1644,7 +1800,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 			expect(row.state).toBe("CANCELLED");
 			expect(row.completed_at).toBeTypeOf("number");
 
-			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				// p1 owns both operations, so both report its one error.
@@ -1668,40 +1824,40 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 
 	it("stays in PREPARING and writes no transition when younger than MAX_PREPARING_HOLD_MS", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING", undefined, Date.now() - 10_000);
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "PREPARING", undefined, Date.now() - 10_000);
+			insertParticipant(tc, state, { name: "p1" });
 			const txPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
 				.toArray()[0];
 			expect(row.state).toBe("PREPARING");
 			expect(row.completed_at).toBeNull();
-			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(fokosErrorWith("transaction_undecided"));
+			expect(() => tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toThrow(fokosErrorWith("transaction_undecided"));
 		});
 	});
 
 	it("commits the transaction when a participant answers accepted on a pass that crosses the bound", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING", undefined, Date.now() - 30_000);
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "PREPARING", undefined, Date.now() - 30_000);
+			insertParticipant(tc, state, { name: "p1" });
 			const txPrepare = vi.fn(async () => enveloped({ outcome: "accepted" as const }));
 			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
 				.toArray()[0];
 			expect(row.state).toBe("COMMITTED");
 			expect(row.completed_at).toBeTypeOf("number");
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -1712,10 +1868,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 
 	it("leaves a COMMITTING transaction in COMMITTING when crossing the bound", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "COMMITTING", undefined, Date.now() - 30_000);
-			insertParticipant(state, { name: "p1", prepare: "accepted" });
+			seed(tc, state, "COMMITTING", undefined, Date.now() - 30_000);
+			insertParticipant(tc, state, { name: "p1", prepare: "accepted" });
 
-			tc.cancelTransactionInStore(TX_ID, TOKEN);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
 
 			const row = state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).toArray()[0];
 			expect(row.state).toBe("COMMITTING");
@@ -1728,11 +1884,11 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 	// with the idempotent success.
 	describe("a drive whose decision lost to a concurrent drive", () => {
 		// The row is new, so the `tx_recovery` job of the coordinator does not drive it as a third drive.
-		function twoParticipants(state: DurableObjectState) {
-			seed(state, "PREPARING", undefined, Date.now());
+		function twoParticipants(tc: CoordinatorInternals, state: DurableObjectState) {
+			seed(tc, state, "PREPARING", undefined, Date.now());
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			insertParticipant(state, { name: "p1" });
-			insertParticipant(state, { name: "p2" });
+			insertParticipant(tc, state, { name: "p1" });
+			insertParticipant(tc, state, { name: "p2" });
 		}
 
 		function mockPartitions(p2Prepare: () => Promise<unknown>) {
@@ -1759,15 +1915,15 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 
 		it("sends no cancel when the other drive decided commit", async () => {
 			await withCoordinator(async (tc, state) => {
-				twoParticipants(state);
+				twoParticipants(tc, state);
 				const { txCommit, txCancel } = mockPartitions(async () => {
 					// The other drive received an accept from both participants and wrote the commit decision.
 					state.storage.sql.exec(`UPDATE tc_participants SET prepare_outcome = 'accepted' WHERE transaction_id = ?`, TX_ID);
-					tc.markCommitting(TX_ID, TOKEN);
+					tc.markCommitting(P(tc), TX_ID, TOKEN);
 					throw new Error("p2 unreachable from this drive");
 				});
 
-				await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
+				await expect(tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
 
 				expect(callsFor(txCancel)).toEqual([]);
 				expect(callsFor(txCommit)).toEqual([]);
@@ -1777,14 +1933,14 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 
 		it("sends no commit when the other drive decided cancel", async () => {
 			await withCoordinator(async (tc, state) => {
-				twoParticipants(state);
+				twoParticipants(tc, state);
 				const { txCommit, txCancel } = mockPartitions(async () => {
 					// The other drive reached the hold limit and wrote the cancel decision.
-					tc.cancelTransactionInStore(TX_ID, TOKEN);
+					tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
 					return enveloped({ outcome: "accepted" as const });
 				});
 
-				await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
+				await expect(tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
 
 				expect(callsFor(txCommit)).toEqual([]);
 				expect(callsFor(txCancel)).toEqual([]);
@@ -1795,10 +1951,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 
 	it("releases locks of an accepted participant after the bound cancels the transaction", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING", undefined, Date.now() - 30_000);
+			seed(tc, state, "PREPARING", undefined, Date.now() - 30_000);
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			insertParticipant(state, { name: "p1", prepare: "accepted" });
-			insertParticipant(state, { name: "p2" });
+			insertParticipant(tc, state, { name: "p1", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p2" });
 
 			const txPrepare = vi.fn(async () => {
 				throw new Error("p2 unreachable");
@@ -1813,7 +1969,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 					}) as unknown as DurableObjectStub<FokosDBPartitionDO>,
 			);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(txCancelP1).toHaveBeenCalledWith(
 				expect.anything(),
@@ -1837,15 +1993,15 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 
 	it("deletes the cancelled transaction one IDEMPOTENCY_WINDOW_MS after the bound cancelled it", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARING", undefined, Date.now() - 30_000);
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "PREPARING", undefined, Date.now() - 30_000);
+			insertParticipant(tc, state, { name: "p1" });
 			const txPrepare = vi.fn(async () => {
 				throw new Error("p1 unreachable");
 			});
 			const txCancel = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<FokosDBPartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(countRows(state, "tc_state")).toBe(1);
 			const row = state.storage.sql
@@ -1867,49 +2023,102 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 });
 
 describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
+	/** The hashPrefixBucket at a byte position: `first` and then zeros. */
+	const bucketAt = (first: number) => asHashPrefixBucket(Uint8Array.of(first, 0, 0, 0, 0, 0, 0, 0));
+	/** The whole hashPrefixBucket space: the interval of a root coordinator. */
+	const WHOLE = hashStorageInterval(bucketAt(0), null);
+	/** The token of each transaction that these tests insert. */
+	const tokenOf = (id: string) => `token-${id}`;
+	/** The transactions in storage order: by the hashPrefixBucket of the token, then by the ID. */
+	const inStorageOrder = (tc: CoordinatorInternals, ids: string[]) =>
+		[...ids].sort((a, b) => compareHashPrefixBuckets(P(tc, tokenOf(a)), P(tc, tokenOf(b))) || (a < b ? -1 : 1));
+	const cursorAt = (tc: CoordinatorInternals, id: string): MigrationCursor => ({ prefix: P(tc, tokenOf(id)), transactionId: id });
+	const insertCommitted = (tc: CoordinatorInternals, state: DurableObjectState, ids: string[]) => {
+		for (const id of ids) {
+			insertState(tc, state, { token: tokenOf(id), transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
+		}
+	};
+
 	it("pages the ledger by the row budget, and keeps only the transactions the target owns", async () => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 		await withCoordinator((tc, state) => {
-			const ids = Array.from({ length: 2 * budget.pageRows + 5 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
-			for (const id of ids) {
-				insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
-			}
+			const inserted = Array.from({ length: 2 * budget.pageRows + 5 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
+			insertCommitted(tc, state, inserted);
+			const ids = inStorageOrder(tc, inserted);
 
 			const all = () => true;
-			const first = tc.buildMigrationPage(null, all, budget);
+			const first = tc.buildMigrationPage(null, all, budget, WHOLE);
 			expect(first.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(0, budget.pageRows));
-			expect(first.nextCursor).toBe(ids[budget.pageRows - 1]);
-			const second = tc.buildMigrationPage(first.nextCursor, all, budget);
+			expect(first.nextCursor).toEqual(cursorAt(tc, ids[budget.pageRows - 1]));
+			const second = tc.buildMigrationPage(first.nextCursor, all, budget, WHOLE);
 			expect(second.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(budget.pageRows, 2 * budget.pageRows));
-			const last = tc.buildMigrationPage(second.nextCursor, all, budget);
+			const last = tc.buildMigrationPage(second.nextCursor, all, budget, WHOLE);
 			expect(last.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(2 * budget.pageRows));
 			expect(last.nextCursor).toBeNull();
 
 			// A page that the target owns no row of still advances the cursor past the rows it read.
-			const none = tc.buildMigrationPage(null, () => false, budget);
-			expect(none).toEqual({ page: [], nextCursor: ids[budget.pageRows - 1] });
+			const none = tc.buildMigrationPage(null, () => false, budget, WHOLE);
+			expect(none).toEqual({ page: [], nextCursor: cursorAt(tc, ids[budget.pageRows - 1]) });
 		});
 	});
 
 	it("stops a page at the scan budget and at the transaction budget, each on its own", async () => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 3, scanRows: 10 };
 		await withCoordinator((tc, state) => {
-			const ids = Array.from({ length: 30 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
-			for (const id of ids) {
-				insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
-			}
+			const inserted = Array.from({ length: 30 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
+			insertCommitted(tc, state, inserted);
+			const ids = inStorageOrder(tc, inserted);
 			const idsOf = (page: { state: { transaction_id: string } }[]) => page.map((tx) => tx.state.transaction_id);
 
 			// Every row belongs to the target: the transaction budget stops the page before the scan budget.
-			const dense = tc.buildMigrationPage(null, () => true, budget);
-			expect(dense).toMatchObject({ nextCursor: ids[2] });
+			const dense = tc.buildMigrationPage(null, () => true, budget, WHOLE);
+			expect(dense).toMatchObject({ nextCursor: cursorAt(tc, ids[2]) });
 			expect(idsOf(dense.page)).toEqual(ids.slice(0, 3));
 
 			// One row in five belongs to the target: the scan budget stops the page after 10 rows read.
-			const owned = new Set(ids.filter((_, i) => i % 5 === 0).map((id) => `token-${id}`));
-			const sparse = tc.buildMigrationPage(null, (key) => owned.has(KeyCodec.decode(key.hashKey as KeyBytes) as string), budget);
-			expect(sparse).toMatchObject({ nextCursor: ids[9] });
+			const owned = new Set(ids.filter((_, i) => i % 5 === 0).map(tokenOf));
+			const sparse = tc.buildMigrationPage(null, (key) => owned.has(KeyCodec.decode(key.hashKey as KeyBytes) as string), budget, WHOLE);
+			expect(sparse).toMatchObject({ nextCursor: cursorAt(tc, ids[9]) });
 			expect(idsOf(sparse.page)).toEqual([ids[0], ids[5]]);
+		});
+	});
+
+	// A split target owns one hashPrefixBucket interval. The pages read that interval in primary-key
+	// order, and the cursor continues inside it, so no page reads a row of another target.
+	it.each([
+		["the lower half", bucketAt(0), bucketAt(0x80)],
+		["the upper half", bucketAt(0x80), null],
+	] as const)("reads only %s of the hashPrefixBucket space when the target owns it", async (_name, start, end) => {
+		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 3, scanRows: 4 };
+		const interval = hashStorageInterval(start, end);
+		const inside = (prefix: HashPrefixBucket) =>
+			compareHashPrefixBuckets(prefix, start) >= 0 && (end === null || compareHashPrefixBuckets(prefix, end) < 0);
+		await withCoordinator((tc, state) => {
+			const inserted = Array.from({ length: 30 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
+			insertCommitted(tc, state, inserted);
+			const expected = inStorageOrder(tc, inserted).filter((id) => inside(P(tc, tokenOf(id))));
+			expect(expected.length).toBeGreaterThan(0);
+			expect(expected.length).toBeLessThan(inserted.length);
+
+			const read: string[] = [];
+			const moved: string[] = [];
+			let cursor: MigrationCursor | null = null;
+			do {
+				const built = tc.buildMigrationPage(
+					cursor,
+					(key) => {
+						read.push(KeyCodec.decode(key.hashKey as KeyBytes) as string);
+						return true;
+					},
+					budget,
+					interval,
+				);
+				moved.push(...built.page.map((tx) => tx.state.transaction_id));
+				cursor = built.nextCursor;
+			} while (cursor !== null);
+
+			expect(moved).toEqual(expected);
+			expect(read).toEqual(expected.map(tokenOf));
 		});
 	});
 
@@ -1923,10 +2132,10 @@ describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
 	] as const)("a %s transaction carries its payload in the page: %s", async (tcState, withPayload) => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 		await withCoordinator((tc, state) => {
-			seed(state, tcState);
+			seed(tc, state, tcState);
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
 
-			const { page } = tc.buildMigrationPage(null, () => true, budget);
+			const { page } = tc.buildMigrationPage(null, () => true, budget, WHOLE);
 
 			expect(page).toHaveLength(1);
 			expect(page[0].items).toHaveLength(2);
@@ -1943,14 +2152,15 @@ describe("FokosDBTransactionCoordinatorDO - migration of an item with more than 
 	it("moves every tc_items row with its op_index", async () => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 		await withCoordinator((tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(
-				`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, 2, 'check', 'p1')`,
+				`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 2, 'check', 'p1')`,
+				P(tc),
 				TX_ID,
 				kb("hk1"),
 				kb("sk1"),
 			);
-			const { page } = tc.buildMigrationPage(null, () => true, budget);
+			const { page } = tc.buildMigrationPage(null, () => true, budget, hashStorageInterval(asHashPrefixBucket(new Uint8Array(8)), null));
 			expect(page[0].items.map((item) => item.op_index)).toEqual([0, 1, 2]);
 
 			// The target starts empty. A page that comes again is idempotent.
@@ -1974,7 +2184,7 @@ describe("FokosDBTransactionCoordinatorDO - recoverTransactionForParticipant", (
 	// with the route context it stored.
 	it("answers from the ledger through the stored route context", async () => {
 		await withCoordinator(async (tc, state) => {
-			insertState(state, { token: TOKEN, transactionId: TX_ID, state: "COMMITTED", createdAt: BASE_TIME, completedAt: BASE_TIME });
+			insertState(tc, state, { token: TOKEN, transactionId: TX_ID, state: "COMMITTED", createdAt: BASE_TIME, completedAt: BASE_TIME });
 
 			const coordinator = tc as unknown as FokosDBTransactionCoordinatorDO;
 			await expect(coordinator.recoverTransactionForParticipant({ transactionId: TX_ID, idempotencyToken: TOKEN })).resolves.toEqual({
@@ -2001,7 +2211,7 @@ describe("FokosDBTransactionCoordinatorDO - fokosDestroy", () => {
 	// wiped with the partitions.
 	it("wipes the idempotency window and the alarm, then evicts the instance", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "COMMITTED");
+			seed(tc, state, "COMMITTED");
 			await state.storage.setAlarm(Date.now() + 60_000);
 			expect(countRows(state, "tc_state")).toBe(1);
 			expect(countRows(state, "tc_items")).toBe(2);
@@ -2030,10 +2240,10 @@ describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare
 		return FokosError.toWire(new FokosUnavailableError(def, { message: "refused" }));
 	}
 
-	function cancelWith(state: DurableObjectState, tc: CoordinatorInternals) {
+	function cancelWith(tc: CoordinatorInternals, state: DurableObjectState) {
 		state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-		tc.cancelTransactionInStore(TX_ID, TOKEN);
-		const response = tc.loadFinalResponse(TX_ID, TOKEN);
+		tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+		const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
 		if (response.outcome !== "cancelled") {
 			throw new Error("the transaction did not cancel");
 		}
@@ -2042,13 +2252,13 @@ describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare
 
 	it("reports the stored error of a participant whose prepare threw on its operations, and keeps the other answer", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, "PREPARING");
+			seed(tc, state, "PREPARING");
 			const stored = unavailableWire("partition_migrating");
-			insertParticipant(state, { name: "p1", error: stored });
-			insertParticipant(state, { name: "p2", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p1", error: stored });
+			insertParticipant(tc, state, { name: "p2", prepare: "accepted" });
 
 			// The same event: the error_id the partition minted survives the storage and the cancel.
-			expect(cancelWith(state, tc).results).toEqual([
+			expect(cancelWith(tc, state).results).toEqual([
 				{ outcome: "rejected", reason: { code: "partition_migrating", hashKey: "hk1", sortKey: "sk1", error_id: stored.error_id } },
 				{ outcome: "passed" },
 			]);
@@ -2057,11 +2267,11 @@ describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare
 
 	it("reports prepare_unanswered for a participant with no answer and no stored error", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, { name: "p1" });
-			insertParticipant(state, { name: "p2", prepare: "accepted" });
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, { name: "p1" });
+			insertParticipant(tc, state, { name: "p2", prepare: "accepted" });
 
-			expect(cancelWith(state, tc).results).toEqual([
+			expect(cancelWith(tc, state).results).toEqual([
 				{
 					outcome: "rejected",
 					reason: { code: "prepare_unanswered", hashKey: "hk1", sortKey: "sk1", error_id: expect.stringMatching(/^e_mpncbz_/) },
@@ -2073,11 +2283,11 @@ describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare
 
 	it("reports the stored error of each failed participant on its own operations", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, { name: "p2", error: unavailableWire("partition_over_size") });
-			insertParticipant(state, { name: "p1", error: unavailableWire("partition_migrating") });
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, { name: "p2", error: unavailableWire("partition_over_size") });
+			insertParticipant(tc, state, { name: "p1", error: unavailableWire("partition_migrating") });
 
-			expect(cancelWith(state, tc).results).toMatchObject([
+			expect(cancelWith(tc, state).results).toMatchObject([
 				{ outcome: "rejected", reason: { code: "partition_migrating", hashKey: "hk1" } },
 				{ outcome: "rejected", reason: { code: "partition_over_size", hashKey: "hk2" } },
 			]);
@@ -2086,8 +2296,8 @@ describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare
 
 	it("uses a later answer of a participant in place of the error it stored", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, "PREPARING");
-			insertParticipant(state, {
+			seed(tc, state, "PREPARING");
+			insertParticipant(tc, state, {
 				name: "p1",
 				prepare: "rejected",
 				error: unavailableWire("partition_migrating"),
@@ -2096,9 +2306,9 @@ describe("FokosDBTransactionCoordinatorDO - the stored cause of a failed prepare
 					results: [{ opIndex: 0, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1" } }],
 				},
 			});
-			insertParticipant(state, { name: "p2", prepare: "accepted" });
+			insertParticipant(tc, state, { name: "p2", prepare: "accepted" });
 
-			const response = cancelWith(state, tc);
+			const response = cancelWith(tc, state);
 
 			expect(response.results).toEqual([
 				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1" } },
@@ -2115,15 +2325,16 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 
 	/** p1 owns operation 0 and p2 owns operation 1. The row is new, so the tx_recovery job does not drive it. */
 	function twoParticipants(
+		tc: CoordinatorInternals,
 		state: DurableObjectState,
 		tcState: TCState,
-		p1: Parameters<typeof insertParticipant>[1],
-		p2: Parameters<typeof insertParticipant>[1],
+		p1: Parameters<typeof insertParticipant>[2],
+		p2: Parameters<typeof insertParticipant>[2],
 	) {
-		seed(state, tcState, undefined, Date.now());
+		seed(tc, state, tcState, undefined, Date.now());
 		state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-		insertParticipant(state, { name: "p1", ...p1 });
-		insertParticipant(state, { name: "p2", ...p2 });
+		insertParticipant(tc, state, { name: "p1", ...p1 });
+		insertParticipant(tc, state, { name: "p2", ...p2 });
 	}
 
 	function mockPartitions(prepare: (name: string) => Promise<unknown>) {
@@ -2166,14 +2377,14 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 		["a FokosExpressionError", expressionError, "expression_invalid"],
 	])("tries a prepare that throws %s one time in drivePrepare, and cancels with its code and error_id", async (_name, make, code) => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "CREATED", undefined, Date.now());
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "CREATED", undefined, Date.now());
+			insertParticipant(tc, state, { name: "p1" });
 			const error = make();
 			const { txPrepare, callsFor } = mockPartitions(async () => {
 				throw error;
 			});
 
-			const response = await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
+			const response = await tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(callsFor(txPrepare)).toHaveLength(1);
 			expect(response).toMatchObject({
@@ -2188,22 +2399,22 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 
 	it("keeps a stored FokosExpressionError when a concurrent drive stores a transport error", async () => {
 		await withCoordinator(async (tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, {});
 			const first = expressionError();
-			tc.storePrepareError(TX_ID, "p2", first);
-			tc.storePrepareError(TX_ID, "p2", transient());
+			tc.storePrepareError(P(tc), TX_ID, "p2", first);
+			tc.storePrepareError(P(tc), TX_ID, "p2", transient());
 			expect(storedError(state, "p2")).toMatchObject({ code: "expression_invalid", error_id: first.error_id });
 		});
 	});
 
 	it("cancels in a recovery drive at once, before the hold limit, and releases the locks of the participant that accepted", async () => {
 		await withCoordinator(async (tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, {});
 			const { txPrepare, txCancel, callsFor } = mockPartitions(async () => {
 				throw fatal();
 			});
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(callsFor(txPrepare, "p2")).toHaveLength(1);
 			expect(callsFor(txCancel, "p1")).toHaveLength(1);
@@ -2214,14 +2425,14 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 	it("sends no prepare after a restart that left a stored fatal error, cancels, and keeps the fatal code and error_id", async () => {
 		await withCoordinator(async (tc, state) => {
 			const stored = FokosError.toWire(fatal());
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, { error: stored });
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, { error: stored });
 			const { txPrepare, txCancel, callsFor } = mockPartitions(async () => enveloped({ outcome: "accepted" as const }));
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(callsFor(txPrepare)).toHaveLength(0);
 			expect(callsFor(txCancel, "p1")).toHaveLength(1);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toMatchObject({
 				outcome: "cancelled",
 				results: [
 					{ outcome: "passed" },
@@ -2233,46 +2444,46 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 
 	it("keeps the first stored fatal error when a concurrent drive stores a transport error or another validation error", async () => {
 		await withCoordinator((tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, {});
 			const first = fatal();
-			tc.storePrepareError(TX_ID, "p2", first);
-			tc.storePrepareError(TX_ID, "p2", new Error("Network connection lost."));
-			tc.storePrepareError(TX_ID, "p2", fatal());
+			tc.storePrepareError(P(tc), TX_ID, "p2", first);
+			tc.storePrepareError(P(tc), TX_ID, "p2", new Error("Network connection lost."));
+			tc.storePrepareError(P(tc), TX_ID, "p2", fatal());
 			expect(storedError(state, "p2")).toMatchObject({ code: "transact_version_after_write", error_id: first.error_id });
 		});
 	});
 
 	it("stores no answer after a stored fatal error, so markCommitting writes nothing", async () => {
 		await withCoordinator((tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
-			tc.storePrepareError(TX_ID, "p2", fatal());
-			tc.storePrepareAnswer(TX_ID, "p2", { outcome: "accepted" });
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, {});
+			tc.storePrepareError(P(tc), TX_ID, "p2", fatal());
+			tc.storePrepareAnswer(P(tc), TX_ID, "p2", { outcome: "accepted" });
 			expect(participant(state, "p2").prepare_outcome).toBeNull();
-			tc.markCommitting(TX_ID, TOKEN);
+			tc.markCommitting(P(tc), TX_ID, TOKEN);
 			expect(stateOf(state)).toBe("PREPARING");
 		});
 	});
 
 	it("keeps an answer stored before an error", async () => {
 		await withCoordinator((tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, { prepare: "accepted" });
-			tc.storePrepareError(TX_ID, "p2", fatal());
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, { prepare: "accepted" });
+			tc.storePrepareError(P(tc), TX_ID, "p2", fatal());
 			expect(participant(state, "p2")).toEqual({ prepare_outcome: "accepted", error_json: null });
 		});
 	});
 
 	it("replaces a stored transient error with a fatal one, and the check after the fan-out cancels", async () => {
 		await withCoordinator(async (tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, { error: FokosError.toWire(transient()) });
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, { error: FokosError.toWire(transient()) });
 			const error = fatal();
 			mockPartitions(async () => {
 				throw error;
 			});
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(stateOf(state)).toBe("CANCELLED");
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toMatchObject({
 				results: [
 					{ outcome: "passed" },
 					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: error.error_id } },
@@ -2283,15 +2494,15 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 
 	it("sends no cancel when the recovery drive lost to a concurrent commit decision", async () => {
 		await withCoordinator(async (tc, state) => {
-			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			twoParticipants(tc, state, "PREPARING", { prepare: "accepted" }, {});
 			const { txCancel, callsFor } = mockPartitions(async () => {
 				// The other drive received an accept from p2 and wrote the commit decision.
 				state.storage.sql.exec(`UPDATE tc_participants SET prepare_outcome = 'accepted' WHERE transaction_id = ?`, TX_ID);
-				tc.markCommitting(TX_ID, TOKEN);
+				tc.markCommitting(P(tc), TX_ID, TOKEN);
 				throw fatal();
 			});
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+			await tc.runPrepareRecovery(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(callsFor(txCancel)).toHaveLength(0);
 			expect(["COMMITTING", "COMMITTED"]).toContain(stateOf(state));
@@ -2300,14 +2511,14 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 
 	it("still retries partition_migrating", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "CREATED", undefined, Date.now());
-			insertParticipant(state, { name: "p1" });
+			seed(tc, state, "CREATED", undefined, Date.now());
+			insertParticipant(tc, state, { name: "p1" });
 			const { txPrepare, callsFor } = mockPartitions(async () => {
 				throw transient();
 			});
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
+			await tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 			expect(callsFor(txPrepare)).toHaveLength(DEFAULT_COORDINATOR_CONFIG.participantRetry.prepareMaxAttempts);
 		});

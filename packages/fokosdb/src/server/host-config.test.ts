@@ -71,7 +71,7 @@ describe("resolveCoordinatorConfig", () => {
 		[{ participantRetry: { prepareRecoveryMaxAttempts: 0 } }, /prepareRecoveryMaxAttempts must be an integer of at least 1/],
 		[{ alarmRecoveryBudgetMs: 15 * 60_000 }, /alarmRecoveryBudgetMs must be less than 840000/],
 		[{ sweepBatchRows: 0 }, /sweepBatchRows must be an integer of at least 1/],
-		[{ sweepDeleteChunkRows: 101 }, /sweepDeleteChunkRows must be at most 100/],
+		[{ sweepDeleteChunkRows: 51 }, /sweepDeleteChunkRows must be at most 50/],
 		[{ recoveryScanRows: 0 }, /recoveryScanRows must be an integer of at least 1/],
 		[{ recoveryConcurrentDrives: 0 }, /recoveryConcurrentDrives must be an integer of at least 1/],
 		[{ maxDatabaseBytes: 10_000_000_001 }, /maxDatabaseBytes must be at most 9000000000/],

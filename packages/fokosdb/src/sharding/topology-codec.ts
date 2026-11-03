@@ -307,7 +307,8 @@ export function isPromotedHashPrefixBucket(view: HashTopologyView, hashPrefixBuc
 			b = mid;
 		}
 	}
-	const found = a < promoted.count && KeyCodec.compareSlice(bytes, a * HASH_PREFIX_BUCKET_BYTES, (a + 1) * HASH_PREFIX_BUCKET_BYTES, key) === 0;
+	const found =
+		a < promoted.count && KeyCodec.compareSlice(bytes, a * HASH_PREFIX_BUCKET_BYTES, (a + 1) * HASH_PREFIX_BUCKET_BYTES, key) === 0;
 	return found ? "exact" : false;
 }
 

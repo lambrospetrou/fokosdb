@@ -127,7 +127,10 @@ export type TransactionCoordinatorDOConfig = Readonly<{
 	alarmRecoveryBudgetMs: number;
 	/** The rows that one step of the idempotency sweep and one step of the source cleanup read. */
 	sweepBatchRows: number;
-	/** The transaction IDs in one `DELETE` statement of the idempotency sweep. At most 100, the bound parameter limit. */
+	/**
+	 * The transactions in one `DELETE` statement of the idempotency sweep. Each transaction binds two
+	 * parameters, its hashPrefixBucket and its ID, so at most 50: half the bound parameter limit.
+	 */
 	sweepDeleteChunkRows: number;
 	/** The non-terminal transactions that one step of the `tx_recovery` job reads. */
 	recoveryScanRows: number;
@@ -212,7 +215,7 @@ export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFr
 	participantRetry: { baseDelayMs: 100, maxDelayMs: 2_000, prepareMaxAttempts: 3, prepareRecoveryMaxAttempts: 5 },
 	alarmRecoveryBudgetMs: 15_000,
 	sweepBatchRows: 1_000,
-	sweepDeleteChunkRows: 100,
+	sweepDeleteChunkRows: 50,
 	recoveryScanRows: 100,
 	recoveryConcurrentDrives: 6,
 	maxDatabaseBytes: 5 * 1024 * 1024 * 1024,
@@ -282,8 +285,8 @@ export function resolveCoordinatorConfig(overrides: TransactionCoordinatorDOConf
 	checkInteger(c, "sweepBatchRows", 1);
 	checkInteger(c, "sweepDeleteChunkRows", 1);
 	check(
-		c.sweepDeleteChunkRows <= SQL_MAX_BOUND_PARAMETERS,
-		() => `sweepDeleteChunkRows must be at most ${SQL_MAX_BOUND_PARAMETERS}, got ${c.sweepDeleteChunkRows}`,
+		2 * c.sweepDeleteChunkRows <= SQL_MAX_BOUND_PARAMETERS,
+		() => `sweepDeleteChunkRows must be at most ${SQL_MAX_BOUND_PARAMETERS / 2}, got ${c.sweepDeleteChunkRows}`,
 	);
 	checkInteger(c, "recoveryScanRows", 1);
 	checkInteger(c, "recoveryConcurrentDrives", 1);

@@ -11,9 +11,11 @@ import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transa
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { DEFAULT_LIMITS, encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
+import { asHashPrefixBucket, compareHashPrefixBuckets, type HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
+import type { FokosStorageInterval, RouteKey } from "../../src/sharding/runtime-types.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { partitionPrefixOf } from "../storage-prefix.js";
@@ -40,10 +42,11 @@ function tokenKey(token: string) {
 }
 
 /** Writes a committed ledger row under a new token, as a transaction that completed now writes it. */
-function insertCommittedToken(state: DurableObjectState, token: string): void {
+function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState, token: string): void {
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
-		 VALUES (?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000')`,
+		`INSERT INTO tc_state (hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
+		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000')`,
+		instance.fokos.storagePrefix(tokenKey(token).hashKey),
 		`tx-${crypto.randomUUID()}`,
 		token,
 		Date.now(),
@@ -53,13 +56,13 @@ function insertCommittedToken(state: DurableObjectState, token: string): void {
 
 /**
  * Queues a hash split of the coordinator. The coordinator must already hold its identity. A split
- * needs two tokens, so the helper adds a committed token of its own.
+ * needs two hashPrefixBuckets, so the helper adds a committed token of its own.
  */
 async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<void> {
 	await runInDurableObject(
 		coordinatorStub(coordinator.doName),
 		async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
-			insertCommittedToken(state, `tc-split-filler-${crypto.randomUUID()}`);
+			insertCommittedToken(instance, state, `tc-split-filler-${crypto.randomUUID()}`);
 			const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 			try {
 				instance.fokos.requestSplitEvaluation();
@@ -68,6 +71,15 @@ async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<
 				size.mockRestore();
 			}
 		},
+	);
+}
+
+/** True when `prefix` is inside the hashPrefixBucket interval `[start, end)`. */
+function inInterval(prefix: HashPrefixBucket, interval: FokosStorageInterval): boolean {
+	const bound = (key: { prefix: Uint8Array }) => asHashPrefixBucket(key.prefix);
+	return (
+		compareHashPrefixBuckets(prefix, bound(interval.start)) >= 0 &&
+		(interval.end === null || compareHashPrefixBuckets(prefix, bound(interval.end)) < 0)
 	);
 }
 
@@ -136,6 +148,74 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		expect(await coordinatorStub(owner.doName).testInitiateWriteCalls()).toBe(1);
 	});
 
+	it("moves each transaction to the child whose interval holds its hashPrefixBucket, and reads no row outside that interval", async () => {
+		const db = makeDB({ controlled: true });
+		const items = keysAcrossPartitions(db, 2, "tc-split-interval").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
+		const token = `tc-split-interval-${crypto.randomUUID()}`;
+		expect(await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }))).toMatchObject({ outcome: "committed" });
+		const tokens = [token, ...Array.from({ length: 20 }, (_, i) => `${token}-${i}`)];
+
+		// Each ledger row that a page read gives to the filter, and whether its hashPrefixBucket is inside
+		// the interval of the page.
+		const reads: boolean[] = [];
+		type PageRead = (
+			cursor: unknown,
+			belongsToTarget: (key: RouteKey) => boolean,
+			budget: unknown,
+			interval: FokosStorageInterval,
+		) => unknown;
+		const root = coordinatorRouter(db).allRoots()[0];
+		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+			for (const filler of tokens.slice(1)) {
+				insertCommittedToken(instance, state, filler);
+			}
+			const host = instance as unknown as { buildMigrationPage: PageRead };
+			const read = host.buildMigrationPage.bind(instance);
+			vi.spyOn(host, "buildMigrationPage").mockImplementation((cursor, belongsToTarget, budget, interval) =>
+				read(
+					cursor,
+					(key) => {
+						reads.push(inInterval(instance.fokos.storagePrefix(key.hashKey), interval));
+						return belongsToTarget(key);
+					},
+					budget,
+					interval,
+				),
+			);
+		});
+		await queueCoordinatorSplit(root);
+		await awaitSplitSettled(root, token);
+
+		const children = await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO) =>
+			instance.fokos.children(),
+		);
+		const held: string[][] = [];
+		for (const child of children) {
+			held.push(
+				await runInDurableObject(
+					coordinatorStub(child.ref.doName),
+					(instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+						const interval = instance.fokos.storageInterval();
+						const rows = state.storage.sql.exec<{ idempotency_token: string }>(`SELECT idempotency_token FROM tc_state`).toArray();
+						const outside = rows.filter(
+							(row) => !inInterval(instance.fokos.storagePrefix(tokenKey(row.idempotency_token).hashKey), interval),
+						);
+						expect(outside).toEqual([]);
+						return rows.map((row) => row.idempotency_token);
+					},
+				),
+			);
+		}
+		// Each child holds a part of the ledger, and together they hold each token one time.
+		expect(held).toHaveLength(2);
+		expect(held.every((part) => part.length > 0)).toBe(true);
+		const all = held.flat();
+		expect(new Set(all).size).toBe(all.length);
+		expect(all).toEqual(expect.arrayContaining(tokens));
+		expect(reads.length).toBeGreaterThan(0);
+		expect(reads.every(Boolean)).toBe(true);
+	});
+
 	it("stops the source at the PREPARED transition after a cutover, and the child resumes the same transaction once", async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "tc-split-prepare");
@@ -184,10 +264,11 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		// to confirm, so one recovery step completes it.
 		const root = coordinatorRouter(db).allRoots()[0];
 		const transactionId = `tx-${crypto.randomUUID()}`;
-		await runInDurableObject(coordinatorStub(root.doName), (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
-				 VALUES (?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
+				`INSERT INTO tc_state (hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
+				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
+				instance.fokos.storagePrefix(tokenKey(token).hashKey),
 				transactionId,
 				token,
 				Date.now() - 60_000,
@@ -265,7 +346,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 
 		const root = coordinatorRouter(db).allRoots()[0];
 		await runInDurableObject(coordinatorStub(root.doName), async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
-			insertCommittedToken(state, `${token}-second`);
+			insertCommittedToken(instance, state, `${token}-second`);
 			const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 			try {
 				await expect(
