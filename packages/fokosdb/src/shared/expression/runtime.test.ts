@@ -12,6 +12,10 @@ import { materializeExpressionBindings } from "./bindings.js";
 import { evaluateConditionPlan } from "./runtime.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, type ExpressionSemanticItem } from "./test-fixtures.js";
 import type { ConditionExpression } from "./types.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => prefixOf(hk);
 
 type StoredFixture = {
 	hashKey: string | Uint8Array;
@@ -29,12 +33,13 @@ async function evaluate(item: StoredFixture | null, condition: ConditionExpressi
 		if (item) {
 			putFixture(state.storage, hashKey, sortKey, item);
 		}
-		return evaluateConditionPlan(state.storage, compileConditionExpression(condition), hashKey, sortKey);
+		return evaluateConditionPlan(state.storage, compileConditionExpression(condition), hashKey, sortKey, P(hashKey));
 	});
 }
 
 function putFixture(storage: DurableObjectStorage, hashKey: KeyBytes, sortKey: KeyBytes, item: StoredFixture): void {
 	new PartitionStore(storage).upsertItem({
+		prefix: P(hashKey),
 		hk: hashKey,
 		sk: sortKey,
 		data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
@@ -215,7 +220,13 @@ describe("compiled condition runtime", () => {
 			const plan = { ...compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }), sql: "no_such_function()" };
 			const error = (() => {
 				try {
-					evaluateConditionPlan(state.storage, plan, KeyCodec.encode("item"), KeyCodec.encodeOptional(undefined));
+					evaluateConditionPlan(
+						state.storage,
+						plan,
+						KeyCodec.encode("item"),
+						KeyCodec.encodeOptional(undefined),
+						P(KeyCodec.encode("item")),
+					);
 					return undefined;
 				} catch (caught) {
 					return caught as Error;
@@ -238,14 +249,20 @@ describe("compiled condition runtime", () => {
 			const queryPlan = state.storage.sql
 				.exec<{
 					detail: string;
-				}>(`EXPLAIN QUERY PLAN ${composeConditionStatement(plan.sql)}`, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings))
+				}>(
+					`EXPLAIN QUERY PLAN ${composeConditionStatement(plan.sql)}`,
+					hashKey,
+					sortKey,
+					P(hashKey),
+					...materializeExpressionBindings(plan.bindings),
+				)
 				.toArray();
 			expect(
-				queryPlan.some((row) => /SEARCH i USING (?:COVERING )?INDEX .*\(hk=\? AND sk=\?\)/.test(row.detail)),
+				queryPlan.some((row) => /SEARCH i USING PRIMARY KEY \(hash_prefix_bucket=\? AND hk=\? AND sk=\?\)/.test(row.detail)),
 				JSON.stringify(queryPlan),
 			).toBe(true);
-			const existing = evaluateConditionPlan(state.storage, plan, hashKey, sortKey);
-			const missing = evaluateConditionPlan(state.storage, plan, KeyCodec.encode("missing"), sortKey);
+			const existing = evaluateConditionPlan(state.storage, plan, hashKey, sortKey, P(hashKey));
+			const missing = evaluateConditionPlan(state.storage, plan, KeyCodec.encode("missing"), sortKey, P(KeyCodec.encode("missing")));
 			expect(existing.rowsRead).toBeGreaterThan(missing.rowsRead);
 			expect(missing.rowsRead).toBe(0);
 		});
@@ -310,10 +327,16 @@ describe("compiled condition runtime", () => {
 			const queryPlan = state.storage.sql
 				.exec<{
 					detail: string;
-				}>(`EXPLAIN QUERY PLAN ${composeConditionStatement(plan.sql)}`, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings))
+				}>(
+					`EXPLAIN QUERY PLAN ${composeConditionStatement(plan.sql)}`,
+					hashKey,
+					sortKey,
+					P(hashKey),
+					...materializeExpressionBindings(plan.bindings),
+				)
 				.toArray();
 			expect(
-				queryPlan.some((row) => /SEARCH i USING (?:COVERING )?INDEX .*\(hk=\? AND sk=\?\)/.test(row.detail)),
+				queryPlan.some((row) => /SEARCH i USING PRIMARY KEY \(hash_prefix_bucket=\? AND hk=\? AND sk=\?\)/.test(row.detail)),
 				JSON.stringify(queryPlan),
 			).toBe(true);
 		});

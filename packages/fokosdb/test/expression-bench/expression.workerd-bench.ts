@@ -77,8 +77,9 @@ it("expression compile and SQLite statements in a FokosDBPartitionDO", async () 
 			expect(put.value.outcome).toBe("ok");
 		}
 		const sql = state.storage.sql;
+		const prefix = instance.fokos.storagePrefix(BENCH_HASH_KEY);
 		return CASES.map((c) => {
-			const { sql: statement, params, bindingCount } = prepareCase(c);
+			const { sql: statement, params, bindingCount } = prepareCase(c, undefined, prefix);
 			const resultRows = sql.exec(statement, ...params).toArray();
 			// A statement that reads no item measures nothing.
 			expect(resultRows.length, c.name).toBe(c.kind === "query" ? BENCH_ITEM_COUNT : 1);
@@ -86,7 +87,7 @@ it("expression compile and SQLite statements in a FokosDBPartitionDO", async () 
 			const first = measure(() => sql.exec(`${statement}\n-- ${unique++}`, ...params).toArray());
 			const again = measure(() => sql.exec(statement, ...params).toArray());
 			const compile = measure(() => compileCase(c));
-			const path = measure(() => prepareCase(c));
+			const path = measure(() => prepareCase(c, undefined, prefix));
 			return `| ${c.name} | ${treeBytes(c)} | ${statement.length} | ${bindingCount} | ${compile.toFixed(1)} | ${path.toFixed(1)} | ${first.toFixed(1)} | ${again.toFixed(1)} |`;
 		});
 	});

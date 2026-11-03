@@ -1,6 +1,7 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
+	asHashPrefixBucket,
 	GOLDEN_RATIO_BIGINT,
 	HashPrefixBucketDigitCursor,
 	hash64,
@@ -12,6 +13,7 @@ import {
 	inHashPrefixBucketInterval,
 	MAX_HASH_DEPTH,
 	maxHashDepth,
+	type HashPrefixBucket,
 } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 
@@ -22,10 +24,10 @@ const KEYS = Array.from({ length: 500 }, (_, i) => kb(`key-${i}-${i % 7 === 0 ? 
 
 const TWO_64 = 1n << 64n;
 const toBigInt = (bucket: Uint8Array) => BigInt(`0x${bucket.toHex()}`);
-function bucketOf(value: bigint): Uint8Array {
+function bucketOf(value: bigint): HashPrefixBucket {
 	const out = new Uint8Array(8);
 	new DataView(out.buffer).setBigUint64(0, value, false);
-	return out;
+	return asHashPrefixBucket(out);
 }
 
 /** The reference digits: each step is `floor(x * M / 2^64)`, and the rest is `x * M mod 2^64`. */

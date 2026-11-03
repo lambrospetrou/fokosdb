@@ -17,7 +17,8 @@ import { one, tryOne } from "../shared/sql-cursor.js";
 import { FokosInternalError, FokosValidationError } from "../shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_VALIDATION_CODES } from "./errors.js";
 import { INIT_RETRY_ALARM_MS } from "./scheduler.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { KeyCodec, type FokosCompositeKey } from "./key-codec.js";
+import { asHashPrefixBucket, compareHashPrefixBuckets, type HashPrefixBucket } from "./hash-primitives.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { validateTopology } from "./route-context.js";
 import { parseHashBody, RANGE_BODY_MAGIC, readBodyVersion, type FokosTopologyEvent, type HashTopologyView } from "./topology-codec.js";
@@ -65,7 +66,7 @@ export type FokosTopologyRead = { status: 200; etag: string; body: Uint8Array } 
 /** The RPC methods of an admin Durable Object that the entrypoint helper calls. */
 export type FokosTopologyAdminRpc = {
 	getTopology(shardGroup: string, ifNoneMatch?: string): Promise<FokosTopologyRead>;
-	getRangeTopology(shardGroup: string, hashKey: Uint8Array, ifNoneMatch?: string): Promise<FokosTopologyRead>;
+	getRangeTopology(shardGroup: string, hashPrefixBucket: HashPrefixBucket, ifNoneMatch?: string): Promise<FokosTopologyRead>;
 };
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -101,20 +102,21 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   idx_fokos_topo_hash_nodes_seq finds them.
 		//
 		// fokos_topo_range_dirty:
-		// - The promoted hash keys that need a new range body. A report that writes a new interval of a
-		//   key inserts the key, and the step that stores the range body deletes it.
+		// - The promoted hashPrefixBuckets that need a new range body. A report that writes a new interval
+		//   of a hashPrefixBucket inserts it, and the step that stores the range body deletes it.
 		//
 		// fokos_topo_range_intervals:
-		// - The known intervals of each promoted hash key. `start` x'' is ~min, and `end_is_max` 1 is ~max.
-		// - The primary key gives the order of the range build: `start` ascending, then `end`
+		// - The known intervals of each promoted hashPrefixBucket. A boundary is the composite key
+		//   `(hk, sk)`. The start `(x'', x'')` is ~min, and `end_is_max` 1 is ~max.
+		// - The primary key gives the order of the range build: the start ascending, then the end
 		//   descending, so a parent comes before its children.
 		// - `seq` is the `version` of the report that inserted the row.
-		// - idx_fokos_topo_range_roots holds the range root of each promoted hash key only, so the
-		//   build reads the promoted keys and no other interval. It is in `seq` order, so a build that
-		//   extends the stored hash body reads only the roots with `seq > built_version`.
+		// - idx_fokos_topo_range_roots holds the range root of each promoted hashPrefixBucket only, so
+		//   the build reads the promoted hashPrefixBuckets and no other interval. It is in `seq` order, so
+		//   a build that extends the stored hash body reads only the roots with `seq > built_version`.
 		//
 		// fokos_topo_bodies:
-		// - The built bodies in chunks. `kind` is `hash` or `range`. A hash body has the hash key x''.
+		// - The built bodies in chunks. `kind` is `hash` or `range`. A hash body has the hashPrefixBucket x''.
 		sql: `
             CREATE TABLE IF NOT EXISTS fokos_topo_groups (
                 shard_group   TEXT    NOT NULL PRIMARY KEY,
@@ -152,30 +154,32 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE INDEX IF NOT EXISTS idx_fokos_topo_hash_nodes_seq ON fokos_topo_hash_nodes (shard_group, seq);
 
             CREATE TABLE IF NOT EXISTS fokos_topo_range_dirty (
-                shard_group TEXT NOT NULL,
-                hash_key    BLOB NOT NULL,
-                PRIMARY KEY (shard_group, hash_key)
+                shard_group        TEXT NOT NULL,
+                hash_prefix_bucket BLOB NOT NULL,
+                PRIMARY KEY (shard_group, hash_prefix_bucket)
             ) WITHOUT ROWID, STRICT;
 
             CREATE TABLE IF NOT EXISTS fokos_topo_range_intervals (
-                shard_group TEXT    NOT NULL,
-                hash_key    BLOB    NOT NULL,
-                start       BLOB    NOT NULL,
-                end_is_max  INTEGER NOT NULL,
-                end         BLOB    NOT NULL,
-                seq         INTEGER NOT NULL,
-                PRIMARY KEY (shard_group, hash_key, start, end_is_max DESC, end DESC)
+                shard_group        TEXT    NOT NULL,
+                hash_prefix_bucket BLOB    NOT NULL,
+                start_hk           BLOB    NOT NULL,
+                start_sk           BLOB    NOT NULL,
+                end_is_max         INTEGER NOT NULL,
+                end_hk             BLOB    NOT NULL,
+                end_sk             BLOB    NOT NULL,
+                seq                INTEGER NOT NULL,
+                PRIMARY KEY (shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max DESC, end_hk DESC, end_sk DESC)
             ) WITHOUT ROWID, STRICT;
             CREATE INDEX IF NOT EXISTS idx_fokos_topo_range_roots
-                ON fokos_topo_range_intervals (shard_group, seq) WHERE start = x'' AND end_is_max = 1;
+                ON fokos_topo_range_intervals (shard_group, seq) WHERE start_hk = x'' AND end_is_max = 1;
 
             CREATE TABLE IF NOT EXISTS fokos_topo_bodies (
-                shard_group TEXT    NOT NULL,
-                kind        TEXT    NOT NULL,
-                hash_key    BLOB    NOT NULL,
-                chunk       INTEGER NOT NULL,
-                bytes       BLOB    NOT NULL,
-                PRIMARY KEY (shard_group, kind, hash_key, chunk)
+                shard_group        TEXT    NOT NULL,
+                kind               TEXT    NOT NULL,
+                hash_prefix_bucket BLOB    NOT NULL,
+                chunk              INTEGER NOT NULL,
+                bytes              BLOB    NOT NULL,
+                PRIMARY KEY (shard_group, kind, hash_prefix_bucket, chunk)
             ) STRICT;`,
 	},
 ];
@@ -194,13 +198,9 @@ type GroupRow = {
 	hash_nodes_n: number;
 };
 
-type IntervalRow = { start: ArrayBuffer; end_is_max: number; end: ArrayBuffer };
+type IntervalRow = { start_hk: ArrayBuffer; start_sk: ArrayBuffer; end_is_max: number; end_hk: ArrayBuffer; end_sk: ArrayBuffer };
 
 const NO_KEY = new Uint8Array(0);
-
-function toBase64Url(bytes: Uint8Array): string {
-	return bytes.toBase64({ alphabet: "base64url", omitPadding: true });
-}
 
 function fromBase64Url(text: string): Uint8Array {
 	return Uint8Array.fromBase64(text, { alphabet: "base64url" });
@@ -371,9 +371,12 @@ export class FokosTopologyKeeper {
 		return answer(cached.etag, cached.body, ifNoneMatch);
 	}
 
-	/** The last built range body of one hash key. A key with no body answers an empty body of version 0. */
-	getRangeTopology(shardGroup: string, hashKey: Uint8Array, ifNoneMatch?: string): FokosTopologyRead {
-		const stored = this.#readBody(shardGroup, "range", hashKey);
+	/**
+	 * The last built range body of one hashPrefixBucket. A hashPrefixBucket with no body answers an
+	 * empty body of version 0.
+	 */
+	getRangeTopology(shardGroup: string, hashPrefixBucket: HashPrefixBucket, ifNoneMatch?: string): FokosTopologyRead {
+		const stored = this.#readBody(shardGroup, "range", hashPrefixBucket);
 		if (stored) {
 			const { epoch, version } = readBodyVersion(stored, RANGE_BODY_MAGIC);
 			return answer(etagOf(epoch, version), stored, ifNoneMatch);
@@ -446,7 +449,7 @@ export class FokosTopologyKeeper {
 		} catch {
 			throw invalidEvent("the source partition ID is not valid", { id: event.id });
 		}
-		const sliceKind = { hash_split: "hash_child", range_split: "range", key_promotion: "promoted_key" }[event.kind];
+		const sliceKind = { hash_split: "hash_child", range_split: "range", key_promotion: "promoted_hash_prefix_bucket" }[event.kind];
 		if (event.targets.some((t) => t.slice.kind !== sliceKind)) {
 			throw invalidEvent(`a ${event.kind} has ${sliceKind} slices only`, { id: event.id });
 		}
@@ -454,11 +457,11 @@ export class FokosTopologyKeeper {
 			if (source.schema !== PartitionIdHelper.SCHEMA_RANGE_V1) {
 				throw invalidEvent("the source of a range_split is a range partition", { id: event.id });
 			}
-			const hashKey = source.hashKey;
-			if (event.targets.some((t) => t.slice.kind === "range" && KeyCodec.compare(t.slice.hashKey, hashKey) !== 0)) {
-				throw invalidEvent("the targets of a range_split have the hash key of the source", { id: event.id });
+			const bucket = source.hashPrefixBucket;
+			if (event.targets.some((t) => t.slice.kind === "range" && compareHashPrefixBuckets(t.slice.hashPrefixBucket, bucket) !== 0)) {
+				throw invalidEvent("the targets of a range_split have the hashPrefixBucket of the source", { id: event.id });
 			}
-			return { source, repartitionKey: toBase64Url(hashKey) };
+			return { source, repartitionKey: bucket.toHex() };
 		}
 		if (source.schema !== PartitionIdHelper.SCHEMA_HASH_V1) {
 			throw invalidEvent(`the source of a ${event.kind} is a hash partition`, { id: event.id });
@@ -470,7 +473,7 @@ export class FokosTopologyKeeper {
 		if (event.kind === "hash_split" && event.targets.length !== event.hashSplitN) {
 			throw invalidEvent("a hash_split has hashSplitN targets", { id: event.id });
 		}
-		// The build reads the promoted key of the first target only.
+		// The build reads the promoted hashPrefixBucket of the first target only.
 		if (event.kind === "key_promotion" && event.targets.length !== 1) {
 			throw invalidEvent("a key_promotion has one target", { id: event.id });
 		}
@@ -479,47 +482,51 @@ export class FokosTopologyKeeper {
 
 	/**
 	 * A promotion and a range split insert the range root, the source interval, and each target
-	 * interval of the hash key. A range split exists only after its promotion, so the range root is real
-	 * also when the report of the promotion is missing. A new interval marks the hash key dirty. Returns
-	 * the number of new range roots and of new intervals, roots included.
+	 * interval of the hashPrefixBucket. A range split exists only after its promotion, so the range root
+	 * is real also when the report of the promotion is missing. A new interval marks the hashPrefixBucket
+	 * dirty. Returns the number of new range roots and of new intervals, roots included.
 	 */
 	#insertRangeIntervals(event: FokosTopologyEvent, source: DecodedId, seq: number): { roots: number; intervals: number } {
 		const sql = this.#storage.sql;
-		const insert = (hashKey: Uint8Array, start: Uint8Array | null, end: Uint8Array | null): number =>
+		const insert = (bucket: HashPrefixBucket, start: FokosCompositeKey | null, end: FokosCompositeKey | null): number =>
 			sql.exec(
-				`INSERT OR IGNORE INTO fokos_topo_range_intervals (shard_group, hash_key, start, end_is_max, end, seq)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+				`INSERT OR IGNORE INTO fokos_topo_range_intervals (shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
 				event.shardGroup,
-				hashKey,
-				start ?? NO_KEY,
+				bucket,
+				start?.hk ?? NO_KEY,
+				start?.sk ?? NO_KEY,
 				end === null ? 1 : 0,
-				end ?? NO_KEY,
+				end?.hk ?? NO_KEY,
+				end?.sk ?? NO_KEY,
 				seq,
 			).rowsWritten;
 		if (event.kind === "hash_split") {
 			return { roots: 0, intervals: 0 };
 		}
-		let hashKey: Uint8Array;
+		let bucket: HashPrefixBucket;
 		let roots: number;
 		let intervals: number;
 		if (event.kind === "key_promotion") {
-			hashKey = (event.targets[0].slice as { hashKey: KeyBytes }).hashKey;
-			roots = insert(hashKey, null, null);
+			const slice = event.targets[0].slice;
+			invariant(slice.kind === "promoted_hash_prefix_bucket", "fokos/topology-keeper: a key_promotion has a promotion slice");
+			bucket = slice.hashPrefixBucket;
+			roots = insert(bucket, null, null);
 			intervals = roots;
 		} else {
 			invariant(source.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology-keeper: a range_split has a range source");
-			// `#checkSource` checked that each target has the hash key of the source.
-			hashKey = source.hashKey;
-			roots = insert(hashKey, null, null);
-			intervals = roots + insert(hashKey, source.startBoundary, source.endBoundary);
+			// `#checkSource` checked that each target has the hashPrefixBucket of the source.
+			bucket = source.hashPrefixBucket;
+			roots = insert(bucket, null, null);
+			intervals = roots + insert(bucket, source.startBoundary, source.endBoundary);
 			for (const { slice } of event.targets) {
 				if (slice.kind === "range") {
-					intervals += insert(hashKey, slice.start, slice.end);
+					intervals += insert(bucket, slice.start, slice.end);
 				}
 			}
 		}
 		if (intervals > 0) {
-			sql.exec(`INSERT OR IGNORE INTO fokos_topo_range_dirty (shard_group, hash_key) VALUES (?1, ?2)`, event.shardGroup, hashKey);
+			sql.exec(`INSERT OR IGNORE INTO fokos_topo_range_dirty (shard_group, hash_prefix_bucket) VALUES (?1, ?2)`, event.shardGroup, bucket);
 		}
 		return { roots, intervals };
 	}
@@ -580,7 +587,10 @@ export class FokosTopologyKeeper {
 		}
 		for (;;) {
 			const dirty = tryOne(
-				sql.exec<{ hash_key: ArrayBuffer }>(`SELECT hash_key FROM fokos_topo_range_dirty WHERE shard_group = ?1 LIMIT 1`, shardGroup),
+				sql.exec<{ hash_prefix_bucket: ArrayBuffer }>(
+					`SELECT hash_prefix_bucket FROM fokos_topo_range_dirty WHERE shard_group = ?1 LIMIT 1`,
+					shardGroup,
+				),
 			);
 			if (dirty === undefined) {
 				break;
@@ -589,12 +599,12 @@ export class FokosTopologyKeeper {
 				sql.exec(`UPDATE fokos_topo_groups SET build_due_at = ?2 WHERE shard_group = ?1`, shardGroup, now);
 				return rows;
 			}
-			const hashKey = new Uint8Array(dirty.hash_key);
+			const bucket = asHashPrefixBucket(new Uint8Array(dirty.hash_prefix_bucket));
 			this.#storage.transactionSync(() => {
-				const built = this.#buildRangeBody(shardGroup, hashKey, group);
+				const built = this.#buildRangeBody(shardGroup, bucket, group);
 				rows += built.rows;
-				this.#writeBody(shardGroup, "range", hashKey, built.body);
-				sql.exec(`DELETE FROM fokos_topo_range_dirty WHERE shard_group = ?1 AND hash_key = ?2`, shardGroup, hashKey);
+				this.#writeBody(shardGroup, "range", bucket, built.body);
+				sql.exec(`DELETE FROM fokos_topo_range_dirty WHERE shard_group = ?1 AND hash_prefix_bucket = ?2`, shardGroup, bucket);
 			});
 		}
 		sql.exec(`UPDATE fokos_topo_groups SET build_due_at = NULL WHERE shard_group = ?1`, shardGroup);
@@ -635,14 +645,14 @@ export class FokosTopologyKeeper {
 			}
 		};
 		const promoted = function* (afterSeq: number) {
-			for (const row of sql.exec<{ hash_key: ArrayBuffer }>(
-				`SELECT hash_key FROM fokos_topo_range_intervals INDEXED BY idx_fokos_topo_range_roots
-				  WHERE shard_group = ?1 AND seq > ?2 AND start = x'' AND end_is_max = 1`,
+			for (const row of sql.exec<{ hash_prefix_bucket: ArrayBuffer }>(
+				`SELECT hash_prefix_bucket FROM fokos_topo_range_intervals INDEXED BY idx_fokos_topo_range_roots
+				  WHERE shard_group = ?1 AND seq > ?2 AND start_hk = x'' AND end_is_max = 1`,
 				shardGroup,
 				afterSeq,
 			)) {
 				rows += 1;
-				yield new Uint8Array(row.hash_key);
+				yield new Uint8Array(row.hash_prefix_bucket);
 			}
 		};
 		let old: HashTopologyView | undefined;
@@ -675,20 +685,21 @@ export class FokosTopologyKeeper {
 	}
 
 	/**
-	 * The range body of one hash key, from its intervals in primary-key order. The first pass also
+	 * The range body of one hashPrefixBucket, from its intervals in primary-key order. The first pass also
 	 * finds the size of the boundaries at each level. Only a body above `maxRangeBodyBytes` reads the
 	 * rows again, and keeps the ranks that fit. Two intervals that cross give a body with the range
 	 * root only.
 	 */
-	#buildRangeBody(shardGroup: string, hashKey: Uint8Array, group: GroupRow): { body: Uint8Array; rows: number } {
+	#buildRangeBody(shardGroup: string, bucket: HashPrefixBucket, group: GroupRow): { body: Uint8Array; rows: number } {
 		const sql = this.#storage.sql;
 		let rows = 0;
 		const scan = function* () {
 			for (const row of sql.exec<IntervalRow>(
-				`SELECT start, end_is_max, end FROM fokos_topo_range_intervals
-				  WHERE shard_group = ?1 AND hash_key = ?2 ORDER BY start, end_is_max DESC, end DESC`,
+				`SELECT start_hk, start_sk, end_is_max, end_hk, end_sk FROM fokos_topo_range_intervals
+				  WHERE shard_group = ?1 AND hash_prefix_bucket = ?2
+				  ORDER BY start_hk, start_sk, end_is_max DESC, end_hk DESC, end_sk DESC`,
 				shardGroup,
-				hashKey,
+				bucket,
 			)) {
 				rows += 1;
 				yield row;
@@ -703,7 +714,7 @@ export class FokosTopologyKeeper {
 			console.error({
 				message: "fokos/topology-keeper: two known range intervals cross. The range body holds the range root only.",
 				shardGroup,
-				hashKey: KeyCodec.keyForLog(KeyCodec.asKeyBytes(hashKey)),
+				hashPrefixBucket: bucket.toHex(),
 			});
 			return encode({ boundaries: [], levels: [], depths: [0] }, null);
 		}
@@ -730,15 +741,15 @@ export class FokosTopologyKeeper {
 	}
 
 	/** The stored body, or undefined. A body of one chunk is the chunk itself, with no copy. */
-	#readBody(shardGroup: string, kind: "hash" | "range", hashKey: Uint8Array): Uint8Array | undefined {
+	#readBody(shardGroup: string, kind: "hash" | "range", bucket: Uint8Array): Uint8Array | undefined {
 		let first: Uint8Array | undefined;
 		let more: Uint8Array[] | undefined;
 		let total = 0;
 		for (const row of this.#storage.sql.exec<{ bytes: ArrayBuffer }>(
-			`SELECT bytes FROM fokos_topo_bodies WHERE shard_group = ?1 AND kind = ?2 AND hash_key = ?3 ORDER BY chunk`,
+			`SELECT bytes FROM fokos_topo_bodies WHERE shard_group = ?1 AND kind = ?2 AND hash_prefix_bucket = ?3 ORDER BY chunk`,
 			shardGroup,
 			kind,
-			hashKey,
+			bucket,
 		)) {
 			const chunk = new Uint8Array(row.bytes);
 			total += chunk.length;
@@ -761,15 +772,15 @@ export class FokosTopologyKeeper {
 		return body;
 	}
 
-	#writeBody(shardGroup: string, kind: "hash" | "range", hashKey: Uint8Array, body: Uint8Array): void {
+	#writeBody(shardGroup: string, kind: "hash" | "range", bucket: Uint8Array, body: Uint8Array): void {
 		const sql = this.#storage.sql;
-		sql.exec(`DELETE FROM fokos_topo_bodies WHERE shard_group = ?1 AND kind = ?2 AND hash_key = ?3`, shardGroup, kind, hashKey);
+		sql.exec(`DELETE FROM fokos_topo_bodies WHERE shard_group = ?1 AND kind = ?2 AND hash_prefix_bucket = ?3`, shardGroup, kind, bucket);
 		for (let chunk = 0; chunk * TOPOLOGY_BODY_CHUNK_BYTES < body.length; chunk++) {
 			sql.exec(
-				`INSERT INTO fokos_topo_bodies (shard_group, kind, hash_key, chunk, bytes) VALUES (?1, ?2, ?3, ?4, ?5)`,
+				`INSERT INTO fokos_topo_bodies (shard_group, kind, hash_prefix_bucket, chunk, bytes) VALUES (?1, ?2, ?3, ?4, ?5)`,
 				shardGroup,
 				kind,
-				hashKey,
+				bucket,
 				chunk,
 				body.subarray(chunk * TOPOLOGY_BODY_CHUNK_BYTES, (chunk + 1) * TOPOLOGY_BODY_CHUNK_BYTES),
 			);
@@ -782,13 +793,13 @@ function answer(etag: string, body: Uint8Array, ifNoneMatch: string | undefined)
 }
 
 /** The range model of one hash key, as `encodeRangeBody` takes it. */
-type RangeSweep = { boundaries: Uint8Array[]; levels: number[]; depths: number[] };
+type RangeSweep = { boundaries: FokosCompositeKey[]; levels: number[]; depths: number[] };
 
 /** The sizes that the first pass finds. */
 type RangeSweepStats = { maxRank: number; bytesByLevel: number[]; countByLevel: number[] };
 
 /**
- * One pass over the known intervals of one hash key, in the order `start` ascending, then `end`
+ * One pass over the known intervals of one hashPrefixBucket, in the order `start` ascending, then `end`
  * descending. A stack holds the open ancestors of the current interval, so the rank of an interval is
  * the rank of its nearest known ancestor plus 1.
  *
@@ -810,46 +821,51 @@ function sweepRangeIntervals(rows: Iterable<IntervalRow>, maxKeptRank: number): 
 		countByLevel: [],
 	};
 	/** `end` null is ~max. */
-	const stack: Array<{ end: KeyBytes | null; rank: number }> = [];
-	let last: KeyBytes | null = null;
-	const emit = (boundary: KeyBytes, level: number) => {
+	const stack: Array<{ end: FokosCompositeKey | null; rank: number }> = [];
+	let last: FokosCompositeKey | null = null;
+	const cmp = KeyCodec.compareComposite;
+	const emit = (boundary: FokosCompositeKey, level: number) => {
 		last = boundary;
-		out.bytesByLevel[level] = (out.bytesByLevel[level] ?? 0) + boundary.length + 4;
+		out.bytesByLevel[level] = (out.bytesByLevel[level] ?? 0) + boundary.hk.length + boundary.sk.length + 8;
 		out.countByLevel[level] = (out.countByLevel[level] ?? 0) + 1;
 		out.boundaries.push(boundary);
 		out.levels.push(level);
 		out.depths.push(level);
 	};
 	/** Closes each open interval that ends at or before `start` (null: the end of the rows). */
-	const closeBefore = (start: KeyBytes | null) => {
+	const closeBefore = (start: FokosCompositeKey | null) => {
 		for (;;) {
 			const top = stack.at(-1);
-			if (!top || top.end === null || (start !== null && KeyCodec.compare(top.end, start) > 0)) {
+			if (!top || top.end === null || (start !== null && cmp(top.end, start) > 0)) {
 				return;
 			}
 			const end = top.end;
-			while (stack.length > 0 && stack.at(-1)!.end !== null && KeyCodec.compare(stack.at(-1)!.end!, end) === 0) {
+			while (stack.length > 0 && stack.at(-1)!.end !== null && cmp(stack.at(-1)!.end!, end) === 0) {
 				stack.pop();
 			}
 			// An end that is also the next start gets its boundary from that start.
-			if (start === null || KeyCodec.compare(end, start) < 0) {
+			if (start === null || cmp(end, start) < 0) {
 				emit(end, stack.at(-1)?.rank ?? -1);
 			}
 		}
 	};
 	for (const row of rows) {
-		const start = KeyCodec.asKeyBytes(new Uint8Array(row.start));
-		const end = row.end_is_max === 1 ? null : KeyCodec.asKeyBytes(new Uint8Array(row.end));
+		const start = { hk: KeyCodec.asKeyBytes(new Uint8Array(row.start_hk)), sk: KeyCodec.asKeyBytes(new Uint8Array(row.start_sk)) };
+		const end =
+			row.end_is_max === 1
+				? null
+				: { hk: KeyCodec.asKeyBytes(new Uint8Array(row.end_hk)), sk: KeyCodec.asKeyBytes(new Uint8Array(row.end_sk)) };
 		closeBefore(start);
 		const top = stack.at(-1);
-		if (top && top.end !== null && (end === null || KeyCodec.compare(top.end, end) < 0)) {
+		if (top && top.end !== null && (end === null || cmp(top.end, end) < 0)) {
 			return "crossed";
 		}
 		const rank = top ? top.rank + 1 : 0;
 		if (rank > maxKeptRank) {
 			continue;
 		}
-		if (start.length > 0 && (last === null || KeyCodec.compare(last, start) !== 0)) {
+		// The start `(x'', x'')` is ~min.
+		if (start.hk.length > 0 && (last === null || cmp(last, start) !== 0)) {
 			emit(start, top?.rank ?? -1);
 		}
 		out.depths[out.depths.length - 1] = rank;
@@ -932,9 +948,9 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 		return this.keeper.getTopology(shardGroup, ifNoneMatch);
 	}
 
-	async getRangeTopology(shardGroup: string, hashKey: Uint8Array, ifNoneMatch?: string): Promise<FokosTopologyRead> {
+	async getRangeTopology(shardGroup: string, hashPrefixBucket: HashPrefixBucket, ifNoneMatch?: string): Promise<FokosTopologyRead> {
 		this.#checkInit("getRangeTopology");
-		return this.keeper.getRangeTopology(shardGroup, hashKey, ifNoneMatch);
+		return this.keeper.getRangeTopology(shardGroup, hashPrefixBucket, ifNoneMatch);
 	}
 
 	async alarm(info?: AlarmInvocationInfo): Promise<void> {
@@ -994,6 +1010,9 @@ export type FokosTopologyEntrypointOptions = {
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
+/** The 16 lowercase hex characters of a hashPrefixBucket in a topology path. */
+const HASH_PREFIX_BUCKET_HEX = /^[0-9a-f]{16}$/;
+
 function noStore(status: number): Response {
 	return new Response(null, { status, headers: { "Cache-Control": "no-store" } });
 }
@@ -1003,7 +1022,7 @@ function noStore(status: number): Response {
  * Cache enabled. It calls the admin Durable Object only on a cache miss or a revalidation.
  *
  * - `GET /internal/v1/topology.Get?sg=<base64url>`: the hash body of the shard group.
- * - `GET /internal/v1/topology.GetForRange?sg=<base64url>&hk=<base64url>`: the range body of one hash key.
+ * - `GET /internal/v1/topology.GetForRange?sg=<base64url>&bk=<16 hex>`: the range body of one hashPrefixBucket.
  *
  * A topology answer has `Cache-Control` and `ETag`, and an `If-None-Match` that equals the ETag gets
  * a 304. Every other answer has `Cache-Control: no-store`.
@@ -1018,21 +1037,26 @@ export async function fokosTopologyEntrypointFetch(request: Request, opts: Fokos
 		return noStore(405);
 	}
 	let shardGroup: string;
-	let hashKey: Uint8Array | undefined;
+	let hashPrefixBucket: HashPrefixBucket | undefined;
 	try {
 		shardGroup = utf8Decoder.decode(fromBase64Url(url.searchParams.get("sg") ?? ""));
-		hashKey = get ? undefined : fromBase64Url(url.searchParams.get("hk") ?? "");
+		if (!get) {
+			const hex = url.searchParams.get("bk") ?? "";
+			hashPrefixBucket = HASH_PREFIX_BUCKET_HEX.test(hex) ? asHashPrefixBucket(Uint8Array.fromHex(hex)) : undefined;
+		}
 	} catch {
 		return noStore(400);
 	}
-	if (shardGroup.length === 0 || hashKey?.length === 0) {
+	if (shardGroup.length === 0 || (!get && hashPrefixBucket === undefined)) {
 		return noStore(400);
 	}
 	const ifNoneMatch = request.headers.get("If-None-Match")?.replace(/^W\//, "") ?? undefined;
 	let read: FokosTopologyRead;
 	try {
 		const admin = opts.admin(shardGroup);
-		read = hashKey ? await admin.getRangeTopology(shardGroup, hashKey, ifNoneMatch) : await admin.getTopology(shardGroup, ifNoneMatch);
+		read = hashPrefixBucket
+			? await admin.getRangeTopology(shardGroup, hashPrefixBucket, ifNoneMatch)
+			: await admin.getTopology(shardGroup, ifNoneMatch);
 	} catch (error) {
 		console.error({ message: "fokos/topology-entrypoint: the admin Durable Object failed.", shardGroup, error: String(error) });
 		return noStore(503);

@@ -15,6 +15,7 @@ import { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { captureConsoleError, kb, makeStub } from "./helpers.js";
+import { partitionPrefixOf } from "../storage-prefix.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 
@@ -39,7 +40,9 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const createdAt = options?.createdAt ?? Date.now() - 10_000;
 		const operation = options?.operation ?? "put";
 		const store = new PartitionStore(state.storage);
+		const P = partitionPrefixOf(state);
 		store.insertPendingLock({
+			prefix: P(kb(options?.hashKey ?? `stale-${transactionId}`)),
 			hk: kb(options?.hashKey ?? `stale-${transactionId}`),
 			sk: kb("sk"),
 			transaction_id: transactionId,
@@ -61,7 +64,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 	function releasePendingLock(store: PartitionStore, transactionId: string): void {
 		store.deletePendingTxKeys(
 			transactionId,
-			store.listPendingTxKeys(transactionId).map((row) => ({ hashKey: row.hk, sortKey: row.sk })),
+			store.listPendingTxKeys(transactionId).map((row) => ({ prefix: row.prefix, hashKey: row.hk, sortKey: row.sk })),
 		);
 	}
 
@@ -139,7 +142,15 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const sharding = new FokosShardingStore(state.storage);
 			const now = Date.now();
-			sharding.insertRepartition({ id: "r1", seq: 1, kind: "hash_split", state: state_, hashKey: null, queuedAt: now, nextAttemptAt: now });
+			sharding.insertRepartition({
+				id: "r1",
+				seq: 1,
+				kind: "hash_split",
+				state: state_,
+				hashPrefixBucket: null,
+				queuedAt: now,
+				nextAttemptAt: now,
+			});
 			childPartitionContexts.forEach((child, index) => {
 				sharding.insertRepartitionTarget({
 					repartitionId: "r1",
@@ -301,6 +312,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
+			const P = partitionPrefixOf(state);
 			const [lock] = store.listPendingTxItems(transactionId);
 			expect(lock).toBeDefined();
 			// The coordinator answers not_found, as after its sweep, and the lock is older than the window.
@@ -309,7 +321,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = 0 WHERE transaction_id = ?`, transactionId);
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.listPendingTxKeys(transactionId)).toHaveLength(0);
-			expect(store.getItemStamp(key.hashKey, key.sortKey).row?.last_read_ts).toBe(transactionTimestamp);
+			expect(store.getItemStamp(P(key.hashKey), key.hashKey, key.sortKey).row?.last_read_ts).toBe(transactionTimestamp);
 		});
 		expect(recoverTransaction).toHaveBeenCalledTimes(1);
 		expect(consoleError.withMessage(LOCK_AGE_GUARD_LOG).filter((log) => log.transactionId === transactionId)).toHaveLength(0);
@@ -351,8 +363,17 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = new PartitionStore(state.storage);
+			const P = partitionPrefixOf(state);
 			// The checked item has a stamp of 10. With a put in the request, the check alone is covered.
-			store.upsertItem({ hk: kb(`checked-${transactionId}`), sk: kb("sk"), data: "v", kind: "text", ttlAt: null, txOrderTs: 10 });
+			store.upsertItem({
+				prefix: P(kb(`checked-${transactionId}`)),
+				hk: kb(`checked-${transactionId}`),
+				sk: kb("sk"),
+				data: "v",
+				kind: "text",
+				ttlAt: null,
+				txOrderTs: 10,
+			});
 			const transactionTimestamp = withPut ? 10 : 11;
 			insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
 				createdAt,
@@ -612,7 +633,9 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const getCoordinatorStub = vi.spyOn(doStubs, "txCoordinatorStubForParticipant");
 		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
+			const P = partitionPrefixOf(state);
 			store.insertPendingLock({
+				prefix: P(kb("stale-ttl")),
 				hk: kb("stale-ttl"),
 				sk: kb("sk"),
 				transaction_id: transactionId,

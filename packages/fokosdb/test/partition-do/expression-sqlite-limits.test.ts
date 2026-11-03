@@ -7,6 +7,7 @@ import { CONDITION_FIXED_BINDING_COUNT } from "../../src/shared/expression/plan.
 import type { ConditionExpression, ExpressionValue, UpdateExpression } from "../../src/shared/expression/types.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { kb, makeStub } from "./helpers.js";
+import { partitionPrefixOf } from "../storage-prefix.js";
 
 /**
  * SQLite refuses a statement whose expression is deeper than 100 levels, and the error does not name
@@ -90,19 +91,20 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 
 		await runInDurableObject(stub, (_instance, state) => {
 			const store = new PartitionStore(state.storage);
+			const P = partitionPrefixOf(state);
 			const contexts = {
 				condition: (value: ExpressionValue) => {
 					const condition: ConditionExpression = { op: "eq", args: [value, value] };
 					return {
 						compile: () => compileConditionExpression(condition),
-						run: () => store.evaluateCondition(condition, key.hashKey, key.sortKey),
+						run: () => store.evaluateCondition(condition, P(key.hashKey), key.hashKey, key.sortKey),
 					};
 				},
 				projection: (value: ExpressionValue) => {
 					const projection = [{ expr: value, as: "x" }];
 					return {
 						compile: () => compileProjectionExpression(projection),
-						run: () => store.getItemProjected(projection, key.hashKey, key.sortKey),
+						run: () => store.getItemProjected(projection, P(key.hashKey), key.hashKey, key.sortKey),
 					};
 				},
 				update: (value: ExpressionValue) => {
@@ -110,8 +112,8 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 					return {
 						compile: () => compileUpdateExpression(update),
 						run: () => {
-							store.probeUpdate(update, key.hashKey, key.sortKey);
-							store.updateItemSingleShot({ hk: key.hashKey, sk: key.sortKey, plan: update, txOrderTs: 1 });
+							store.probeUpdate(update, P(key.hashKey), key.hashKey, key.sortKey);
+							store.updateItemSingleShot({ prefix: P(key.hashKey), hk: key.hashKey, sk: key.sortKey, plan: update, txOrderTs: 1 });
 						},
 					};
 				},

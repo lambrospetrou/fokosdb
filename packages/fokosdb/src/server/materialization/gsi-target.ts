@@ -16,6 +16,7 @@ import {
 } from "../../shared/transaction-limits.js";
 import type { DataKind } from "../../shared/types.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
+import { asHashPrefixBucket, HASH_PREFIX_BUCKET_BYTES } from "../../sharding/hash-primitives.js";
 import type { GsiKey, MaterializationStore, TargetImage } from "./materialization-store.js";
 import type { GsiTargetDefinition } from "./targets.js";
 
@@ -73,6 +74,8 @@ export function compileGsiPlans(target: GsiTargetDefinition): GsiPlans {
 
 /** An empty base hash key. `KeyCodec.encode` never returns an empty key, so no item has it. */
 const NO_ITEM_KEY: KeyBytes = KeyCodec.encodeOptional(undefined);
+// A syntactically valid storage prefix for the compile probe, which never reads a row.
+const NO_ITEM_PREFIX = asHashPrefixBucket(new Uint8Array(HASH_PREFIX_BUCKET_BYTES));
 
 /**
  * Compiles the plans of a GSI target, and runs each statement on no row, so that SQLite prepares it.
@@ -83,7 +86,7 @@ export function checkGsiPlans(store: MaterializationStore, target: GsiTargetDefi
 	const plans = compileGsiPlans(target);
 	for (const plan of [plans.keys, plans.projection]) {
 		if (plan !== undefined) {
-			store.evaluateProjection(plan, NO_ITEM_KEY, NO_ITEM_KEY);
+			store.evaluateProjection(plan, NO_ITEM_PREFIX, NO_ITEM_KEY, NO_ITEM_KEY);
 		}
 	}
 	return plans;
@@ -100,7 +103,7 @@ export function desiredGsiEntry(store: MaterializationStore, plans: GsiPlans, im
 		return { kind: "absent" };
 	}
 	try {
-		const keys = store.evaluateProjection(plans.keys, image.hk, image.sk);
+		const keys = store.evaluateProjection(plans.keys, image.prefix, image.hk, image.sk);
 		if (keys === undefined) {
 			return { kind: "absent" };
 		}
@@ -118,7 +121,7 @@ export function desiredGsiEntry(store: MaterializationStore, plans: GsiPlans, im
 		let data: string | Uint8Array = image.data;
 		let dataKind: DataKind = image.kind;
 		if (plans.projection !== undefined) {
-			const row = store.evaluateProjection(plans.projection, image.hk, image.sk) ?? [];
+			const row = store.evaluateProjection(plans.projection, image.prefix, image.hk, image.sk) ?? [];
 			if (row.some((cell) => cell instanceof Uint8Array)) {
 				return { kind: "violation", code: GSI_PROJECTION_BYTES };
 			}

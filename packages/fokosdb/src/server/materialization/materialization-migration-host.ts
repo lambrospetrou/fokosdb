@@ -15,10 +15,11 @@
  * its other keys, and its cursors move past the moved items. Thus the pages of a promotion use the
  * cursor snapshot that the cutover stored.
  */
-import { KeyCodec } from "../../sharding/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../../shared/invariant.js";
-import { collectStream, comparePositions, sliceKeyRange, type StreamReader } from "../../shared/partition/fokos-migration-host.js";
-import type { HashKeyWalkCursor, ScanCursor } from "../../shared/partition/partition-store.js";
+import { compareHashPrefixBuckets, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { collectStream, comparePositions, rowFilter, type StreamReader } from "../../shared/partition/fokos-migration-host.js";
+import type { KeyRange, StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
 import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js";
@@ -29,7 +30,7 @@ const LINKED_ROW_BYTES = 64;
 
 /** Where the host has got to. The flow stores it as it is and never reads inside it. */
 export type MaterializationHostCursor =
-	| { stream: "items"; cursor: HashKeyWalkCursor<ScanCursor> | null }
+	| { stream: "items"; cursor: StorageCursor | null }
 	| { stream: "producer_fences"; after: string | null }
 	| { stream: "state" };
 
@@ -42,6 +43,8 @@ export type MaterializationMigrationHostDeps = {
 	store: MaterializationStore;
 	/** The `DurableObjectId` of this partition, in hex: the producer ID of its target calls. */
 	selfId: () => string;
+	/** The storage prefix of a hash key in the shard group of this partition. */
+	storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket;
 };
 
 const STREAM_ORDER: Record<MaterializationHostCursor["stream"], number> = { items: 0, producer_fences: 1, state: 2 };
@@ -54,6 +57,7 @@ export class MaterializationMigrationHost implements MigrationHost {
 		slice: FokosSlice,
 		belongsToTarget: (key: RouteKey) => boolean,
 		budget: FokosMigrationPageBudget,
+		interval: KeyRange,
 	): { page: MaterializationHostPage; nextCursor: MaterializationHostCursor | null } {
 		const { store } = this.deps;
 		const from = asHostCursor(cursor);
@@ -62,16 +66,19 @@ export class MaterializationMigrationHost implements MigrationHost {
 				// A position at or below the lowest cursor that the child gets is done for each target.
 				const cursors = [...this.#cursors(slice).values()];
 				const minSeq = cursors.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...cursors);
-				const reader: StreamReader<MigratedLatestItem, ScanCursor> = {
-					readRange: (c, limit, range) => store.queryMigrationItems(c, limit, range, minSeq),
-					walk: (c, limit, owns) => store.walkMigrationItems(c, limit, owns, minSeq),
-					cursorOf: (row) => ({ hk: row.hk, sk: row.sk }),
+				const reader: StreamReader<MigratedLatestItem, StorageCursor> = {
+					read: (c, limit, i) => store.queryMigrationItems(c, limit, i, minSeq),
+					cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk }),
 					estimateBytes: (row) =>
 						row.est_row_bytes +
 						(row.positions.length + row.retries.length) * LINKED_ROW_BYTES +
 						(row.indexKeys ?? []).reduce((n, key) => n + LINKED_ROW_BYTES + key.index_hk.length + key.index_sk.length, 0),
 				};
-				const { rows, nextCursor } = collectStream(reader, from.cursor, sliceKeyRange(slice), belongsToTarget, budget);
+				const { rows, nextCursor } = collectStream(reader, from.cursor, {
+					interval,
+					include: rowFilter(slice, belongsToTarget),
+					budget,
+				});
 				const next: MaterializationHostCursor = nextCursor
 					? { stream: "items", cursor: nextCursor }
 					: { stream: "producer_fences", after: null };
@@ -109,10 +116,10 @@ export class MaterializationMigrationHost implements MigrationHost {
 			case "items": {
 				// An item that is present already contributes nothing, so a retried page does not count
 				// its rows two times.
-				const added: Array<{ hk: MigratedLatestItem["hk"]; bytes: number }> = [];
+				const added: Array<{ prefix: HashPrefixBucket; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
 				for (const item of p.items) {
 					if (store.insertMigratedItem(item)) {
-						added.push({ hk: item.hk, bytes: item.est_row_bytes });
+						added.push({ prefix: item.prefix, hk: item.hk, bytes: item.est_row_bytes });
 					}
 				}
 				store.keySizes.addRows(added);
@@ -156,6 +163,13 @@ export class MaterializationMigrationHost implements MigrationHost {
 				if (!inSlice({ hashKey: item.hk, sortKey: item.sk })) {
 					invariant(false, () => `fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)}, outside the slice`);
 				}
+				// The row is stored under the prefix it carries, so a wrong prefix puts it outside the
+				// range of its own hash key, where a later read by prefix cannot find it.
+				invariant(
+					compareHashPrefixBuckets(item.prefix, this.deps.storagePrefix(item.hk)) === 0,
+					() =>
+						`fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)} with a prefix that is not the storage prefix of the hash key`,
+				);
 			}
 		}
 	}
@@ -166,8 +180,8 @@ export class MaterializationMigrationHost implements MigrationHost {
 	 */
 	#cursors(slice: FokosSlice): ReadonlyMap<string, number> {
 		const { store } = this.deps;
-		if (slice.kind === "promoted_key") {
-			const snapshot = store.cursorSnapshot(slice.hashKey);
+		if (slice.kind === "promoted_hash_prefix_bucket") {
+			const snapshot = store.cursorSnapshot(slice.hashPrefixBucket);
 			invariant(snapshot !== undefined, "fokos/mat-migration: a promotion source has no cursor snapshot");
 			return snapshot;
 		}

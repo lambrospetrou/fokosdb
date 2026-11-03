@@ -4,6 +4,7 @@ import type { FokosDBPartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { KeyCodec } from "./key-codec.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
+import { asHashPrefixBucket } from "./hash-primitives.js";
 import { FOKOS_KV_KEYS, FokosShardingStore, type FokosShardingStoreOptions } from "./sharding-store.js";
 import { DEFAULT_RUNTIME_CONFIG } from "./runtime-config.js";
 
@@ -11,6 +12,10 @@ const REFRESH_MS = DEFAULT_RUNTIME_CONFIG.rangeHierarchyRefreshMs;
 
 const kb = (s: string) => KeyCodec.encode(s);
 const UNBOUNDED = KeyCodec.encodeOptional(undefined);
+const BUCKET = asHashPrefixBucket(Uint8Array.fromHex("0102030405060708"));
+const OTHER_BUCKET = asHashPrefixBucket(Uint8Array.fromHex("0807060504030201"));
+/** A boundary of the hash key "h" with the sort key `sk`. */
+const c = (sk: string) => ({ hk: kb("h"), sk: kb(sk) });
 
 // Runs `fn` against a FokosShardingStore over REAL Durable Object storage. The FokosDBPartitionDO constructor
 // has already run the sharding migrations by the time the callback runs, and they are idempotent.
@@ -46,19 +51,19 @@ describe("FokosShardingStore - migrations", () => {
 });
 
 describe("FokosShardingStore - learnRangeBoundary", () => {
-	// A single hash key's learned range tree:
-	//   depth 1: [-∞,"m") , ["m",+∞)
-	//   depth 2 (within ["m",+∞)): ["m","t") , ["t",+∞)
-	function seedTree(store: FokosShardingStore, hk = kb("h")) {
-		store.learnRangeBoundary(hk, UNBOUNDED, kb("m"), 1, REFRESH_MS);
-		store.learnRangeBoundary(hk, kb("m"), UNBOUNDED, 1, REFRESH_MS);
-		store.learnRangeBoundary(hk, kb("m"), kb("t"), 2, REFRESH_MS);
-		store.learnRangeBoundary(hk, kb("t"), UNBOUNDED, 2, REFRESH_MS);
+	// The learned range tree of one hashPrefixBucket, with boundaries of the hash key "h":
+	//   depth 1: [-∞,("h","m")) , [("h","m"),+∞)
+	//   depth 2 (within [("h","m"),+∞)): [("h","m"),("h","t")) , [("h","t"),+∞)
+	function seedTree(store: FokosShardingStore, hk = BUCKET) {
+		store.learnRangeBoundary(hk, null, c("m"), 1, REFRESH_MS);
+		store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
+		store.learnRangeBoundary(hk, c("m"), c("t"), 2, REFRESH_MS);
+		store.learnRangeBoundary(hk, c("t"), null, 2, REFRESH_MS);
 	}
 
 	it("returns null when nothing is stored", async () => {
 		await withStore((store) => {
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("p"))).toBeNull();
+			expect(store.findDeepestKnownRangeSlice(BUCKET, c("p"))).toBeNull();
 		});
 	});
 
@@ -66,7 +71,7 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		await withStore((store) => {
 			seedTree(store);
 			// "p" is in ["m","t") at depth 2, a strict sub-slice of ["m",+∞) at depth 1.
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("p"))).toEqual({ depth: 2, startBoundary: kb("m"), endBoundary: kb("t") });
+			expect(store.findDeepestKnownRangeSlice(BUCKET, c("p"))).toEqual({ depth: 2, startBoundary: c("m"), endBoundary: c("t") });
 		});
 	});
 
@@ -74,7 +79,7 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		await withStore((store) => {
 			seedTree(store);
 			// "z" is in ["t",+∞) at depth 2 — only matched because the end sentinel is treated as +∞.
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("z"))).toEqual({ depth: 2, startBoundary: kb("t"), endBoundary: null });
+			expect(store.findDeepestKnownRangeSlice(BUCKET, c("z"))).toEqual({ depth: 2, startBoundary: c("t"), endBoundary: null });
 		});
 	});
 
@@ -82,62 +87,61 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		await withStore((store) => {
 			seedTree(store);
 			// "a" only falls in [-∞,"m") at depth 1.
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("a"))).toEqual({ depth: 1, startBoundary: null, endBoundary: kb("m") });
+			expect(store.findDeepestKnownRangeSlice(BUCKET, c("a"))).toEqual({ depth: 1, startBoundary: null, endBoundary: c("m") });
 		});
 	});
 
 	it("falls back to a shallower covering slice when the deeper slice lies to the side of the key", async () => {
 		await withStore((store) => {
-			const hk = kb("h");
+			const hk = BUCKET;
 			// Only a depth-1 ["m",+∞) and a depth-2 ["t",+∞) are known; nothing at depth 2 covers ["m","t").
-			store.learnRangeBoundary(hk, kb("m"), UNBOUNDED, 1, REFRESH_MS);
-			store.learnRangeBoundary(hk, kb("t"), UNBOUNDED, 2, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("t"), null, 2, REFRESH_MS);
 			// "p" is left of "t", so the depth-2 slice does not contain it — fall back to depth 1.
-			expect(store.findDeepestKnownRangeSlice(hk, kb("p"))).toEqual({ depth: 1, startBoundary: kb("m"), endBoundary: null });
+			expect(store.findDeepestKnownRangeSlice(hk, c("p"))).toEqual({ depth: 1, startBoundary: c("m"), endBoundary: null });
 		});
 	});
 
 	it("goes up one depth at a time when the nearest slice at a depth ends before the key", async () => {
 		await withStore((store) => {
-			const hk = kb("h");
-			store.learnRangeBoundary(hk, kb("m"), UNBOUNDED, 1, REFRESH_MS);
-			store.learnRangeBoundary(hk, kb("m"), kb("t"), 2, REFRESH_MS);
-			store.learnRangeBoundary(hk, kb("m"), kb("p"), 3, REFRESH_MS);
+			const hk = BUCKET;
+			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("m"), c("t"), 2, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("m"), c("p"), 3, REFRESH_MS);
 			// The depth-3 slice ["m","p") is the nearest start for "r" but ends before it; depth 2 covers it.
-			expect(store.findDeepestKnownRangeSlice(hk, kb("r"))).toEqual({ depth: 2, startBoundary: kb("m"), endBoundary: kb("t") });
+			expect(store.findDeepestKnownRangeSlice(hk, c("r"))).toEqual({ depth: 2, startBoundary: c("m"), endBoundary: c("t") });
 			// For "u", neither depth 3 nor depth 2 covers it, so the result is depth 1.
-			expect(store.findDeepestKnownRangeSlice(hk, kb("u"))).toEqual({ depth: 1, startBoundary: kb("m"), endBoundary: null });
+			expect(store.findDeepestKnownRangeSlice(hk, c("u"))).toEqual({ depth: 1, startBoundary: c("m"), endBoundary: null });
 		});
 	});
 
 	it("returns null when no stored slice covers the key", async () => {
 		await withStore((store) => {
-			const hk = kb("h");
+			const hk = BUCKET;
 			// Only the right half is known; "a" is left of every stored start.
-			store.learnRangeBoundary(hk, kb("m"), UNBOUNDED, 1, REFRESH_MS);
-			expect(store.findDeepestKnownRangeSlice(hk, kb("a"))).toBeNull();
+			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
+			expect(store.findDeepestKnownRangeSlice(hk, c("a"))).toBeNull();
 		});
 	});
 
-	it("isolates by hash key", async () => {
+	it("isolates by hashPrefixBucket", async () => {
 		await withStore((store) => {
-			seedTree(store, kb("h"));
-			expect(store.findDeepestKnownRangeSlice(kb("other"), kb("p"))).toBeNull();
+			seedTree(store, BUCKET);
+			expect(store.findDeepestKnownRangeSlice(OTHER_BUCKET, c("p"))).toBeNull();
 		});
 	});
 
 	it("learns a known boundary again without a write, and refreshes its stamp once it is old", async () => {
 		await withStore((store, state) => {
 			const learnedAt = (start: string) =>
-				state.storage.sql
-					.exec<{ learned_at: number }>(`SELECT learned_at FROM fokos_range_hierarchy WHERE sk_start_boundary = ?`, kb(start))
-					.one().learned_at;
-			store.learnRangeBoundary(kb("h"), kb("m"), UNBOUNDED, 1, REFRESH_MS, 1_000);
+				state.storage.sql.exec<{ learned_at: number }>(`SELECT learned_at FROM fokos_range_hierarchy WHERE start_sk = ?`, kb(start)).one()
+					.learned_at;
+			store.learnRangeBoundary(BUCKET, c("m"), null, 1, REFRESH_MS, 1_000);
 			// Within the refresh interval the row keeps its stamp: a hot boundary costs one seek and no write.
-			store.learnRangeBoundary(kb("h"), kb("m"), UNBOUNDED, 1, REFRESH_MS, 30_000);
+			store.learnRangeBoundary(BUCKET, c("m"), null, 1, REFRESH_MS, 30_000);
 			expect(learnedAt("m")).toBe(1_000);
 			// Past the interval the stamp moves, so eviction order follows use and not first sight.
-			store.learnRangeBoundary(kb("h"), kb("m"), UNBOUNDED, 1, REFRESH_MS, 100_000);
+			store.learnRangeBoundary(BUCKET, c("m"), null, 1, REFRESH_MS, 100_000);
 			expect(learnedAt("m")).toBe(100_000);
 			expect(store.countRangeHierarchyRows()).toBe(1);
 		});
@@ -146,23 +150,23 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 	it("bounds the table: a learn past the bound evicts the oldest rows, deepest first", async () => {
 		await withStore(
 			(store, state) => {
-				const hk = kb("h");
+				const hk = BUCKET;
 				const rows = () =>
 					state.storage.sql
-						.exec<{ s: ArrayBuffer }>(`SELECT sk_start_boundary AS s FROM fokos_range_hierarchy ORDER BY s`)
+						.exec<{ s: ArrayBuffer }>(`SELECT start_sk AS s FROM fokos_range_hierarchy ORDER BY s`)
 						.toArray()
 						.map((r) => KeyCodec.decode(KeyCodec.asKeyBytes(new Uint8Array(r.s))));
 				// Two rows share the oldest stamp; the deeper one goes first.
-				store.learnRangeBoundary(hk, kb("a"), kb("b"), 1, REFRESH_MS, 1_000);
-				store.learnRangeBoundary(hk, kb("b"), kb("c"), 2, REFRESH_MS, 1_000);
-				store.learnRangeBoundary(hk, kb("c"), kb("d"), 1, REFRESH_MS, 2_000);
+				store.learnRangeBoundary(hk, c("a"), c("b"), 1, REFRESH_MS, 1_000);
+				store.learnRangeBoundary(hk, c("b"), c("c"), 2, REFRESH_MS, 1_000);
+				store.learnRangeBoundary(hk, c("c"), c("d"), 1, REFRESH_MS, 2_000);
 				expect(store.countRangeHierarchyRows()).toBe(3);
 
-				store.learnRangeBoundary(hk, kb("d"), kb("e"), 1, REFRESH_MS, 3_000);
+				store.learnRangeBoundary(hk, c("d"), c("e"), 1, REFRESH_MS, 3_000);
 				expect(store.countRangeHierarchyRows()).toBe(3);
 				expect(rows()).toEqual(["a", "c", "d"]);
 
-				store.learnRangeBoundary(hk, kb("b"), kb("c"), 2, REFRESH_MS, 4_000);
+				store.learnRangeBoundary(hk, c("b"), c("c"), 2, REFRESH_MS, 4_000);
 				expect(store.countRangeHierarchyRows()).toBe(3);
 				expect(rows()).toEqual(["b", "c", "d"]);
 			},
@@ -173,8 +177,8 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 	it("evicts down to 90 % of the bound, so the next inserts do not evict", async () => {
 		await withStore(
 			(store, state) => {
-				const hk = kb("h");
-				const learn = (i: number) => store.learnRangeBoundary(hk, kb(`k${String(i).padStart(2, "0")}`), UNBOUNDED, 1, REFRESH_MS, i);
+				const hk = BUCKET;
+				const learn = (i: number) => store.learnRangeBoundary(hk, c(`k${String(i).padStart(2, "0")}`), null, 1, REFRESH_MS, i);
 				for (let i = 0; i < 20; i++) {
 					learn(i);
 				}
@@ -201,17 +205,17 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 	it("corrects the row count at eviction after rows were deleted", async () => {
 		await withStore(
 			(store) => {
-				const hk = kb("h");
-				store.learnRangeBoundary(hk, kb("a"), kb("b"), 1, REFRESH_MS, 1_000);
-				store.learnRangeBoundary(hk, kb("b"), kb("c"), 1, REFRESH_MS, 2_000);
-				store.learnRangeBoundary(hk, kb("c"), kb("d"), 1, REFRESH_MS, 3_000);
-				store.deleteLearnedRangeSlice(hk, kb("b"), kb("c"));
+				const hk = BUCKET;
+				store.learnRangeBoundary(hk, c("a"), c("b"), 1, REFRESH_MS, 1_000);
+				store.learnRangeBoundary(hk, c("b"), c("c"), 1, REFRESH_MS, 2_000);
+				store.learnRangeBoundary(hk, c("c"), c("d"), 1, REFRESH_MS, 3_000);
+				store.deleteLearnedRangeSlice(hk, { depth: 1, startBoundary: c("b"), endBoundary: c("c") });
 				// Three rows fit the bound again, so this insert evicts nothing.
-				store.learnRangeBoundary(hk, kb("d"), kb("e"), 1, REFRESH_MS, 4_000);
+				store.learnRangeBoundary(hk, c("d"), c("e"), 1, REFRESH_MS, 4_000);
 				expect(store.countRangeHierarchyRows()).toBe(3);
-				store.learnRangeBoundary(hk, kb("e"), kb("f"), 1, REFRESH_MS, 5_000);
+				store.learnRangeBoundary(hk, c("e"), c("f"), 1, REFRESH_MS, 5_000);
 				expect(store.countRangeHierarchyRows()).toBe(3);
-				expect(store.findDeepestKnownRangeSlice(hk, kb("a"))).toBeNull();
+				expect(store.findDeepestKnownRangeSlice(hk, c("a"))).toBeNull();
 			},
 			{ rangeHierarchyMaxRows: () => 3 },
 		);
@@ -221,23 +225,53 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		let maxRows = 5;
 		await withStore(
 			(store) => {
-				const hk = kb("h");
-				store.learnRangeBoundary(hk, kb("a"), kb("b"), 1, REFRESH_MS, 1_000);
-				store.learnRangeBoundary(hk, kb("b"), kb("c"), 1, REFRESH_MS, 2_000);
-				store.learnRangeBoundary(hk, kb("c"), kb("d"), 1, REFRESH_MS, 3_000);
+				const hk = BUCKET;
+				store.learnRangeBoundary(hk, c("a"), c("b"), 1, REFRESH_MS, 1_000);
+				store.learnRangeBoundary(hk, c("b"), c("c"), 1, REFRESH_MS, 2_000);
+				store.learnRangeBoundary(hk, c("c"), c("d"), 1, REFRESH_MS, 3_000);
 				expect(store.countRangeHierarchyRows()).toBe(3);
 
 				maxRows = 2;
-				store.learnRangeBoundary(hk, kb("d"), kb("e"), 1, REFRESH_MS, 4_000);
+				store.learnRangeBoundary(hk, c("d"), c("e"), 1, REFRESH_MS, 4_000);
 				expect(store.countRangeHierarchyRows()).toBe(2);
 
 				maxRows = 0;
-				expect(() => store.learnRangeBoundary(hk, kb("e"), kb("f"), 1, REFRESH_MS, 5_000)).toThrow(
+				expect(() => store.learnRangeBoundary(hk, c("e"), c("f"), 1, REFRESH_MS, 5_000)).toThrow(
 					invariantFailure(/rangeHierarchyMaxRows must be at least 1/),
 				);
 			},
 			{ rangeHierarchyMaxRows: () => maxRows },
 		);
+	});
+});
+
+describe("FokosShardingStore - composite range boundaries", () => {
+	it("finds the slice of a key between the boundaries of two hash keys of one hashPrefixBucket", async () => {
+		await withStore((store) => {
+			// Two hash keys share the hashPrefixBucket. A boundary between them has the empty sort key.
+			const split = { hk: kb("b"), sk: UNBOUNDED };
+			store.learnRangeBoundary(BUCKET, null, split, 1, REFRESH_MS);
+			store.learnRangeBoundary(BUCKET, split, null, 1, REFRESH_MS);
+			expect(store.findDeepestKnownRangeSlice(BUCKET, { hk: kb("a"), sk: kb("z") })).toEqual({
+				depth: 1,
+				startBoundary: null,
+				endBoundary: split,
+			});
+			expect(store.findDeepestKnownRangeSlice(BUCKET, { hk: kb("b"), sk: UNBOUNDED })).toEqual({
+				depth: 1,
+				startBoundary: split,
+				endBoundary: null,
+			});
+			expect(store.findDeepestKnownRangeSlice(BUCKET, { hk: kb("b"), sk: kb("a") })).toEqual({
+				depth: 1,
+				startBoundary: split,
+				endBoundary: null,
+			});
+			expect(store.listLearnedRangeSlices(BUCKET)).toEqual([
+				{ depth: 1, startBoundary: null, endBoundary: split },
+				{ depth: 1, startBoundary: split, endBoundary: null },
+			]);
+		});
 	});
 });
 

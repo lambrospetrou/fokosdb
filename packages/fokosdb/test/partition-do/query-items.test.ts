@@ -29,6 +29,7 @@ import {
 	withMigrationHeld,
 	rangeOf,
 } from "./partition-harness.js";
+import { partitionPrefixOf } from "../storage-prefix.js";
 
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
@@ -76,15 +77,9 @@ describe("FokosDBPartitionDO — range split", () => {
 
 		const seed45 = (state: DurableObjectState, hk: KeyBytes) => {
 			const store = new PartitionStore(state.storage);
+			const P = partitionPrefixOf(state);
 			for (let i = 0; i < 45; i++) {
-				store.upsertItem({
-					hk,
-					sk: kb(String(i).padStart(3, "0")),
-					data: "x",
-					kind: "text",
-					ttlAt: null,
-					txOrderTs: 0,
-				});
+				store.upsertItem({ prefix: P(hk), hk, sk: kb(String(i).padStart(3, "0")), data: "x", kind: "text", ttlAt: null, txOrderTs: 0 });
 			}
 		};
 
@@ -196,8 +191,10 @@ describe("FokosDBPartitionDO — range split", () => {
 			const hashKey = kb("lp-bigzero");
 			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
+				const P = partitionPrefixOf(state);
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({
+						prefix: P(hashKey),
 						hk: hashKey,
 						sk: kb(`big${i}`),
 						data: new Uint8Array(100 * 1024),
@@ -223,8 +220,10 @@ describe("FokosDBPartitionDO — range split", () => {
 			const hashKey = kb("lp-exchange");
 			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
+				const P = partitionPrefixOf(state);
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({
+						prefix: P(hashKey),
 						hk: hashKey,
 						sk: kb(`big${i}`),
 						data: new Uint8Array(100 * 1024),
@@ -305,10 +304,11 @@ describe("FokosDBPartitionDO — range split", () => {
 			const hashKey = kb("lp-projbudget");
 			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
+				const P = partitionPrefixOf(state);
 				// A 60 KiB text cell estimates at 64 + 120 KiB, so two rows fit a 250 KiB page.
 				const doc = JSON.stringify({ big: "x".repeat(60 * 1024) });
 				for (let i = 0; i < 6; i++) {
-					store.upsertItem({ hk: hashKey, sk: kb(`big${i}`), data: doc, kind: "json", ttlAt: null, txOrderTs: 0 });
+					store.upsertItem({ prefix: P(hashKey), hk: hashKey, sk: kb(`big${i}`), data: doc, kind: "json", ttlAt: null, txOrderTs: 0 });
 				}
 				const plan = queryTree({ projection: [{ expr: { ref: "data", path: "$.big" } }] });
 
@@ -334,10 +334,12 @@ describe("FokosDBPartitionDO — range split", () => {
 			const hashKey = kb("lp-undefined");
 			await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
+				const P = partitionPrefixOf(state);
 				for (let i = 0; i < 6; i++) {
 					// `opt` exists on every other item, so every other wire row has a missing first cell.
 					const doc = i % 2 === 0 ? { opt: i } : { other: i };
 					store.upsertItem({
+						prefix: P(hashKey),
 						hk: hashKey,
 						sk: kb(String(i).padStart(3, "0")),
 						data: JSON.stringify(doc),
@@ -374,8 +376,17 @@ describe("FokosDBPartitionDO — range split", () => {
 			const hashKey = kb("lp-limit");
 			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
+				const P = partitionPrefixOf(state);
 				const doc = Object.fromEntries(Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => [`f${k}`, k]));
-				store.upsertItem({ hk: hashKey, sk: kb("s"), data: JSON.stringify(doc), kind: "json", ttlAt: null, txOrderTs: 0 });
+				store.upsertItem({
+					prefix: P(hashKey),
+					hk: hashKey,
+					sk: kb("s"),
+					data: JSON.stringify(doc),
+					kind: "json",
+					ttlAt: null,
+					txOrderTs: 0,
+				});
 				const projection: ProjectionExpression[] = Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => ({
 					expr: { ref: "data", path: `$.f${k}` },
 				}));
@@ -393,9 +404,11 @@ describe("FokosDBPartitionDO — range split", () => {
 			const hashKey = kb(`lp-huge-${direction}`);
 			await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
+				const P = partitionPrefixOf(state);
 				for (const sk of ["a", "b", "c"]) {
 					const dataBytes = MAX_ITEM_BYTES - hashKey.byteLength - kb(sk).byteLength - EST_ROW_BYTES_K;
 					store.upsertItem({
+						prefix: P(hashKey),
 						hk: hashKey,
 						sk: kb(sk),
 						data: new Uint8Array(dataBytes),

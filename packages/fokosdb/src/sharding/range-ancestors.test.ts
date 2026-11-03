@@ -40,7 +40,8 @@ describe("selectRangeAncestors", () => {
 
 // Test-only helper: only `depth` matters for selection; boundaries are opaque passthrough data.
 function anc(depth: number): RangeAncestorInfo {
-	return { depth, startBoundary: KeyCodec.encode(`b${depth}`), endBoundary: KeyCodec.encode(`e${depth}`) };
+	const hk = KeyCodec.encode("h");
+	return { depth, startBoundary: { hk, sk: KeyCodec.encode(`b${depth}`) }, endBoundary: { hk, sk: KeyCodec.encode(`e${depth}`) } };
 }
 
 function depths(list: RangeAncestorInfo[]): number[] {

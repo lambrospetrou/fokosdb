@@ -26,6 +26,7 @@ import {
 	PROMOTION_TEST_MAX_SIZE_MB,
 	type TestPartition,
 } from "./partition-harness.js";
+import { partitionPrefixOf } from "../storage-prefix.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 const REPAIR_FAILED_LOG = "fokos/partition: forced resolution failed";
@@ -42,13 +43,13 @@ function cutOverPromotion(state: DurableObjectState, hashKey: string | null): vo
 		seq,
 		kind: "key_promotion",
 		state: "cutover",
-		hashKey: hashKey === null ? null : kb(hashKey),
+		hashPrefixBucket: hashKey === null ? null : partitionPrefixOf(state)(kb(hashKey)),
 		queuedAt: now,
 		cutoverAt: now,
 		nextAttemptAt: now + PARKED_MS,
 	});
 	if (hashKey !== null) {
-		sharding.insertRouteOverride(kb(hashKey), id);
+		sharding.insertRouteOverride(partitionPrefixOf(state)(kb(hashKey)), id);
 	}
 }
 
@@ -61,7 +62,9 @@ function insertLock(
 ): PartitionStore {
 	const createdAt = options?.createdAt ?? Date.now() - 10_000;
 	const store = new PartitionStore(state.storage);
+	const P = partitionPrefixOf(state);
 	store.insertPendingLock({
+		prefix: P(kb(hashKey)),
 		hk: kb(hashKey),
 		sk: kb(options?.sortKey ?? "sk"),
 		transaction_id: transactionId,
@@ -334,7 +337,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 			// The row is a copy now. The new owner commits its own row after its import.
 			expect(dispatch).not.toHaveBeenCalled();
 			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null, data: "moved-value" });
-			expect(store.getItem(kb("alice"), kb("sk")).row).toBeUndefined();
+			expect(store.getItem(partitionPrefixOf(state)(kb("alice")), kb("alice"), kb("sk")).row).toBeUndefined();
 		});
 	});
 

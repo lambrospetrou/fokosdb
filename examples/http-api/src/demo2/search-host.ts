@@ -1,6 +1,7 @@
 import {
 	FokosShardingRuntime,
 	KeyCodec,
+	type FokosCompositeKey,
 	type FokosEnvelope,
 	type FokosOperations,
 	type FokosRangeVisit,
@@ -111,19 +112,27 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 		const identity = this.fokos.initialized() ? this.fokos.identity() : null;
 		const lifecycle = identity ? this.fokos.lifecycle() : null;
 		const range = identity?.range;
+		const tenants = this.ctx.storage.sql
+			.exec<{
+				tenant: string;
+				docs: number;
+			}>("SELECT tenant_id AS tenant, COUNT(*) AS docs FROM docs GROUP BY tenant_id ORDER BY tenant_id")
+			.toArray();
+		// A range edge is a composite key: the tenant, then the sort key.
+		const edgeTenant = range?.start?.hk ?? range?.end?.hk;
+		const sortEdge = (k: FokosCompositeKey | null | undefined) => (k ? decodeEdge(k.sk) : null);
 		return {
 			role: lifecycle?.role ?? "owner",
 			kind: identity?.kind ?? "hash",
 			importState: lifecycle?.import?.state ?? null,
 			repartitionState: lifecycle?.activeRepartition?.state ?? null,
-			tenants: this.ctx.storage.sql
-				.exec<{
-					tenant: string;
-					docs: number;
-				}>("SELECT tenant_id AS tenant, COUNT(*) AS docs FROM docs GROUP BY tenant_id ORDER BY tenant_id")
-				.toArray(),
+			tenants,
 			range: range
-				? { tenant: KeyCodec.decode(range.hashKey) as string, start: decodeEdge(range.start), end: decodeEdge(range.end) }
+				? {
+						tenant: edgeTenant ? (KeyCodec.decode(edgeTenant) as string) : (tenants[0]?.tenant ?? ""),
+						start: sortEdge(range.start),
+						end: sortEdge(range.end),
+					}
 				: null,
 		};
 	}
@@ -221,15 +230,17 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 		return {
 			// A shared hash partition does not split. A large tenant leaves it by promotion.
 			evaluateSplit: ({ identity, policy }) => (identity.kind === "range" && this.docCount() >= policy.rangeSplitAtDocs ? {} : false),
-			// The boundaries divide the documents of this partition into equal parts in sort-key order.
-			// A range partition holds the documents of one tenant only.
+			// The boundaries divide the documents of this partition into equal parts in (tenant, sort key)
+			// order. A range partition holds the tenants of one hashPrefixBucket, normally one tenant.
 			computeRangeBoundaries: ({ childCount }) => {
 				const keys = sql
-					.exec<{ sort_key: string }>("SELECT sort_key FROM docs ORDER BY sort_key")
-					.toArray()
-					.map((r) => r.sort_key);
+					.exec<{ tenant_id: string; sort_key: string }>("SELECT tenant_id, sort_key FROM docs ORDER BY tenant_id, sort_key")
+					.toArray();
 				if (keys.length < childCount) return null;
-				return Array.from({ length: childCount - 1 }, (_, i) => KeyCodec.encode(keys[Math.floor(((i + 1) * keys.length) / childCount)]));
+				return Array.from({ length: childCount - 1 }, (_, i): FokosCompositeKey => {
+					const key = keys[Math.floor(((i + 1) * keys.length) / childCount)];
+					return { hk: KeyCodec.encode(key.tenant_id), sk: KeyCodec.encode(key.sort_key) };
+				});
 			},
 			migration: {
 				buildPage: (cursor, _slice, belongsToTarget) => {
@@ -257,11 +268,18 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 					if (!Array.isArray(page)) throw new Error("search migration page must be an array");
 				},
 			},
-			// Every target has acknowledged its import. A promotion moved one tenant, and a range split moved all rows.
+			// Every target has acknowledged its import. A promotion moved the tenants of one
+			// hashPrefixBucket, and a range split moved all rows.
 			cleanupSourceStep: (plan) => {
 				const slice = plan.targets[0]?.slice;
-				if (plan.kind === "key_promotion" && slice?.kind === "promoted_key") {
-					sql.exec("DELETE FROM docs WHERE tenant_id = ?", KeyCodec.decode(slice.hashKey) as string);
+				if (plan.kind === "key_promotion" && slice?.kind === "promoted_hash_prefix_bucket") {
+					const moved = slice.hashPrefixBucket;
+					for (const { tenant_id } of sql.exec<{ tenant_id: string }>("SELECT DISTINCT tenant_id FROM docs").toArray()) {
+						const prefix = this.fokos.storagePrefix(KeyCodec.encode(tenant_id));
+						if (prefix.length === moved.length && prefix.every((b, i) => b === moved[i])) {
+							sql.exec("DELETE FROM docs WHERE tenant_id = ?", tenant_id);
+						}
+					}
 				} else {
 					sql.exec("DELETE FROM docs");
 				}

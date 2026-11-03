@@ -98,12 +98,13 @@ export function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): Transact
 	return items.map((item, i) => ({ ...item, opIndex: i }));
 }
 
-/** The keys of the lock rows of one transaction on one partition, as `"<hash>/<sort>"`, in storage order. */
+/** The keys of the lock rows of one transaction on one partition, as `"<hash>/<sort>"`, sorted. */
 export async function lockKeys(stub: DurableObjectStub<FokosDBPartitionDO>, transactionId: string): Promise<string[]> {
 	return await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		new PartitionStore(state.storage)
 			.listPendingTxItems(transactionId)
-			.map((row) => `${new TextDecoder().decode(row.hk)}/${new TextDecoder().decode(row.sk)}`),
+			.map((row) => `${new TextDecoder().decode(row.hk)}/${new TextDecoder().decode(row.sk)}`)
+			.sort(),
 	);
 }
 

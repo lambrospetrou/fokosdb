@@ -23,7 +23,9 @@ import {
 	type RangeTarget,
 	type RangeTopologyView,
 } from "../../src/sharding/topology-codec.js";
-import { hashSplitReport, promotionReport, rangeSplitReport } from "./topology-events.js";
+import { bucketPromotionReport, hashSplitReport, promotionReport, rangeSplitReport } from "./topology-events.js";
+import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import type { FokosCompositeKey } from "../../src/sharding/key-codec.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 
@@ -173,7 +175,9 @@ describe("topology keeper — reports", () => {
 						}
 					}
 					for (const [key, rank] of promoted) {
-						reports.push({ rank, report: (sg) => promotionReport(sg, k(`p${key}`), 0, 3, 2) });
+						// Each shard group has its own seed, so both groups get the bucket of one fixed group.
+						const bucket = hashPrefixBucketOf(k(`p${key}`), "fixed");
+						reports.push({ rank, report: (sg) => bucketPromotionReport(sg, bucket, 0, 3, 2) });
 					}
 					reports.sort((a, b) => a.rank - b.rank);
 					const keeper = newKeeper();
@@ -203,8 +207,8 @@ describe("topology keeper — reports", () => {
 			await keeper.registerRepartition(promotionReport(sg, KeyCodec.encode("u42"), 0, 2, 2));
 			keeper.runDueBuilds(LATER);
 			const view = parseHashBody(body(keeper.getTopology(sg)));
-			expect(maybePromoted(view, KeyCodec.encode("u42"))).toBe(true);
-			expect(maybePromoted(view, KeyCodec.encode("u43"))).toBe(false);
+			expect(maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode("u42"), sg))).toBe(true);
+			expect(maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode("u43"), sg))).toBe(false);
 		});
 	});
 });
@@ -273,6 +277,11 @@ describe("topology keeper — build failure", () => {
 
 const k = (s: string) => KeyCodec.encode(s);
 const HK = k("u42");
+/** The composite key of the sort key `s` of `HK`. */
+const c = (s: string): FokosCompositeKey => ({ hk: HK, sk: k(s) });
+/** The range body of the hashPrefixBucket of `hashKey`. */
+const rangeBody = (keeper: FokosTopologyKeeper, sg: string, hashKey: KeyBytes = HK) =>
+	body(keeper.getRangeTopology(sg, hashPrefixBucketOf(hashKey, sg)));
 
 function rangeOf(view: RangeTopologyView, target: RangeTarget | null) {
 	if (!target) {
@@ -280,7 +289,7 @@ function rangeOf(view: RangeTopologyView, target: RangeTarget | null) {
 	}
 	const edge = (p: number) => {
 		const b = rangeBoundaryAt(view, p);
-		return b === null ? null : (KeyCodec.decode(b) as string);
+		return b === null ? null : (KeyCodec.decode(b.sk) as string);
 	};
 	return [edge(target.start), edge(target.end), target.rank];
 }
@@ -293,41 +302,41 @@ describe("topology keeper — range build", () => {
 	it("builds the example: levels, depths, and the lookups", async () => {
 		await withKeeper(async (keeper, { sg, storage }) => {
 			await keeper.registerRepartition(promotionReport(sg, HK));
-			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [k("g"), k("p")]));
-			await keeper.registerRepartition(rangeSplitReport(sg, HK, k("g"), k("p"), [k("k")]));
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [c("g"), c("p")]));
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, c("g"), c("p"), [c("k")]));
 			keeper.runDueBuilds(LATER);
 			// B is a target of the first split and the source of the second, and is stored once.
 			expect(storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_range_intervals").one().n).toBe(6);
-			const view = parseRangeBody(body(keeper.getRangeTopology(sg, HK)));
+			const view = parseRangeBody(rangeBody(keeper, sg));
 			expect([...view.levels]).toEqual([0, 1, 0]);
 			expect([...view.depths]).toEqual([1, 2, 2, 1]);
 			const none = new Set<number>();
-			expect(rangeOf(view, rangePointLookup(view, k("h"), none))).toEqual(["g", "k", 2]);
-			expect(rangeOf(view, rangePointLookup(view, k("k"), none))).toEqual(["k", "p", 2]);
-			expect(rangeOf(view, rangeIntervalLookup(view, interval("h", "m"), none))).toEqual(["g", "p", 1]);
-			expect(rangeOf(view, rangeIntervalLookup(view, interval("a", "h"), none))).toEqual([null, null, 0]);
+			expect(rangeOf(view, rangePointLookup(view, c("h"), none))).toEqual(["g", "k", 2]);
+			expect(rangeOf(view, rangePointLookup(view, c("k"), none))).toEqual(["k", "p", 2]);
+			expect(rangeOf(view, rangeIntervalLookup(view, HK, interval("h", "m"), none))).toEqual(["g", "p", 1]);
+			expect(rangeOf(view, rangeIntervalLookup(view, HK, interval("a", "h"), none))).toEqual([null, null, 0]);
 			// The fallback of a miss at [g, k) is its parent B.
-			const target = rangePointLookup(view, k("h"), none)!;
-			expect(rangeOf(view, rangePointLookup(view, k("h"), new Set([rangeCutKey(view, target)])))).toEqual(["g", "p", 1]);
+			const target = rangePointLookup(view, c("h"), none)!;
+			expect(rangeOf(view, rangePointLookup(view, c("h"), new Set([rangeCutKey(view, target)])))).toEqual(["g", "p", 1]);
 		});
 	});
 
 	it("keeps the range root when only an inner split is known, and when the promotion report is missing", async () => {
 		await withKeeper(async (keeper, { sg }) => {
-			await keeper.registerRepartition(rangeSplitReport(sg, HK, k("g"), k("p"), [k("k")]));
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, c("g"), c("p"), [c("k")]));
 			keeper.runDueBuilds(LATER);
-			const view = parseRangeBody(body(keeper.getRangeTopology(sg, HK)));
+			const view = parseRangeBody(rangeBody(keeper, sg));
 			expect([...view.levels]).toEqual([0, 1, 0]);
 			expect([...view.depths]).toEqual([0, 2, 2, 0]);
-			expect(rangeOf(view, rangePointLookup(view, k("a"), new Set()))).toEqual([null, null, 0]);
-			expect(rangeOf(view, rangePointLookup(view, k("h"), new Set()))).toEqual(["g", "k", 2]);
+			expect(rangeOf(view, rangePointLookup(view, c("a"), new Set()))).toEqual([null, null, 0]);
+			expect(rangeOf(view, rangePointLookup(view, c("h"), new Set()))).toEqual(["g", "k", 2]);
 		});
 	});
 
 	it("stores the range root only when two intervals cross, and an empty body for a key that is not promoted", async () => {
 		await withKeeper(async (keeper, { sg }) => {
-			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [k("g")]));
-			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, k("m"), [k("h")]));
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [c("g")]));
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, c("m"), [c("h")]));
 			const error = console.error;
 			console.error = () => {};
 			try {
@@ -335,9 +344,9 @@ describe("topology keeper — range build", () => {
 			} finally {
 				console.error = error;
 			}
-			const view = parseRangeBody(body(keeper.getRangeTopology(sg, HK)));
+			const view = parseRangeBody(rangeBody(keeper, sg));
 			expect([view.n, [...view.depths]]).toEqual([0, [0]]);
-			const empty = parseRangeBody(body(keeper.getRangeTopology(sg, k("other"))));
+			const empty = parseRangeBody(rangeBody(keeper, sg, k("other")));
 			expect(empty.depths.length).toBe(0);
 		});
 	});
@@ -346,7 +355,7 @@ describe("topology keeper — range build", () => {
 		await withKeeper(
 			async (keeper, { sg, storage }) => {
 				const dirty = () => storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_range_dirty").one().n;
-				const rangeEtag = (key: KeyBytes) => keeper.getRangeTopology(sg, key).etag;
+				const rangeEtag = (key: KeyBytes) => keeper.getRangeTopology(sg, hashPrefixBucketOf(key, sg)).etag;
 				const keys = [k("u1"), k("u2"), k("u3")];
 				for (const key of keys) {
 					await keeper.registerRepartition(promotionReport(sg, key));
@@ -359,7 +368,7 @@ describe("topology keeper — range build", () => {
 				expect(hashEtag).toBe('"0.3"');
 				expect(keeper.nextBuildAt()).toBe(LATER);
 				// A range split of a promoted key: a new version, the key is dirty, and the hash body stays.
-				await keeper.registerRepartition(rangeSplitReport(sg, keys[0], null, null, [k("m")]));
+				await keeper.registerRepartition(rangeSplitReport(sg, keys[0], null, null, [{ hk: keys[0], sk: k("m") }]));
 				// Another report of a known fact writes nothing new, so the version stays at 4.
 				await keeper.registerRepartition(promotionReport(sg, keys[1]));
 				for (let step = 0; step < 3; step++) {
@@ -369,7 +378,7 @@ describe("topology keeper — range build", () => {
 				expect(keeper.nextBuildAt()).toBeNull();
 				expect(keeper.getTopology(sg).etag).toBe(hashEtag);
 				expect(keys.map(rangeEtag)).toEqual(['"0.4"', '"0.4"', '"0.4"']);
-				const range = parseRangeBody(body(keeper.getRangeTopology(sg, keys[0])));
+				const range = parseRangeBody(rangeBody(keeper, sg, keys[0]));
 				expect([range.version, range.n]).toEqual([4n, 1]);
 				// A hash split builds the hash body only.
 				await keeper.registerRepartition(hashSplitReport(sg, { rootTreesN: 1, hashSplitN: 4 }, 0, []));
@@ -389,20 +398,20 @@ describe("topology keeper — range build", () => {
 	it("stores a body above one chunk in chunks, and a new keeper answers it with no build", async () => {
 		await withKeeper(
 			async (keeper, { sg, storage, newKeeper }) => {
-				const big = (i: number) => k(`b${String(i).padStart(3, "0")}${"x".repeat(25_000)}`);
-				let start: KeyBytes | null = null;
+				const big = (i: number) => c(`b${String(i).padStart(3, "0")}${"x".repeat(25_000)}`);
+				let start: FokosCompositeKey | null = null;
 				for (let i = 1; i <= 48; i++) {
 					await keeper.registerRepartition(rangeSplitReport(sg, HK, start, null, [big(i)]));
 					start = big(i);
 				}
 				keeper.runDueBuilds(LATER);
-				const stored = body(keeper.getRangeTopology(sg, HK));
+				const stored = rangeBody(keeper, sg);
 				expect(stored.length).toBeGreaterThan(TOPOLOGY_BODY_CHUNK_BYTES);
 				expect(storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_bodies WHERE kind = 'range'").one().n).toBe(2);
 				expect(parseRangeBody(stored).truncatedAtRank).toBeNull();
 				const again = newKeeper();
 				expect(again.nextBuildAt()).toBeNull();
-				expect(body(again.getRangeTopology(sg, HK))).toEqual(stored);
+				expect(rangeBody(again, sg)).toEqual(stored);
 				expect(body(again.getTopology(sg))).toEqual(body(keeper.getTopology(sg)));
 			},
 			{ maxRangeBodyBytes: 8 * 1024 * 1024 },
@@ -412,15 +421,27 @@ describe("topology keeper — range build", () => {
 
 // ─── the range lookups against a search of the known intervals ──────────────
 
-/** An interval of integer edges. 0 is ~min and 1000 is ~max. */
+/**
+ * An interval of integer edges. 0 is ~min and 1000 is ~max. The integers map to composite keys of two
+ * hash keys of one hashPrefixBucket, in the same order: below `SPLIT` a sort key of `HA`, at `SPLIT` the
+ * empty sort key of `HB`, and above `SPLIT` a sort key of `HB`. Thus a tree has boundaries inside each
+ * hash key and between the two hash keys.
+ */
 type Iv = { lo: number; hi: number };
 const MIN = 0;
 const MAX = 1000;
-const ik = (n: number) => k(`k${String(n).padStart(4, "0")}`);
+const SPLIT = 500;
+const HA = k("a");
+const HB = k("b");
+const sk = (n: number) => (n === SPLIT ? KeyCodec.encodeOptional(undefined) : k(`k${String(n).padStart(4, "0")}`));
+const ik = (n: number): FokosCompositeKey => ({ hk: n < SPLIT ? HA : HB, sk: sk(n) });
 const edgeKey = (n: number) => (n === MIN || n === MAX ? null : ik(n));
 const edgeOf = (view: RangeTopologyView, p: number) => {
 	const b = rangeBoundaryAt(view, p);
-	return b === null ? (p === 0 ? MIN : MAX) : Number((KeyCodec.decode(b) as string).slice(1));
+	if (b === null) {
+		return p === 0 ? MIN : MAX;
+	}
+	return b.sk.length === 0 ? SPLIT : Number((KeyCodec.decode(b.sk) as string).slice(1));
 };
 
 /** The deepest known interval that holds [x, y), or the point x when y is null, with a rank of at most `maxRank`. */
@@ -479,7 +500,7 @@ describe("topology keeper — range lookups (property)", () => {
 								...iv,
 								rank: unique.filter((o) => o !== iv && o.lo <= iv.lo && iv.hi <= o.hi).length,
 							}));
-							const view = parseRangeBody(body(keeper.getRangeTopology(sg, HK)));
+							const view = parseRangeBody(rangeBody(keeper, sg));
 							const maxRank = view.truncatedAtRank ?? Number.POSITIVE_INFINITY;
 							const asIv = (t: RangeTarget | null) => t && { lo: edgeOf(view, t.start), hi: edgeOf(view, t.end), rank: t.rank };
 							const pick = (iv: (Iv & { rank: number }) | null) => iv && { lo: iv.lo, hi: iv.hi, rank: iv.rank };
@@ -490,13 +511,18 @@ describe("topology keeper — range lookups (property)", () => {
 									const parent = rangePointLookup(view, ik(a), new Set([rangeCutKey(view, point)]));
 									expect(asIv(parent)).toEqual(pick(deepest(ranked, a, null, point.rank - 1)));
 								}
-								if (a !== b) {
-									const [x, y] = a < b ? [a, b] : [b, a];
-									expect(
-										asIv(
-											rangeIntervalLookup(view, interval(`k${String(x).padStart(4, "0")}`, `k${String(y).padStart(4, "0")}`), new Set()),
-										),
-									).toEqual(pick(deepest(ranked, x, y, maxRank)));
+								// A query with no upper bound covers the sort keys of one hash key up to its end.
+								const hashKey = ik(a).hk;
+								const lower = { value: sk(a), inclusive: true };
+								expect(asIv(rangeIntervalLookup(view, hashKey, { lower }, new Set()))).toEqual(
+									pick(deepest(ranked, a, a < SPLIT ? SPLIT : MAX, maxRank)),
+								);
+								const [x, y] = a < b ? [a, b] : [b, a];
+								if (x !== y && (y < SPLIT || x >= SPLIT)) {
+									const upper = { value: sk(y), inclusive: false };
+									expect(asIv(rangeIntervalLookup(view, ik(x).hk, { lower: { value: sk(x), inclusive: true }, upper }, new Set()))).toEqual(
+										pick(deepest(ranked, x, y, maxRank)),
+									);
 								}
 							}
 						}),
@@ -523,20 +549,22 @@ describe("topology entrypoint", () => {
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
 		let seen: string | undefined;
 		const conditional = await fokosTopologyEntrypointFetch(
-			new Request(`http://topology/internal/v1/topology.GetForRange?sg=${sg}&hk=dTQy`, { headers: { "If-None-Match": '"1.4"' } }),
+			new Request(`http://topology/internal/v1/topology.GetForRange?sg=${sg}&bk=0123456789abcdef`, {
+				headers: { "If-None-Match": '"1.4"' },
+			}),
 			{
 				...opts,
 				admin: () => ({
 					getTopology: ok,
-					getRangeTopology: async (_sg, hk, ifNoneMatch) => {
-						seen = `${new TextDecoder().decode(hk)} ${ifNoneMatch}`;
+					getRangeTopology: async (_sg, bucket, ifNoneMatch) => {
+						seen = `${bucket.toHex()} ${ifNoneMatch}`;
 						return { status: 304, etag: '"1.4"' };
 					},
 				}),
 			},
 		);
 		expect(conditional.status).toBe(304);
-		expect(seen).toBe('u42 "1.4"');
+		expect(seen).toBe('0123456789abcdef "1.4"');
 	});
 
 	it("answers no-store for another path, another method, a bad query, and an admin that fails", async () => {

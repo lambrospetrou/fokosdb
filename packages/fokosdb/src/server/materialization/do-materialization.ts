@@ -17,7 +17,7 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusRequest,
 } from "../../sharding/repartition-types.js";
-import { promotedKeyOf } from "../../sharding/repartition-slice.js";
+import { promotedHashPrefixBucketOf } from "../../sharding/repartition-slice.js";
 import { identityDepth } from "../../sharding/partition-id.js";
 import { materializationStubByName, partitionStubByName, pushTargetStub } from "../../shared/do-stubs.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
@@ -136,8 +136,8 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		this.#splitPlanner = new SplitPlanner({
 			keySizes: this.#store.keySizes,
 			source: {
-				probeHashKeys: () => this.#store.probeHashKeys(),
-				sortKeySizes: (hashKey, start, end) => this.#store.sortKeySizes(hashKey, start, end),
+				probeHashPrefixBuckets: () => this.#store.probeHashPrefixBuckets(),
+				compositeKeySizes: (hashPrefixBucket, start, end) => this.#store.compositeKeySizes(hashPrefixBucket, start, end),
 			},
 			databaseSize: () => this.#store.databaseSize,
 			promotionFraction: () => this.config().promotionFraction,
@@ -351,8 +351,13 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		return {
 			evaluateSplit: (input) => this.#splitPlanner.evaluateSplit(input),
-			computeRangeBoundaries: ({ hashKey, start, end, childCount }) => this.#splitPlanner.rangeBoundaries(hashKey, start, end, childCount),
-			migration: new MaterializationMigrationHost({ store: this.#store, selfId: () => this.ctx.id.toString() }),
+			computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) =>
+				this.#splitPlanner.rangeBoundaries(hashPrefixBucket, start, end, childCount),
+			migration: new MaterializationMigrationHost({
+				store: this.#store,
+				selfId: () => this.ctx.id.toString(),
+				storagePrefix: (hashKey) => this.fokos.storagePrefix(hashKey),
+			}),
 			// Each call of a target from before the cutover then has an epoch below the epoch that the
 			// child gets with its inherited work, so each receiver rejects a late call. A promotion
 			// source keeps its other keys and its runner continues, so its cursors move past the moved
@@ -360,31 +365,31 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 			onRepartitionCutover: (plan) => {
 				this.#store.raiseAllTargetEpochs();
 				if (plan.kind === "key_promotion") {
-					this.#store.storeCursorSnapshot(promotedKeyOf(plan));
+					this.#store.storeCursorSnapshot(promotedHashPrefixBucketOf(plan));
 				}
 			},
-			// The child has each row of the promoted key now. Each new write of the key goes to the
+			// The child has each row of the promoted hashPrefixBucket now. Each new write of it goes to the
 			// child, so the estimate is not necessary, and the cleanup can delete the rows above the
 			// snapshot.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
-					const hashKey = promotedKeyOf(plan);
-					this.#store.keySizes.remove(hashKey);
-					this.#store.deleteCursorSnapshot(hashKey);
+					const bucket = promotedHashPrefixBucketOf(plan);
+					this.#store.keySizes.remove(bucket);
+					this.#store.deleteCursorSnapshot(bucket);
 				}
 			},
-			// A split keeps its rows, as `FokosDBPartitionDO` does. A promotion deletes the items of its key in
-			// steps of a limited size, because one large delete holds each request of this partition
-			// until its write is durable.
+			// A split keeps its rows, as `FokosDBPartitionDO` does. A promotion deletes the items of its
+			// hashPrefixBucket in steps of a limited size, because one large delete holds each request of
+			// this partition until its write is durable.
 			cleanupSourceStep: (plan) => {
 				if (plan.kind !== "key_promotion") {
 					return true;
 				}
-				const hashKey = promotedKeyOf(plan);
-				if (!this.#store.transactionSync(() => this.#store.deleteItemsOfHashKey(hashKey, this.config().cleanup.deleteRows))) {
+				const bucket = promotedHashPrefixBucketOf(plan);
+				if (!this.#store.transactionSync(() => this.#store.deleteItemsOfHashPrefixBucket(bucket, this.config().cleanup.deleteRows))) {
 					return false;
 				}
-				this.#store.keySizes.remove(hashKey);
+				this.#store.keySizes.remove(bucket);
 				return true;
 			},
 			jobs: [
@@ -496,14 +501,15 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 					if (req.epoch > stored) {
 						this.#store.raiseProducerEpoch(req.producerId, req.epoch);
 					}
-					const current = this.#store.storedImage(item.hashKey, item.sortKey);
+					const prefix = this.fokos.storagePrefix(item.hashKey);
+					const current = this.#store.storedImage(prefix, item.hashKey, item.sortKey);
 					if (current !== undefined && item.revision <= current.revision) {
 						return "applied";
 					}
 					if (overSize && !item.deleted) {
 						return "over_size";
 					}
-					const keyEstBytes = this.#store.putLatestImage(item, this.fokosNow(), current, targets);
+					const keyEstBytes = this.#store.putLatestImage(prefix, item, this.fokosNow(), current, targets);
 					if (keyEstBytes !== undefined && !item.deleted) {
 						grown.push({ hashKey: item.hashKey, keyEstBytes });
 					}

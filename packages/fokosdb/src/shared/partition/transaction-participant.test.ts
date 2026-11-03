@@ -13,6 +13,10 @@ import { conditionTree, updateTree } from "../expression/test-fixtures.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
+import { ALL_ROWS, prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
 
 /** Matches the `results` of a rejected answer that hold a rejected entry whose reason matches `reason`. */
 function aRejection(reason: Record<string, unknown>) {
@@ -39,6 +43,7 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 		const clock = { now: BASE_NOW };
 		const participant = new TransactionParticipant({
 			store,
+			storagePrefix: P,
 			now: () => clock.now,
 			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 			staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
@@ -83,7 +88,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 
 			expect(() => participant.prepareLocal(request)).toThrow(invariantFailure(/is required/));
-			expect(store.pendingLockFor(kb("hk1"), kb("sk1"))).toBeUndefined();
+			expect(store.pendingLockFor(P(kb("hk1")), kb("hk1"), kb("sk1"))).toBeUndefined();
 		});
 	});
 
@@ -97,8 +102,8 @@ describe("TransactionParticipant - prepare", () => {
 			});
 
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect(store.pendingLockFor(kb("hk1"), kb("sk1"))?.transaction_id).toBe(request.transactionId);
-			expect(store.pendingLockFor(kb("hk2"), KeyCodec.encodeOptional(undefined))?.transaction_id).toBe(request.transactionId);
+			expect(store.pendingLockFor(P(kb("hk1")), kb("hk1"), kb("sk1"))?.transaction_id).toBe(request.transactionId);
+			expect(store.pendingLockFor(P(kb("hk2")), kb("hk2"), KeyCodec.encodeOptional(undefined))?.transaction_id).toBe(request.transactionId);
 
 			// Idempotent re-prepare: accepted again, no duplicate locks.
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
@@ -127,7 +132,7 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with condition_failed when an item condition does not hold", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "existing", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("sk"), data: "existing", kind: "text", ttlAt: null, txOrderTs: 1 });
 
 			const request = prepareReq({
 				items: [
@@ -163,7 +168,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			const keys = Array.from({ length: itemCount }, (_v, i) => kb(`capped-${String(i).padStart(3, "0")}`));
 			for (const hk of keys) {
-				store.upsertItem({ hk, sk: KeyCodec.encodeOptional(undefined), data, kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(hk), hk, sk: KeyCodec.encodeOptional(undefined), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 
 			const request = prepareReq({
@@ -206,6 +211,7 @@ describe("TransactionParticipant - prepare", () => {
 			// The item exists but is kind: "text", not json. An absent item is NOT this case: it has the
 			// empty document as its pre-image, so the update creates it.
 			store.upsertItem({
+				prefix: P(kb("text-item")),
 				hk: kb("text-item"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "text content",
@@ -246,7 +252,7 @@ describe("TransactionParticipant - prepare", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(store.listPendingTxKeys(request.transactionId).length).toBe(1);
 			// Nothing is written before commit.
-			expect(store.getItem(kb("fresh"), sk).row).toBeUndefined();
+			expect(store.getItem(P(kb("fresh")), kb("fresh"), sk).row).toBeUndefined();
 
 			const commit = participant.commitLocal({
 				transactionId: request.transactionId,
@@ -255,7 +261,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(commit.response).toEqual({ outcome: "committed" });
 
-			const created = store.getItem(kb("fresh"), sk).row;
+			const created = store.getItem(P(kb("fresh")), kb("fresh"), sk).row;
 			expect(created).toMatchObject({
 				v: 1,
 				ttl_epoch_utc_seconds: 555,
@@ -281,7 +287,7 @@ describe("TransactionParticipant - prepare", () => {
 				outcome: "rejected",
 				results: aRejection({ code: "condition_failed", hashKey: "guarded" }),
 			});
-			expect(store.getItem(kb("guarded"), sk).row).toBeUndefined();
+			expect(store.getItem(P(kb("guarded")), kb("guarded"), sk).row).toBeUndefined();
 			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 		});
 	});
@@ -294,7 +300,7 @@ describe("TransactionParticipant - prepare", () => {
 			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
 			const sk = KeyCodec.encodeOptional(undefined);
 			const binaryKey = KeyCodec.encode(new Uint8Array([1, 2, 3]));
-			store.upsertItem({ hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(binaryKey), hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const request = prepareReq({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toMatchObject({
@@ -303,7 +309,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			// The rejection took no lock and wrote nothing.
 			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
-			expect(store.getItem(binaryKey, sk).row?.v).toBe(1);
+			expect(store.getItem(P(binaryKey), binaryKey, sk).row?.v).toBe(1);
 
 			// The single-shot path answers with the same reason.
 			expect(
@@ -320,6 +326,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
+				prefix: P(kb("user")),
 				hk: kb("user"),
 				sk,
 				data: JSON.stringify({ name: "Alice", score: 10 }),
@@ -357,7 +364,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(commit.response).toEqual({ outcome: "committed" });
 
-			const committed = store.getItem(kb("user"), sk);
+			const committed = store.getItem(P(kb("user")), kb("user"), sk);
 			expect(committed.row?.v).toBe(2);
 			expect(committed.row?.ttl_epoch_utc_seconds).toBe(555);
 			expect(JSON.parse(committed.row?.data as string)).toEqual({ name: "Alice", score: 20, role: "admin" });
@@ -383,7 +390,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect([...store.queryPendingTxPage(null, 1, null)][0]).toMatchObject({
+			expect([...store.queryPendingTxPage(null, 1, ALL_ROWS)][0]).toMatchObject({
 				ttl_epoch_utc_seconds: 777,
 				transaction_ts: request.transactionTimestamp,
 				coordinator_json: JSON.stringify(request.coordinator),
@@ -397,6 +404,7 @@ describe("TransactionParticipant - prepare", () => {
 	it("rejects with timestamp_conflict when the item's read watermark is not older", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "v",
@@ -426,6 +434,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = kb("sk");
 			store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk,
 				data: "v",
@@ -434,7 +443,7 @@ describe("TransactionParticipant - prepare", () => {
 				txOrderTs: (BASE_NOW + 10) * TX_ORDER_TS_UNITS_PER_MS,
 			});
 			// A committed check ordered the item far ahead of the write that created it.
-			store.bumpItemReadTs(kb("hk"), sk, (BASE_NOW + 500) * TX_ORDER_TS_UNITS_PER_MS);
+			store.bumpItemReadTs(P(kb("hk")), kb("hk"), sk, (BASE_NOW + 500) * TX_ORDER_TS_UNITS_PER_MS);
 
 			// The check is newer than the last write, so it commits even though an earlier read
 			// already ordered the item above it.
@@ -468,6 +477,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = kb("sk");
 			store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk,
 				data: "v",
@@ -500,6 +510,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			// 1. A transaction committed with a coordinator clock running ahead of this partition's.
 			store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "from-tx",
@@ -510,6 +521,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			// 2. A non-transactional put lands next, stamped with the partition's own (lower) clock.
 			store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "from-put",
@@ -528,7 +540,7 @@ describe("TransactionParticipant - prepare", () => {
 				outcome: "rejected",
 				results: aRejection({ code: "timestamp_conflict", hashKey: "hk", sortKey: "sk" }),
 			});
-			expect(store.getItem(kb("hk"), kb("sk")).row?.data).toBe("from-put");
+			expect(store.getItem(P(kb("hk")), kb("hk"), kb("sk")).row?.data).toBe("from-put");
 		});
 	});
 
@@ -536,6 +548,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			// A transactional delete bumps the watermark even though the row never existed.
 			store.deleteItem({
+				prefix: P(kb("gone")),
 				hk: kb("gone"),
 				sk: KeyCodec.encodeOptional(undefined),
 				txOrderTs: (BASE_NOW + 200) * TX_ORDER_TS_UNITS_PER_MS,
@@ -582,19 +595,19 @@ describe("TransactionParticipant - prepare", () => {
 			[
 				"a single-item delete",
 				(_p: TransactionParticipant, store: PartitionStore) =>
-					store.deleteItem({ hk: X.hashKey, sk: X.sortKey, txOrderTs: BASE_NOW * TX_ORDER_TS_UNITS_PER_MS }),
+					store.deleteItem({ prefix: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, txOrderTs: BASE_NOW * TX_ORDER_TS_UNITS_PER_MS }),
 			],
 		])("after the transaction put X and %s removed it", async (_name, deleteX) => {
 			await withParticipant(({ participant, store }) => {
 				const request = commitAhead(participant, { ...X, operation: "put", data: "from-tx", kind: "text" });
 				deleteX(participant, store);
-				expect(store.getItem(X.hashKey, X.sortKey).row).toBeUndefined();
+				expect(store.getItem(P(X.hashKey), X.hashKey, X.sortKey).row).toBeUndefined();
 
 				expect(participant.prepareLocal(request)).toMatchObject({
 					outcome: "rejected",
 					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
 				});
-				expect(store.getItem(X.hashKey, X.sortKey).row).toBeUndefined();
+				expect(store.getItem(P(X.hashKey), X.hashKey, X.sortKey).row).toBeUndefined();
 			});
 		});
 
@@ -609,6 +622,7 @@ describe("TransactionParticipant - prepare", () => {
 				"a single-item put",
 				(_p: TransactionParticipant, store: PartitionStore) =>
 					store.upsertItem({
+						prefix: P(X.hashKey),
 						hk: X.hashKey,
 						sk: X.sortKey,
 						data: "new",
@@ -619,17 +633,17 @@ describe("TransactionParticipant - prepare", () => {
 			],
 		])("after the transaction deleted X and %s created it again", async (_name, putX) => {
 			await withParticipant(({ participant, store }) => {
-				store.upsertItem({ hk: X.hashKey, sk: X.sortKey, data: "old", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, data: "old", kind: "text", ttlAt: null, txOrderTs: 1 });
 				const request = commitAhead(participant, { ...X, operation: "delete" });
 				putX(participant, store);
 				// X had v = 1. Its delete has the revision 2, so the new row starts at v = 3.
-				expect(store.getItem(X.hashKey, X.sortKey).row).toMatchObject({ data: "new", v: 3, last_read_ts: aheadTs });
+				expect(store.getItem(P(X.hashKey), X.hashKey, X.sortKey).row).toMatchObject({ data: "new", v: 3, last_read_ts: aheadTs });
 
 				expect(participant.prepareLocal(request)).toMatchObject({
 					outcome: "rejected",
 					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
 				});
-				expect(store.getItem(X.hashKey, X.sortKey).row?.data).toBe("new");
+				expect(store.getItem(P(X.hashKey), X.hashKey, X.sortKey).row?.data).toBe("new");
 			});
 		});
 	});
@@ -689,7 +703,7 @@ describe("TransactionParticipant - prepare", () => {
 					outcome: "rejected",
 					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
 				});
-				expect(store.pendingLockFor(X.hashKey, X.sortKey)).toBeUndefined();
+				expect(store.pendingLockFor(P(X.hashKey), X.hashKey, X.sortKey)).toBeUndefined();
 			});
 		});
 
@@ -713,12 +727,12 @@ describe("TransactionParticipant - prepare", () => {
 
 		it("does not raise the deletion watermark when the item has a row", async () => {
 			await withParticipant(({ participant, store }) => {
-				store.upsertItem({ hk: X.hashKey, sk: X.sortKey, data: "v", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, data: "v", kind: "text", ttlAt: null, txOrderTs: 1 });
 				const check = prepareReq({ transactionTimestamp: checkTs, items: [{ ...X, operation: "check" }] });
 				expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
 				expect(participant.commitLocal(check).response).toEqual({ outcome: "committed" });
 				expect(store.getMaxDeleteTxOrderTs()).toBe(0);
-				expect(store.getItem(X.hashKey, X.sortKey).row).toMatchObject({ last_read_ts: checkTs, last_write_ts: 1 });
+				expect(store.getItem(P(X.hashKey), X.hashKey, X.sortKey).row).toMatchObject({ last_read_ts: checkTs, last_write_ts: 1 });
 			});
 		});
 	});
@@ -757,6 +771,7 @@ describe("TransactionParticipant - prepare", () => {
 	it("locks nothing when any item in the request is rejected", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
+				prefix: P(kb("conflicting")),
 				hk: kb("conflicting"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "v",
@@ -777,7 +792,7 @@ describe("TransactionParticipant - prepare", () => {
 				results: aRejection({ code: "timestamp_conflict", hashKey: "conflicting" }),
 			});
 			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
-			expect(store.pendingLockFor(kb("fine"), KeyCodec.encodeOptional(undefined))).toBeUndefined();
+			expect(store.pendingLockFor(P(kb("fine")), kb("fine"), KeyCodec.encodeOptional(undefined))).toBeUndefined();
 		});
 	});
 });
@@ -786,6 +801,7 @@ describe("TransactionParticipant - commit", () => {
 	it("applies put, delete, and check operations and clears the locks", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
+				prefix: P(kb("to-delete")),
 				hk: kb("to-delete"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "old",
@@ -794,6 +810,7 @@ describe("TransactionParticipant - commit", () => {
 				txOrderTs: 1,
 			});
 			store.upsertItem({
+				prefix: P(kb("to-check")),
 				hk: kb("to-check"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "kept",
@@ -824,18 +841,18 @@ describe("TransactionParticipant - commit", () => {
 			expect(commit.response).toEqual({ outcome: "committed" });
 
 			// Commit applies the expiry instant from the prepared row, not from the commit request.
-			const put = store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row;
+			const put = store.getItem(P(kb("to-put")), kb("to-put"), KeyCodec.encodeOptional(undefined)).row;
 			expect(put).toMatchObject({ data: "new-value", ttl_epoch_utc_seconds: 777, last_read_ts: commitTs, last_write_ts: commitTs });
 			expect(commit.promotionCandidates).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
 
 			// delete: row gone, the deletion watermark advanced to the commit timestamp, and
 			// max_deleted_v recorded the delete revision (v + 1) of the removed row.
-			expect(store.getItem(kb("to-delete"), KeyCodec.encodeOptional(undefined)).row).toBeUndefined();
+			expect(store.getItem(P(kb("to-delete")), kb("to-delete"), KeyCodec.encodeOptional(undefined)).row).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(commitTs);
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(2);
 
 			// check: data untouched, only the read watermark advanced.
-			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toMatchObject({
+			expect(store.getItem(P(kb("to-check")), kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toMatchObject({
 				data: "kept",
 				last_read_ts: commitTs,
 				last_write_ts: 1,
@@ -847,8 +864,8 @@ describe("TransactionParticipant - commit", () => {
 			// A commit retry finds no locks and applies nothing a second time: every timestamp and
 			// both deletion-metadata values stay exactly where the first commit left them.
 			const afterCommit = {
-				put: store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row,
-				check: store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row,
+				put: store.getItem(P(kb("to-put")), kb("to-put"), KeyCodec.encodeOptional(undefined)).row,
+				check: store.getItem(P(kb("to-check")), kb("to-check"), KeyCodec.encodeOptional(undefined)).row,
 				metadata: store.getDeletionMetadata(),
 			};
 			const retryCommit = participant.commitLocal({
@@ -859,8 +876,8 @@ describe("TransactionParticipant - commit", () => {
 			expect(retryCommit.response).toEqual({ outcome: "committed" });
 			// A retry re-applies nothing, so it grew no key and must name no candidate.
 			expect(retryCommit.promotionCandidates).toEqual([]);
-			expect(store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.put);
-			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.check);
+			expect(store.getItem(P(kb("to-put")), kb("to-put"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.put);
+			expect(store.getItem(P(kb("to-check")), kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.check);
 			expect(store.getDeletionMetadata()).toEqual(afterCommit.metadata);
 		});
 	});
@@ -885,6 +902,7 @@ describe("TransactionParticipant - commit", () => {
 			const asked: string[] = [];
 			const source = new TransactionParticipant({
 				store,
+				storagePrefix: P,
 				maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 				staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 				ownerCheck: () => (key) => {
@@ -900,7 +918,7 @@ describe("TransactionParticipant - commit", () => {
 			expect(source.commitLocal(commit).response).toEqual({ outcome: "committed" });
 
 			expect(asked).toHaveLength(1);
-			expect(store.getItem(kb("owned"), kb("sk")).row).toMatchObject({ data: "v1" });
+			expect(store.getItem(P(kb("owned")), kb("owned"), kb("sk")).row).toMatchObject({ data: "v1" });
 			expect(store.listPendingTxKeys(request.transactionId).map((row) => KeyCodec.decode(row.sk))).toEqual(["a", "b", "c"]);
 		});
 	});
@@ -964,7 +982,7 @@ describe("TransactionParticipant - single shot", () => {
 					items: withOpIndex([{ hashKey: kb("ttl-put"), sortKey, operation: "put", data: "value", kind: "text", ttlAt: 777 }]),
 				}).response,
 			).toEqual({ outcome: "committed" });
-			expect(store.getItem(kb("ttl-put"), sortKey).row?.ttl_epoch_utc_seconds).toBe(777);
+			expect(store.getItem(P(kb("ttl-put")), kb("ttl-put"), sortKey).row?.ttl_epoch_utc_seconds).toBe(777);
 		});
 	});
 
@@ -972,6 +990,7 @@ describe("TransactionParticipant - single shot", () => {
 		await withParticipant(({ participant, store }) => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
+				prefix: P(kb("u1")),
 				hk: kb("u1"),
 				sk: sortKey,
 				data: JSON.stringify({ count: 1, name: "item1" }),
@@ -987,7 +1006,7 @@ describe("TransactionParticipant - single shot", () => {
 			});
 			expect(res.response).toEqual({ outcome: "committed" });
 
-			const updated = store.getItem(kb("u1"), sortKey);
+			const updated = store.getItem(P(kb("u1")), kb("u1"), sortKey);
 			expect(updated.row?.v).toBe(2);
 			expect(JSON.parse(updated.row?.data as string)).toEqual({ count: 2, name: "item1" });
 			expect(updated.row?.ttl_epoch_utc_seconds).toBe(999);
@@ -1004,7 +1023,7 @@ describe("TransactionParticipant - single shot", () => {
 			});
 			expect(res.response).toEqual({ outcome: "committed" });
 
-			const created = store.getItem(kb("missing-u"), sortKey).row;
+			const created = store.getItem(P(kb("missing-u")), kb("missing-u"), sortKey).row;
 			expect(created).toMatchObject({ v: 1, ttl_epoch_utc_seconds: 42 });
 			expect(JSON.parse(created?.data as string)).toEqual({ a: 1 });
 			expect(res.promotionCandidates).toEqual([{ hashKey: kb("missing-u"), keyEstBytes: expect.any(Number) }]);
@@ -1026,7 +1045,7 @@ describe("TransactionParticipant - single shot", () => {
 			});
 			// A rejected single-shot writes nothing, so it names no candidate.
 			expect(res.promotionCandidates).toEqual([]);
-			expect(store.getItem(kb("no-parent"), sortKey).row).toBeUndefined();
+			expect(store.getItem(P(kb("no-parent")), kb("no-parent"), sortKey).row).toBeUndefined();
 		});
 	});
 });
@@ -1057,7 +1076,15 @@ describe("TransactionParticipant - cancel", () => {
 	it("discards the materialized document of an update and leaves the item untouched", async () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
-			store.upsertItem({ hk: kb("user"), sk, data: JSON.stringify({ score: 10 }), kind: "json", ttlAt: null, txOrderTs: 10 });
+			store.upsertItem({
+				prefix: P(kb("user")),
+				hk: kb("user"),
+				sk,
+				data: JSON.stringify({ score: 10 }),
+				kind: "json",
+				ttlAt: null,
+				txOrderTs: 10,
+			});
 
 			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.score" }, value: { val: 999 } }]);
 			const request = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
@@ -1066,7 +1093,7 @@ describe("TransactionParticipant - cancel", () => {
 			participant.cancelLocal(request.transactionId, request.items);
 
 			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
-			const item = store.getItem(kb("user"), sk);
+			const item = store.getItem(P(kb("user")), kb("user"), sk);
 			expect(item.row?.v).toBe(1);
 			expect(JSON.parse(item.row?.data as string)).toEqual({ score: 10 });
 			// Nothing applied, so no call reported a new size for this key.
@@ -1079,7 +1106,7 @@ describe("TransactionParticipant - cancel", () => {
 				transactionTimestamp: retry.transactionTimestamp,
 				items: [{ hashKey: kb("user"), sortKey: sk }],
 			});
-			const committed = store.getItem(kb("user"), sk);
+			const committed = store.getItem(P(kb("user")), kb("user"), sk);
 			expect(committed.row?.v).toBe(2);
 			expect(JSON.parse(committed.row?.data as string)).toEqual({ score: 999 });
 			// Applied exactly once, for this key. The byte arithmetic of the estimate is partition-store's
@@ -1096,10 +1123,10 @@ describe("TransactionParticipant - readForTransaction", () => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			// Two writes carrying the same transaction order timestamp: the item timestamps are identical, only `v`
 			// moves. This is the pair the two-phase read must be able to tell apart.
-			store.upsertItem({ hk: kb("k"), sk, data: "first", kind: "text", ttlAt: 777, txOrderTs: 100 });
+			store.upsertItem({ prefix: P(kb("k")), hk: kb("k"), sk, data: "first", kind: "text", ttlAt: 777, txOrderTs: 100 });
 			const before = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
-			store.upsertItem({ hk: kb("k"), sk, data: "second", kind: "text", ttlAt: 777, txOrderTs: 100 });
+			store.upsertItem({ prefix: P(kb("k")), hk: kb("k"), sk, data: "second", kind: "text", ttlAt: 777, txOrderTs: 100 });
 			const after = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
 			invariant(before.found && after.found);
@@ -1113,6 +1140,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 	it("echoes canonical KeyBytes and returns data, maxDeletedV of an absent item, and hasPendingWrite per item", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
+				prefix: P(kb("existing")),
 				hk: kb("existing"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "value",
@@ -1168,12 +1196,12 @@ describe("TransactionParticipant - readForTransaction", () => {
 						{ hashKey: kb("absent"), sortKey: sk },
 					],
 				}).items;
-			store.upsertItem({ hk: kb("found"), sk, data: "f", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("found")), hk: kb("found"), sk, data: "f", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("other")), hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("other")), hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
 
 			const before = read();
-			store.deleteItem({ hk: kb("other"), sk, txOrderTs: 2 });
+			store.deleteItem({ prefix: P(kb("other")), hk: kb("other"), sk, txOrderTs: 2 });
 			const after = read();
 
 			// The found item carries no delete value, so the delete of another item leaves it unchanged.
@@ -1188,7 +1216,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 		await withParticipant(({ participant, store }) => {
 			const hk = kb("k");
 			const sk = KeyCodec.encodeOptional(undefined);
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const hasPendingWrite = () => participant.readForTransactionLocal({ items: [{ hashKey: hk, sortKey: sk }] }).items[0].hasPendingWrite;
 
 			// A pending check cannot change the item, so the read may serialize on either side of it.
@@ -1225,6 +1253,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 
 			// An operation value the code does not know counts as a pending write, not a read.
 			store.insertPendingLock({
+				prefix: P(hk),
 				hk,
 				sk,
 				transaction_id: "unknown-op",
@@ -1296,6 +1325,7 @@ describe("TransactionParticipant - claimStaleTransactions", () => {
 			const staleMs = DEFAULT_PARTITION_CONFIG.staleTransactionMs;
 			const lock = (name: string, createdAt: number, nextRecoveryAt: number) =>
 				store.insertPendingLock({
+					prefix: P(kb(name)),
 					hk: kb(name),
 					sk: kb("sk"),
 					transaction_id: name,

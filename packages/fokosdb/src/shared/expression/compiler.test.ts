@@ -7,6 +7,7 @@ import { compileConditionExpression, compileUpdateExpression } from "./compiler.
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
 	composeConditionStatement,
+	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
 	UPDATE_FIXED_BINDING_COUNT,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
@@ -100,7 +101,7 @@ describe("condition SQLite compiler", () => {
 
 	it("emits direct placeholders for a homogeneous in expression", () => {
 		const plan = compileConditionExpression({ op: "in", args: [{ ref: "v" }, { val: 1 }, { val: 2 }, { val: 3 }] });
-		expect(plan.sql).toMatch(/ IN \(CAST\(\?3 AS INTEGER\), CAST\(\?4 AS INTEGER\), CAST\(\?5 AS INTEGER\)\)/);
+		expect(plan.sql).toMatch(/ IN \(CAST\(\?4 AS INTEGER\), CAST\(\?5 AS INTEGER\), CAST\(\?6 AS INTEGER\)\)/);
 		expect(plan.bindings.filter((binding) => binding.kind === "val")).toEqual([
 			{ kind: "val", value: 1 },
 			{ kind: "val", value: 2 },
@@ -114,9 +115,11 @@ describe("condition SQLite compiler", () => {
 				op: "in",
 				args: [{ ref: "v" }, ...Array.from({ length: choices }, (_, value) => ({ val: value }))],
 			}) as unknown as ConditionExpression;
-		const plan = compileConditionExpression(makeIn(EXPRESSION_LIMITS.completeStatementBindings - 2));
+		const plan = compileConditionExpression(makeIn(EXPRESSION_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT));
 		expect(plan.completeBindingCount).toBe(EXPRESSION_LIMITS.completeStatementBindings);
-		expect(() => compileConditionExpression(makeIn(EXPRESSION_LIMITS.completeStatementBindings - 1))).toThrow(/binding limit/);
+		expect(() =>
+			compileConditionExpression(makeIn(EXPRESSION_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT + 1)),
+		).toThrow(/binding limit/);
 	});
 
 	it("normalizes negative zero for a lossless JSON round trip", () => {
@@ -137,7 +140,7 @@ describe("condition SQLite compiler", () => {
 		expect(plan.dataDependencies).toEqual({ completeData: true, paths: ["$.a"] });
 	});
 
-	it("numbers parameters densely after the two fixed key bindings", () => {
+	it("numbers parameters densely after the fixed key and prefix bindings", () => {
 		for (const condition of [
 			{ op: "eq", args: [{ ref: "data", path: "$.value" }, { val: null }] },
 			{ op: "begins_with", args: [{ ref: "data", path: "$.value" }, { val: "prefix" }] },
@@ -153,9 +156,9 @@ describe("condition SQLite compiler", () => {
 			const indexes = new Set([...plan.sql.matchAll(/\?(\d+)/g)].map((match) => Number(match[1])));
 			expect(indexes.size, message).toBe(plan.bindingCount);
 			for (let i = 0; i < plan.bindingCount; i++) {
-				expect(indexes.has(3 + i), message).toBe(true);
+				expect(indexes.has(CONDITION_FIXED_BINDING_COUNT + 1 + i), message).toBe(true);
 			}
-			expect(composeConditionStatement(plan.sql).match(/\?(?!\d)/g)?.length, message).toBe(2);
+			expect(composeConditionStatement(plan.sql).match(/\?(?!\d)/g)?.length, message).toBe(3);
 		}
 	});
 
@@ -179,7 +182,7 @@ describe("condition SQLite compiler", () => {
 	it("guards a data path against a literal with one json_type test", () => {
 		const path = { ref: "data", path: "$.value" } as const;
 		const guard = (test: string) =>
-			`CASE WHEN (i.hk IS NOT NULL AND i.data_kind = 2) AND json_type(i.data, ?3) ${test} THEN 1 ELSE 0 END AND `;
+			`CASE WHEN (i.hk IS NOT NULL AND i.data_kind = 2) AND json_type(i.data, ?4) ${test} THEN 1 ELSE 0 END AND `;
 		for (const [literal, test] of [
 			[null, "= 'null'"],
 			[true, "IN ('true', 'false')"],
@@ -193,7 +196,7 @@ describe("condition SQLite compiler", () => {
 				const { sql } = compileConditionExpression({ op: "eq", args });
 				expect(sql.startsWith(`(${guard(test)}`), sql).toBe(true);
 				// The guard reads the path one time, and the value test reads it one time.
-				expect(sql.split("i.data, ?3").length - 1, sql).toBe(2);
+				expect(sql.split("i.data, ?4").length - 1, sql).toBe(2);
 			}
 		}
 		const start = `(${guard("= 'text'")}`;
@@ -260,7 +263,7 @@ describe("byte literal compilation", () => {
 
 	it("emits direct placeholders for byte choices against a key", () => {
 		const plan = compileConditionExpression({ op: "in", args: [{ ref: "hashKey" }, { b64: "YQ==" }, { b64: "Yg==" }] });
-		expect(plan.sql).toMatch(/ IN \(\?3, \?4\)/);
+		expect(plan.sql).toMatch(/ IN \(\?4, \?5\)/);
 		expect(plan.bindings).toEqual([
 			{ kind: "keyB64", value: "YQ==" },
 			{ kind: "keyB64", value: "Yg==" },

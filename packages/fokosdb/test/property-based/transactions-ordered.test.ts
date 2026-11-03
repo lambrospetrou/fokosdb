@@ -27,6 +27,10 @@ import { TX_ORDER_TS_UNITS_PER_MS } from "../../src/shared/transaction-limits.js
 import type { TransactionItem, TransactionItemKey } from "../../src/shared/transaction-wire-types.js";
 import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
 import { propertyRuns } from "./harness.js";
+import { prefixOf } from "../storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
 
 const PROPERTY_RUNS = propertyRuns(100);
 // One second for each run, which is far more than a run on one Durable Object takes.
@@ -97,14 +101,23 @@ function reset(storage: DurableObjectStorage): void {
 function seed(store: PartitionStore, start: (number | undefined)[], deletedV: number): void {
 	// A deleted row with v = deletedV raises max_deleted_v, so a new row starts above it.
 	for (let i = 0; i < deletedV; i++) {
-		store.upsertItem({ hk: KeyCodec.encode("gone"), sk: KeyCodec.encode("s"), data: "g", kind: "text", ttlAt: null, txOrderTs: 1 });
+		store.upsertItem({
+			prefix: P(KeyCodec.encode("gone")),
+			hk: KeyCodec.encode("gone"),
+			sk: KeyCodec.encode("s"),
+			data: "g",
+			kind: "text",
+			ttlAt: null,
+			txOrderTs: 1,
+		});
 	}
 	if (deletedV > 0) {
-		store.deleteItem({ hk: KeyCodec.encode("gone"), sk: KeyCodec.encode("s"), txOrderTs: 2 });
+		store.deleteItem({ prefix: P(KeyCodec.encode("gone")), hk: KeyCodec.encode("gone"), sk: KeyCodec.encode("s"), txOrderTs: 2 });
 	}
 	start.forEach((size, i) => {
 		if (size !== undefined) {
 			store.upsertItem({
+				prefix: P(KEYS[i].hashKey),
 				hk: KEYS[i].hashKey,
 				sk: KEYS[i].sortKey,
 				data: JSON.stringify({ s: "y".repeat(size) }),
@@ -118,11 +131,15 @@ function seed(store: PartitionStore, start: (number | undefined)[], deletedV: nu
 
 const b64 = (value: unknown) => (typeof value === "string" ? value : new Uint8Array(value as ArrayBuffer).toBase64());
 
+/**
+ * The stored state that the paths must agree on. It leaves out `item_id`: a new row takes the next id
+ * of the counter, and an id never comes back, so the id depends on the count of earlier writes.
+ */
 function snapshot(storage: DurableObjectStorage) {
 	return {
 		items: storage.sql
 			.exec(
-				`SELECT item_id, hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, est_row_bytes FROM items ORDER BY hk, sk`,
+				`SELECT hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, est_row_bytes FROM items ORDER BY hk, sk`,
 			)
 			.toArray()
 			.map((r) => ({ ...r, hk: b64(r.hk), sk: b64(r.sk), data: b64(r.data) })),
@@ -153,6 +170,7 @@ describe("ordered per-item execution — the paths agree with the reference run"
 				const store = new PartitionStore(state.storage);
 				const participant = new TransactionParticipant({
 					store,
+					storagePrefix: P,
 					now: () => BASE_NOW,
 					maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 					staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,

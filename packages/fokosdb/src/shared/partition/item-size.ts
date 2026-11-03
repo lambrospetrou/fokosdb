@@ -15,7 +15,10 @@ import { DATA_KINDS, type DataKind } from "../types.js";
 export const JSON_KIND_CODE = DATA_KINDS.indexOf("json");
 
 // Fixed per-row overhead added to est_row_bytes. See the "items" migration for what K covers in PartitionStore.
-export const EST_ROW_BYTES_K = 108;
+// test/storage-bench/row-bytes.workerd-bench.ts measures the storage of a row. K is 108, the fixed part of a
+// rowid items table with two key indexes, plus 42: with the same keys and data, this WITHOUT ROWID layout
+// with idx_items_scan and idx_items_item_id used 33 to 48 bytes (42 on average) more for each row.
+export const EST_ROW_BYTES_K = 150;
 
 /**
  * The ONLY definition of the est_row_bytes formula. `dataExpr` must be the same SQL that produces the

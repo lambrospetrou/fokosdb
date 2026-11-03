@@ -1,6 +1,6 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { hashPrefixBucketDigits, hashPrefixBucketOf } from "./hash-primitives.js";
+import { asHashPrefixBucket, hashPrefixBucketDigits, hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 import { findLeaf, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
@@ -49,7 +49,7 @@ function positions(forest: Forest): Map<string, number> {
 const bk = (key: string) => hashPrefixBucketOf(KeyCodec.encode(key), "codec-test");
 
 /** The reference walk: follow the digits of the hashPrefixBucket through the split nodes, and stop before a cut node. */
-function referenceLeaf(forest: Forest, bucket: Uint8Array, cut: ReadonlySet<string>): { node: string; path: number[] } {
+function referenceLeaf(forest: Forest, bucket: HashPrefixBucket, cut: ReadonlySet<string>): { node: string; path: number[] } {
 	let node = String(hashPrefixBucketDigits(bucket, forest.R, forest.K, 0).root);
 	const path: number[] = [];
 	while (forest.children.has(node)) {
@@ -93,7 +93,7 @@ describe("topology codec — hash body", () => {
 				fc.integer({ min: 1, max: 5 }),
 				fc.integer({ min: 2, max: 4 }),
 				fc.array(fc.nat(), { maxLength: 60 }),
-				fc.array(fc.uint8Array({ minLength: 8, maxLength: 8 }), { minLength: 1, maxLength: 30 }),
+				fc.array(fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asHashPrefixBucket), { minLength: 1, maxLength: 30 }),
 				fc.array(fc.nat(), { maxLength: 4 }),
 				(R, K, picks, keys, cutPicks) => {
 					const forest = buildForest(R, K, picks);
@@ -313,7 +313,10 @@ describe("topology codec — body framing", () => {
 		const encoded = encodeRangeBody({
 			epoch: 1,
 			version: 4,
-			boundaries: [KeyCodec.encode("g"), KeyCodec.encode("k")],
+			boundaries: [
+				{ hk: KeyCodec.encode("h"), sk: KeyCodec.encode("g") },
+				{ hk: KeyCodec.encode("h"), sk: KeyCodec.encode("k") },
+			],
 			levels: [0, 1],
 			depths: [1, 2, 2],
 			truncatedAtRank: null,

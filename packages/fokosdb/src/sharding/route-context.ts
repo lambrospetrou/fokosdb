@@ -6,7 +6,8 @@
  * and the host policy. The sharding code reads the first three and treats the policy as an opaque
  * value that it stores, compares, and forwards.
  */
-import type { KeyBytes } from "./key-codec.js";
+import type { FokosCompositeKey } from "./key-codec.js";
+import type { HashPrefixBucket } from "./hash-primitives.js";
 import type { RangeAncestorInfo } from "./types.js";
 import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
@@ -65,7 +66,7 @@ export type FokosRouteContext<TPolicy> = {
 	 * a hash partition, and `"01"` and two base64url parts for a range partition.
 	 */
 	partitionId: string;
-	/** `<shardGroup>~h.<root>[.<child>...]` or `<shardGroup>~r.<hk>.<start>.<end>`. */
+	/** `<shardGroup>~h.<root>[.<child>...]` or `<shardGroup>~r.<hashPrefixBucket hex>.<start>.<end>`. */
 	doName: string;
 	/** Immutable topology of the shard group. Persisted at creation. A later mismatch is an error. */
 	topology: FokosTopology;
@@ -94,11 +95,15 @@ export type FokosPartitionIdentity = {
 	 * Hash: the root index and the child path, decoded from `ref.partitionId`, and the hashPrefixBucket
 	 * interval `[start, end)` of the node. `depth` is `path.length`, and a null `end` has no upper bound.
 	 */
-	hash?: { rootIndex: number; path: number[]; depth: number; start: Uint8Array; end: Uint8Array | null };
+	hash?: { rootIndex: number; path: number[]; depth: number; start: HashPrefixBucket; end: HashPrefixBucket | null };
+	/**
+	 * Range: the promoted hashPrefixBucket of the range tree, and the composite interval
+	 * `[start, end)` of this node inside it. A null edge is unbounded.
+	 */
 	range?: {
-		hashKey: KeyBytes;
-		start: KeyBytes | null;
-		end: KeyBytes | null;
+		hashPrefixBucket: HashPrefixBucket;
+		start: FokosCompositeKey | null;
+		end: FokosCompositeKey | null;
 		depth: number;
 		/** The bounded ancestor set from `fokosInit`. Immutable. */
 		ancestors: RangeAncestorInfo[];

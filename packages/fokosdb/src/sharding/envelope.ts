@@ -21,7 +21,12 @@ export const ROUTE_EVIDENCE_MAX_BYTES = 10 * 1024;
 export function routeNodeBytes(node: FokosRouteNode): number {
 	let bytes = 128 + 2 * (node.ref.doName.length + node.ref.partitionId.length + node.actorId.length);
 	for (const ancestor of node._rangeAncestors ?? []) {
-		bytes += 24 + ancestor.startBoundary.byteLength + ancestor.endBoundary.byteLength;
+		bytes +=
+			24 +
+			ancestor.startBoundary.hk.byteLength +
+			ancestor.startBoundary.sk.byteLength +
+			ancestor.endBoundary.hk.byteLength +
+			ancestor.endBoundary.sk.byteLength;
 	}
 	return bytes;
 }

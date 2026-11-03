@@ -6,17 +6,12 @@
  */
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind } from "../../shared/types.js";
-import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../sharding/key-codec.js";
+import { asHashPrefixBucket, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
 import { exists, one, tryOne } from "../../shared/sql-cursor.js";
 import { JSON_KIND_CODE } from "../../shared/partition/item-size.js";
 import { KeySizeStats } from "../../shared/partition/key-size-stats.js";
-import {
-	walkByHashKey,
-	type HashKeyWalkCursor,
-	type HashKeyWalkEntry,
-	type KeyRange,
-	type ScanCursor,
-} from "../../shared/partition/partition-store.js";
+import { intervalTerms, type KeyRange, type StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosTargetDefinition } from "./targets.js";
 import { materializedPlanBindings } from "../../shared/expression/bindings.js";
 import type { CompiledProjectionPlan } from "../../shared/expression/plan.js";
@@ -27,7 +22,8 @@ const TARGETS_KV_KEY = "__fokosdb/mat/targets";
 
 /**
  * The KV key of the cursor snapshots of the promotions of this partition that are between their
- * cutover and their completion: the cursor of each target at the cutover, by the promoted hash key.
+ * cutover and their completion: the cursor of each target at the cutover, by the promoted
+ * hashPrefixBucket in hex.
  */
 const CURSOR_SNAPSHOTS_KV_KEY = "__fokosdb/mat/cursor_snapshots";
 
@@ -59,10 +55,11 @@ const LATEST_ROW_BYTES_K = 60;
 
 /**
  * The SQL of the `est_row_bytes` of a `latest_items` row, with the base hash key in `?1` and the base
- * sort key in `?2`. `dataParam` holds the stored `data` value, or is null for a tombstone.
+ * sort key in `?2`. `prefixParam` holds the storage prefix. `dataParam` holds the stored `data` value,
+ * or is null for a tombstone.
  */
-function latestRowBytesExpr(dataParam: string | null): string {
-	const fixed = `2 * (octet_length(?1) + octet_length(?2)) + ${LATEST_ROW_BYTES_K}`;
+function latestRowBytesExpr(prefixParam: string, dataParam: string | null): string {
+	const fixed = `2 * (octet_length(${prefixParam}) + octet_length(?1) + octet_length(?2)) + ${LATEST_ROW_BYTES_K}`;
 	return dataParam === null ? fixed : `octet_length(${dataParam}) + ${fixed}`;
 }
 
@@ -76,12 +73,15 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - A rowid table with `data` last, for the reasons of the items table of PartitionStore: a large
 		//   payload does not get a private overflow page, and a read of the metadata columns reads no
 		//   overflow page.
+		// - `hash_prefix_bucket` is the storage prefix of `base_hk` in the shard group of this partition,
+		//   which the runtime gives (`storagePrefix`). The store treats it as opaque bytes. The unique key
+		//   leads with it, so the rows of one hash child are one key range of the index.
 		// - `item_id` links the rows of other tables to the item, so `(base_hk, base_sk)` is stored one
 		//   time. Each statement that deletes a row must delete its linked rows in the same transaction,
 		//   because SQLite can give the id to a new row again.
 		// - No rule reads the value of `deleted_at_ms`. It orders the garbage collection of tombstones.
-		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The keys count
-		//   two times, because the UNIQUE index holds a second copy of them. LATEST_ROW_BYTES_K gives the
+		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The prefix and the
+		//   keys count two times, because the UNIQUE index holds a second copy of them. LATEST_ROW_BYTES_K gives the
 		//   fixed part: the integer columns, the record header, the rowid, and the fixed part of the
 		//   index entry. It is an approximate value for size accounting (promotion, split, batch and page
 		//   budgets). A change of the formula needs no data migration, because each change of a key
@@ -113,17 +113,18 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   is left.
 		sql: `
             CREATE TABLE IF NOT EXISTS latest_items (
-                item_id       INTEGER PRIMARY KEY,
-                base_hk       BLOB    NOT NULL,
-                base_sk       BLOB    NOT NULL DEFAULT x'',
-                revision      INTEGER NOT NULL,
-                deleted_at_ms INTEGER,
-                newest_seq    INTEGER,
-                data_kind     INTEGER,
-                ttl_at        INTEGER,
-                est_row_bytes INTEGER NOT NULL DEFAULT 0,
-                data          ANY,
-                UNIQUE (base_hk, base_sk)
+                item_id            INTEGER PRIMARY KEY,
+                hash_prefix_bucket BLOB    NOT NULL,
+                base_hk            BLOB    NOT NULL,
+                base_sk            BLOB    NOT NULL DEFAULT x'',
+                revision           INTEGER NOT NULL,
+                deleted_at_ms      INTEGER,
+                newest_seq         INTEGER,
+                data_kind          INTEGER,
+                ttl_at             INTEGER,
+                est_row_bytes      INTEGER NOT NULL DEFAULT 0,
+                data               ANY,
+                UNIQUE (hash_prefix_bucket, base_hk, base_sk)
             ) STRICT;
 
             CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc ON latest_items (deleted_at_ms) WHERE deleted_at_ms IS NOT NULL;
@@ -244,10 +245,11 @@ export class MaterializationStore {
 	}
 
 	/** The stored image of a base item, live or tombstone, or undefined when it has none. */
-	storedImage(hk: KeyBytes, sk: KeyBytes): StoredImage | undefined {
+	storedImage(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): StoredImage | undefined {
 		const row = tryOne(
 			this.#storage.sql.exec<{ item_id: number; revision: number; est_row_bytes: number; newest_seq: number | null }>(
-				`SELECT item_id, revision, est_row_bytes, newest_seq FROM latest_items WHERE base_hk = ? AND base_sk = ?`,
+				`SELECT item_id, revision, est_row_bytes, newest_seq FROM latest_items WHERE hash_prefix_bucket = ? AND base_hk = ? AND base_sk = ?`,
+				prefix,
 				hk,
 				sk,
 			),
@@ -267,6 +269,7 @@ export class MaterializationStore {
 	 * Returns the new size estimate of the base hash key when the size of the row changed, or undefined.
 	 */
 	putLatestImage(
+		prefix: HashPrefixBucket,
 		image: LatestImage,
 		nowMs: number,
 		current: StoredImage | undefined,
@@ -277,9 +280,9 @@ export class MaterializationStore {
 		const newestSeq = position === null ? (current?.newestSeq ?? null) : position.seq;
 		const row = image.deleted
 			? sql.exec<{ item_id: number; est_row_bytes: number }>(
-					`INSERT INTO latest_items (base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ${latestRowBytesExpr(null)}, NULL)
-					 ON CONFLICT (base_hk, base_sk) DO UPDATE SET
+					`INSERT INTO latest_items (hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
+					 VALUES (?6, ?1, ?2, ?3, ?4, ?5, NULL, NULL, ${latestRowBytesExpr("?6", null)}, NULL)
+					 ON CONFLICT (hash_prefix_bucket, base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = excluded.deleted_at_ms, newest_seq = excluded.newest_seq,
 					   data_kind = NULL, ttl_at = NULL, est_row_bytes = excluded.est_row_bytes, data = NULL
 					 RETURNING item_id, est_row_bytes`,
@@ -288,11 +291,12 @@ export class MaterializationStore {
 					image.revision,
 					nowMs,
 					newestSeq,
+					prefix,
 				)
 			: sql.exec<{ item_id: number; est_row_bytes: number }>(
-					`INSERT INTO latest_items (base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?1, ?2, ?3, NULL, ?7, ?4, ?5, ${latestRowBytesExpr("?6")}, ?6)
-					 ON CONFLICT (base_hk, base_sk) DO UPDATE SET
+					`INSERT INTO latest_items (hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
+					 VALUES (?8, ?1, ?2, ?3, NULL, ?7, ?4, ?5, ${latestRowBytesExpr("?8", "?6")}, ?6)
+					 ON CONFLICT (hash_prefix_bucket, base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = NULL, newest_seq = excluded.newest_seq,
 					   data_kind = excluded.data_kind, ttl_at = excluded.ttl_at, est_row_bytes = excluded.est_row_bytes, data = excluded.data
 					 RETURNING item_id, est_row_bytes`,
@@ -303,6 +307,7 @@ export class MaterializationStore {
 					image.ttlAt,
 					image.data,
 					newestSeq,
+					prefix,
 				);
 		const { item_id: itemId, est_row_bytes: newEst } = row.one();
 		if (position?.kind === "insert") {
@@ -320,7 +325,7 @@ export class MaterializationStore {
 		}
 		// The ingest reads the new estimate only when the key grew, so an equal size needs no read.
 		const oldEst = current?.estRowBytes ?? 0;
-		return newEst === oldEst ? undefined : this.keySizes.change(image.hashKey, oldEst, newEst);
+		return newEst === oldEst ? undefined : this.keySizes.change(prefix, image.hashKey, oldEst, newEst);
 	}
 
 	/**
@@ -449,21 +454,21 @@ export class MaterializationStore {
 
 	// ─── cursor snapshots ─────────────────────────────────────────────────────
 
-	/** Stores the cursor of each target as the snapshot of the promotion of `hk`. */
-	storeCursorSnapshot(hk: KeyBytes): void {
+	/** Stores the cursor of each target as the snapshot of the promotion of `prefix`. */
+	storeCursorSnapshot(prefix: HashPrefixBucket): void {
 		const snapshots = this.#cursorSnapshots();
-		snapshots.set(snapshotKey(hk), new Map(this.targetRows().map((row) => [row.targetId, row.cursorSeq])));
+		snapshots.set(prefix.toHex(), new Map(this.targetRows().map((row) => [row.targetId, row.cursorSeq])));
 		this.#storage.kv.put(CURSOR_SNAPSHOTS_KV_KEY, snapshots);
 	}
 
-	/** The cursor of each target in the snapshot of the promotion of `hk`, or undefined when it has none. */
-	cursorSnapshot(hk: KeyBytes): ReadonlyMap<string, number> | undefined {
-		return this.#cursorSnapshots().get(snapshotKey(hk));
+	/** The cursor of each target in the snapshot of the promotion of `prefix`, or undefined when it has none. */
+	cursorSnapshot(prefix: HashPrefixBucket): ReadonlyMap<string, number> | undefined {
+		return this.#cursorSnapshots().get(prefix.toHex());
 	}
 
-	deleteCursorSnapshot(hk: KeyBytes): void {
+	deleteCursorSnapshot(prefix: HashPrefixBucket): void {
 		const snapshots = this.#cursorSnapshots();
-		snapshots.delete(snapshotKey(hk));
+		snapshots.delete(prefix.toHex());
 		if (snapshots.size === 0) {
 			this.#storage.kv.delete(CURSOR_SNAPSHOTS_KV_KEY);
 		} else {
@@ -573,6 +578,7 @@ export class MaterializationStore {
 	targetImage(itemId: number): TargetImage | undefined {
 		const row = tryOne(
 			this.#storage.sql.exec<{
+				hash_prefix_bucket: ArrayBuffer;
 				base_hk: ArrayBuffer;
 				base_sk: ArrayBuffer;
 				revision: number;
@@ -581,7 +587,7 @@ export class MaterializationStore {
 				ttl_at: number | null;
 				data: string | ArrayBuffer | null;
 			}>(
-				`SELECT base_hk, base_sk, revision, deleted_at_ms IS NOT NULL AS deleted, data_kind, ttl_at,
+				`SELECT hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms IS NOT NULL AS deleted, data_kind, ttl_at,
 				   CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END AS data
 				 FROM latest_items WHERE item_id = ?`,
 				itemId,
@@ -590,13 +596,14 @@ export class MaterializationStore {
 		if (!row) {
 			return undefined;
 		}
+		const prefix = asHashPrefixBucket(new Uint8Array(row.hash_prefix_bucket));
 		const hk = new Uint8Array(row.base_hk) as KeyBytes;
 		const sk = new Uint8Array(row.base_sk) as KeyBytes;
 		if (row.deleted === 1 || row.data === null || row.data_kind === null) {
-			return { hk, sk, revision: row.revision, deleted: true };
+			return { prefix, hk, sk, revision: row.revision, deleted: true };
 		}
 		const data = typeof row.data === "string" ? row.data : new Uint8Array(row.data);
-		return { hk, sk, revision: row.revision, deleted: false, kind: DATA_KINDS[row.data_kind], data, ttlAt: row.ttl_at };
+		return { prefix, hk, sk, revision: row.revision, deleted: false, kind: DATA_KINDS[row.data_kind], data, ttlAt: row.ttl_at };
 	}
 
 	/** The revision of an item, or undefined when it has no row. */
@@ -714,17 +721,18 @@ export class MaterializationStore {
 	 * columns of `latest_items` the names of the items table, so the compiled SQL reads the columns
 	 * that it expects. Undefined when the item has no row.
 	 */
-	evaluateProjection(plan: CompiledProjectionPlan, hk: KeyBytes, sk: KeyBytes): ProjectedWireRow | undefined {
+	evaluateProjection(plan: CompiledProjectionPlan, prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): ProjectedWireRow | undefined {
 		const columns = plan.valueSql.flatMap((valueSql, index) => [`${valueSql} AS p${index}`, `${plan.typeSql[index]} AS t${index}`]);
 		const row = tryOne(
 			this.#storage.sql.exec<Record<string, SqlStorageValue>>(
 				`SELECT ${columns.join(", ")}
 				 FROM (SELECT base_hk AS hk, base_sk AS sk, revision AS v, ttl_at AS ttl_epoch_utc_seconds, data_kind, data
-				       FROM latest_items WHERE base_hk = ?2 AND base_sk = ?3) AS i
+				       FROM latest_items WHERE hash_prefix_bucket = ?4 AND base_hk = ?2 AND base_sk = ?3) AS i
 				 LIMIT 1`,
 				...materializedPlanBindings(plan, "pool"),
 				hk,
 				sk,
+				prefix,
 			),
 		);
 		return row === undefined ? undefined : decodeProjectedRow(row, plan.names.length);
@@ -796,8 +804,9 @@ export class MaterializationStore {
 			return false;
 		}
 		const row = tryOne(
-			sql.exec<{ base_hk: ArrayBuffer; est_row_bytes: number; newest_seq: number | null }>(
-				`DELETE FROM latest_items WHERE item_id = ? AND deleted_at_ms IS NOT NULL RETURNING base_hk, est_row_bytes, newest_seq`,
+			sql.exec<{ hash_prefix_bucket: ArrayBuffer; base_hk: ArrayBuffer; est_row_bytes: number; newest_seq: number | null }>(
+				`DELETE FROM latest_items WHERE item_id = ? AND deleted_at_ms IS NOT NULL
+				 RETURNING hash_prefix_bucket, base_hk, est_row_bytes, newest_seq`,
 				itemId,
 			),
 		);
@@ -805,16 +814,16 @@ export class MaterializationStore {
 			return false;
 		}
 		this.#deletePositions(row.newest_seq);
-		this.keySizes.subtract(new Uint8Array(row.base_hk) as KeyBytes, row.est_row_bytes);
+		this.keySizes.subtract(asHashPrefixBucket(new Uint8Array(row.hash_prefix_bucket)), row.est_row_bytes);
 		return true;
 	}
 
 	/**
-	 * Deletes up to `limit` items of the base hash key `hk`, with their positions and their
-	 * `target_retry` rows. Returns true when no item of the key is left. The size estimate of the key
-	 * is not changed: the caller deletes it.
+	 * Deletes up to `limit` items of the storage prefix `prefix`, with their positions and their
+	 * `target_retry` rows. Returns true when no item of the prefix is left. The size estimate of the
+	 * prefix is not changed: the caller deletes it.
 	 */
-	deleteItemsOfHashKey(hk: KeyBytes, limit: number): boolean {
+	deleteItemsOfHashPrefixBucket(prefix: HashPrefixBucket, limit: number): boolean {
 		const sql = this.#storage.sql;
 		// The rows are read before the deletes, because the loop deletes from the table that it reads.
 		// `limit` bounds the array.
@@ -822,7 +831,7 @@ export class MaterializationStore {
 			.exec<{
 				item_id: number;
 				newest_seq: number | null;
-			}>(`SELECT item_id, newest_seq FROM latest_items WHERE base_hk = ?1 LIMIT ?2`, hk, limit)
+			}>(`SELECT item_id, newest_seq FROM latest_items WHERE hash_prefix_bucket = ?1 LIMIT ?2`, prefix, limit)
 			.toArray();
 		for (const row of rows) {
 			this.#deletePositions(row.newest_seq);
@@ -830,7 +839,7 @@ export class MaterializationStore {
 			sql.exec(`DELETE FROM target_index_keys WHERE item_id = ?1`, row.item_id);
 			sql.exec(`DELETE FROM latest_items WHERE item_id = ?1`, row.item_id);
 		}
-		return !exists(sql.exec(`SELECT 1 FROM latest_items WHERE base_hk = ?1 LIMIT 1`, hk));
+		return !exists(sql.exec(`SELECT 1 FROM latest_items WHERE hash_prefix_bucket = ?1 LIMIT 1`, prefix));
 	}
 
 	/**
@@ -847,65 +856,70 @@ export class MaterializationStore {
 
 	// ─── split decisions ──────────────────────────────────────────────────────
 
-	/** The first base hash key, and whether another one follows it. Two seeks of the unique key index. */
-	probeHashKeys(): { first: KeyBytes; more: boolean } | null {
+	/**
+	 * One base hash key of the first storage prefix, and whether another prefix follows it. Two seeks
+	 * of the unique key index.
+	 */
+	probeHashPrefixBuckets(): { first: KeyBytes; more: boolean } | null {
 		const sql = this.#storage.sql;
-		const first = tryOne(sql.exec<{ base_hk: ArrayBuffer }>(`SELECT base_hk FROM latest_items ORDER BY base_hk LIMIT 1`));
+		const first = tryOne(
+			sql.exec<{ hash_prefix_bucket: ArrayBuffer; base_hk: ArrayBuffer }>(
+				`SELECT hash_prefix_bucket, base_hk FROM latest_items ORDER BY hash_prefix_bucket, base_hk LIMIT 1`,
+			),
+		);
 		if (!first) {
 			return null;
 		}
-		return { first: asKey(first.base_hk), more: exists(sql.exec(`SELECT 1 FROM latest_items WHERE base_hk > ?1 LIMIT 1`, first.base_hk)) };
+		return {
+			first: asKey(first.base_hk),
+			more: exists(sql.exec(`SELECT 1 FROM latest_items WHERE hash_prefix_bucket > ?1 LIMIT 1`, first.hash_prefix_bucket)),
+		};
 	}
 
-	/** The items of `hk` in `[start, end)` in sort-key order, each with its `est_row_bytes`. It reads one row at a time. */
-	*sortKeySizes(hk: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Generator<{ sk: KeyBytes; bytes: number }> {
-		const lower = start ?? KeyCodec.encodeOptional(undefined);
-		const rows =
-			end === null
-				? this.#storage.sql.exec<{ base_sk: ArrayBuffer; est_row_bytes: number }>(
-						`SELECT base_sk, est_row_bytes FROM latest_items WHERE base_hk = ?1 AND base_sk >= ?2 ORDER BY base_sk`,
-						hk,
-						lower,
-					)
-				: this.#storage.sql.exec<{ base_sk: ArrayBuffer; est_row_bytes: number }>(
-						`SELECT base_sk, est_row_bytes FROM latest_items WHERE base_hk = ?1 AND base_sk >= ?2 AND base_sk < ?3 ORDER BY base_sk`,
-						hk,
-						lower,
-						end,
-					);
-		for (const row of rows) {
-			yield { sk: asKey(row.base_sk), bytes: row.est_row_bytes };
+	/**
+	 * The items of `prefix` in the composite interval `[start, end)` of `(base_hk, base_sk)`, in that
+	 * order, each with its `est_row_bytes`. A null edge is unbounded. It reads one row at a time.
+	 */
+	*compositeKeySizes(
+		prefix: HashPrefixBucket,
+		start: FokosCompositeKey | null,
+		end: FokosCompositeKey | null,
+	): Generator<{ hk: KeyBytes; sk: KeyBytes; bytes: number }> {
+		const conds = ["hash_prefix_bucket = ?"];
+		const params: unknown[] = [prefix];
+		if (start !== null) {
+			conds.push("(base_hk, base_sk) >= (?, ?)");
+			params.push(start.hk, start.sk);
+		}
+		if (end !== null) {
+			conds.push("(base_hk, base_sk) < (?, ?)");
+			params.push(end.hk, end.sk);
+		}
+		for (const row of this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer; est_row_bytes: number }>(
+			`SELECT base_hk, base_sk, est_row_bytes FROM latest_items WHERE ${conds.join(" AND ")} ORDER BY base_hk, base_sk`,
+			...params,
+		)) {
+			yield { hk: asKey(row.base_hk), sk: asKey(row.base_sk), bytes: row.est_row_bytes };
 		}
 	}
 
 	// ─── migration ────────────────────────────────────────────────────────────
 
 	/**
-	 * Pages `latest_items` in `(base_hk, base_sk)` order, strictly after `cursor`, each item with its
+	 * Pages `latest_items` over `interval` in storage order, strictly after `cursor`, each item with its
 	 * positions above `minSeq` and its `target_retry` rows. A position at or below `minSeq` is done for
-	 * each target, so the target needs no copy. `range` limits the read to one hash key and one
-	 * sort-key interval, with the cursor rules of `itemsPageStatement`. The generator reads one item
-	 * each time the caller asks for the next one.
+	 * each target, so the target needs no copy. The cursor and interval rules of `itemsPageStatement`
+	 * apply. The generator reads one item each time the caller asks for the next one.
 	 */
-	*queryMigrationItems(cursor: ScanCursor | null, limit: number, range: KeyRange | null, minSeq: number): Generator<MigratedLatestItem> {
-		const conds: string[] = [];
-		const params: unknown[] = [];
-		if (range === null) {
-			if (cursor) {
-				conds.push("(base_hk, base_sk) > (?, ?)");
-				params.push(cursor.hk, cursor.sk);
-			}
-		} else {
-			conds.push("base_hk = ?", cursor ? "base_sk > ?" : "base_sk >= ?");
-			params.push(range.hk, cursor ? cursor.sk : range.start);
-			if (range.end !== null) {
-				conds.push("base_sk < ?");
-				params.push(range.end);
-			}
-		}
-		const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")} ` : "";
+	*queryMigrationItems(cursor: StorageCursor | null, limit: number, interval: KeyRange, minSeq: number): Generator<MigratedLatestItem> {
+		const { conds, params } = intervalTerms(
+			["hash_prefix_bucket", "base_hk", "base_sk"],
+			interval,
+			cursor && [cursor.prefix, cursor.hk, cursor.sk],
+		);
 		const rows = this.#storage.sql.exec<{
 			item_id: number;
+			hash_prefix_bucket: ArrayBuffer;
 			base_hk: ArrayBuffer;
 			base_sk: ArrayBuffer;
 			revision: number;
@@ -916,14 +930,15 @@ export class MaterializationStore {
 			est_row_bytes: number;
 			data: string | ArrayBuffer | null;
 		}>(
-			`SELECT item_id, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data
-			 FROM latest_items ${where}ORDER BY base_hk, base_sk LIMIT ?`,
+			`SELECT item_id, hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data
+			 FROM latest_items WHERE ${conds.join(" AND ")} ORDER BY hash_prefix_bucket, base_hk, base_sk LIMIT ?`,
 			...params,
 			limit,
 		);
-		for (const { base_hk, base_sk, data, ...row } of rows) {
+		for (const { hash_prefix_bucket, base_hk, base_sk, data, ...row } of rows) {
 			yield {
 				...row,
+				prefix: asHashPrefixBucket(new Uint8Array(hash_prefix_bucket)),
 				hk: asKey(base_hk),
 				sk: asKey(base_sk),
 				data: data === null || typeof data === "string" ? data : new Uint8Array(data),
@@ -932,29 +947,6 @@ export class MaterializationStore {
 				indexKeys: this.#indexKeyRows(row.item_id),
 			};
 		}
-	}
-
-	/** The hash-key walk of `latest_items` for a hash child, with the rules of `walkByHashKey`. */
-	walkMigrationItems(
-		cursor: HashKeyWalkCursor<ScanCursor> | null,
-		limit: number,
-		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
-		minSeq: number,
-	): Generator<HashKeyWalkEntry<MigratedLatestItem>> {
-		const firstRowAfter = (after: KeyBytes | null) => {
-			const row = tryOne(
-				after === null
-					? this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer }>(
-							`SELECT base_hk, base_sk FROM latest_items ORDER BY base_hk, base_sk LIMIT 1`,
-						)
-					: this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer }>(
-							`SELECT base_hk, base_sk FROM latest_items WHERE base_hk > ?1 ORDER BY base_hk, base_sk LIMIT 1`,
-							after,
-						),
-			);
-			return row && { hk: asKey(row.base_hk), sk: asKey(row.base_sk) };
-		};
-		return walkByHashKey(firstRowAfter, cursor, limit, owns, (after, n, range) => this.queryMigrationItems(after, n, range, minSeq));
 	}
 
 	/** The positions of an item from its newest position `seq`, while they are above `minSeq`. */
@@ -1000,17 +992,17 @@ export class MaterializationStore {
 	/**
 	 * Inserts a migrated item with its positions and its `target_retry` rows, which it marks as
 	 * inherited. A target takes no write while it imports, so an item that is present came from an
-	 * earlier try of the same page, and the insert keeps it. The conflict target stays `(base_hk,
-	 * base_sk)`, for the reason of `PartitionStore.insertItemIfAbsent`. Returns true when it inserted
-	 * the item.
+	 * earlier try of the same page, and the insert keeps it. The conflict target stays
+	 * `(hash_prefix_bucket, base_hk, base_sk)`, for the reason of `PartitionStore.insertItemIfAbsent`.
+	 * Returns true when it inserted the item.
 	 */
 	insertMigratedItem(item: MigratedLatestItem): boolean {
 		const sql = this.#storage.sql;
 		const inserted = tryOne(
 			sql.exec(
-				`INSERT INTO latest_items (item_id, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-				 ON CONFLICT (base_hk, base_sk) DO NOTHING
+				`INSERT INTO latest_items (item_id, hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
+				 VALUES (?1, ?11, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+				 ON CONFLICT (hash_prefix_bucket, base_hk, base_sk) DO NOTHING
 				 RETURNING item_id`,
 				item.item_id,
 				item.hk,
@@ -1022,6 +1014,7 @@ export class MaterializationStore {
 				item.ttl_at,
 				item.est_row_bytes,
 				item.data,
+				item.prefix,
 			),
 		);
 		if (inserted === undefined) {
@@ -1143,7 +1136,7 @@ export type TargetItemRef = { itemId: number; estRowBytes: number };
 
 export type TargetPosition = TargetItemRef & { seq: number; inRetry: boolean };
 
-export type TargetImage = { hk: KeyBytes; sk: KeyBytes; revision: number } & (
+export type TargetImage = { prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes; revision: number } & (
 	| { deleted: true }
 	| { deleted: false; kind: DataKind; data: string | Uint8Array; ttlAt: number | null }
 );
@@ -1160,6 +1153,8 @@ export type MigratedRetryRow = { target_id: string; kind: string; not_before: nu
  */
 export type MigratedLatestItem = {
 	item_id: number;
+	/** The storage prefix of `hk`. */
+	prefix: HashPrefixBucket;
 	hk: KeyBytes;
 	sk: KeyBytes;
 	revision: number;
@@ -1197,9 +1192,6 @@ export type MigratedState = {
 };
 
 /** The KV field name of the snapshot of a promoted hash key. */
-function snapshotKey(hk: KeyBytes): string {
-	return hk.toBase64({ alphabet: "base64url" });
-}
 
 function asKey(value: ArrayBuffer): KeyBytes {
 	return KeyCodec.asKeyBytes(new Uint8Array(value));

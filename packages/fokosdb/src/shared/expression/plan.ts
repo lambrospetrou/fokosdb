@@ -5,15 +5,16 @@ import type { QuerySelect } from "../types.js";
 import type { ExpressionRequiredColumn } from "./semantic.js";
 
 export const CONDITION_PLAN_VERSION = 1 as const;
-export const CONDITION_FIXED_BINDING_COUNT = 2;
+/** hk, sk, and the storage prefix of the item, bound before the plan in a condition statement. */
+export const CONDITION_FIXED_BINDING_COUNT = 3;
 
 export const UPDATE_PLAN_VERSION = 1 as const;
 
 export const PROJECTION_PLAN_VERSION = 1 as const;
 export const QUERY_PLAN_VERSION = 1 as const;
 
-/** hk and sk, bound after the pool in a projected point read. */
-export const PROJECTION_FIXED_BINDING_COUNT = 2;
+/** hk, sk, and the storage prefix of the item, bound after the pool in a projected point read. */
+export const PROJECTION_FIXED_BINDING_COUNT = 3;
 /**
  * The parameter every pool-layout plan owns, bound always, with the text "[]" when the plan has no
  * descriptor. Workers SQLite requires the bound value count to equal the statement's parameter
@@ -22,17 +23,18 @@ export const PROJECTION_FIXED_BINDING_COUNT = 2;
  * parameters follow the statement's fixed head.
  */
 export const POOL_PARAM = 1;
-/** hk, near bound, far bound, LIMIT: the widest scan tail after the pool of a query plan. */
-export const QUERY_MAX_TRAILING_BINDING_COUNT = 4;
+/** The storage prefix, hk, near bound, far bound, LIMIT: the widest scan tail after the pool of a query plan. */
+export const QUERY_MAX_TRAILING_BINDING_COUNT = 5;
 /** The scan terms of the widest query statement, used for the SQL size check. */
-export const QUERY_WIDEST_SCAN_CONDITIONS: readonly string[] = ["hk = ?", "sk >= ?", "sk <= ?"];
+export const QUERY_WIDEST_SCAN_CONDITIONS: readonly string[] = ["hash_prefix_bucket = ?", "hk = ?", "sk >= ?", "sk <= ?"];
 
 /**
  * Parameters every statement that runs an update plan binds BEFORE the plan's own, in this order:
- * the hash key and the sort key. The compiler offsets the plan's parameters past them, exactly as it
- * does for a condition, so every such statement shares one numbering and one binding order.
+ * the hash key, the sort key, and the storage prefix of the item. The compiler offsets the plan's
+ * parameters past them, exactly as it does for a condition, so every such statement shares one
+ * numbering and one binding order.
  */
-export const UPDATE_FIXED_BINDING_COUNT = 2;
+export const UPDATE_FIXED_BINDING_COUNT = 3;
 
 /**
  * The widest statement-local tail any statement appends AFTER an update plan's parameters — today
@@ -46,19 +48,21 @@ export const UPDATE_FIXED_BINDING_COUNT = 2;
 export const UPDATE_MAX_TRAILING_BINDING_COUNT = 6;
 
 export function composeConditionStatement(predicateSql: string): string {
-	return `WITH requested(requested_hk, requested_sk) AS (VALUES (?, ?))
+	return `WITH requested(requested_hk, requested_sk, requested_prefix) AS (VALUES (?, ?, ?))
 SELECT i.hk IS NOT NULL AS item_present,
        CASE WHEN (${predicateSql}) THEN 1 ELSE 0 END AS condition_ok,
        i.last_read_ts,
        i.last_write_ts
 FROM requested
-LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
+LEFT JOIN items AS i
+  ON i.hash_prefix_bucket = requested.requested_prefix AND i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
 }
 
 /**
  * The statement that reads what an update plan gives for one item, and writes nothing.
  *
- * ?1 and ?2 are the keys, as they are in every statement that runs an update plan.
+ * ?1 and ?2 are the keys and ?3 is the storage prefix, as they are in every statement that runs an
+ * update plan.
  *
  * value_type_ok names ONE cause of an inapplicable update, so a caller learns that its value was
  * bytes for this item instead of only that the update did not apply. It runs over a JSON pre-image
@@ -66,7 +70,7 @@ LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.reque
  * row has a JSON pre-image, because an update creates the item.
  */
 export function composeUpdateProbeStatement(plan: Pick<CompiledUpdatePlan, "documentSql" | "applicableSql" | "valueTypeSql">): string {
-	return `WITH requested(requested_hk, requested_sk) AS (VALUES (?1, ?2))
+	return `WITH requested(requested_hk, requested_sk, requested_prefix) AS (VALUES (?1, ?2, ?3))
 SELECT i.hk IS NOT NULL AS item_present,
        i.applicable,
        CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
@@ -75,7 +79,8 @@ SELECT i.hk IS NOT NULL AS item_present,
        i.last_write_ts
 FROM (SELECT i.*, (${plan.applicableSql}) AS applicable
       FROM requested
-      LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk) AS i`;
+      LEFT JOIN items AS i
+        ON i.hash_prefix_bucket = requested.requested_prefix AND i.hk = requested.requested_hk AND i.sk = requested.requested_sk) AS i`;
 }
 
 /** The TTL of the stored row. The `ttlSql` of an update write that sets no TTL. */
@@ -84,7 +89,9 @@ export const UPDATE_STORED_TTL_SQL = "i.ttl_epoch_utc_seconds";
 /**
  * The statement that applies an update plan to one item, and creates the item when it is absent.
  *
- * ?1 and ?2 are the keys. `txOrderTsParam` and `limitParam` are parameters of the statement tail.
+ * ?1 and ?2 are the keys, and ?3 is the storage prefix. `txOrderTsParam`, `itemIdParam`, and
+ * `limitParam` are parameters of the statement tail. `itemIdParam` is the `item_id` of a row that
+ * the statement creates.
  * `ttlSql` is a tail parameter for an operation that sets a TTL, and UPDATE_STORED_TTL_SQL for one
  * that does not: the TTL of the pre-image then survives. The insert carries the TTL of the joined
  * row, which is NULL for an item that this statement creates, and the conflict branch assigns that
@@ -97,17 +104,17 @@ export const UPDATE_STORED_TTL_SQL = "i.ttl_epoch_utc_seconds";
  */
 export function composeUpdateWriteStatement(
 	plan: Pick<CompiledUpdatePlan, "documentSql">,
-	tail: { txOrderTsParam: string; ttlSql: string; limitParam: string },
+	tail: { txOrderTsParam: string; ttlSql: string; itemIdParam: string; limitParam: string },
 ): string {
-	const { txOrderTsParam, ttlSql, limitParam } = tail;
+	const { txOrderTsParam, ttlSql, itemIdParam, limitParam } = tail;
 	const estRowBytes = estRowBytesExpr(plan.documentSql, "?1", "?2");
-	return `INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
-SELECT ?1, ?2, ${JSON_KIND_CODE}, ${ttlSql}, d.max_deleted_v + 1,
+	return `INSERT INTO items (hash_prefix_bucket, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+SELECT ?3, ?1, ?2, ${itemIdParam}, ${JSON_KIND_CODE}, ${ttlSql}, d.max_deleted_v + 1,
        MAX(${txOrderTsParam}, d.max_delete_tx_order_ts), MAX(${txOrderTsParam}, d.max_delete_tx_order_ts),
        ${estRowBytes}, ${plan.documentSql}
-  FROM deletion_metadata AS d LEFT JOIN items AS i ON i.hk = ?1 AND i.sk = ?2
+  FROM deletion_metadata AS d LEFT JOIN items AS i ON i.hash_prefix_bucket = ?3 AND i.hk = ?1 AND i.sk = ?2
  WHERE d.id = 1 AND ${estRowBytes} <= ${limitParam}
-ON CONFLICT(hk, sk) DO UPDATE SET
+ON CONFLICT(hash_prefix_bucket, hk, sk) DO UPDATE SET
   data = excluded.data,
   data_kind = excluded.data_kind,
   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
@@ -122,7 +129,7 @@ export function composeProjectionStatement(plan: Pick<CompiledProjectionPlan, "v
 	const columns = plan.valueSql.flatMap((valueSql, index) => [`${valueSql} AS p${index}`, `${plan.typeSql[index]} AS t${index}`]);
 	return `SELECT i.v, i.ttl_epoch_utc_seconds, ${columns.join(", ")}
 FROM items AS i
-WHERE i.hk = ?2 AND i.sk = ?3
+WHERE i.hash_prefix_bucket = ?4 AND i.hk = ?2 AND i.sk = ?3
 LIMIT 1`;
 }
 
@@ -201,7 +208,7 @@ export type CompiledConditionPlan = {
 	bindings: readonly ExpressionBindingDescriptor[];
 	/** Number of parameter bindings in this plan. */
 	bindingCount: number;
-	/** Total bindings including fixed statement parameters (requested_hk, requested_sk). */
+	/** Total bindings including fixed statement parameters (requested_hk, requested_sk, requested_prefix). */
 	completeBindingCount: number;
 	/** Storage columns required to execute the condition statement. */
 	requiredColumns: readonly ExpressionRequiredColumn[];
@@ -296,7 +303,7 @@ export type CompiledProjectionPlan = {
 	bindings: readonly ExpressionBindingDescriptor[];
 	/** Number of binding descriptors in this plan. */
 	bindingCount: number;
-	/** POOL_PARAM plus PROJECTION_FIXED_BINDING_COUNT (2: hk, sk); the pool is bound also when the plan has no descriptor. */
+	/** POOL_PARAM plus PROJECTION_FIXED_BINDING_COUNT (3: hk, sk, prefix); the pool is bound also when the plan has no descriptor. */
 	completeBindingCount: number;
 	/** Storage columns required to execute the projection statement. */
 	requiredColumns: readonly ExpressionRequiredColumn[];

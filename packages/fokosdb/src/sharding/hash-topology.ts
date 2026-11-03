@@ -1,4 +1,4 @@
-import { HashPrefixBucketDigitCursor, maxHashDepth } from "./hash-primitives.js";
+import { HashPrefixBucketDigitCursor, maxHashDepth, type HashPrefixBucket } from "./hash-primitives.js";
 
 export type HashTopologySnapshot = {
 	// Zero-copy Uint8Array view over the used portion of the arena buffer (nextFree * 4 bytes).
@@ -73,7 +73,7 @@ export class HashTopology {
 	}
 
 	/** The digits of `hashPrefixBucket` below the owner: the owner owns the bucket, so its own digits are skipped. */
-	private digitsBelowOwner(hashPrefixBucket: Uint8Array): HashPrefixBucketDigitCursor {
+	private digitsBelowOwner(hashPrefixBucket: HashPrefixBucket): HashPrefixBucketDigitCursor {
 		const cursor = new HashPrefixBucketDigitCursor(hashPrefixBucket, this.rootTreesN);
 		for (let d = 0; d < this.ownerAbsDepth; d++) {
 			cursor.next(this.K);
@@ -96,7 +96,7 @@ export class HashTopology {
 	 * deepest known descendant.
 	 * @return relative depth (0 = immediate child is the target; no deeper split recorded yet)
 	 */
-	findLeaf(hashPrefixBucket: Uint8Array): number {
+	findLeaf(hashPrefixBucket: HashPrefixBucket): number {
 		const digits = this.digitsBelowOwner(hashPrefixBucket);
 		let block = 0;
 		let relDepth = 0;
@@ -118,7 +118,7 @@ export class HashTopology {
 	 * @param actualRelDepth The actual relative depth of the target partition that served the request (non-split leaf).
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	updateFromHint(hashPrefixBucket: Uint8Array, actualRelDepth: number): boolean {
+	updateFromHint(hashPrefixBucket: HashPrefixBucket, actualRelDepth: number): boolean {
 		const digits = this.digitsBelowOwner(hashPrefixBucket);
 		let block = 0;
 		let updated = false;
@@ -153,7 +153,7 @@ export class HashTopology {
 	 * ancestor. The orphaned block keeps its slots: the arena never frees, and the loss is bounded.
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	invalidate(hashPrefixBucket: Uint8Array, relDepth: number): boolean {
+	invalidate(hashPrefixBucket: HashPrefixBucket, relDepth: number): boolean {
 		if (relDepth < 1) {
 			return false;
 		}

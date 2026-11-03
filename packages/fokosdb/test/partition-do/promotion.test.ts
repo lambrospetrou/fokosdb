@@ -359,8 +359,8 @@ describe.concurrent("FokosDBPartitionDO — a range root before its first page",
 			"false-positive",
 			(k) =>
 				childDigit(partition.ctx.topology, kb(k), 0) === childDigit(partition.ctx.topology, kb("bob"), 0) &&
-				rootBloom.maybePromoted(kb(k)) &&
-				ownerBloom.maybePromoted(kb(k)),
+				rootBloom.maybePromoted(partition.bucketOf(k)) &&
+				ownerBloom.maybePromoted(partition.bucketOf(k)),
 		);
 		const owner = await partition.childOwning(key);
 		expect(owner.doName).toBe(bobOwner.doName);
@@ -542,8 +542,8 @@ describe.concurrent("FokosDBPartitionDO — a transaction through a hash jump to
 		// depth-2 hint for one of them names the same grandchild for the other. The filter of the root
 		// reports h1 as promoted and h2 as not promoted, and no promotion moved either key.
 		const path = (key: string) => hashDigits(partition.ctx.topology, kb(key), 2).path;
-		const h1 = findKey("tx-path", (k) => rootBloom.maybePromoted(kb(k)));
-		const h2 = findKey("tx-path", (k) => path(k).join() === path(h1).join() && k !== h1 && !rootBloom.maybePromoted(kb(k)));
+		const h1 = findKey("tx-path", (k) => rootBloom.maybePromoted(partition.bucketOf(k)));
+		const h2 = findKey("tx-path", (k) => path(k).join() === path(h1).join() && k !== h1 && !rootBloom.maybePromoted(partition.bucketOf(k)));
 		const owner = await partition.childOwning(h1);
 		const missing = TestPartition.at(resolveDescendantHashPartitionContext(partition.ctx, path(h1)));
 
@@ -678,9 +678,9 @@ describe.concurrent("FokosDBPartitionDO — the Bloom step of the transaction sh
 		// calls to the same partition, and it fails with `commit_keyset_mismatch`. In the first case the
 		// second hash key has no Bloom hit and is local. In the second case both hash keys have a Bloom
 		// hit and one exact target.
-		const hit = findKey("hit", (k) => bloom.maybePromoted(kb(k)));
-		const otherHit = findKey("hit", (k) => k !== hit && bloom.maybePromoted(kb(k)));
-		const miss = findKey("miss", (k) => !bloom.maybePromoted(kb(k)));
+		const hit = findKey("hit", (k) => bloom.maybePromoted(partition.bucketOf(k)));
+		const otherHit = findKey("hit", (k) => k !== hit && bloom.maybePromoted(partition.bucketOf(k)));
+		const miss = findKey("miss", (k) => !bloom.maybePromoted(partition.bucketOf(k)));
 		for (const [first, second] of [
 			[hit, miss],
 			[hit, otherHit],
@@ -721,7 +721,7 @@ describe.concurrent("FokosDBPartitionDO — the Bloom step of the transaction sh
 		const bloom = await learnOnePromotion(partition);
 		// The filter reports this hash key as promoted, and no promotion started for it. Its range root
 		// answers `range_partition_not_initialized`, and the source resolves the key again without the filter.
-		const hashKey = findKey("false-positive", (k) => bloom.maybePromoted(kb(k)));
+		const hashKey = findKey("false-positive", (k) => bloom.maybePromoted(partition.bucketOf(k)));
 		const rangeRoot = partition.rangeRoot(hashKey);
 
 		const put = await partition.put({ hashKey: kb(hashKey), sortKey: kb("sk1"), data: "v", kind: "text" });
@@ -761,7 +761,7 @@ describe.concurrent("FokosDBPartitionDO — the Bloom step of the transaction sh
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		const bloom = await learnOnePromotion(partition);
 		// The filter reports this hash key as promoted, and no promotion moved it.
-		const hashKey = findKey("false-positive", (k) => bloom.maybePromoted(kb(k)));
+		const hashKey = findKey("false-positive", (k) => bloom.maybePromoted(partition.bucketOf(k)));
 		await partition.put({ hashKey: kb(hashKey), sortKey: kb("sk1"), data: "v", kind: "text" });
 
 		const rangeRoot = partition.rangeRoot(hashKey);

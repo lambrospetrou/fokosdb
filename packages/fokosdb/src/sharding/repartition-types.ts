@@ -8,12 +8,13 @@
  * application defines its own streams.
  */
 import type { FokosMigrationPageBudget } from "./runtime-config.js";
+import type { HashPrefixBucket } from "./hash-primitives.js";
 import type { KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { PromotedKeyCursor, RepartitionKind, RepartitionState, TargetInitialization } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
-import type { FokosEnvelope, FokosRequestPromotionResult } from "./runtime-types.js";
+import type { FokosEnvelope, FokosRequestPromotionResult, FokosStorageInterval } from "./runtime-types.js";
 
 export type { FokosPartitionRef, FokosSlice };
 
@@ -117,7 +118,7 @@ export type FokosMigrationAckRequest = {
 
 /** One bounded page of one phase. A `host` page also holds exactly one of the host's own streams. */
 export type FokosMigrationPage =
-	| { phase: "overrides"; overrides: { hashKey: KeyBytes }[]; nextCursor: FokosMigrationCursor | null }
+	| { phase: "overrides"; overrides: { hashPrefixBucket: HashPrefixBucket }[]; nextCursor: FokosMigrationCursor | null }
 	| { phase: "host"; page: unknown; nextCursor: FokosMigrationCursor | null };
 
 /**
@@ -171,11 +172,17 @@ export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteL
  * what each page carries; it ends the phase by answering with a null cursor.
  *
  * `belongsToTarget` is the ownership function of the slice, and the host must filter its rows with
- * it. For a `hash_child` slice it returns false for a hash key with a terminal route override, because
- * a range tree owns that key; the child receives the override pointer and no data copy. For a `range`
- * slice it tests the hash key and `[start, end)`. For a `promoted_key` slice it tests the hash key only.
+ * it. For a `hash_child` slice it returns false for a hash key whose hashPrefixBucket has a terminal
+ * route override, because a range tree owns that hashPrefixBucket; the child receives the override
+ * pointer and no data copy. For a `range` slice it tests the hashPrefixBucket and the composite
+ * interval `[start, end)`. For a `promoted_hash_prefix_bucket` slice it tests the hashPrefixBucket.
  *
  * `budget` holds the active page budgets of the runtime. The host keeps each page inside them.
+ *
+ * `interval` is the storage interval of the target, its scope after the cutover. Every row of the
+ * slice is inside it, so the host reads the interval in storage order and filters each row with
+ * `belongsToTarget`. The host must not compute the interval from the slice alone: a hash-child slice
+ * has no root and no ancestor path.
  *
  * `validatePage` runs on the target before the page transaction, and a throw delays the import with
  * no write. `inSlice` is true for a key in the slice of the target. It does not read the route
@@ -187,6 +194,7 @@ export interface MigrationHost {
 		slice: FokosSlice,
 		belongsToTarget: (key: RouteKey) => boolean,
 		budget: FokosMigrationPageBudget,
+		interval: FokosStorageInterval,
 	): { page: unknown; nextCursor: unknown };
 	applyPage(page: unknown, slice: FokosSlice): void;
 	validatePage(cursor: unknown, page: unknown, nextCursor: unknown, inSlice: (key: RouteKey) => boolean): void;
@@ -196,8 +204,8 @@ export interface MigrationHost {
 
 /** One repartition, and one of its targets when it has one. */
 export type FokosStatusEntry = {
-	/** `hashKey` is the key a promotion moves, and null for a split. */
-	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState; hashKey: KeyBytes | null };
+	/** `hashPrefixBucket` is the hashPrefixBucket a promotion moves, and null for a split. */
+	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState; hashPrefixBucket: HashPrefixBucket | null };
 	target: null | {
 		index: number;
 		ref: FokosPartitionRef;

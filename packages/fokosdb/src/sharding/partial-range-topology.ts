@@ -1,5 +1,5 @@
 import { AddResult, BloomFilter, type BloomFilterSnapshot } from "../shared/bloom-filter.js";
-import type { KeyBytes } from "./key-codec.js";
+import type { HashPrefixBucket } from "./hash-primitives.js";
 
 export type PartialRangeTopologySnapshot = {
 	version: 1;
@@ -22,27 +22,15 @@ export class PartialRangeTopology {
 	}
 
 	/**
-	 * @returns True if the key is probably promoted (may be a false positive), false if definitely not promoted.
+	 * @returns True if the hashPrefixBucket is probably promoted (may be a false positive), false if
+	 * definitely not promoted.
 	 */
-	maybePromoted(hashKey: KeyBytes): boolean {
-		return this.bloom.has(hashKey);
+	maybePromoted(hashPrefixBucket: HashPrefixBucket): boolean {
+		return this.bloom.has(hashPrefixBucket);
 	}
 
-	learnPromotedKey(hashKey: KeyBytes): AddResult {
-		return this.bloom.add(hashKey);
-	}
-
-	/**
-	 * @returns True if any key was newly added to the bloom filter (i.e. the filter was modified).
-	 */
-	learnPromotedKeys(hashKeys: Iterable<KeyBytes>): boolean {
-		let anyAdded = false;
-		for (const key of hashKeys) {
-			if (this.bloom.add(key) === AddResult.Added) {
-				anyAdded = true;
-			}
-		}
-		return anyAdded;
+	learnPromotedHashPrefixBucket(hashPrefixBucket: HashPrefixBucket): AddResult {
+		return this.bloom.add(hashPrefixBucket);
 	}
 
 	toSnapshot(): PartialRangeTopologySnapshot {

@@ -15,6 +15,7 @@ import { env } from "cloudflare:workers";
 import { expect, it } from "vitest";
 import { FokosTopologyKeeper, KeyCodec } from "../../src/sharding/index-server.js";
 import { parseHashBody } from "../../src/sharding/topology-codec.js";
+import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
 import { hashSplitReport, promotionReport } from "../sharding/topology-events.js";
 
 const R = 16;
@@ -77,9 +78,10 @@ it("hash body build", async () => {
 				storage.transactionSync(() => {
 					for (let i = 0; i < promoted; i++) {
 						sql.exec(
-							`INSERT INTO fokos_topo_range_intervals (shard_group, hash_key, start, end_is_max, end, seq) VALUES (?1, ?2, x'', 1, x'', 1)`,
+							`INSERT INTO fokos_topo_range_intervals (shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
+							 VALUES (?1, ?2, x'', x'', 1, x'', x'', 1)`,
 							sg,
-							KeyCodec.encode(`user-${i}`),
+							hashPrefixBucketOf(KeyCodec.encode(`user-${i}`), sg),
 						);
 					}
 					sql.exec(

@@ -14,6 +14,10 @@ import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.
 import type { PrepareRequest, TransactionItem, TransactionItemKey } from "../transaction-wire-types.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
 
 const kb = (s: string) => KeyCodec.encode(s);
 const SK = kb("sk");
@@ -29,6 +33,7 @@ async function withPartition<R>(fn: (h: Harness) => R): Promise<R> {
 		const store = new PartitionStore(state.storage);
 		const participant = new TransactionParticipant({
 			store,
+			storagePrefix: P,
 			now: () => BASE_NOW,
 			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 			staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
@@ -95,13 +100,21 @@ function uniqueKeys(items: readonly TransactionItem[]): TransactionItemKey[] {
  * from a deleted item. Every stamp is older than T.
  */
 function seed(store: PartitionStore): void {
-	store.upsertItem({ hk: kb("A"), sk: SK, data: JSON.stringify({ n: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
-	store.upsertItem({ hk: kb("A"), sk: SK, data: JSON.stringify({ n: 1, a: true }), kind: "json", ttlAt: 500, txOrderTs: 2 });
-	store.upsertItem({ hk: kb("B"), sk: SK, data: JSON.stringify({ b: 1 }), kind: "json", ttlAt: null, txOrderTs: 3 });
+	store.upsertItem({ prefix: P(kb("A")), hk: kb("A"), sk: SK, data: JSON.stringify({ n: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
+	store.upsertItem({
+		prefix: P(kb("A")),
+		hk: kb("A"),
+		sk: SK,
+		data: JSON.stringify({ n: 1, a: true }),
+		kind: "json",
+		ttlAt: 500,
+		txOrderTs: 2,
+	});
+	store.upsertItem({ prefix: P(kb("B")), hk: kb("B"), sk: SK, data: JSON.stringify({ b: 1 }), kind: "json", ttlAt: null, txOrderTs: 3 });
 	for (let i = 0; i < 3; i++) {
-		store.upsertItem({ hk: kb("gone"), sk: SK, data: "x", kind: "text", ttlAt: null, txOrderTs: 4 });
+		store.upsertItem({ prefix: P(kb("gone")), hk: kb("gone"), sk: SK, data: "x", kind: "text", ttlAt: null, txOrderTs: 4 });
 	}
-	store.deleteItem({ hk: kb("gone"), sk: SK, txOrderTs: 5 });
+	store.deleteItem({ prefix: P(kb("gone")), hk: kb("gone"), sk: SK, txOrderTs: 5 });
 }
 
 const b64 = (value: unknown) => (typeof value === "string" ? value : new Uint8Array(value as ArrayBuffer).toBase64());
@@ -268,7 +281,7 @@ describe("ordered per-item execution: evaluate", () => {
 			seed(store);
 			// A newer read of A: a check orders against last_write_ts and passes, a put orders against
 			// last_read_ts and fails.
-			store.bumpItemReadTs(kb("A"), SK, T + 1);
+			store.bumpItemReadTs(P(kb("A")), kb("A"), SK, T + 1);
 			const ops = withOpIndex([check("A", true), put("A", { n: 2 }), check("A", true)]);
 			expect(participant.prepareLocal(prepareReq(ops))).toMatchObject({
 				outcome: "rejected",
@@ -316,7 +329,7 @@ describe("ordered per-item execution: evaluate", () => {
 	])("returns the same failure image on both paths after %s of another item", async (_name, beforeDelete, version) => {
 		await withPartition(({ participant, store, storage }) => {
 			for (let i = 0; i < 50; i++) {
-				store.upsertItem({ hk: kb("A"), sk: SK, data: '{"n":1}', kind: "json", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb("A")), hk: kb("A"), sk: SK, data: '{"n":1}', kind: "json", ttlAt: null, txOrderTs: 1 });
 			}
 			const before = snapshot(storage);
 			const ops = withOpIndex([
@@ -486,11 +499,11 @@ describe("ordered per-item execution: versions", () => {
 			// A delete of another item at v = 50 between prepare and commit raises max_deleted_v to its
 			// delete revision 51.
 			storage.sql.exec(`UPDATE items SET v = 50 WHERE hk = ?`, kb("B"));
-			store.deleteItem({ hk: kb("B"), sk: SK, txOrderTs: 10 });
+			store.deleteItem({ prefix: P(kb("B")), hk: kb("B"), sk: SK, txOrderTs: 10 });
 			expect(store.getMaxDeletedV()).toBe(51);
 
 			participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: T, items: uniqueKeys(request.items) });
-			const row = store.getItem(kb("X"), SK).row;
+			const row = store.getItem(P(kb("X")), kb("X"), SK).row;
 			expect(row?.v).toBe(53);
 			expect(JSON.parse(row?.data as string)).toEqual({ n: 2 });
 		});
@@ -539,7 +552,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			const stored = storage.sql.exec<{ data: ArrayBuffer; v: number }>(`SELECT data, v FROM items WHERE hk = ?`, kb("A")).one();
 			expect(new Uint8Array(stored.data)).toEqual(lock.data);
 			expect(stored.v).toBe(4);
-			expect(JSON.parse(store.getItem(kb("A"), SK).row?.data as string)).toEqual({ n: 3, a: true });
+			expect(JSON.parse(store.getItem(P(kb("A")), kb("A"), SK).row?.data as string)).toEqual({ n: 3, a: true });
 		});
 	});
 
@@ -591,6 +604,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			for (const key of ["A", "C"]) {
 				store.insertPendingLock({
 					...tx,
+					prefix: P(kb(key)),
 					hk: kb(key),
 					sk: SK,
 					operation: "put",
@@ -629,7 +643,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			// A repeated commit finds no lock row and applies nothing.
 			participant.commitLocal(commit);
 			expect(snapshot(storage)).toEqual(after);
-			expect(JSON.parse(store.getItem(kb("A"), SK).row?.data as string)).toEqual({ n: 6 });
+			expect(JSON.parse(store.getItem(P(kb("A")), kb("A"), SK).row?.data as string)).toEqual({ n: 6 });
 		});
 	});
 
@@ -642,7 +656,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(warn).not.toHaveBeenCalled();
 
-			store.deletePendingTxKeys(request.transactionId, [{ hashKey: kb("C"), sortKey: SK }]);
+			store.deletePendingTxKeys(request.transactionId, [{ prefix: P(kb("C")), hashKey: kb("C"), sortKey: SK }]);
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(warn.mock.calls[0][0]).toMatchObject({ transactionId: request.transactionId, lockedItems: 1, items: 2, outcome: "accepted" });
@@ -694,7 +708,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(store.listPendingTxKeys(request.transactionId)).toHaveLength(12);
 			participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: T, items: uniqueKeys(request.items) });
-			keys.forEach((sortKey, i) => expect(store.getItem(kb("H"), sortKey).row?.data).toBe(`v-${i}`));
+			keys.forEach((sortKey, i) => expect(store.getItem(P(kb("H")), kb("H"), sortKey).row?.data).toBe(`v-${i}`));
 		});
 	});
 });

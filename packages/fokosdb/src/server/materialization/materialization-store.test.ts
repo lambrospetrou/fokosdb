@@ -4,6 +4,10 @@ import { describe, expect, it } from "vitest";
 import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);
@@ -28,7 +32,13 @@ async function withStore(fn: (h: Harness) => void): Promise<void> {
 		fn({
 			store,
 			ingest: (hk, revision, targets, deleted = false) =>
-				store.putLatestImage(image(hk, revision, deleted), 1_000, store.storedImage(kb(hk), NO_SK), targets),
+				store.putLatestImage(
+					P(image(hk, revision, deleted).hashKey),
+					image(hk, revision, deleted),
+					1_000,
+					store.storedImage(P(kb(hk)), kb(hk), NO_SK),
+					targets,
+				),
 			positions: () =>
 				state.storage.sql
 					.exec<{
@@ -37,7 +47,7 @@ async function withStore(fn: (h: Harness) => void): Promise<void> {
 						prev_seq: number | null;
 					}>(`SELECT seq, item_id, prev_seq FROM change_positions ORDER BY seq`)
 					.toArray(),
-			newestSeq: (hk) => store.storedImage(kb(hk), NO_SK)?.newestSeq,
+			newestSeq: (hk) => store.storedImage(P(kb(hk)), kb(hk), NO_SK)?.newestSeq,
 		});
 	});
 }
@@ -119,13 +129,14 @@ describe("MaterializationStore — change positions", () => {
 describe("MaterializationStore — row size estimate", () => {
 	it("counts the data, the keys two times, and the fixed part, for a live image and for a tombstone", async () => {
 		await withStore((h) => {
-			const keys = kb("x").byteLength + NO_SK.byteLength;
+			// The keys and the 8-byte storage prefix.
+			const keys = 8 + kb("x").byteLength + NO_SK.byteLength;
 			h.ingest("x", 1, []);
-			expect(h.store.storedImage(kb("x"), NO_SK)!.estRowBytes).toBe("v1".length + 2 * keys + 60);
-			expect(h.store.keySizes.bytesOf(kb("x"))).toBe("v1".length + 2 * keys + 60);
+			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe("v1".length + 2 * keys + 60);
+			expect(h.store.keySizes.bytesOf(P(kb("x")))).toBe("v1".length + 2 * keys + 60);
 			h.ingest("x", 2, [], true);
-			expect(h.store.storedImage(kb("x"), NO_SK)!.estRowBytes).toBe(2 * keys + 60);
-			expect(h.store.keySizes.bytesOf(kb("x"))).toBe(2 * keys + 60);
+			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe(2 * keys + 60);
+			expect(h.store.keySizes.bytesOf(P(kb("x")))).toBe(2 * keys + 60);
 		});
 	});
 });

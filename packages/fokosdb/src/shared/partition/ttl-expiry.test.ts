@@ -7,6 +7,10 @@ import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";
 import { invariantFailure } from "../../../test/errors-matchers.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => prefixOf(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NOW_SECONDS = 100;
@@ -31,7 +35,7 @@ function config(overrides: Partial<TtlSweepConfig> = {}): TtlSweepConfig {
 }
 
 function putExpired(store: PartitionStore, hk: string, ttlAt: number, data = "d"): number {
-	store.upsertItem({ hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, txOrderTs: 1 });
+	store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, txOrderTs: 1 });
 	return new TextEncoder().encode(data).length + kb(hk).byteLength + kb("s").byteLength + EST_ROW_BYTES_K;
 }
 
@@ -102,7 +106,7 @@ describe("TtlExpiry", () => {
 			expect(await expiry.runCycle()).toMatchObject({ deletedRows: 3, more: false });
 			expect(checks).toBe(2);
 			expect(itemCount(state)).toBe(1);
-			expect(store.getItem(copy, kb("s")).row).toBeDefined();
+			expect(store.getItem(P(copy), copy, kb("s")).row).toBeDefined();
 		});
 	});
 
@@ -267,7 +271,7 @@ describe("TtlExpiry", () => {
 				await expect(expiry.runCycle()).rejects.toThrow(invariantFailure(name));
 			}
 			expect(checks).toBe(0);
-			expect(store.getItem(kb("kept"), kb("s")).row).toBeDefined();
+			expect(store.getItem(P(kb("kept")), kb("kept"), kb("s")).row).toBeDefined();
 		});
 	});
 

@@ -218,7 +218,7 @@ function makeCluster(partitions: Record<string, Partition>) {
 		target: { ref: FokosPartitionRef; state?: RepartitionState },
 		kind: RepartitionKind,
 	): FokosStatusEntry => ({
-		repartition: { id: `r${seq}`, seq, kind, state: target.state ?? "completed", hashKey: null },
+		repartition: { id: `r${seq}`, seq, kind, state: target.state ?? "completed", hashPrefixBucket: null },
 		target: { index, ref: target.ref, initialization: "initialized", acknowledged: true },
 	});
 	const isPromotion = (target: { ref: FokosPartitionRef }) => target.ref.partitionId.startsWith("01");

@@ -6,7 +6,8 @@
  * signature of the runtime derives from it, so a call that names one operation and passes the request
  * of another does not compile.
  */
-import type { KeyBytes } from "./key-codec.js";
+import type { FokosCompositeKey, KeyBytes } from "./key-codec.js";
+import type { HashPrefixBucket } from "./hash-primitives.js";
 import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosImportState, MigrationHost, RouteKey } from "./repartition-types.js";
@@ -87,8 +88,19 @@ export type FokosOwner =
 	| { kind: "remote"; target: FokosPartitionRef; speculative: boolean }
 	| { kind: "out_of_range" };
 
-/** One direct target of a router, in `target_index` order. Range children carry their interval. */
-export type FokosChild = { ref: FokosPartitionRef; start: KeyBytes | null; end: KeyBytes | null };
+/** One direct target of a router, in `target_index` order. Range children carry their composite interval. */
+export type FokosChild = { ref: FokosPartitionRef; start: FokosCompositeKey | null; end: FokosCompositeKey | null };
+
+/**
+ * A position in the storage order `(prefix, hk, sk)`. An absent `hk` or `sk` is the empty key, the
+ * minimum. `prefix` is a `HashPrefixBucket` for a bound at a bucket edge, but a bound can also be the
+ * empty byte string, so the field stays unbranded. The host treats it as opaque bytes: the first
+ * primary-key column of its rows.
+ */
+export type FokosStorageKey = { prefix: Uint8Array; hk?: KeyBytes; sk?: KeyBytes };
+
+/** A half-open storage interval. A null end has no upper bound. */
+export type FokosStorageInterval = { start: FokosStorageKey; end: FokosStorageKey | null };
 
 /**
  * One range request. The interval keeps its inclusive and exclusive bounds: an inclusive upper bound
@@ -105,8 +117,8 @@ export type FokosRangeInput = {
 /**
  * One planned visit of a range frontier.
  *
- * `start` and `end` are the half-open sort-key segment this visit covers, inside the immutable
- * interval of the target partition. A visit that fills a gap of the learned hierarchy covers only that
+ * `start` and `end` are the half-open sort-key segment of the requested hash key that this visit
+ * covers, inside the immutable interval of the target partition. A visit that fills a gap of the learned hierarchy covers only that
  * gap and not the whole interval of its target, so two visits never serve one sort key twice. The host
  * clips its request to the segment.
  */
@@ -370,16 +382,16 @@ export interface FokosShardingHooks<TPolicy> {
 		policy: TPolicy;
 	}): false | { data?: unknown } | { promote: KeyBytes[]; data?: unknown };
 	/**
-	 * Range partitions only. Returns `childCount - 1` strictly increasing boundaries inside (start, end),
-	 * or null when the host cannot produce valid boundaries yet.
+	 * Range partitions only. Returns `childCount - 1` strictly increasing composite boundaries inside
+	 * (start, end) of the hashPrefixBucket, or null when the host cannot produce valid boundaries yet.
 	 */
 	computeRangeBoundaries?(input: {
-		hashKey: KeyBytes;
-		start: KeyBytes | null;
-		end: KeyBytes | null;
+		hashPrefixBucket: HashPrefixBucket;
+		start: FokosCompositeKey | null;
+		end: FokosCompositeKey | null;
 		childCount: number;
 		policy: TPolicy;
-	}): KeyBytes[] | null;
+	}): FokosCompositeKey[] | null;
 	/** The host phase of the migration. */
 	migration: MigrationHost;
 	/**

@@ -139,9 +139,9 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 		const sql = this.ctx.storage.sql;
 		return {
 			evaluateSplit: ({ policy }) => (this.rowCount() > policy.maxRows ? {} : false),
-			computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
+			computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) =>
 				todo(
-					`NTILE(${childCount}) over sk of ${JSON.stringify(hashKey) ?? "null"} in [${JSON.stringify(start) ?? "null"}, ${JSON.stringify(end) ?? "null"})`,
+					`NTILE(${childCount}) over (hk, sk) of ${hashPrefixBucket.toHex()} in [${JSON.stringify(start) ?? "null"}, ${JSON.stringify(end) ?? "null"})`,
 				),
 			migration: {
 				buildPage: (cursor, _slice, belongsToTarget) => {
@@ -171,10 +171,16 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 					return true;
 				}
 				const slice = plan.targets[0].slice;
-				if (slice.kind !== "promoted_key") {
+				if (slice.kind !== "promoted_hash_prefix_bucket") {
 					return true;
 				}
-				sql.exec("DELETE FROM docs WHERE hk = ?", slice.hashKey);
+				// The promotion moves every hash key of the hashPrefixBucket.
+				const bucket = slice.hashPrefixBucket.toHex();
+				for (const { hk } of sql.exec<{ hk: ArrayBuffer }>("SELECT DISTINCT hk FROM docs").toArray()) {
+					if (this.fokos.storagePrefix(new Uint8Array(hk) as KeyBytes).toHex() === bucket) {
+						sql.exec("DELETE FROM docs WHERE hk = ?", hk);
+					}
+				}
 				return true;
 			},
 		};

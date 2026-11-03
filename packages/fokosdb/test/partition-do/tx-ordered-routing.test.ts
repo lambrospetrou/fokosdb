@@ -107,7 +107,7 @@ describe("FokosDBPartitionDO — the operations of one item reach one owner", ()
 		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("bob") });
 		const rangeRoot = await partition.awaitPromoted("bob");
 		await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") });
-		expect((await storedBloom(partition)).maybePromoted(kb("bob"))).toBe(true);
+		expect((await storedBloom(partition)).maybePromoted(partition.bucketOf("bob"))).toBe(true);
 
 		const request = prepareOf([
 			put("bob", "x", { n: 1 }),

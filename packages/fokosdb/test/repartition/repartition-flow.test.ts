@@ -8,6 +8,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
+import type { HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { childDigit, type DigitTopology } from "../hash-digits.js";
 import {
@@ -16,6 +17,7 @@ import {
 	lockCount,
 	lockRow,
 	makeCluster,
+	P,
 	putItem,
 	putLock,
 	storedBytes,
@@ -23,7 +25,10 @@ import {
 	type Node,
 	type NodeEnv,
 } from "./repartition-harness.js";
+import { ALL_ROWS } from "../storage-prefix.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
+import invariant from "../../src/shared/invariant.js";
+import { compositeInInterval } from "../../src/sharding/repartition-slice.js";
 import { TransactionParticipant } from "../../src/shared/partition/transaction-participant.js";
 import { DEFAULT_STALE_TRANSACTION_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
 import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
@@ -65,7 +70,7 @@ describe("Repartition — arbitration", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, sharding }) => {
-			expect(source.queue({ kind: "key_promotion", hashKey: kb("hot") })).toMatchObject({ id: "r1" });
+			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("hot")) })).toMatchObject({ id: "r1" });
 			// queued, planned and cutover all still own the key's move.
 			expect(source.queue({ kind: "hash_split" })).toBeUndefined();
 			sharding.setRepartitionState("r1", "cutover");
@@ -83,7 +88,7 @@ describe("Repartition — arbitration", () => {
 			expect(source.queue({ kind: "hash_split" })).toMatchObject({ id: "r1" });
 			for (const state of ["queued", "planned", "cutover", "completed", "cleaned"] as const) {
 				sharding.setRepartitionState("r1", state);
-				expect(source.queue({ kind: "key_promotion", hashKey: kb("hot") }), `blocked at ${state}`).toBeUndefined();
+				expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("hot")) }), `blocked at ${state}`).toBeUndefined();
 			}
 		});
 	});
@@ -92,12 +97,12 @@ describe("Repartition — arbitration", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, sharding }) => {
-			expect(source.queue({ kind: "key_promotion", hashKey: kb("alice") })).toMatchObject({ id: "r1" });
-			expect(source.queue({ kind: "key_promotion", hashKey: kb("alice") })).toBeUndefined();
+			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) })).toMatchObject({ id: "r1" });
+			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) })).toBeUndefined();
 			// A different key is unrelated: two promotions progress at the same time.
-			expect(source.queue({ kind: "key_promotion", hashKey: kb("bob") })).toMatchObject({ id: "r2" });
-			expect(sharding.routeOverrideFor(kb("alice"))).toEqual({ repartitionId: "r1", state: "queued" });
-			expect(sharding.routeOverrideFor(kb("bob"))).toEqual({ repartitionId: "r2", state: "queued" });
+			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("bob")) })).toMatchObject({ id: "r2" });
+			expect(sharding.routeOverrideFor(P(kb("alice")))).toEqual({ repartitionId: "r1", state: "queued" });
+			expect(sharding.routeOverrideFor(P(kb("bob")))).toEqual({ repartitionId: "r2", state: "queued" });
 		});
 	});
 
@@ -108,7 +113,7 @@ describe("Repartition — arbitration", () => {
 		await root.enter(({ source }) => expect(source.queue({ kind: "range_split" })).toBeUndefined());
 		// The range node has no stored context yet, so it answers from the context the harness gave it.
 		await rangeRoot.enter(({ source }) => {
-			expect(source.queue({ kind: "key_promotion", hashKey: kb("alice") })).toBeUndefined();
+			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) })).toBeUndefined();
 			expect(source.queue({ kind: "range_split" })).toMatchObject({ kind: "range_split", state: "queued" });
 		});
 	});
@@ -184,12 +189,12 @@ describe("Repartition — planning", () => {
 
 			const targets = sharding.listRepartitionTargets("r1", "range_split");
 			expect(targets).toHaveLength(2);
-			const first = targets[0].slice as { start: KeyBytes | null; end: KeyBytes };
-			const second = targets[1].slice as { start: KeyBytes; end: KeyBytes | null };
+			const [first, second] = targets.map((t) => t.slice);
+			invariant(first.kind === "range" && second.kind === "range", "a range split has range slices");
 			// The children tile [start, end) with no gap: the first ends exactly where the second begins.
 			expect(first.start).toBeNull();
 			expect(second.end).toBeNull();
-			expect(KeyCodec.compare(first.end, second.start)).toBe(0);
+			expect(KeyCodec.compareComposite(first.end!, second.start!)).toBe(0);
 		});
 	});
 });
@@ -274,7 +279,7 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
 			putLock(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") }, T0);
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) }, T0);
 		});
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
@@ -298,9 +303,10 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 		await drainImport(rangeRoot);
 		await rangeRoot.enter(({ store }) => {
-			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
+			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
 			const participant = new TransactionParticipant({
 				store,
+				storagePrefix: P,
 				maxClockSkewMs: () => 0,
 				staleTransactionMs: () => DEFAULT_STALE_TRANSACTION_MS,
 				// The range root owns every key of the promoted hash key.
@@ -308,8 +314,8 @@ describe("Repartition — initialization and cutover", () => {
 			});
 			// lockRow writes the transaction timestamp 1.
 			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 1, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
-			expect(store.getItem(kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
-			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([lockRow("alice", "s1")]);
+			expect(store.getItem(P(kb("alice")), kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
+			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toEqual([lockRow("alice", "s1")]);
 		});
 
 		// The completion keeps the copies, and the cleanup deletes them.
@@ -327,7 +333,7 @@ describe("Repartition — initialization and cutover", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") }, T0);
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) }, T0);
 		});
 		// Plan, initialize the target, and cut over.
 		for (let step = 0; step < 3; step++) {
@@ -377,6 +383,7 @@ describe("Repartition — the migration protocol", () => {
 		await root.enter(({ source, store }) => {
 			for (let i = 0; i < 1_500; i++) {
 				store.upsertItem({
+					prefix: P(kb(`k${i}`)),
 					hk: kb(`k${i}`),
 					sk: KeyCodec.encodeOptional(undefined),
 					data: `d-${i}`,
@@ -394,8 +401,8 @@ describe("Repartition — the migration protocol", () => {
 		await cutOver(root);
 
 		const rows = ({ store }: NodeEnv) => ({
-			items: [...store.queryItemsPage(null, 1_000_000, null)].map(({ hk, sk, data }) => ({ hk, sk, data })),
-			locks: [...store.queryPendingTxPage(null, 1_000_000, null)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
+			items: [...store.queryItemsPage(null, 1_000_000, ALL_ROWS)].map(({ hk, sk, data }) => ({ hk, sk, data })),
+			locks: [...store.queryPendingTxPage(null, 1_000_000, ALL_ROWS)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
 		});
 		const source = await root.enter(rows);
 
@@ -452,7 +459,7 @@ describe("Repartition — the migration protocol", () => {
 
 		await childA.enter(({ store, target }) => {
 			expect(target.importState()).toBe("imported");
-			expect([...store.queryItemsPage(null, 100, null)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2"]);
+			expect([...store.queryItemsPage(null, 100, ALL_ROWS)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2"]);
 		});
 		await childA.enter(({ storage }) => {
 			// The estimate is maintained page by page, from the sizes SQLite measured on each insert, so
@@ -460,9 +467,9 @@ describe("Repartition — the migration protocol", () => {
 			expect(keySizeEstimate(storage, keyA)).toBe(storedBytes(storage, keyA));
 		});
 		await childB.enter(({ store }) => {
-			expect([...store.queryItemsPage(null, 100, null)]).toHaveLength(1);
+			expect([...store.queryItemsPage(null, 100, ALL_ROWS)]).toHaveLength(1);
 			// A lock inside the slice follows its key, so commit or cancel can still find it.
-			expect([...store.queryPendingTxPage(null, 10, null)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
+			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
 		});
 
 		// The acknowledgements complete the source. The source keeps its lock copies until the cleanup.
@@ -472,9 +479,9 @@ describe("Repartition — the migration protocol", () => {
 		await childA.enter(({ target }) => expect(target.importState()).toBe("active"));
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect([...store.queryPendingTxPage(null, 10, null)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
+			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
 			// A split keeps its item rows: only a promotion gives them back.
-			expect([...store.queryItemsPage(null, 100, null)]).toHaveLength(3);
+			expect([...store.queryItemsPage(null, 100, ALL_ROWS)]).toHaveLength(3);
 			expect(sharding.getPlanHead("r1")).toBeDefined();
 		});
 
@@ -482,8 +489,8 @@ describe("Repartition — the migration protocol", () => {
 			expect(source.sourceCleanupStep()).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			// The cleanup deletes the lock copies, and a split keeps its item rows.
-			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([]);
-			expect([...store.queryItemsPage(null, 100, null)]).toHaveLength(3);
+			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toEqual([]);
+			expect([...store.queryItemsPage(null, 100, ALL_ROWS)]).toHaveLength(3);
 			// The final cleanup deletes the plan chain.
 			expect(sharding.getPlanHead("r1")).toBeUndefined();
 			expect(source.sourceCleanupStep()).toBe("idle");
@@ -523,7 +530,7 @@ describe("Repartition — the migration protocol", () => {
 
 		const promo = makeCluster().hashNode([0]);
 		const key = kb("alice");
-		await plan(promo, { kind: "key_promotion", hashKey: key });
+		await plan(promo, { kind: "key_promotion", hashPrefixBucket: P(key) });
 		const promoTarget = await promo.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "key_promotion")[0]);
 
 		await promo.enter(({ source, sharding }) => {
@@ -571,11 +578,16 @@ describe("Repartition — the migration protocol", () => {
 		await child.enter(async ({ target, store }) => {
 			expect(target.importState()).toBe("imported");
 			// A user delete lands on the finished copy.
-			store.deleteItem({ hk: kb(keyForChild(0, c.base.topology, "a")), sk: kb("s1"), txOrderTs: 99 });
+			store.deleteItem({
+				prefix: P(kb(keyForChild(0, c.base.topology, "a"))),
+				hk: kb(keyForChild(0, c.base.topology, "a")),
+				sk: kb("s1"),
+				txOrderTs: 99,
+			});
 			// A page that arrives now must not put the row back: the record says the import is over, and
 			// the ingest inserts an absent row rather than failing on it.
 			expect(await target.importOnePage()).toBe("idle");
-			expect([...store.queryItemsPage(null, 10, null)]).toHaveLength(0);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)]).toHaveLength(0);
 		});
 	});
 
@@ -596,7 +608,7 @@ describe("Repartition — the migration protocol", () => {
 			const rec = target.importRecord()!;
 			expect(rec.state).toBe("awaiting_data");
 			expect(rec.cursor).toBeNull();
-			expect([...store.queryItemsPage(null, 10, null)]).toHaveLength(0);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)]).toHaveLength(0);
 		});
 
 		// A page whose cursor walks back to an earlier phase is refused for the same reason.
@@ -650,9 +662,9 @@ describe("Repartition — the migration protocol", () => {
 		const child = await firstChild(c, root);
 
 		for (const bad of [
-			{ kind: "after_key", hk: null },
-			{ kind: "row", row: { hk: kb("a"), sk: undefined } },
-			{ hk: kb("a"), sk: null },
+			{ prefix: P(kb("a")), hk: null, sk: kb("s1") },
+			{ prefix: P(kb("a")), hk: kb("a"), sk: undefined },
+			{ hk: kb("a"), sk: kb("s1") },
 		]) {
 			c.nextPullPage(root.doName, {
 				phase: "host",
@@ -745,14 +757,14 @@ describe("Repartition — promotions", () => {
 				putItem(store, "alice", sk);
 			}
 			putItem(store, "bob", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
 		});
 		await cutOver(root);
 		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
 		await drainImport(rangeRoot);
 
 		await rangeRoot.enter(({ store }) => {
-			expect([...store.queryItemsPage(null, 10, null)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
 		});
 		await sendAck(rangeRoot);
 
@@ -768,7 +780,7 @@ describe("Repartition — promotions", () => {
 			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			// Only the promoted key went back; every other key this partition owns stayed.
-			expect([...store.queryItemsPage(null, 10, null)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 		});
 	});
 
@@ -780,7 +792,7 @@ describe("Repartition — promotions", () => {
 				putItem(store, "alice", sk);
 			}
 			putItem(store, "bob", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
 		});
 		await cutOver(root);
 		// Rows as the source keeps them after the cutover: one transaction with MAX_ITEMS_PER_TX keys
@@ -798,7 +810,7 @@ describe("Repartition — promotions", () => {
 		await drainImport(rangeRoot);
 		await rangeRoot.enter(({ store }) => {
 			// The payload, the coordinator reference, the timestamps, and the quarantine came across.
-			expect([...store.queryPendingTxPage(null, 1_000, null)]).toEqual([...wide, guarded]);
+			expect([...store.queryPendingTxPage(null, 1_000, ALL_ROWS)]).toEqual([...wide, guarded]);
 		});
 		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1));
 
@@ -826,20 +838,20 @@ describe("Repartition — promotions", () => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			expect(store.listPendingTxKeys("tx-a")).toEqual([]);
 			expect(lockCount(store, "alice")).toBe(1);
-			expect([...store.queryItemsPage(null, 10, null)]).toHaveLength(4);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)]).toHaveLength(4);
 
 			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			expect(lockCount(store, "alice")).toBe(0);
-			expect([...store.queryItemsPage(null, 10, null)]).toHaveLength(2);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)]).toHaveLength(2);
 
 			expect(source.sourceCleanupStep(T0 + 10_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
-			expect([...store.queryItemsPage(null, 10, null)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 			expect(lockCount(store, "bob")).toBe(1);
 		});
 		// The target keeps its locks.
-		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 1_000, null)]).toHaveLength(MAX_ITEMS_PER_TX + 1));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 1_000, ALL_ROWS)]).toHaveLength(MAX_ITEMS_PER_TX + 1));
 	});
 
 	// A promotion reads only the rows of its key. The other keys hold ten times the scan cap, so a read
@@ -855,7 +867,7 @@ describe("Repartition — promotions", () => {
 				putItem(store, "aaron", `s${i}`);
 				putItem(store, "bob", `s${i}`);
 			}
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => {
@@ -871,13 +883,13 @@ describe("Repartition — promotions", () => {
 		expect(pulls.items).toBe(1);
 		expect(pulls.pending_tx).toBe(1);
 		await rangeRoot.enter(({ store }) => {
-			expect([...store.queryItemsPage(null, 100, null)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
-			expect([...store.queryPendingTxPage(null, 100, null)]).toEqual([lockRow("alice", "s1", "tx-a")]);
+			expect([...store.queryItemsPage(null, 100, ALL_ROWS)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
+			expect([...store.queryPendingTxPage(null, 100, ALL_ROWS)]).toEqual([lockRow("alice", "s1", "tx-a")]);
 		});
 	});
 
-	it("lets a hash child step past each hash key of a sibling with one scanned entry, in both streams", async () => {
-		// Each page scans at most 5 entries. A key of the sibling is one entry, whatever its row count.
+	it("reads only the interval of a hash child, so no row of a sibling costs a scanned entry, in both streams", async () => {
+		// Each page scans at most 5 rows. The interval of the child holds no row of the sibling.
 		const c = makeCluster({ runtimeConfig: { migrationScanRows: 5 } });
 		const root = c.hashNode([0]);
 		const own = ["a", "b", "c"].map((prefix) => keyForChild(0, c.base.topology, prefix));
@@ -900,8 +912,8 @@ describe("Repartition — promotions", () => {
 		await cutOver(root);
 		const owned = ({ hk }: { hk: KeyBytes }) => childDigit(c.base.topology, hk, 0) === 0;
 		const rows = ({ store }: NodeEnv) => ({
-			items: [...store.queryItemsPage(null, 10_000, null)].map(({ hk, sk }) => ({ hk, sk })),
-			locks: [...store.queryPendingTxPage(null, 10_000, null)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
+			items: [...store.queryItemsPage(null, 10_000, ALL_ROWS)].map(({ hk, sk }) => ({ hk, sk })),
+			locks: [...store.queryPendingTxPage(null, 10_000, ALL_ROWS)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
 		});
 		const source = await root.enter(rows);
 		const expected = { items: source.items.filter(owned), locks: source.locks.filter(owned) };
@@ -910,10 +922,10 @@ describe("Repartition — promotions", () => {
 
 		const child = await firstChild(c, root);
 		const pulls = await pullsByStream(child);
-		// In each stream, 6 rows and 10 skipped keys are 16 entries: 3 full pages and 1 last page. A read
-		// of each row scans 1,006 rows, which takes 202 pages.
-		expect(pulls.items).toBe(4);
-		expect(pulls.pending_tx).toBe(4);
+		// In each stream, the 6 rows of the child are 1 full page and 1 last page. A read of the whole
+		// table scans 1,006 rows, which takes 202 pages.
+		expect(pulls.items).toBe(2);
+		expect(pulls.pending_tx).toBe(2);
 		expect(await child.enter(rows)).toEqual(expected);
 	});
 
@@ -922,7 +934,7 @@ describe("Repartition — promotions", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => {
@@ -950,7 +962,7 @@ describe("Repartition — promotions", () => {
 			expect.objectContaining({ transactionId: "tx-bad", coordinatorRef: "not-json", doName: rangeRoot.doName }),
 		]);
 		// The open lock came across with the guarded ones.
-		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 10, null)]).toHaveLength(4));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toHaveLength(4));
 	});
 
 	it("writes one line for each page of a quarantined transaction that spans pages", async () => {
@@ -958,7 +970,7 @@ describe("Repartition — promotions", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => {
@@ -1005,7 +1017,7 @@ describe("Repartition — promotions", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 }));
@@ -1020,7 +1032,7 @@ describe("Repartition — promotions", () => {
 		} finally {
 			logged.mockRestore();
 		}
-		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 10, null)]).toHaveLength(1));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toHaveLength(1));
 	});
 
 	it("stops each page of large rows at the byte budget and resumes after its last row", async () => {
@@ -1039,8 +1051,8 @@ describe("Repartition — promotions", () => {
 		await cutOver(root);
 
 		const rows = ({ store }: NodeEnv) => ({
-			items: [...store.queryItemsPage(null, 1_000_000, null)].map(({ hk, sk, data }) => ({ hk, sk, data })),
-			locks: [...store.queryPendingTxPage(null, 1_000_000, null)].map(({ hk, sk, transaction_id, data }) => ({
+			items: [...store.queryItemsPage(null, 1_000_000, ALL_ROWS)].map(({ hk, sk, data }) => ({ hk, sk, data })),
+			locks: [...store.queryPendingTxPage(null, 1_000_000, ALL_ROWS)].map(({ hk, sk, transaction_id, data }) => ({
 				hk,
 				sk,
 				transaction_id,
@@ -1089,9 +1101,9 @@ describe("Repartition — promotions", () => {
 			putItem(store, promoted, "s1");
 			putItem(store, plain, "s1");
 			// A promotion that finished long ago, with its source rows already reclaimed.
-			source.queue({ kind: "key_promotion", hashKey: kb(promoted) });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(promoted)) });
 			sharding.setRepartitionState("r1", "cleaned", { cutoverAt: 1, completedAt: 2 });
-			store.deleteItemsBatchForHashKey(kb(promoted), 100);
+			store.deleteItemsBatchForHashPrefixBucket(P(kb(promoted)), 100);
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -1101,7 +1113,7 @@ describe("Repartition — promotions", () => {
 		await child.enter(({ store, sharding }) => {
 			// The forward pointer came across as a finished promotion with an initialized, acknowledged
 			// target, so routing, status and destroy traversal all see the link.
-			const override = sharding.routeOverrideFor(kb(promoted))!;
+			const override = sharding.routeOverrideFor(P(kb(promoted)))!;
 			expect(override.state).toBe("cleaned");
 			const inherited = sharding.getRepartition(override.repartitionId)!;
 			expect(inherited).toMatchObject({ kind: "key_promotion", state: "cleaned" });
@@ -1112,7 +1124,7 @@ describe("Repartition — promotions", () => {
 				targetIndex: 0,
 			});
 			// The data lives in a range tree that neither partition owns, so no item copy came with it.
-			expect([...store.queryItemsPage(null, 10, null)].map((r) => KeyCodec.decode(r.hk))).toEqual([plain]);
+			expect([...store.queryItemsPage(null, 10, ALL_ROWS)].map((r) => KeyCodec.decode(r.hk))).toEqual([plain]);
 		});
 	});
 
@@ -1123,9 +1135,9 @@ describe("Repartition — promotions", () => {
 		const sibling = keyForChild(1, c.base.topology, "s");
 
 		await root.enter(({ source, sharding }) => {
-			source.queue({ kind: "key_promotion", hashKey: kb(mine) });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(mine)) });
 			sharding.setRepartitionState("r1", "cleaned");
-			source.queue({ kind: "key_promotion", hashKey: kb(sibling) });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(sibling)) });
 			sharding.setRepartitionState("r2", "cleaned");
 			source.queue({ kind: "hash_split" });
 		});
@@ -1134,8 +1146,8 @@ describe("Repartition — promotions", () => {
 		await drainImport(child);
 
 		await child.enter(({ sharding }) => {
-			expect(sharding.hasRouteOverride(kb(mine))).toBe(true);
-			expect(sharding.hasRouteOverride(kb(sibling))).toBe(false);
+			expect(sharding.hasRouteOverride(P(kb(mine)))).toBe(true);
+			expect(sharding.hasRouteOverride(P(kb(sibling)))).toBe(false);
 		});
 	});
 });
@@ -1150,7 +1162,15 @@ describe("Repartition — range splits", () => {
 		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
 		const sks = ["s1", "s2", "s3", "s4", "s5", "s6"];
 		await rangeRoot.enter(({ source, store }) => {
-			store.upsertItem({ hk: kb("alice"), sk: KeyCodec.encodeOptional(undefined), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({
+				prefix: P(kb("alice")),
+				hk: kb("alice"),
+				sk: KeyCodec.encodeOptional(undefined),
+				data: "d",
+				kind: "text",
+				ttlAt: null,
+				txOrderTs: 1,
+			});
 			for (const sk of sks) {
 				putItem(store, "alice", sk, "x".repeat(200));
 			}
@@ -1164,24 +1184,23 @@ describe("Repartition — range splits", () => {
 		});
 
 		const rows = ({ store }: NodeEnv) => ({
-			items: [...store.queryItemsPage(null, 1_000, null)].map(({ hk, sk, data }) => ({ hk, sk, data })),
-			locks: [...store.queryPendingTxPage(null, 1_000, null)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
+			items: [...store.queryItemsPage(null, 1_000, ALL_ROWS)].map(({ hk, sk, data }) => ({ hk, sk, data })),
+			locks: [...store.queryPendingTxPage(null, 1_000, ALL_ROWS)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
 		});
 		const source = await rangeRoot.enter(rows);
 		const targets = await rangeRoot.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "range_split"));
 		expect(targets).toHaveLength(2);
 		let received = 0;
 		for (const t of targets) {
-			const slice = t.slice as { start: KeyBytes | null; end: KeyBytes | null };
+			const slice = t.slice;
+			invariant(slice.kind === "range", "a range split has range slices");
 			const child = c.rangeNode(rangeRoot.ctx, kb("alice"), slice.start, slice.end);
 			expect(child.doName).toBe(t.doName);
 			const pulls = await pullsByStream(child);
 			expect(pulls.items, `${child.doName}: items`).toBe(1);
 			expect(pulls.pending_tx, `${child.doName}: locks`).toBe(1);
 
-			const start = slice.start ?? KeyCodec.encodeOptional(undefined);
-			const inSlice = ({ sk }: { sk: KeyBytes }) =>
-				KeyCodec.compare(sk, start) >= 0 && (slice.end === null || KeyCodec.compare(sk, slice.end) < 0);
+			const inSlice = ({ hk, sk }: { hk: KeyBytes; sk: KeyBytes }) => compositeInInterval({ hk, sk }, slice.start, slice.end);
 			const imported = await child.enter(rows);
 			expect(imported.items).toEqual(source.items.filter(inSlice));
 			expect(imported.locks).toEqual(source.locks.filter(inSlice));
@@ -1219,19 +1238,25 @@ describe("Repartition — the status view", () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await root.enter(({ source }) => {
-			source.queue({ kind: "key_promotion", hashKey: kb("hot") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("hot")) });
 			// Still queued after the step below, so it has no target row. It is one entry with no target.
-			source.queue({ kind: "key_promotion", hashKey: kb("warm") });
+			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("warm")) });
 		});
 		await plan(root);
 
 		const page = await root.enter(({ source }) => source.promotionEntries(null, 1_000));
 		expect(page.nextCursor).toBeNull();
 		expect(
-			page.entries.map((e) => [e.repartition.seq, e.repartition.state, e.repartition.hashKey, e.target?.index, e.target?.initialization]),
+			page.entries.map((e) => [
+				e.repartition.seq,
+				e.repartition.state,
+				e.repartition.hashPrefixBucket,
+				e.target?.index,
+				e.target?.initialization,
+			]),
 		).toEqual([
-			[1, "planned", kb("hot"), 0, "pending"],
-			[2, "queued", kb("warm"), undefined, undefined],
+			[1, "planned", P(kb("hot")), 0, "pending"],
+			[2, "queued", P(kb("warm")), undefined, undefined],
 		]);
 		expect(await root.enter(({ source }) => source.splitEntries())).toEqual([]);
 	});
@@ -1241,7 +1266,7 @@ describe("Repartition — the status view", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source }) => {
 			for (const hk of ["a", "b", "c"]) {
-				source.queue({ kind: "key_promotion", hashKey: kb(hk) });
+				source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(hk)) });
 			}
 		});
 
@@ -1266,7 +1291,7 @@ describe("Repartition — the status view", () => {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-type QueueRequest = { kind: RepartitionKind; hashKey?: KeyBytes };
+type QueueRequest = { kind: RepartitionKind; hashPrefixBucket?: HashPrefixBucket };
 
 /** Queues if needed, then plans, leaving every target `pending`. */
 async function plan(node: Node, request?: QueueRequest, now = T0): Promise<void> {

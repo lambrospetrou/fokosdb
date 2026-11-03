@@ -160,12 +160,13 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * client instance sends to later, because only this instance can fall back after a miss.
 	 */
 	resolve(key: RouteKey, opts?: FokosResolveOptions): FokosRouteContext<TPolicy> {
-		return this.#resolveKey(key.hashKey, (view, cut) => rangePointLookup(view, key.sortKey, cut), true, opts?.speculative ?? true);
+		const composite = { hk: key.hashKey, sk: key.sortKey };
+		return this.#resolveKey(key.hashKey, (view, cut) => rangePointLookup(view, composite, cut), true, opts?.speculative ?? true);
 	}
 
 	/** The deepest known partition that holds the whole interval. That partition plans the range frontier. */
 	resolveRange(input: FokosRangeInput): FokosRouteContext<TPolicy> {
-		return this.#resolveKey(input.hashKey, (view, cut) => rangeIntervalLookup(view, input.interval, cut), true, true);
+		return this.#resolveKey(input.hashKey, (view, cut) => rangeIntervalLookup(view, input.hashKey, input.interval, cut), true, true);
 	}
 
 	/**
@@ -188,15 +189,18 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		if (!hash) {
 			return root;
 		}
-		if (bloom && maybePromoted(hash.view, hashKey)) {
-			const range = cachedRangeTopology(opts, topology.shardGroup, hashKey);
+		// A promotion moves the whole hashPrefixBucket of a key, so the promoted set and the range
+		// entries are by hashPrefixBucket.
+		const bucket = hashPrefixBucketOf(hashKey, topology.shardGroup);
+		if (bloom && maybePromoted(hash.view, bucket)) {
+			const range = cachedRangeTopology(opts, topology.shardGroup, bucket);
 			// A range entry with no segment says that the Bloom hit is a false positive.
 			if (range ? range.view.depths.length > 0 : speculative) {
 				const target = range ? rangeLookup(range.view, range.cut) : { start: 0, end: 1, rank: 0 };
 				if (target) {
 					const start = range ? rangeBoundaryAt(range.view, target.start) : null;
 					const end = range ? rangeBoundaryAt(range.view, target.end) : null;
-					const ctx = resolveRangePartitionContext(root, hashKey, start, end);
+					const ctx = resolveRangePartitionContext(root, bucket, start, end);
 					this.#fallbacks.set(ctx, {
 						root,
 						next: (e) => {
@@ -215,7 +219,6 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 				}
 			}
 		}
-		const bucket = hashPrefixBucketOf(hashKey, topology.shardGroup);
 		const leaf = findLeaf(hash.view, topology.rootTreesN, topology.hashSplitN, bucket, hash.cut);
 		if (leaf.path.length === 0) {
 			return root;

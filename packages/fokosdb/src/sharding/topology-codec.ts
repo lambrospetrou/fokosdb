@@ -3,16 +3,16 @@
  * Durable Object, the framing of the two bodies that the admin Durable Object serves, and the readers
  * that a caller uses on the fetched bytes.
  *
- * - The hash body holds the hash split bitmap and the Bloom filter of the promoted keys.
- * - The range body holds the known range intervals of one promoted hash key.
+ * - The hash body holds the hash split bitmap and the Bloom filter of the promoted hashPrefixBuckets.
+ * - The range body holds the known range intervals of one promoted hashPrefixBucket.
  *
  * A reader makes typed-array views over the fetched bytes and does not decode them into objects.
  * `docs/agent-plans/2026-10-23-encoded-topology-auto-admin.md` gives the formats. The writer side is
  * in `topology-encode.ts`, so a caller does not ship it.
  */
 import { layerHas } from "../shared/bloom-filter.js";
-import { HashPrefixBucketDigitCursor } from "./hash-primitives.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { HashPrefixBucketDigitCursor, type HashPrefixBucket } from "./hash-primitives.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
@@ -218,7 +218,7 @@ export function findLeaf(
 	view: HashTopologyView,
 	rootTreesN: number,
 	hashSplitN: number,
-	hashPrefixBucket: Uint8Array,
+	hashPrefixBucket: HashPrefixBucket,
 	cut: ReadonlySet<number>,
 ): { pos: number; root: number; path: number[] } {
 	const digits = new HashPrefixBucketDigitCursor(hashPrefixBucket, rootTreesN);
@@ -237,20 +237,33 @@ export function findLeaf(
 	return { pos, root, path };
 }
 
-/** True when the Bloom filter of the body holds `hashKey`, which can be a false positive. */
-export function maybePromoted(view: HashTopologyView, hashKey: KeyBytes): boolean {
-	return view.bloom !== null && layerHas(view.bloom, hashKey);
+/** True when the Bloom filter of the body holds `hashPrefixBucket`, which can be a false positive. */
+export function maybePromoted(view: HashTopologyView, hashPrefixBucket: HashPrefixBucket): boolean {
+	return view.bloom !== null && layerHas(view.bloom, hashPrefixBucket);
 }
 
 // ─── the range body ──────────────────────────────────────────────────────────
 
+const NO_KEY = KeyCodec.encodeOptional(undefined);
+
+/** `hashKey || 0x00`: no hash key is between `hashKey` and it. */
+function nextHashKey(hashKey: KeyBytes): KeyBytes {
+	const next = new Uint8Array(hashKey.length + 1);
+	next.set(hashKey);
+	return KeyCodec.asKeyBytes(next);
+}
+
 export type RangeTopologyView = TopologyVersion & {
 	/** The number of inner boundaries. */
 	n: number;
+	/**
+	 * `2n + 1` offsets into `bytes`. Boundary `j` is the hash key `offsets[2j] .. offsets[2j + 1]` and
+	 * the sort key `offsets[2j + 1] .. offsets[2j + 2]`.
+	 */
 	offsets: Uint32Array;
 	bytes: Uint8Array;
 	levels: Uint16Array | Uint32Array;
-	/** `n + 1` values, or none when the hash key is not promoted. */
+	/** `n + 1` values, or none when the hashPrefixBucket is not promoted. */
 	depths: Uint16Array | Uint32Array;
 	truncatedAtRank: number | null;
 	byteLength: number;
@@ -265,7 +278,10 @@ export function parseRangeBody(input: Uint8Array): RangeTopologyView {
 	}
 	const s = header.sections;
 	const offsetCount = intField(s.boundaryOffsets, "count");
-	const n = offsetCount - 1;
+	if (offsetCount % 2 !== 1) {
+		throw new Error("fokos/topology: the range body has an even count of boundary offsets");
+	}
+	const n = (offsetCount - 1) / 2;
 	const byteCount = intField(s.boundaryBytes, "length");
 	const levelCount = intField(s.boundaryLevel, "count");
 	const depthCount = intField(s.segmentDepth, "count");
@@ -274,10 +290,10 @@ export function parseRangeBody(input: Uint8Array): RangeTopologyView {
 	}
 	const at = (name: string, length: number) => body.byteOffset + sectionOffset(body, s[name], length, name);
 	const offsets = new Uint32Array(body.buffer, at("boundaryOffsets", offsetCount * 4), offsetCount);
-	if (offsets[0] !== 0 || offsets[n] !== byteCount) {
+	if (offsets[0] !== 0 || offsets[2 * n] !== byteCount) {
 		throw new Error("fokos/topology: the boundary offsets are not valid");
 	}
-	for (let j = 0; j < n; j++) {
+	for (let j = 0; j < 2 * n; j++) {
 		if (offsets[j + 1] < offsets[j]) {
 			throw new Error("fokos/topology: the boundary offsets are not valid");
 		}
@@ -305,12 +321,15 @@ function levelAt(view: RangeTopologyView, p: number): number {
 }
 
 /** The number of boundaries that are less than `key`, or less than or equal to it with `orEqual`. */
-function countBoundaries(view: RangeTopologyView, key: KeyBytes, orEqual: boolean): number {
+function countBoundaries(view: RangeTopologyView, key: FokosCompositeKey, orEqual: boolean): number {
 	let lo = 0;
 	let hi = view.n;
 	while (lo < hi) {
 		const mid = (lo + hi) >>> 1;
-		const cmp = KeyCodec.compareSlice(view.bytes, view.offsets[mid], view.offsets[mid + 1], key);
+		const o = view.offsets;
+		const cmp =
+			KeyCodec.compareSlice(view.bytes, o[2 * mid], o[2 * mid + 1], key.hk) ||
+			KeyCodec.compareSlice(view.bytes, o[2 * mid + 1], o[2 * mid + 2], key.sk);
 		if (cmp < 0 || (orEqual && cmp === 0)) {
 			lo = mid + 1;
 		} else {
@@ -321,8 +340,16 @@ function countBoundaries(view: RangeTopologyView, key: KeyBytes, orEqual: boolea
 }
 
 /** The boundary at position `p` (1 .. n), or null for `~min` and `~max`. */
-export function rangeBoundaryAt(view: RangeTopologyView, p: number): KeyBytes | null {
-	return p === 0 || p === view.n + 1 ? null : KeyCodec.asKeyBytes(view.bytes.subarray(view.offsets[p - 1], view.offsets[p]));
+export function rangeBoundaryAt(view: RangeTopologyView, p: number): FokosCompositeKey | null {
+	if (p === 0 || p === view.n + 1) {
+		return null;
+	}
+	const o = view.offsets;
+	const j = p - 1;
+	return {
+		hk: KeyCodec.asKeyBytes(view.bytes.subarray(o[2 * j], o[2 * j + 1])),
+		sk: KeyCodec.asKeyBytes(view.bytes.subarray(o[2 * j + 1], o[2 * j + 2])),
+	};
 }
 
 /** One known interval: its start and end positions and its rank. Rank 0 is the range root. */
@@ -355,22 +382,33 @@ function intervalRule(view: RangeTopologyView, i: number, j: number, threshold: 
 	return null;
 }
 
-/** The deepest known interval of the sort key `sortKey`. Null for a body with no segment, or when the cut removes every candidate. */
-export function rangePointLookup(view: RangeTopologyView, sortKey: KeyBytes, cut: ReadonlySet<number>): RangeTarget | null {
+/** The deepest known interval of `key`. Null for a body with no segment, or when the cut removes every candidate. */
+export function rangePointLookup(view: RangeTopologyView, key: FokosCompositeKey, cut: ReadonlySet<number>): RangeTarget | null {
 	if (view.depths.length === 0) {
 		return null;
 	}
-	const i = countBoundaries(view, sortKey, true);
+	const i = countBoundaries(view, key, true);
 	return intervalRule(view, i, i, view.depths[i], cut);
 }
 
-/** The deepest known interval that holds the whole interval of a range request. */
-export function rangeIntervalLookup(view: RangeTopologyView, interval: SkInterval, cut: ReadonlySet<number>): RangeTarget | null {
+/**
+ * The deepest known interval that holds the whole sort-key interval of a range request of `hashKey`.
+ * An absent lower bound is the first key of `hashKey`, `(hashKey, x'')`. An absent upper bound is
+ * below `(hashKey || 0x00, x'')`, the first key above every key of `hashKey`.
+ */
+export function rangeIntervalLookup(
+	view: RangeTopologyView,
+	hashKey: KeyBytes,
+	interval: SkInterval,
+	cut: ReadonlySet<number>,
+): RangeTarget | null {
 	if (view.depths.length === 0) {
 		return null;
 	}
-	const i = interval.lower ? countBoundaries(view, interval.lower.value, true) : 0;
-	const j = interval.upper ? countBoundaries(view, interval.upper.value, interval.upper.inclusive) : view.n;
+	const i = countBoundaries(view, { hk: hashKey, sk: interval.lower?.value ?? NO_KEY }, true);
+	const j = interval.upper
+		? countBoundaries(view, { hk: hashKey, sk: interval.upper.value }, interval.upper.inclusive)
+		: countBoundaries(view, { hk: nextHashKey(hashKey), sk: NO_KEY }, false);
 	if (j < i) {
 		return intervalRule(view, i, i, view.depths[i], cut);
 	}

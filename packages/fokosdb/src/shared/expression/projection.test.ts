@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { queryScanStatement } from "../partition/partition-store.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
+import { asHashPrefixBucket } from "../../sharding/hash-primitives.js";
 import { materializeExpressionBindings } from "./bindings.js";
 import { compileProjectionExpression, compileQueryExpression } from "./compiler.js";
 import { ExpressionError, type ExpressionErrorCode } from "./errors.js";
@@ -225,7 +226,7 @@ describe("query compiler", () => {
 			projection: [{ expr: { ref: "data", path: "$.a" } }],
 		});
 		expect(plan.bindings.filter((binding) => binding.kind === "path" && binding.value === "$.a")).toHaveLength(1);
-		expect(plan.completeBindingCount).toBe(5);
+		expect(plan.completeBindingCount).toBe(POOL_PARAM + QUERY_MAX_TRAILING_BINDING_COUNT);
 		expect(plan.requiredColumns).toEqual(["data_kind", "data"]);
 		expect(plan.dataDependencies).toEqual({ completeData: false, paths: ["$.a"] });
 		assertRoundTrips(plan);
@@ -251,7 +252,7 @@ describe("query compiler", () => {
 			} as unknown as ConditionExpression,
 			projection: Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, i) => entry({ val: i }, `k${i}`)),
 		});
-		expect(plan.completeBindingCount).toBe(5);
+		expect(plan.completeBindingCount).toBe(POOL_PARAM + QUERY_MAX_TRAILING_BINDING_COUNT);
 		assertRoundTrips(plan);
 	});
 
@@ -297,6 +298,7 @@ describe("query compiler", () => {
 	it("keeps the widest scan tail in step with the store's scan shape", () => {
 		// The widest scan tail in the plan module must follow the store's scan shape.
 		const { sql } = queryScanStatement({
+			prefix: asHashPrefixBucket(new Uint8Array(8)),
 			hk: KeyCodec.encode("h"),
 			lower: KeyCodec.encode("a"),
 			lowerInclusive: true,

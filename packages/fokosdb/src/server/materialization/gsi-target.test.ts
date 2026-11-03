@@ -8,6 +8,10 @@ import { resolveLimits } from "../../shared/transaction-limits.js";
 import { checkGsiPlans, desiredGsiEntry, GSI_SQLITE_UNRECOVERABLE_ERROR } from "./gsi-target.js";
 import { MaterializationStore } from "./materialization-store.js";
 import { validateTargets, type GsiTargetDefinition } from "./targets.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);
@@ -48,13 +52,14 @@ describe("checkGsiPlans", () => {
 		await withStore((store, sql) => {
 			const data = new Uint8Array(sql.exec<{ b: ArrayBuffer }>(`SELECT jsonb(?) AS b`, `{"n":-2147483648}`).one().b);
 			store.putLatestImage(
+				P(kb("bad")),
 				{ opIndex: 0, hashKey: kb("bad"), sortKey: NO_SK, revision: 1, deleted: false, data, kind: "json", ttlAt: null },
 				1_000,
 				undefined,
 				[],
 			);
 			const plans = checkGsiPlans(store, target);
-			const image = store.targetImage(store.storedImage(kb("bad"), NO_SK)!.itemId)!;
+			const image = store.targetImage(store.storedImage(P(kb("bad")), kb("bad"), NO_SK)!.itemId)!;
 			expect(desiredGsiEntry(store, plans, image, resolveLimits(undefined))).toEqual({
 				kind: "violation",
 				code: GSI_SQLITE_UNRECOVERABLE_ERROR,

@@ -17,7 +17,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../src/sharding/key-codec.js";
+import type { HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
+import { ALL_ROWS, prefixOf } from "../storage-prefix.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import {
 	isRangePartition,
@@ -44,8 +46,8 @@ import type {
 	FokosPartitionRef,
 	FokosRepartitionPeer,
 } from "../../src/sharding/repartition-types.js";
-import type { FokosRepartitionPlan } from "../../src/sharding/runtime-types.js";
-import invariant from "../../src/shared/invariant.js";
+import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import { promotedHashPrefixBucketOf } from "../../src/sharding/repartition-slice.js";
 
 export const kb = (s: string) => KeyCodec.encode(s);
 
@@ -87,7 +89,8 @@ export type Cluster = {
 	/** The node for a context, created on first use so a target exists before it is initialized. */
 	node(ctx: FokosDBRouteContext): Node;
 	hashNode(idxs: number[]): Node;
-	rangeNode(from: FokosDBRouteContext, hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Node;
+	/** The range node of the hashPrefixBucket of `hashKey`, with the composite interval `[start, end)`. */
+	rangeNode(from: FokosDBRouteContext, hashKey: KeyBytes, start: FokosCompositeKey | null, end: FokosCompositeKey | null): Node;
 	/** Per-node counts of the side effects the flow asks its DO for. */
 	scheduled(doName: string): number;
 	alarms(doName: string): number[];
@@ -99,11 +102,18 @@ export type Cluster = {
 	cutovers(doName: string): Array<{ id: string; kind: string; state: string | undefined }>;
 };
 
+/**
+ * The table of every cluster. A cluster keeps its storage apart with the suffix of its stub names, so
+ * two clusters can share the table, and `P` gives the storage prefix of each node.
+ */
+const CLUSTER_TABLE = "repartition";
+
+/** The storage prefix of a hash key in the shard group of every cluster, as a node of the cluster stores it. */
+export const P = (hk: KeyBytes): HashPrefixBucket => prefixOf(hk, `fokos.p.${CLUSTER_TABLE}`);
+
 export type ClusterOptions = {
 	hashSplitN?: number;
 	rangeSplitN?: number;
-	/** Fixes the table name, so two clusters can be built over one topology. */
-	tableName?: string;
 	/** Runtime settings over the defaults, for example a smaller migration page. */
 	runtimeConfig?: FokosRuntimeConfigOverrides;
 };
@@ -111,7 +121,7 @@ export type ClusterOptions = {
 export function makeCluster(opts: ClusterOptions = {}): Cluster {
 	const cfg = createTableConfig({
 		table: {
-			name: opts.tableName ?? `repartition-${crypto.randomUUID()}`,
+			name: CLUSTER_TABLE,
 			ns: "PARTITION_DO",
 			nsTx: "TRANSACTION_COORDINATOR_DO",
 			rootTreesN: 1,
@@ -148,7 +158,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			return cluster.node({ ...base, doName: doName!, partitionId: opaque });
 		},
 		rangeNode(from, hashKey, start, end) {
-			return cluster.node(resolveRangePartitionContext(from, hashKey, start, end));
+			return cluster.node(resolveRangePartitionContext(from, hashPrefixBucketOf(hashKey, from.topology.shardGroup), start, end));
 		},
 		scheduled: (doName) => scheduled.get(doName) ?? 0,
 		alarms: (doName) => alarms.get(doName) ?? [],
@@ -233,9 +243,15 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					logParams: () => ({ doName, partitionId: ctx.partitionId }),
 					captureChanges: () => false,
 					selfId: () => doName,
+					storagePrefix: (hashKey) => hashPrefixBucketOf(hashKey, ctx.topology.shardGroup),
 				}),
-				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => {
-					const plan = planRangeBoundaries(store.keySizes.bytesOf(hashKey), childCount, start, store.sortKeySizes(hashKey, start, end));
+				computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) => {
+					const plan = planRangeBoundaries(
+						store.keySizes.bytesOf(hashPrefixBucket),
+						childCount,
+						start,
+						store.compositeKeySizes(hashPrefixBucket, start, end),
+					);
 					return "boundaries" in plan ? plan.boundaries : null;
 				},
 				onRepartitionCutover: (plan) => {
@@ -247,15 +263,15 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					if (plan.kind !== "key_promotion") {
 						return store.deletePendingTxCopiesBatch(null, CLEANUP_BATCH);
 					}
-					const hashKey = promotedKeyOf(plan);
-					if (!store.deletePendingTxCopiesBatch(hashKey, CLEANUP_BATCH)) {
+					const bucket = promotedHashPrefixBucketOf(plan);
+					if (!store.deletePendingTxCopiesBatch(bucket, CLEANUP_BATCH)) {
 						return false;
 					}
-					store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
-					if (store.hasItemsForHashKey(hashKey)) {
+					store.deleteItemsBatchForHashPrefixBucket(bucket, CLEANUP_BATCH);
+					if (store.hasItemsForHashPrefixBucket(bucket)) {
 						return false;
 					}
-					store.keySizes.remove(hashKey);
+					store.keySizes.remove(bucket);
 					return true;
 				},
 			},
@@ -284,16 +300,9 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 /** Small enough that a promotion with a handful of rows needs more than one cleanup step. */
 export const CLEANUP_BATCH = 2;
 
-/** The one key of a promotion plan: its single target carries a `promoted_key` slice. */
-function promotedKeyOf(plan: FokosRepartitionPlan): KeyBytes {
-	const slice = plan.targets[0]?.slice;
-	invariant(slice?.kind === "promoted_key", "a promotion plan carries one promoted_key slice");
-	return slice.hashKey;
-}
-
 /** Writes one committed item straight into a node's store, as a user write would leave it. */
 export function putItem(store: PartitionStore, hk: string, sk: string, data = `d-${hk}-${sk}`): void {
-	store.upsertItem({ hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt: null, txOrderTs: 1 });
+	store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 }
 
 /** Writes one pending lock. The lock moves with its key to the target that owns the key. */
@@ -304,6 +313,7 @@ export function putLock(store: PartitionStore, hk: string, sk: string, transacti
 /** One unguarded lock row, for a test that writes it itself or compares an imported copy with it. */
 export function lockRow(hk: string, sk: string, transactionId = "tx-1"): PendingTxItem {
 	return {
+		prefix: P(kb(hk)),
 		hk: kb(hk),
 		sk: kb(sk),
 		transaction_id: transactionId,
@@ -322,7 +332,7 @@ export function lockRow(hk: string, sk: string, transactionId = "tx-1"): Pending
 
 /** The number of lock rows under one hash key in a node's store. */
 export function lockCount(store: PartitionStore, hk: string): number {
-	return [...store.queryPendingTxPage(null, 1_000_000, null)].filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
+	return [...store.queryPendingTxPage(null, 1_000_000, ALL_ROWS)].filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
 }
 
 /** The running size estimate of one hash key, which the import maintains page by page. */

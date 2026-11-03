@@ -9,6 +9,7 @@ import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { kb, makeStub } from "./helpers.js";
+import { ALL_ROWS, partitionPrefixOf, prefixOf } from "../storage-prefix.js";
 
 const PRODUCER = "a".repeat(64);
 const OTHER = "b".repeat(64);
@@ -115,17 +116,23 @@ describe("FokosDBPartitionDO — gsiWriteEntries", () => {
 		const source = gsiTable();
 		await source.write({ epoch: 7, items: [put(0, "g", "a", "u1")] });
 		await source.write({ producerId: OTHER, epoch: 2, items: [put(0, "h", "a", "u1")] });
-		const slice = { kind: "promoted_key" as const, hashKey: kb("none") };
+		const slice = { kind: "promoted_hash_prefix_bucket" as const, hashPrefixBucket: prefixOf(kb("none")) };
 		const inSlice = () => false;
 		const budget = { pageBytes: 1 << 20, pageRows: 1, scanRows: 100 };
-		const host = (store: PartitionStore) =>
-			new FokosMigrationHost({ store, logParams: () => ({}), captureChanges: () => false, selfId: () => "self" });
+		const host = (store: PartitionStore, state: DurableObjectState) =>
+			new FokosMigrationHost({
+				store,
+				logParams: () => ({}),
+				captureChanges: () => false,
+				selfId: () => "self",
+				storagePrefix: partitionPrefixOf(state),
+			});
 		const pages = await runInDurableObject(source.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
-			const h = host(new PartitionStore(state.storage));
+			const h = host(new PartitionStore(state.storage), state);
 			const out: unknown[] = [];
 			let cursor: unknown = { stream: "pending_tx", cursor: null };
 			while (cursor !== null) {
-				const page = h.buildPage(cursor, slice, inSlice, budget);
+				const page = h.buildPage(cursor, slice, inSlice, budget, ALL_ROWS);
 				h.validatePage(cursor, page.page, page.nextCursor, inSlice);
 				out.push(page.page);
 				cursor = page.nextCursor;
@@ -141,7 +148,7 @@ describe("FokosDBPartitionDO — gsiWriteEntries", () => {
 		const target = gsiTable();
 		await target.write({ epoch: 9, items: [put(0, "x", "a", "u1")] });
 		await runInDurableObject(target.stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
-			const h = host(new PartitionStore(state.storage));
+			const h = host(new PartitionStore(state.storage), state);
 			for (const page of pages) {
 				h.applyPage(page, slice);
 			}

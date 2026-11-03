@@ -10,18 +10,16 @@ import {
 	estimateItemBytes,
 	estimateProjectedRowBytes,
 	itemsPageStatement,
-	nextHashKeyStatement,
+	outboxPageStatement,
 	PartitionStore,
 	pendingTxPageStatement,
 	queryScanStatement,
-	type HashKeyWalkCursor,
-	type HashKeyWalkEntry,
 	type ItemLinkId,
 	type KeyRange,
 	type MigratedItem,
 	type PendingTransactionCursor,
 	type PendingTxItem,
-	type ScanCursor,
+	type StorageCursor,
 	type SqlMetrics,
 	type StoredItem,
 } from "./partition-store.js";
@@ -31,8 +29,28 @@ import { planRangeBoundaries } from "./split-planner.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
+import { hashPrefixBucketOf } from "../../sharding/hash-primitives.js";
+import { rangeStorageInterval } from "../../sharding/repartition-slice.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
+/** The storage prefix of a hash key. The store treats it as opaque bytes, so the shard group of the helper does not matter. */
+const STORE_TEST_GROUP = "fokos.p.store-test";
+const P = (hk: KeyBytes) => hashPrefixBucketOf(hk, STORE_TEST_GROUP);
+/**
+ * The storage interval of the sort keys `[start, end)` of one hash key: a composite interval of its
+ * prefix. With no end, it stops at `hk || 0x00`, the first key above every key of `hk`.
+ */
+function keyInterval(hk: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): KeyRange {
+	const next = KeyCodec.asKeyBytes(Uint8Array.from([...hk, 0]));
+	return rangeStorageInterval(
+		P(hk),
+		{ hk, sk: start ?? KeyCodec.encodeOptional(undefined) },
+		{ hk: end === null ? next : hk, sk: end ?? KeyCodec.encodeOptional(undefined) },
+	);
+}
+
+/** Every row of the table. */
+const ALL: KeyRange = { start: { prefix: new Uint8Array() }, end: null };
 const keyLabel = (key: KeyBytes): string => {
 	const decoded = KeyCodec.decode(key);
 	return typeof decoded === "string" ? decoded : `b64:${decoded.toBase64({ alphabet: "base64url" })}`;
@@ -88,6 +106,7 @@ describe("PartitionStore - items", () => {
 	it("upsertItem inserts with version 1 and increments on every overwrite", async () => {
 		await withStore((store) => {
 			const first = store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "v1",
@@ -97,6 +116,7 @@ describe("PartitionStore - items", () => {
 			});
 			expect(first.version).toBe(1);
 			const second = store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "v2",
@@ -106,6 +126,7 @@ describe("PartitionStore - items", () => {
 			});
 			expect(second.version).toBe(2);
 			const third = store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "v3",
@@ -120,10 +141,11 @@ describe("PartitionStore - items", () => {
 	it("upsertItem never lowers the item timestamps, but still applies the write", async () => {
 		await withStore((store) => {
 			// As if committed by a transaction whose coordinator clock ran ahead of this partition's.
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "from-tx", kind: "text", ttlAt: null, txOrderTs: 5_000 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("sk"), data: "from-tx", kind: "text", ttlAt: null, txOrderTs: 5_000 });
 
 			// A non-transactional put stamps the partition's own (lower) clock.
 			const second = store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "from-put",
@@ -134,42 +156,46 @@ describe("PartitionStore - items", () => {
 
 			// The write lands in full — only the timestamps are held at the high-water mark.
 			expect(second.version).toBe(2);
-			expect(store.getItem(kb("hk"), kb("sk")).row).toMatchObject({ data: "from-put", last_read_ts: 5_000, last_write_ts: 5_000 });
+			expect(store.getItem(P(kb("hk")), kb("hk"), kb("sk")).row).toMatchObject({
+				data: "from-put",
+				last_read_ts: 5_000,
+				last_write_ts: 5_000,
+			});
 
 			// A later timestamp still moves them forward.
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "newer", kind: "text", ttlAt: null, txOrderTs: 9_000 });
-			expect(store.getItem(kb("hk"), kb("sk")).row).toMatchObject({ last_read_ts: 9_000, last_write_ts: 9_000 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("sk"), data: "newer", kind: "text", ttlAt: null, txOrderTs: 9_000 });
+			expect(store.getItem(P(kb("hk")), kb("hk"), kb("sk")).row).toMatchObject({ last_read_ts: 9_000, last_write_ts: 9_000 });
 		});
 	});
 
 	it("getItem returns converted data, ttl, version, and item timestamps", async () => {
 		await withStore((store) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "hello", kind: "text", ttlAt: 1234, txOrderTs: 42 });
-			const str = store.getItem(kb("hk"), kb("s"));
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: "hello", kind: "text", ttlAt: 1234, txOrderTs: 42 });
+			const str = store.getItem(P(kb("hk")), kb("hk"), kb("s"));
 			expect(str.row).toEqual({ data: "hello", kind: "text", ttl_epoch_utc_seconds: 1234, v: 1, last_read_ts: 42, last_write_ts: 42 });
 			expect(str.rowsRead).toBe(1);
 
 			const bin = new Uint8Array([1, 2, 3]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
-			const got = store.getItem(kb("hk"), kb("b"));
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
+			const got = store.getItem(P(kb("hk")), kb("hk"), kb("b"));
 			expect(got.row?.data).toBeInstanceOf(Uint8Array);
 			expect(got.row?.data).toEqual(bin);
 
-			expect(store.getItem(kb("hk"), kb("missing")).row).toBeUndefined();
+			expect(store.getItem(P(kb("hk")), kb("hk"), kb("missing")).row).toBeUndefined();
 		});
 	});
 
 	it("measureItemBytesWithStamp returns the measured size and the item stamps, and reads at most one row", async () => {
 		await withStore((store) => {
 			const value = JSON.stringify({ a: 1 });
-			const absent = store.measureItemBytesWithStamp({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
+			const absent = store.measureItemBytesWithStamp({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
 			expect(absent).toMatchObject({ itemPresent: false, lastReadTs: null, lastWriteTs: null });
 			expect(absent.estRowBytes).toBe(store.measureItemBytes({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" }));
 			expect(absent.rowsRead).toBeLessThanOrEqual(1);
 
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "old", kind: "text", ttlAt: null, txOrderTs: 42 });
-			store.bumpItemReadTs(kb("hk"), kb("s"), 50);
-			const present = store.measureItemBytesWithStamp({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: "old", kind: "text", ttlAt: null, txOrderTs: 42 });
+			store.bumpItemReadTs(P(kb("hk")), kb("hk"), kb("s"), 50);
+			const present = store.measureItemBytesWithStamp({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
 			expect(present).toMatchObject({ estRowBytes: absent.estRowBytes, itemPresent: true, lastReadTs: 50, lastWriteTs: 42 });
 			expect(present.rowsRead).toBe(1);
 		});
@@ -178,7 +204,15 @@ describe("PartitionStore - items", () => {
 	it("getItemProjected returns the wire cells, the version, and the ttl of one row", async () => {
 		await withStore((store) => {
 			const doc = { n: 7, s: "x", none: null, k: [1, 2] };
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: JSON.stringify(doc), kind: "json", ttlAt: 1234, txOrderTs: 0 });
+			store.upsertItem({
+				prefix: P(kb("hk")),
+				hk: kb("hk"),
+				sk: kb("j"),
+				data: JSON.stringify(doc),
+				kind: "json",
+				ttlAt: 1234,
+				txOrderTs: 0,
+			});
 			const plan = projectionTree([
 				{ expr: { ref: "data", path: "$.n" } },
 				{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
@@ -187,7 +221,7 @@ describe("PartitionStore - items", () => {
 				{ expr: { ref: "v" }, as: "ver" },
 			]);
 
-			const res = store.getItemProjected(plan, kb("hk"), kb("j"));
+			const res = store.getItemProjected(plan, P(kb("hk")), kb("hk"), kb("j"));
 			expect(res.rowsRead).toBe(1);
 			expect(res.row).toEqual({
 				// Cells are positional in plan order: number, missing, JSON null, array as JSON text, version.
@@ -197,11 +231,11 @@ describe("PartitionStore - items", () => {
 			});
 
 			const bin = new Uint8Array([9, 8]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
 			const binPlan = projectionTree([{ expr: { ref: "data" } }]);
-			expect(store.getItemProjected(binPlan, kb("hk"), kb("b")).row?.projected).toEqual([bin]);
+			expect(store.getItemProjected(binPlan, P(kb("hk")), kb("hk"), kb("b")).row?.projected).toEqual([bin]);
 
-			expect(store.getItemProjected(plan, kb("hk"), kb("missing")).row).toBeUndefined();
+			expect(store.getItemProjected(plan, P(kb("hk")), kb("hk"), kb("missing")).row).toBeUndefined();
 		});
 	});
 
@@ -209,8 +243,8 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const unicodeText = "hello € and Ω";
 			const expectedTextBytes = new TextEncoder().encode(unicodeText).byteLength;
-			store.upsertItem({ hk: kb("hk"), sk: kb("text"), data: unicodeText, kind: "text", ttlAt: 1234, txOrderTs: 1 });
-			const textRes = store.getItemImage(kb("hk"), kb("text"));
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("text"), data: unicodeText, kind: "text", ttlAt: 1234, txOrderTs: 1 });
+			const textRes = store.getItemImage(P(kb("hk")), kb("hk"), kb("text"));
 			expect(textRes.row).toEqual({
 				data: unicodeText,
 				kind: "text",
@@ -221,8 +255,8 @@ describe("PartitionStore - items", () => {
 			expect(textRes.rowsRead).toBe(1);
 
 			const bin = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("bytes"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 1 });
-			const bytesRes = store.getItemImage(kb("hk"), kb("bytes"));
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("bytes"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 1 });
+			const bytesRes = store.getItemImage(P(kb("hk")), kb("hk"), kb("bytes"));
 			expect(bytesRes.row).toEqual({
 				data: bin,
 				kind: "bytes",
@@ -232,8 +266,8 @@ describe("PartitionStore - items", () => {
 
 			const jsonText = JSON.stringify({ key: "value", num: 42 });
 			const expectedJsonBytes = new TextEncoder().encode(jsonText).byteLength;
-			store.upsertItem({ hk: kb("hk"), sk: kb("json"), data: jsonText, kind: "json", ttlAt: 5678, txOrderTs: 1 });
-			const jsonRes = store.getItemImage(kb("hk"), kb("json"));
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("json"), data: jsonText, kind: "json", ttlAt: 5678, txOrderTs: 1 });
+			const jsonRes = store.getItemImage(P(kb("hk")), kb("hk"), kb("json"));
 			expect(jsonRes.row).toEqual({
 				data: jsonText,
 				kind: "json",
@@ -242,7 +276,7 @@ describe("PartitionStore - items", () => {
 				imageBytes: expectedJsonBytes,
 			});
 
-			expect(store.getItemImage(kb("hk"), kb("absent")).row).toBeUndefined();
+			expect(store.getItemImage(P(kb("hk")), kb("hk"), kb("absent")).row).toBeUndefined();
 		});
 	});
 
@@ -250,6 +284,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const est1 = expectedRowBytes("aaaa", kb("hk"), kb("s1"));
 			const r1 = store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("s1"),
 				data: "aaaa",
@@ -262,12 +297,13 @@ describe("PartitionStore - items", () => {
 
 			// Second sort key accumulates on the same hash key.
 			const est2 = expectedRowBytes("bb", kb("hk"), kb("s2"));
-			const r2 = store.upsertItem({ hk: kb("hk"), sk: kb("s2"), data: "bb", kind: "text", ttlAt: null, txOrderTs: 2 });
+			const r2 = store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s2"), data: "bb", kind: "text", ttlAt: null, txOrderTs: 2 });
 			expect(r2.keyEstBytes).toBe(est1 + est2);
 
 			// Overwrite replaces the old row's contribution, not adds to it.
 			const est1b = expectedRowBytes("aaaaaaaa", kb("hk"), kb("s1"));
 			const r3 = store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("s1"),
 				data: "aaaaaaaa",
@@ -278,16 +314,16 @@ describe("PartitionStore - items", () => {
 			expect(r3.keyEstBytes).toBe(est1b + est2);
 
 			// Delete removes its contribution.
-			const del = store.deleteItem({ hk: kb("hk"), sk: kb("s1"), txOrderTs: 10 });
+			const del = store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s1"), txOrderTs: 10 });
 			expect(del.deleted).toBe(true);
 			expect(kseBytes(state, "hk")).toBe(est2);
 
 			// Deleting the last item of the key deletes its estimate row.
-			store.deleteItem({ hk: kb("hk"), sk: kb("s2"), txOrderTs: 11 });
+			store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s2"), txOrderTs: 11 });
 			expect(kseBytes(state, "hk")).toBeUndefined();
 
 			// A new write of the key starts a new estimate.
-			const r4 = store.upsertItem({ hk: kb("hk"), sk: kb("s3"), data: "c", kind: "text", ttlAt: null, txOrderTs: 12 });
+			const r4 = store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s3"), data: "c", kind: "text", ttlAt: null, txOrderTs: 12 });
 			expect(r4.keyEstBytes).toBe(expectedRowBytes("c", kb("hk"), kb("s3")));
 			expect(kseBytes(state, "hk")).toBe(r4.keyEstBytes);
 		});
@@ -297,36 +333,40 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const estimateRows = () => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM key_size_estimates`).one().n;
 			for (let i = 0; i < 20; i++) {
-				store.upsertItem({ hk: kb(`k${i}`), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb(`k${i}`)), hk: kb(`k${i}`), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			for (let i = 0; i < 10; i++) {
-				store.deleteItem({ hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 2 });
+				store.deleteItem({ prefix: P(kb(`k${i}`)), hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 2 });
 			}
 			// The transactional delete form, also for a row that is already gone.
 			for (let i = 10; i < 20; i++) {
-				store.deleteItem({ hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 3, bumpTxOrderTsAlways: true });
-				store.deleteItem({ hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 4, bumpTxOrderTsAlways: true });
+				store.deleteItem({ prefix: P(kb(`k${i}`)), hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 3, bumpTxOrderTsAlways: true });
+				store.deleteItem({ prefix: P(kb(`k${i}`)), hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 4, bumpTxOrderTsAlways: true });
 			}
 			expect(estimateRows()).toBe(0);
 		});
 	});
 
-	it("queryItemsPage pages in (hk, sk) order and resumes strictly after the cursor", async () => {
+	it("queryItemsPage pages in (prefix, hk, sk) order and resumes strictly after the cursor", async () => {
 		await withStore((store) => {
+			// The first hash key in storage order has two rows, and the other has one.
+			const [first, second] =
+				KeyCodec.compare(KeyCodec.asKeyBytes(P(kb("a"))), KeyCodec.asKeyBytes(P(kb("b")))) < 0 ? ["a", "b"] : ["b", "a"];
 			for (const [hk, sk] of [
-				["a", "1"],
-				["a", "2"],
-				["b", "1"],
+				[first, "1"],
+				[first, "2"],
+				[second, "1"],
 			] as const) {
-				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			const page1 = [...store.queryItemsPage(null, 2, null)];
+			const page1 = [...store.queryItemsPage(null, 2, ALL)];
 			expect(page1.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([
-				["a", "1"],
-				["a", "2"],
+				[first, "1"],
+				[first, "2"],
 			]);
-			const page2 = [...store.queryItemsPage({ hk: kb("a"), sk: kb("2") }, 2, null)];
-			expect(page2.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([["b", "1"]]);
+			expect(page1.map((r) => r.prefix)).toEqual([P(kb(first)), P(kb(first))]);
+			const page2 = [...store.queryItemsPage({ prefix: P(kb(first)), hk: kb(first), sk: kb("2") }, 2, ALL)];
+			expect(page2.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([[second, "1"]]);
 		});
 	});
 
@@ -342,31 +382,33 @@ describe("PartitionStore - items", () => {
 				[kb("c"), kb("q")],
 			];
 			for (const [hk, sk] of keys) {
-				store.upsertItem({ hk, sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(hk), hk, sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			// Walk the whole table one row at a time, the way migration does.
 			const seen: string[] = [];
-			let cursor: { hk: KeyBytes; sk: KeyBytes } | null = null;
+			let cursor: StorageCursor | null = null;
 			for (;;) {
-				const page: MigratedItem[] = [...store.queryItemsPage(cursor, 1, null)];
+				const page: MigratedItem[] = [...store.queryItemsPage(cursor, 1, ALL)];
 				if (page.length === 0) {
 					break;
 				}
 				const row = page[0];
 				seen.push(`${keyLabel(row.hk)}/${keyLabel(row.sk)}`);
-				cursor = { hk: row.hk, sk: row.sk };
+				cursor = { prefix: row.prefix, hk: row.hk, sk: row.sk };
 			}
-			expect(seen).toEqual(["a/", "a/m", "b/", "c/q"]);
+			expect([...seen].sort()).toEqual(["a/", "a/m", "b/", "c/q"]);
+			// Each key keeps its rows together, with the empty sort key first.
+			expect(seen.indexOf("a/m")).toBe(seen.indexOf("a/") + 1);
 		});
 	});
 
 	it("stores json as JSONB, persists data_kind, and decodes to JSON text on read", async () => {
 		await withStore((store, state) => {
 			const jsonText = JSON.stringify({ a: 1, b: ["x", true, null] });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			// getItem decodes JSONB → JSON text and surfaces the kind.
-			const got = store.getItem(kb("hk"), kb("j"));
+			const got = store.getItem(P(kb("hk")), kb("hk"), kb("j"));
 			expect(got.row?.kind).toBe("json");
 			expect(JSON.parse(got.row!.data as string)).toEqual({ a: 1, b: ["x", true, null] });
 
@@ -398,17 +440,17 @@ describe("PartitionStore - items", () => {
 				EST_ROW_BYTES_K;
 
 			const multibyte = "héllo—✓"; // multi-byte UTF-8: octet_length > .length
-			store.upsertItem({ hk: kb("hk"), sk: kb("t"), data: multibyte, kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("t"), data: multibyte, kind: "text", ttlAt: null, txOrderTs: 1 });
 			expect(readEst("t")).toBe(octetLen("t", multibyte));
 
 			const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bytes, kind: "bytes", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("b"), data: bytes, kind: "bytes", ttlAt: null, txOrderTs: 1 });
 			expect(readEst("b")).toBe(octetLen("b", bytes));
 
 			// For json, the stored JSONB blob size is what octet_length(data) measures — read it from SQL
 			// rather than the input text (the two differ), then confirm the constant folds in.
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 			const jsonBlobLen = state.storage.sql
 				.exec<{ n: number }>(`SELECT octet_length(data) AS n FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb("j"))
 				.toArray()[0].n;
@@ -424,8 +466,8 @@ describe("PartitionStore - items", () => {
 
 			// The migration writer carries the formula independently of upsertItem — both must agree.
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
-			const migrated = [...store.queryItemsPage(null, 10, null)][0];
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
+			const migrated = [...store.queryItemsPage(null, 10, ALL)][0];
 			store.insertItemIfAbsent({ ...migrated, item_id: linkId(migrated.item_id + 1), sk: kb("j2") });
 			// Same row under a longer sk: the only difference must be octet_length(sk).
 			expect(readEst("j2")).toBe(readEst("j")! - kb("j").byteLength + kb("j2").byteLength);
@@ -433,6 +475,7 @@ describe("PartitionStore - items", () => {
 			const bytes = new Uint8Array([1, 2, 3, 4, 5]);
 			store.insertItemIfAbsent({
 				item_id: linkId(100),
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("b"),
 				data: bytes,
@@ -446,7 +489,7 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	// idx_items_scan is what keeps `sortKeySizes` off the wide
+	// idx_items_scan is what keeps `compositeKeySizes` off the wide
 	// item rows. A generated est_row_bytes column, or a narrower index, silently loses "COVERING" and
 	// costs ~20x more page reads without failing any other test.
 	it("the est_row_bytes scans stay index-only", async () => {
@@ -473,15 +516,16 @@ describe("PartitionStore - items", () => {
 		await withStore((_store, state) => {
 			const plan = (sql: string) =>
 				state.storage.sql
-					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, kb("hk"), kb("sk"))
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, P(kb("hk")), kb("hk"), kb("sk"))
 					.toArray()
 					.map((r) => r.detail)
 					.join(" | ");
+			const where = "WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1";
 
-			expect(plan(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE hk = ? AND sk = ? LIMIT 1`)).toContain(
-				"COVERING INDEX idx_items_scan (hk=? AND sk=?)",
+			expect(plan(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan ${where}`)).toContain(
+				"COVERING INDEX idx_items_scan (hash_prefix_bucket=? AND hk=? AND sk=?)",
 			);
-			expect(plan(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`)).toContain("sqlite_autoindex_items_1");
+			expect(plan(`SELECT est_row_bytes FROM items ${where}`)).toContain("USING PRIMARY KEY");
 		});
 	});
 
@@ -489,14 +533,15 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const jsonText = JSON.stringify({ a: 1 });
-			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const storedEst = (sk: string) =>
 				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, hk, kb(sk)).toArray()[0]!.e;
 
 			const { rows } = scanRows(store, {
+				prefix: P(hk),
 				hk,
 				lower: KeyCodec.encodeOptional(undefined),
 				lowerInclusive: true,
@@ -523,12 +568,13 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			const jsonText = JSON.stringify({ a: 1 });
-			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const scan = (select: "count" | "projection") =>
 				scanRows(store, {
+					prefix: P(hk),
 					hk,
 					lower: KeyCodec.encodeOptional(undefined),
 					lowerInclusive: true,
@@ -563,16 +609,17 @@ describe("PartitionStore - items", () => {
 				const hk = kb("hk");
 				const EMPTY = KeyCodec.encodeOptional(undefined);
 				for (const sk of [EMPTY, kb("a"), kb("b"), kb("c"), kb("d")]) {
-					store.upsertItem({ hk, sk, data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
+					store.upsertItem({ prefix: P(hk), hk, sk, data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 				}
 				const sksOf = (opts: {
 					lower?: KeyBytes;
 					lowerInclusive?: boolean;
 					upper?: KeyBytes | null;
 					upperInclusive?: boolean;
-					cursor?: ScanCursor | null;
+					cursor?: { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean } | null;
 				}) =>
 					scanRows(store, {
+						prefix: P(hk),
 						hk,
 						direction,
 						limit: 100,
@@ -606,9 +653,10 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			for (let i = 0; i < 10; i++) {
-				store.upsertItem({ hk, sk: kb(String(i).padStart(2, "0")), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(hk), hk, sk: kb(String(i).padStart(2, "0")), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			const bounds = {
+				prefix: P(hk),
 				hk,
 				lower: KeyCodec.encodeOptional(undefined),
 				lowerInclusive: true,
@@ -644,7 +692,15 @@ describe("PartitionStore - items", () => {
 					.map((r) => r.detail)
 					.join(" | ");
 
-			const bounds = { hk: kb("hk"), lower: kb("a"), lowerInclusive: true, upper: kb("z"), upperInclusive: false, plan: null };
+			const bounds = {
+				prefix: P(kb("hk")),
+				hk: kb("hk"),
+				lower: kb("a"),
+				lowerInclusive: true,
+				upper: kb("z"),
+				upperInclusive: false,
+				plan: null,
+			};
 			for (const direction of ["asc", "desc"] as const) {
 				for (const cursor of [null, { hk: kb("hk"), sk: kb("m") }]) {
 					const { sql, params } = queryScanStatement({ ...bounds, direction, cursor, limit: 10, select: "count" });
@@ -686,10 +742,10 @@ describe("PartitionStore - items", () => {
 	it("migration reads json verbatim (raw JSONB) and re-inserts it queryable by jsonb_extract", async () => {
 		await withStore((store, state) => {
 			const jsonText = JSON.stringify({ status: "ok", count: 7 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			// Migration-style read: no json() decode, so json data is the raw JSONB blob.
-			const migrated = [...store.queryItemsPage(null, 10, null)][0];
+			const migrated = [...store.queryItemsPage(null, 10, ALL)][0];
 			expect(migrated.kind).toBe("json");
 			expect(migrated.data).toBeInstanceOf(Uint8Array);
 
@@ -709,16 +765,16 @@ describe("PartitionStore - items", () => {
 			const hk = kb("created-hk");
 			const sk = kb("created-sk");
 
-			const first = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 5 });
+			const first = store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 5 });
 			expect(first.version).toBe(1);
-			const created = store.getItem(hk, sk).row;
+			const created = store.getItem(P(hk), hk, sk).row;
 			expect(created).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: null, last_read_ts: 5, last_write_ts: 5 });
 			expect(JSON.parse(created?.data as string)).toEqual({ x: 1 });
 			// The created row is measured and accounted for exactly as an upsert of the same document is.
 			expect(kseBytes(state, "created-hk")).toBe(first.keyEstBytes);
 
 			// The second call finds the row it created and takes the conflict branch.
-			const second = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 6 });
+			const second = store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 6 });
 			expect(second.version).toBe(2);
 			expect(kseBytes(state, "created-hk")).toBe(second.keyEstBytes);
 		});
@@ -731,20 +787,20 @@ describe("PartitionStore - items", () => {
 			const plan = (x: number) => updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: x } }]);
 
 			// As if committed by a transaction whose coordinator clock ran ahead of this partition's.
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 5_000 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 5_000 });
 
 			// A single-shot update stamps the partition's own (lower) clock.
-			const second = store.updateItemSingleShot({ hk, sk, plan: plan(2), txOrderTs: 1_000 });
+			const second = store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan: plan(2), txOrderTs: 1_000 });
 
 			// The write lands in full — only the timestamps are held at the high-water mark.
 			expect(second.version).toBe(2);
-			const afterLag = store.getItem(hk, sk).row;
+			const afterLag = store.getItem(P(hk), hk, sk).row;
 			expect(afterLag).toMatchObject({ last_read_ts: 5_000, last_write_ts: 5_000 });
 			expect(JSON.parse(afterLag?.data as string)).toEqual({ x: 2 });
 
 			// A later timestamp still moves them forward.
-			store.updateItemSingleShot({ hk, sk, plan: plan(3), txOrderTs: 9_000 });
-			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 9_000, last_write_ts: 9_000 });
+			store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan: plan(3), txOrderTs: 9_000 });
+			expect(store.getItem(P(hk), hk, sk).row).toMatchObject({ last_read_ts: 9_000, last_write_ts: 9_000 });
 		});
 	});
 
@@ -752,7 +808,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const sk = kb("sk");
-			store.upsertItem({ hk, sk, data: JSON.stringify({ count: 5 }), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({ count: 5 }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const plan = updateTree([
 				{
 					action: "set",
@@ -762,7 +818,7 @@ describe("PartitionStore - items", () => {
 				{ action: "set", target: { ref: "data", path: "$.at" }, value: { val: 1_788_000_000 } },
 				{ action: "set", target: { ref: "data", path: "$.ratio" }, value: { val: 1.5 } },
 			]);
-			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
+			store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 2 });
 
 			// JSON.parse reads 6.0 as 6, so the test reads the stored text and the JSON type of each member.
 			const row = state.storage.sql
@@ -782,17 +838,17 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			const sk = kb("sk");
-			store.upsertItem({ hk, sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 100 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 100 });
 
-			store.bumpItemReadTs(hk, sk, 200);
-			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 200, last_write_ts: 100 });
+			store.bumpItemReadTs(P(hk), hk, sk, 200);
+			expect(store.getItem(P(hk), hk, sk).row).toMatchObject({ last_read_ts: 200, last_write_ts: 100 });
 
 			// An out-of-order check must not move the watermark back.
-			store.bumpItemReadTs(hk, sk, 150);
-			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 200, last_write_ts: 100 });
+			store.bumpItemReadTs(P(hk), hk, sk, 150);
+			expect(store.getItem(P(hk), hk, sk).row).toMatchObject({ last_read_ts: 200, last_write_ts: 100 });
 
-			store.bumpItemReadTs(hk, sk, 300);
-			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 300, last_write_ts: 100 });
+			store.bumpItemReadTs(P(hk), hk, sk, 300);
+			expect(store.getItem(P(hk), hk, sk).row).toMatchObject({ last_read_ts: 300, last_write_ts: 100 });
 		});
 	});
 
@@ -801,26 +857,26 @@ describe("PartitionStore - items", () => {
 			const hk = kb("hk");
 			const sk = kb("sk");
 			const timestamps = () => {
-				const row = store.getItem(hk, sk).row;
+				const row = store.getItem(P(hk), hk, sk).row;
 				invariant(row, "the item must exist");
 				expect(row.last_read_ts).toBeGreaterThanOrEqual(row.last_write_ts);
 				return row;
 			};
 
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 500 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 500 });
 			expect(timestamps()).toMatchObject({ last_read_ts: 500, last_write_ts: 500 });
 
 			// A committed check orders the item ahead of the write that created it.
-			store.bumpItemReadTs(hk, sk, 700);
+			store.bumpItemReadTs(P(hk), hk, sk, 700);
 			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 500 });
 
 			// A put stamped by a lagging clock lands below the read watermark.
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 600 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 600 });
 			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 600 });
 
 			// A single-shot update stamped between the two watermarks lands between them too.
 			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
-			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 650 });
+			store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 650 });
 			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 650 });
 		});
 	});
@@ -833,8 +889,8 @@ describe("PartitionStore - items", () => {
 				{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: "a".repeat(MAX_ITEM_BYTES) } },
 			];
 			const plan = updateTree(update);
-			expect(() => store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 1 })).toThrow(fokosErrorWith("item_too_large"));
-			expect(store.getItem(hk, sk).row).toBeUndefined();
+			expect(() => store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 1 })).toThrow(fokosErrorWith("item_too_large"));
+			expect(store.getItem(P(hk), hk, sk).row).toBeUndefined();
 		});
 	});
 
@@ -842,14 +898,14 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("my-hash-key");
 			const sk = kb("my-sort-key");
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.hk" }, value: { ref: "hashKey" } },
 				{ action: "set", target: { ref: "data", path: "$.sk" }, value: { ref: "sortKey" } },
 			];
 			const plan = updateTree(update);
-			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
-			const { row } = store.getItem(hk, sk);
+			store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 2 });
+			const { row } = store.getItem(P(hk), hk, sk);
 			expect(row).toBeDefined();
 			const data = JSON.parse(row!.data as string);
 			expect(data).toEqual({ hk: "my-hash-key", sk: "my-sort-key" });
@@ -860,7 +916,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb(new Uint8Array([1, 2, 3]));
 			const sk = kb(new Uint8Array([4, 5, 6]));
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 			// A function around the reference must not escape the test: SQLite carries the untagged key
 			// bytes through, and the result is still a blob that a JSON document cannot hold.
 			const values = [
@@ -871,12 +927,12 @@ describe("PartitionStore - items", () => {
 			];
 			for (const value of values) {
 				const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value }] as UpdateExpression);
-				const probe = store.probeUpdate(plan, hk, sk);
+				const probe = store.probeUpdate(plan, P(hk), hk, sk);
 				expect(probe.applicable).toBe(false);
 				expect(probe.valueTypeOk).toBe(false);
 			}
 			// The item is untouched: an inapplicable update writes nothing.
-			expect(JSON.parse(store.getItem(hk, sk).row?.data as string)).toEqual({});
+			expect(JSON.parse(store.getItem(P(hk), hk, sk).row?.data as string)).toEqual({});
 		});
 	});
 
@@ -884,13 +940,13 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const sk = kb("s1");
-			store.upsertItem({ hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const before = kseBytes(state, "hk");
 
 			const plan = updateTree([
 				{ action: "set", target: { ref: "data", path: "$.note" }, value: { val: "a considerably longer note than the first one" } },
 			]);
-			const res = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
+			const res = store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan, txOrderTs: 2 });
 
 			// The size the update stored is measured over the document the update wrote, and the key's
 			// estimate carries exactly that row. An update grows an item without carrying its bytes, so
@@ -912,12 +968,13 @@ describe("PartitionStore - items", () => {
 			// A migration copies rows that were accepted under the limit of their time, so the ingest
 			// path carries no size guard. A guard there would drop an item when the limit falls.
 			const oversized = "x".repeat(MAX_ITEM_BYTES + 1);
-			expect(() => store.upsertItem({ hk, sk, data: oversized, kind: "text", ttlAt: null, txOrderTs: 1 })).toThrow(
+			expect(() => store.upsertItem({ prefix: P(hk), hk, sk, data: oversized, kind: "text", ttlAt: null, txOrderTs: 1 })).toThrow(
 				fokosErrorWith("item_too_large"),
 			);
 
 			store.insertItemIfAbsent({
 				item_id: linkId(1),
+				prefix: P(hk),
 				hk,
 				sk,
 				data: oversized,
@@ -927,7 +984,7 @@ describe("PartitionStore - items", () => {
 				last_read_ts: 1,
 				last_write_ts: 1,
 			});
-			expect(store.getItem(hk, sk).row).toMatchObject({ v: 7, data: oversized });
+			expect(store.getItem(P(hk), hk, sk).row).toMatchObject({ v: 7, data: oversized });
 		});
 	});
 
@@ -935,6 +992,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const copied = (id: number, sk: string, data: string) => ({
 				item_id: linkId(id),
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb(sk),
 				data,
@@ -944,7 +1002,7 @@ describe("PartitionStore - items", () => {
 				last_read_ts: 1,
 				last_write_ts: 1,
 			});
-			const rows = () => [...store.queryItemsPage(null, 10, null)].map((r) => ({ item_id: r.item_id, data: r.data }));
+			const rows = () => [...store.queryItemsPage(null, 10, ALL)].map((r) => ({ item_id: r.item_id, data: r.data }));
 
 			store.insertItemIfAbsent(copied(1000, "a", "first"));
 			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
@@ -957,15 +1015,17 @@ describe("PartitionStore - items", () => {
 			expect(() => store.insertItemIfAbsent(copied(1000, "b", "other"))).toThrow(/UNIQUE constraint failed: items\.item_id/);
 			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
 
-			// A local write after the copy takes an id above every copied id.
-			store.upsertItem({ hk: kb("hk"), sk: kb("c"), data: "local", kind: "text", ttlAt: null, txOrderTs: 2 });
+			// The ingest raises the mark after its page. A local write after the copy takes an id above
+			// every copied id.
+			store.raiseItemIdMark(1000);
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("c"), data: "local", kind: "text", ttlAt: null, txOrderTs: 2 });
 			expect(rows()).toEqual([
 				{ item_id: 1000, data: "first" },
 				{ item_id: 1001, data: "local" },
 			]);
 
 			// An overwrite keeps the id of the item.
-			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "overwritten", kind: "text", ttlAt: null, txOrderTs: 3 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("a"), data: "overwritten", kind: "text", ttlAt: null, txOrderTs: 3 });
 			expect(rows()).toEqual([
 				{ item_id: 1000, data: "overwritten" },
 				{ item_id: 1001, data: "local" },
@@ -977,28 +1037,28 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("text-key");
 			const sk = kb("text-sort");
-			store.upsertItem({ hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			// A missing target parent is inapplicable, but the values are fine, so the cause is not the
 			// value type. Only that distinction lets a caller tell a fixable value from a stale item.
 			const missingParent = updateTree([{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } }]);
-			const probe = store.probeUpdate(missingParent, hk, sk);
+			const probe = store.probeUpdate(missingParent, P(hk), hk, sk);
 			expect(probe.applicable).toBe(false);
 			expect(probe.valueTypeOk).toBe(true);
 
 			// A text key is a valid update value, so the same plan that fails over a binary key applies here.
 			const keyValue = updateTree([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
-			expect(store.probeUpdate(keyValue, hk, sk)).toMatchObject({ applicable: true, valueTypeOk: true });
+			expect(store.probeUpdate(keyValue, P(hk), hk, sk)).toMatchObject({ applicable: true, valueTypeOk: true });
 		});
 	});
 });
 
 describe("PartitionStore - TTL deletion", () => {
 	function put(store: PartitionStore, hk: string, sk: string, ttlAt: number | null, data = "d"): number {
-		store.upsertItem({ hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt, txOrderTs: 1 });
+		store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt, txOrderTs: 1 });
 		return expectedRowBytes(data, kb(hk), kb(sk));
 	}
 
-	it("uses the bounded covering-index candidate plan and deletes the owned rows by item_id", async () => {
+	it("uses the bounded covering-index candidate plan and deletes the owned rows by primary key", async () => {
 		await withStore((_store, state) => {
 			const explain = (sql: string, ...bindings: unknown[]) =>
 				state.storage.sql
@@ -1008,39 +1068,42 @@ describe("PartitionStore - TTL deletion", () => {
 					.join(" | ");
 			const candidates = (indexHint: string, position: string, ...positionBindings: unknown[]) =>
 				explain(
-					`SELECT i.item_id, i.ttl_epoch_utc_seconds AS ttl, i.hk, i.sk FROM items i${indexHint}
+					`SELECT i.ttl_epoch_utc_seconds AS ttl, i.hash_prefix_bucket, i.hk, i.sk FROM items i${indexHint}
 					  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 					    AND i.ttl_epoch_utc_seconds <= ?1
 					    ${position}
-					    AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
-					  ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
+					    AND NOT EXISTS (SELECT 1 FROM pending_transactions p
+					                     WHERE p.hash_prefix_bucket = i.hash_prefix_bucket AND p.hk = i.hk AND p.sk = i.sk)
+					  ORDER BY i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk
 					  LIMIT ?2`,
 					100,
 					10,
 					...positionBindings,
 				);
-			const afterPosition = "AND (i.ttl_epoch_utc_seconds, i.hk, i.sk) > (?3, ?4, ?5)";
+			const afterPosition = "AND (i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk) > (?3, ?4, ?5, ?6)";
 
 			for (const details of [
 				candidates(" INDEXED BY idx_items_ttl", ""),
 				candidates("", ""),
-				candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, kb("a"), kb("s")),
+				candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, P(kb("a")), kb("a"), kb("s")),
 			]) {
 				expect(details).toContain("SEARCH i USING COVERING INDEX idx_items_ttl");
 				expect(details).toMatch(/SEARCH p USING COVERING INDEX sqlite_autoindex_pending_transactions_1/);
-				expect(details).not.toMatch(/SCAN p|USE TEMP B-TREE FOR ORDER BY/);
+				expect(details).not.toMatch(/SCAN p|USE TEMP B-TREE FOR/);
 			}
 			// The scan seeks to the position, and does not read the rows before it.
-			expect(candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, kb("a"), kb("s"))).toContain(
-				"idx_items_ttl ((ttl_epoch_utc_seconds,hk,sk)>(?,?,?) AND ttl_epoch_utc_seconds<?)",
+			expect(candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, P(kb("a")), kb("a"), kb("s"))).toContain(
+				"idx_items_ttl ((ttl_epoch_utc_seconds,hash_prefix_bucket,hk,sk)>(?,?,?,?) AND ttl_epoch_utc_seconds<?)",
 			);
 			expect(
 				explain(
-					`DELETE FROM items WHERE item_id IN (SELECT value FROM json_each(?1))
-					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
-					"[1,2]",
+					`DELETE FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?
+					 RETURNING est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
+					P(kb("a")),
+					kb("a"),
+					kb("s"),
 				),
-			).toMatch(/SEARCH items USING INTEGER PRIMARY KEY/);
+			).toMatch(/SEARCH items USING PRIMARY KEY \(hash_prefix_bucket=\? AND hk=\? AND sk=\?\)/);
 		});
 	});
 
@@ -1055,6 +1118,7 @@ describe("PartitionStore - TTL deletion", () => {
 			const futureBytes = put(store, "a", "future", 101, "future");
 
 			store.insertPendingLock({
+				prefix: P(kb("locked")),
 				hk: kb("locked"),
 				sk: kb("s"),
 				transaction_id: "tx-locked",
@@ -1072,9 +1136,9 @@ describe("PartitionStore - TTL deletion", () => {
 
 			const first = store.deleteExpiredItems(100, 2, ownsAll);
 			expect(first).toMatchObject({ deletedRows: 2, deletedBytes: oldBytes + secondBytes });
-			expect(store.getItem(kb("a"), kb("old")).row).toBeUndefined();
-			expect(store.getItem(kb("b"), kb("s")).row).toBeUndefined();
-			expect(store.getItem(kb("a"), kb("next")).row).toBeDefined();
+			expect(store.getItem(P(kb("a")), kb("a"), kb("old")).row).toBeUndefined();
+			expect(store.getItem(P(kb("b")), kb("b"), kb("s")).row).toBeUndefined();
+			expect(store.getItem(P(kb("a")), kb("a"), kb("next")).row).toBeDefined();
 			expect(kseBytes(state, "a")).toBe(nextBytes + nullBytes + futureBytes);
 			// The sweep removed the last item of "b", so its estimate row is gone.
 			expect(kseBytes(state, "b")).toBeUndefined();
@@ -1086,16 +1150,16 @@ describe("PartitionStore - TTL deletion", () => {
 			store.bumpMaxDeleteTxOrderTs(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 			const second = store.deleteExpiredItems(100, 2, ownsAll);
 			expect(second).toMatchObject({ deletedRows: 2, deletedBytes: nextBytes + exactBytes });
-			expect(store.getItem(kb("a"), kb("next")).row).toBeUndefined();
-			expect(store.getItem(kb("c"), kb("exact")).row).toBeUndefined();
+			expect(store.getItem(P(kb("a")), kb("a"), kb("next")).row).toBeUndefined();
+			expect(store.getItem(P(kb("c")), kb("c"), kb("exact")).row).toBeUndefined();
 			expect(kseBytes(state, "a")).toBe(nullBytes + futureBytes);
 			expect(kseBytes(state, "c")).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 
-			expect(store.getItem(kb("locked"), kb("s")).row).toBeDefined();
+			expect(store.getItem(P(kb("locked")), kb("locked"), kb("s")).row).toBeDefined();
 			expect(kseBytes(state, "locked")).toBe(lockedBytes);
-			expect(store.getItem(kb("a"), kb("null")).row).toBeDefined();
-			expect(store.getItem(kb("a"), kb("future")).row).toBeDefined();
+			expect(store.getItem(P(kb("a")), kb("a"), kb("null")).row).toBeDefined();
+			expect(store.getItem(P(kb("a")), kb("a"), kb("future")).row).toBeDefined();
 			expect(store.deleteExpiredItems(100, 2, ownsAll)).toEqual({ deletedRows: 0, deletedBytes: 0, resumeAfter: null });
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(2);
 		});
@@ -1127,18 +1191,18 @@ describe("PartitionStore - deletion watermark", () => {
 	it("deleteItem bumps the watermark only when a row was deleted, unless bumpTxOrderTsAlways", async () => {
 		await withStore((store) => {
 			// Absent row, default behavior: no bump.
-			const miss = store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 100 });
+			const miss = store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("absent"), txOrderTs: 100 });
 			expect(miss.deleted).toBe(false);
 			expect(miss.deleteVersion).toBeUndefined();
 			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 0, maxDeletedV: 0 });
 
 			// Absent row, transactional behavior: bump the watermark regardless. No row means no v to record.
-			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 100, bumpTxOrderTsAlways: true });
+			store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("absent"), txOrderTs: 100, bumpTxOrderTsAlways: true });
 			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 100, maxDeletedV: 0 });
 
 			// Present row at v = 1: bump both. The delete revision is v + 1.
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
-			const hit = store.deleteItem({ hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			const hit = store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
 			expect(hit.deleted).toBe(true);
 			expect(hit.deleteVersion).toBe(2);
 			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 200, maxDeletedV: 2 });
@@ -1166,10 +1230,10 @@ describe("PartitionStore - deletion watermark", () => {
 			const store = new PartitionStore(recordingStorage);
 			const metadataStatements = () => statements.filter((sql) => sql.includes("deletion_metadata"));
 
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 
 			statements.length = 0;
-			const hit = store.deleteItem({ hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
+			const hit = store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
 			expect(hit.deleted).toBe(true);
 			const hitWrites = metadataStatements();
 			expect(hitWrites).toHaveLength(1);
@@ -1179,7 +1243,7 @@ describe("PartitionStore - deletion watermark", () => {
 
 			// The transactional absent delete advances the watermark only, in one statement.
 			statements.length = 0;
-			const miss = store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 300, bumpTxOrderTsAlways: true });
+			const miss = store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("absent"), txOrderTs: 300, bumpTxOrderTsAlways: true });
 			expect(miss.deleted).toBe(false);
 			const missWrites = metadataStatements();
 			expect(missWrites).toHaveLength(1);
@@ -1188,7 +1252,7 @@ describe("PartitionStore - deletion watermark", () => {
 
 			// The non-transactional absent delete writes no metadata at all.
 			statements.length = 0;
-			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 400 });
+			store.deleteItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("absent"), txOrderTs: 400 });
 			expect(metadataStatements()).toHaveLength(0);
 			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, maxDeletedV: 2 });
 		});
@@ -1196,20 +1260,20 @@ describe("PartitionStore - deletion watermark", () => {
 
 	it("promotion cleanup changes neither deletion-metadata value", async () => {
 		await withStore((store) => {
-			store.upsertItem({ hk: kb("alice"), sk: kb("s1"), data: "a1", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk: kb("alice"), sk: kb("s2"), data: "a2", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk: kb("bob"), sk: kb("s"), data: "b", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("alice")), hk: kb("alice"), sk: kb("s1"), data: "a1", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("alice")), hk: kb("alice"), sk: kb("s2"), data: "a2", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("bob")), hk: kb("bob"), sk: kb("s"), data: "b", kind: "text", ttlAt: null, txOrderTs: 1 });
 
 			// A real user delete first, so both metadata fields are non-zero.
-			store.deleteItem({ hk: kb("bob"), sk: kb("s"), txOrderTs: 555 });
+			store.deleteItem({ prefix: P(kb("bob")), hk: kb("bob"), sk: kb("s"), txOrderTs: 555 });
 			const before = store.getDeletionMetadata();
 			expect(before).toEqual({ maxDeleteTxOrderTs: 555, maxDeletedV: 2 });
 
-			// The cleanup a promotion runs over the hash key it is moving.
-			store.deleteItemsBatchForHashKey(kb("alice"), 1000);
-			store.keySizes.remove(kb("alice"));
+			// The cleanup a promotion runs over the hashPrefixBucket it is moving.
+			store.deleteItemsBatchForHashPrefixBucket(P(kb("alice")), 1000);
+			store.keySizes.remove(P(kb("alice")));
 
-			expect(store.hasItemsForHashKey(kb("alice"))).toBe(false);
+			expect(store.hasItemsForHashPrefixBucket(P(kb("alice")))).toBe(false);
 			expect(store.getDeletionMetadata()).toEqual(before);
 		});
 	});
@@ -1217,14 +1281,14 @@ describe("PartitionStore - deletion watermark", () => {
 
 describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", () => {
 	const text = (store: PartitionStore, hk: string, txOrderTs: number) =>
-		store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs }).version;
+		store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs }).version;
 	const setA = updateTree([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
-	const row = (store: PartitionStore, hk: string) => store.getItem(kb(hk), kb("s")).row;
+	const row = (store: PartitionStore, hk: string) => store.getItem(P(kb(hk)), kb(hk), kb("s")).row;
 
 	it("starts the first item row of a new partition at v = 1", async () => {
 		await withStore((store) => {
 			expect(text(store, "x", 1)).toBe(1);
-			expect(store.updateItemSingleShot({ hk: kb("y"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(1);
+			expect(store.updateItemSingleShot({ prefix: P(kb("y")), hk: kb("y"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(1);
 		});
 	});
 
@@ -1233,15 +1297,15 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			text(store, "x", 1);
 			text(store, "x", 1);
 			expect(text(store, "x", 1)).toBe(3);
-			expect(store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 1 }).deleteVersion).toBe(4);
+			expect(store.deleteItem({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), txOrderTs: 1 }).deleteVersion).toBe(4);
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(4);
 			expect(text(store, "x", 1)).toBe(5);
 			// An update of the existing row keeps v + 1.
 			expect(text(store, "x", 1)).toBe(6);
 
-			expect(store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 1 }).deleteVersion).toBe(7);
-			expect(store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(8);
-			expect(store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(9);
+			expect(store.deleteItem({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), txOrderTs: 1 }).deleteVersion).toBe(7);
+			expect(store.updateItemSingleShot({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(8);
+			expect(store.updateItemSingleShot({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(9);
 		});
 	});
 
@@ -1250,8 +1314,8 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			text(store, "old", 1);
 			text(store, "hot", 1);
 			text(store, "hot", 1);
-			store.deleteItem({ hk: kb("hot"), sk: kb("s"), txOrderTs: 1 });
-			store.deleteItem({ hk: kb("old"), sk: kb("s"), txOrderTs: 1 });
+			store.deleteItem({ prefix: P(kb("hot")), hk: kb("hot"), sk: kb("s"), txOrderTs: 1 });
+			store.deleteItem({ prefix: P(kb("old")), hk: kb("old"), sk: kb("s"), txOrderTs: 1 });
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(3);
 		});
 	});
@@ -1259,7 +1323,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 	it("deletes only the expired rows that the owner check accepts, and keeps the copies", async () => {
 		await withStore((store, state) => {
 			const expiring = (hk: string, sk: string) =>
-				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 }).version;
+				store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 }).version;
 			expiring("copy", "s1");
 			expiring("copy", "s2");
 			const ownedVersion = expiring("owned", "s");
@@ -1268,9 +1332,9 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 
 			// The chunk holds the 2 copies and the owned row. Only the owned row is deleted and counted.
 			expect(store.deleteExpiredItems(100, 3, ownsByKey)).toMatchObject({ deletedRows: 1 });
-			expect(store.getItem(kb("owned"), kb("s")).row).toBeUndefined();
-			expect(store.getItem(kb("copy"), kb("s1")).row).toBeDefined();
-			expect(store.getItem(kb("copy"), kb("s2")).row).toBeDefined();
+			expect(store.getItem(P(kb("owned")), kb("owned"), kb("s")).row).toBeUndefined();
+			expect(store.getItem(P(kb("copy")), kb("copy"), kb("s1")).row).toBeDefined();
+			expect(store.getItem(P(kb("copy")), kb("copy"), kb("s2")).row).toBeDefined();
 			expect(kseBytes(state, "copy")).toBe(copyBytes);
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(ownedVersion + 1);
 
@@ -1284,9 +1348,17 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 		await withStore((store) => {
 			// 12 copies expire first, and the owned row expires last. One chunk of limit 1 reads at most 10 candidates.
 			for (let n = 0; n < 12; n++) {
-				store.upsertItem({ hk: kb("copy"), sk: kb(`s${String(n).padStart(2, "0")}`), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
+				store.upsertItem({
+					prefix: P(kb("copy")),
+					hk: kb("copy"),
+					sk: kb(`s${String(n).padStart(2, "0")}`),
+					data: "d",
+					kind: "text",
+					ttlAt: 10,
+					txOrderTs: 1,
+				});
 			}
-			store.upsertItem({ hk: kb("owned"), sk: kb("s"), data: "d", kind: "text", ttlAt: 20, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("owned")), hk: kb("owned"), sk: kb("s"), data: "d", kind: "text", ttlAt: 20, txOrderTs: 1 });
 			const ownsByKey = (row: { hk: KeyBytes }) => keyLabel(row.hk) !== "copy";
 
 			const first = store.deleteExpiredItems(100, 1, ownsByKey);
@@ -1296,7 +1368,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 
 			const second = store.deleteExpiredItems(100, 1, ownsByKey, first.resumeAfter);
 			expect(second).toMatchObject({ deletedRows: 1, resumeAfter: { ttlAt: 20, hk: kb("owned"), sk: kb("s") } });
-			expect(store.getItem(kb("owned"), kb("s")).row).toBeUndefined();
+			expect(store.getItem(P(kb("owned")), kb("owned"), kb("s")).row).toBeUndefined();
 			expect(store.deleteExpiredItems(100, 1, ownsByKey, second.resumeAfter)).toEqual({
 				deletedRows: 0,
 				deletedBytes: 0,
@@ -1307,7 +1379,8 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 
 	it("raises max_deleted_v to the highest delete revision (v + 1) of a sweep chunk, and a recreate starts above it", async () => {
 		await withStore((store) => {
-			const expiring = (hk: string) => store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
+			const expiring = (hk: string) =>
+				store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
 			expiring("a");
 			expiring("b");
 			expiring("b");
@@ -1321,8 +1394,8 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 	it("raises max_delete_tx_order_ts to the last_read_ts of a removed row", async () => {
 		await withStore((store) => {
 			text(store, "x", 100);
-			store.bumpItemReadTs(kb("x"), kb("s"), 200);
-			store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 160 });
+			store.bumpItemReadTs(P(kb("x")), kb("x"), kb("s"), 200);
+			store.deleteItem({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), txOrderTs: 160 });
 			expect(store.getMaxDeleteTxOrderTs()).toBe(200);
 		});
 	});
@@ -1330,8 +1403,8 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 	it("raises max_delete_tx_order_ts to the last_read_ts of an expired row above its expiry time", async () => {
 		await withStore((store) => {
 			const expiryTs = 10 * 1000 * TX_ORDER_TS_UNITS_PER_MS;
-			store.upsertItem({ hk: kb("x"), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
-			store.bumpItemReadTs(kb("x"), kb("s"), expiryTs + 5);
+			store.upsertItem({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
+			store.bumpItemReadTs(P(kb("x")), kb("x"), kb("s"), expiryTs + 5);
 			expect(store.deleteExpiredItems(100, 10, ownsAll).deletedRows).toBe(1);
 			expect(store.getMaxDeleteTxOrderTs()).toBe(expiryTs + 5);
 		});
@@ -1342,7 +1415,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			store.bumpMaxDeleteTxOrderTs(200);
 			text(store, "put", 160);
 			expect(row(store, "put")).toMatchObject({ last_read_ts: 200, last_write_ts: 200 });
-			store.updateItemSingleShot({ hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 160 });
+			store.updateItemSingleShot({ prefix: P(kb("upd")), hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 160 });
 			expect(row(store, "upd")).toMatchObject({ last_read_ts: 200, last_write_ts: 200 });
 
 			// A create with a higher timestamp keeps its own.
@@ -1354,12 +1427,12 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 	it("does not take max_delete_tx_order_ts into the stamps of an update of an existing row", async () => {
 		await withStore((store) => {
 			text(store, "put", 100);
-			store.updateItemSingleShot({ hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 100 });
+			store.updateItemSingleShot({ prefix: P(kb("upd")), hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 100 });
 			store.bumpMaxDeleteTxOrderTs(500);
 
 			text(store, "put", 150);
 			expect(row(store, "put")).toMatchObject({ v: 2, last_read_ts: 150, last_write_ts: 150 });
-			store.updateItemSingleShot({ hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 150 });
+			store.updateItemSingleShot({ prefix: P(kb("upd")), hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 150 });
 			expect(row(store, "upd")).toMatchObject({ v: 2, last_read_ts: 150, last_write_ts: 150 });
 		});
 	});
@@ -1380,6 +1453,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 describe("PartitionStore - pending transactions", () => {
 	function lockRow(hk: string, sk: string, transactionId: string) {
 		return {
+			prefix: P(kb(hk)),
 			hk: kb(hk),
 			sk: kb(sk),
 			transaction_id: transactionId,
@@ -1411,11 +1485,11 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(lockRow("hk", "s", "tx1"));
 			store.insertPendingLock(lockRow("hk", "s", "tx1")); // retry — INSERT OR IGNORE
 			expect(store.listPendingTxKeys("tx1").length).toBe(1);
-			expect(store.pendingLockFor(kb("hk"), kb("s"))?.transaction_id).toBe("tx1");
-			expect(store.pendingLockFor(kb("hk"), kb("other"))).toBeUndefined();
+			expect(store.pendingLockFor(P(kb("hk")), kb("hk"), kb("s"))?.transaction_id).toBe("tx1");
+			expect(store.pendingLockFor(P(kb("hk")), kb("hk"), kb("other"))).toBeUndefined();
 
-			store.deletePendingTxKeys("tx1", [{ hashKey: kb("hk"), sortKey: kb("s") }]);
-			expect(store.pendingLockFor(kb("hk"), kb("s"))).toBeUndefined();
+			store.deletePendingTxKeys("tx1", [{ prefix: P(kb("hk")), hashKey: kb("hk"), sortKey: kb("s") }]);
+			expect(store.pendingLockFor(P(kb("hk")), kb("hk"), kb("s"))).toBeUndefined();
 			expect(store.hasAnyPendingTx()).toBe(false);
 		});
 	});
@@ -1426,7 +1500,7 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(row);
 
 			expect(store.listPendingTxItems(row.transaction_id)[0].ttl_epoch_utc_seconds).toBe(777);
-			expect([...store.queryPendingTxPage(null, 1, null)][0].ttl_epoch_utc_seconds).toBe(777);
+			expect([...store.queryPendingTxPage(null, 1, ALL)][0].ttl_epoch_utc_seconds).toBe(777);
 		});
 	});
 
@@ -1439,7 +1513,7 @@ describe("PartitionStore - pending transactions", () => {
 			];
 			store.insertPendingLock({ ...lockRow("hk", "s", "tx-ops"), op_list: opList });
 			expect(store.listPendingTxItems("tx-ops")[0].op_list).toEqual(opList);
-			expect([...store.queryPendingTxPage(null, 1, null)][0].op_list).toEqual(opList);
+			expect([...store.queryPendingTxPage(null, 1, ALL)][0].op_list).toEqual(opList);
 
 			for (const bad of ["[]", '[[0,"frobnicate"]]', '[[0.5,"put"]]', "[[0]]", '{"0":"put"}']) {
 				state.storage.sql.exec(`UPDATE pending_transactions SET op_list = ?`, bad);
@@ -1450,16 +1524,24 @@ describe("PartitionStore - pending transactions", () => {
 
 	it("readItemData returns the stored JSONB of a json item, which upsertItem stores again unchanged", async () => {
 		await withStore((store, state) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: '{"k":"he said \\"hi\\""}', kind: "json", ttlAt: 42, txOrderTs: 1 });
-			const read = store.readItemData(kb("hk"), kb("s"));
+			store.upsertItem({
+				prefix: P(kb("hk")),
+				hk: kb("hk"),
+				sk: kb("s"),
+				data: '{"k":"he said \\"hi\\""}',
+				kind: "json",
+				ttlAt: 42,
+				txOrderTs: 1,
+			});
+			const read = store.readItemData(P(kb("hk")), kb("hk"), kb("s"));
 			expect(read).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: 42 });
 			expect(read?.data).toBeInstanceOf(Uint8Array);
 			const stored = () => new Uint8Array(state.storage.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM items`).one().data);
 			expect(stored()).toEqual(read?.data);
 
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: read!.data, kind: read!.kind, ttlAt: 42, txOrderTs: 2 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: read!.data, kind: read!.kind, ttlAt: 42, txOrderTs: 2 });
 			expect(stored()).toEqual(read?.data);
-			expect(store.readItemData(kb("hk"), kb("absent"))).toBeUndefined();
+			expect(store.readItemData(P(kb("hk")), kb("hk"), kb("absent"))).toBeUndefined();
 		});
 	});
 
@@ -1471,7 +1553,7 @@ describe("PartitionStore - pending transactions", () => {
 			}
 			expect(store.hasAnyPendingTx()).toBe(true);
 
-			expect(store.deletePendingTxCopiesBatch(kb("hk"), 10)).toBe(true);
+			expect(store.deletePendingTxCopiesBatch(P(kb("hk")), 10)).toBe(true);
 			expect(store.hasAnyPendingTx()).toBe(false);
 		});
 	});
@@ -1507,12 +1589,12 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(lockRow("b", "2", "tx2"));
 			expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_tx_info`).one().n).toBe(2);
 
-			store.deletePendingTxKeys("tx1", [{ hashKey: kb("a"), sortKey: kb("1") }]);
+			store.deletePendingTxKeys("tx1", [{ prefix: P(kb("a")), hashKey: kb("a"), sortKey: kb("1") }]);
 			expect(pendingTxRow(state, "tx1")).toBeDefined();
 			// The cleanup after a promotion deletes the copies of one hash key.
-			expect(store.deletePendingTxCopiesBatch(kb("a"), 10)).toBe(true);
+			expect(store.deletePendingTxCopiesBatch(P(kb("a")), 10)).toBe(true);
 			expect(pendingTxRow(state, "tx1")).toBeDefined();
-			expect(store.deletePendingTxCopiesBatch(kb("b"), 10)).toBe(true);
+			expect(store.deletePendingTxCopiesBatch(P(kb("b")), 10)).toBe(true);
 			expect(pendingTxRow(state, "tx1")).toBeUndefined();
 			expect(pendingTxRow(state, "tx2")).toBeUndefined();
 
@@ -1542,10 +1624,10 @@ describe("PartitionStore - pending transactions", () => {
 
 			// A budget of 1 row still deletes all copies of the transaction that the step starts: tx1
 			// holds the first key of "a".
-			expect(store.deletePendingTxCopiesBatch(kb("a"), 1)).toBe(false);
+			expect(store.deletePendingTxCopiesBatch(P(kb("a")), 1)).toBe(false);
 			expect(remaining()).toEqual([0, 3, 2]);
 
-			expect(store.deletePendingTxCopiesBatch(kb("a"), 5)).toBe(true);
+			expect(store.deletePendingTxCopiesBatch(P(kb("a")), 5)).toBe(true);
 			// The row of "b" is not a copy, so tx3 keeps it and its transaction row.
 			expect(remaining()).toEqual([0, 0, 1]);
 			expect(pendingTxRow(state, "tx3")).toBeDefined();
@@ -1572,7 +1654,7 @@ describe("PartitionStore - pending transactions", () => {
 	it("quarantines a transaction once and excludes it from the stale scan", async () => {
 		await withStore((store) => {
 			store.insertPendingLock(lockRow("a", "1", "tx-guarded"));
-			const guarded = [{ hashKey: kb("a"), sortKey: kb("1") }];
+			const guarded = [{ prefix: P(kb("a")), hashKey: kb("a"), sortKey: kb("1") }];
 			expect(store.guardPendingTx("tx-guarded", 2000)).toBe(true);
 			expect(store.guardPendingTx("tx-guarded", 3000)).toBe(false);
 			expect(store.listPendingTxItems("tx-guarded")[0].guarded_at).toBe(2000);
@@ -1601,14 +1683,17 @@ describe("PartitionStore - pending transactions", () => {
 		});
 	});
 
-	it("queryPendingTxPage orders by (hk, sk, transaction_id) and resumes strictly after the cursor", async () => {
+	it("queryPendingTxPage orders by (prefix, hk, sk, transaction_id) and resumes strictly after the cursor", async () => {
 		await withStore((store) => {
-			store.insertPendingLock(lockRow("a", "1", "tx2"));
-			store.insertPendingLock(lockRow("a", "1", "tx1"));
-			store.insertPendingLock(lockRow("b", "1", "tx3"));
-			const page1 = [...store.queryPendingTxPage(null, 2, null)];
+			// The first hash key in storage order has two locks, and the other has one.
+			const [first, second] =
+				KeyCodec.compare(KeyCodec.asKeyBytes(P(kb("a"))), KeyCodec.asKeyBytes(P(kb("b")))) < 0 ? ["a", "b"] : ["b", "a"];
+			store.insertPendingLock(lockRow(first, "1", "tx2"));
+			store.insertPendingLock(lockRow(first, "1", "tx1"));
+			store.insertPendingLock(lockRow(second, "1", "tx3"));
+			const page1 = [...store.queryPendingTxPage(null, 2, ALL)];
 			expect(page1.map((r) => r.transaction_id)).toEqual(["tx1", "tx2"]);
-			const page2 = [...store.queryPendingTxPage({ hk: kb("a"), sk: kb("1"), transaction_id: "tx2" }, 2, null)];
+			const page2 = [...store.queryPendingTxPage({ prefix: P(kb(first)), hk: kb(first), sk: kb("1"), transaction_id: "tx2" }, 2, ALL)];
 			expect(page2.map((r) => r.transaction_id)).toEqual(["tx3"]);
 		});
 	});
@@ -1699,7 +1784,10 @@ describe("PartitionStore - pending transactions", () => {
 });
 
 describe("PartitionStore - range split boundaries", () => {
-	/** The boundaries that the split planner computes from the rows of `sortKeySizes`, or null. */
+	/**
+	 * The sort keys of the boundaries that the split planner computes from the rows of
+	 * `compositeKeySizes`, or null. The partition holds one hash key, so each boundary has it.
+	 */
 	function computeBoundaries(
 		store: PartitionStore,
 		hk: KeyBytes,
@@ -1707,13 +1795,18 @@ describe("PartitionStore - range split boundaries", () => {
 		end: KeyBytes | null,
 		N: number,
 	): KeyBytes[] | null {
-		const plan = planRangeBoundaries(store.keySizes.bytesOf(hk), N, start, store.sortKeySizes(hk, start, end));
-		return "boundaries" in plan ? plan.boundaries : null;
+		const edge = (sk: KeyBytes | null) => (sk === null ? null : { hk, sk });
+		const plan = planRangeBoundaries(store.keySizes.bytesOf(P(hk)), N, edge(start), store.compositeKeySizes(P(hk), edge(start), edge(end)));
+		if (!("boundaries" in plan)) {
+			return null;
+		}
+		expect(plan.boundaries.every((b) => KeyCodec.compare(b.hk, hk) === 0)).toBe(true);
+		return plan.boundaries.map((b) => b.sk);
 	}
 
 	function put(store: PartitionStore, hk: string, ...sks: string[]) {
 		for (const sk of sks) {
-			store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 		}
 	}
 
@@ -1808,6 +1901,7 @@ describe("PartitionStore - range split boundaries", () => {
 			// Insert in a non-sorted order so the DB sort is doing real work.
 			for (const sk of [emoji, bin, uFFFF]) {
 				store.upsertItem({
+					prefix: P(kb("hk")),
 					hk: kb("hk"),
 					sk: kb(sk),
 					data: new Uint8Array(0),
@@ -1849,7 +1943,7 @@ describe("PartitionStore - range split boundaries", () => {
 			// 40 equal-size rows → with N=4 each child should get ~10; byte-balance ≈ count-balance here.
 			const keys = Array.from({ length: 40 }, (_, i) => `k${String(i).padStart(3, "0")}`);
 			for (const sk of keys) {
-				store.upsertItem({ hk: kb("hk"), sk: kb(sk), data: "payload", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb(sk), data: "payload", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			const boundaries = computeBoundaries(store, kb("hk"), null, null, 4);
 			expect(boundaries).not.toBeNull();
@@ -1875,9 +1969,10 @@ describe("PartitionStore - range split boundaries", () => {
 			// keyed to sort last. With N=2, step = B/2 < heavy weight, so the light rows all fall below
 			// the threshold and the heavy row alone tips it over → boundary lands between them.
 			for (let i = 0; i < 10; i++) {
-				store.upsertItem({ hk: kb("hk"), sk: kb(`k${i}`), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb(`k${i}`), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			store.upsertItem({
+				prefix: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("zheavy"),
 				data: "H".repeat(5000),
@@ -1899,9 +1994,9 @@ describe("PartitionStore - range split boundaries", () => {
 			// A single dominant row between two light rows. With N=3 the heavy row crosses the first
 			// threshold and the relative bump pushes the next threshold past the remaining bytes, so only
 			// one boundary is emitted (< N-1) → null, and the split retries on a later cycle.
-			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("a"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toBeNull();
 		});
 	});
@@ -1910,16 +2005,17 @@ describe("PartitionStore - range split boundaries", () => {
 describe("PartitionStore - migration pages", () => {
 	const EMPTY = KeyCodec.encodeOptional(undefined);
 
-	function lockRow(hk: KeyBytes, sk: KeyBytes, transactionId: string) {
+	function lockRow(hk: KeyBytes, sk: KeyBytes, transactionId: string): PendingTxItem {
 		return {
+			prefix: P(hk),
 			hk,
 			sk,
 			transaction_id: transactionId,
 			transaction_ts: 123,
 			operation: "put",
-			op_list: [[0, "put"] as [number, "put"]],
+			op_list: [[0, "put"]],
 			data: "d",
-			kind: "text" as const,
+			kind: "text",
 			ttl_epoch_utc_seconds: null,
 			coordinator_json: '{"doName":"tc-1"}',
 			created_at: 1000,
@@ -1929,12 +2025,18 @@ describe("PartitionStore - migration pages", () => {
 	}
 
 	const pairs = (rows: Iterable<{ hk: KeyBytes; sk: KeyBytes }>) => [...rows].map((r) => `${keyLabel(r.hk)}/${keyLabel(r.sk)}`);
+	/** The rows of one hash key in `[start, end)`, as a range target reads them. */
+	const keyRange = (hk: string, start: KeyBytes | null, end: KeyBytes | null) => keyInterval(kb(hk), start, end);
+	const itemCursor = (hk: string, sk: KeyBytes): StorageCursor => ({ prefix: P(kb(hk)), hk: kb(hk), sk });
+	/** The hash keys in storage order: by prefix, then by key. */
+	const inStorageOrder = (hks: string[]) =>
+		[...hks].sort(
+			(a, b) => KeyCodec.compare(KeyCodec.asKeyBytes(P(kb(a))), KeyCodec.asKeyBytes(P(kb(b)))) || KeyCodec.compare(kb(a), kb(b)),
+		);
 
-	// A cursor or a range must SEEK on all its bounds. A statement that seeks only on `hk=?`, or only on
-	// the start of the range, returns the same rows, so only the plan finds the regression: each page
-	// then reads all the rows before it again. The text must match exactly. SQLite shows `sk>?` also
-	// for `sk >= ?`.
-	it("each page statement seeks on all its bounds", async () => {
+	// A cursor or a bound must SEEK. A statement that seeks only on the lower bound returns the same
+	// rows, so only the plan finds the regression: each page then reads all the rows before it again.
+	it("each page statement seeks on its lower bound or cursor, and on its upper bound", async () => {
 		await withStore((_store, state) => {
 			const plan = ({ sql, params }: { sql: string; params: unknown[] }) =>
 				state.storage.sql
@@ -1942,75 +2044,68 @@ describe("PartitionStore - migration pages", () => {
 					.toArray()
 					.map((r) => r.detail)
 					.join(" | ");
-			const open: KeyRange = { hk: kb("h"), start: EMPTY, end: null };
-			const closed: KeyRange = { hk: kb("h"), start: kb("a"), end: kb("z") };
-			const itemCursor = { hk: kb("h"), sk: kb("b") };
-			const lockCursor = { hk: kb("h"), sk: kb("b"), transaction_id: "tx" };
-			const items = "items USING INDEX sqlite_autoindex_items_1";
-			const locks = "p USING INDEX sqlite_autoindex_pending_transactions_1";
+			const closed = keyRange("h", kb("a"), kb("z"));
+			const open: KeyRange = { start: { prefix: P(kb("h")) }, end: null };
+			const cursor = itemCursor("h", kb("b"));
+			const lockCursor = { ...cursor, transaction_id: "tx" };
+			const items = "SEARCH items USING PRIMARY KEY";
+			const locks = "SEARCH p USING INDEX sqlite_autoindex_pending_transactions_1";
+			const outbox = "SEARCH materialization_outbox USING INDEX sqlite_autoindex_materialization_outbox_1";
 			const info = " | SEARCH t USING INDEX sqlite_autoindex_pending_tx_info_1 (transaction_id=?)";
+			const both = "((hash_prefix_bucket,hk,sk)>(?,?,?) AND (hash_prefix_bucket,hk,sk)<(?,?,?))";
+			const lower = "((hash_prefix_bucket,hk,sk)>(?,?,?))";
 
-			expect(plan(itemsPageStatement(null, 5, null))).toBe(`SCAN ${items}`);
-			expect(plan(itemsPageStatement(itemCursor, 5, null))).toBe(`SEARCH ${items} ((hk,sk)>(?,?))`);
-			expect(plan(itemsPageStatement(null, 5, open))).toBe(`SEARCH ${items} (hk=? AND sk>?)`);
-			expect(plan(itemsPageStatement(itemCursor, 5, open))).toBe(`SEARCH ${items} (hk=? AND sk>?)`);
-			expect(plan(itemsPageStatement(null, 5, closed))).toBe(`SEARCH ${items} (hk=? AND sk>? AND sk<?)`);
-			expect(plan(itemsPageStatement(itemCursor, 5, closed))).toBe(`SEARCH ${items} (hk=? AND sk>? AND sk<?)`);
-
-			expect(plan(pendingTxPageStatement(null, 5, null))).toBe(`SCAN ${locks}${info}`);
-			expect(plan(pendingTxPageStatement(lockCursor, 5, null))).toBe(`SEARCH ${locks} ((hk,sk,transaction_id)>(?,?,?))${info}`);
-			expect(plan(pendingTxPageStatement(null, 5, open))).toBe(`SEARCH ${locks} (hk=? AND sk>?)${info}`);
-			expect(plan(pendingTxPageStatement(lockCursor, 5, open))).toBe(`SEARCH ${locks} (hk=? AND (sk,transaction_id)>(?,?))${info}`);
-			expect(plan(pendingTxPageStatement(null, 5, closed))).toBe(`SEARCH ${locks} (hk=? AND sk>? AND sk<?)${info}`);
+			expect(plan(itemsPageStatement(null, 5, closed))).toBe(`${items} ${both}`);
+			expect(plan(itemsPageStatement(cursor, 5, closed))).toBe(`${items} ${both}`);
+			expect(plan(itemsPageStatement(cursor, 5, open))).toBe(`${items} ${lower}`);
+			expect(plan(outboxPageStatement(null, 5, closed))).toBe(`${outbox} ${both}`);
+			expect(plan(outboxPageStatement(cursor, 5, closed))).toBe(`${outbox} ${both}`);
+			expect(plan(pendingTxPageStatement(null, 5, closed))).toBe(`${locks} ${both}${info}`);
 			expect(plan(pendingTxPageStatement(lockCursor, 5, closed))).toBe(
-				`SEARCH ${locks} (hk=? AND (sk,transaction_id)>(?,?) AND sk<?)${info}`,
+				`${locks} ((hash_prefix_bucket,hk,sk,transaction_id)>(?,?,?,?) AND (hash_prefix_bucket,hk,sk)<(?,?,?))${info}`,
 			);
 		});
 	});
 
-	// The plan proves the seek. This test proves the cost: a range page reads the rows that it returns
-	// and the one row after them, and no row of the other keys or of the sort keys above the range.
+	// The plan proves the seek. This test proves the cost: a page reads the rows that it returns and
+	// the one row after them, and no row of the other keys or of the sort keys above the range.
 	it("a range page reads only the rows that it returns", async () => {
 		await withStore((store, state) => {
 			const sk = (i: number) => kb(`k${String(i).padStart(4, "0")}`);
-			for (let i = 0; i < 500; i++) {
-				for (const hk of ["a", "c"]) {
-					store.upsertItem({ hk: kb(hk), sk: sk(i), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			for (const hk of ["a", "b", "c"]) {
+				for (let i = 0; i < (hk === "b" ? 600 : 500); i++) {
+					store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: sk(i), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 					store.insertPendingLock(lockRow(kb(hk), sk(i), `tx-${hk}-${i}`));
 				}
 			}
-			for (let i = 0; i < 600; i++) {
-				store.upsertItem({ hk: kb("b"), sk: sk(i), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
-				store.insertPendingLock(lockRow(kb("b"), sk(i), `tx-b-${i}`));
-			}
-			const range: KeyRange = { hk: kb("b"), start: sk(50), end: sk(100) };
+			const range = keyRange("b", sk(50), sk(100));
 			const run = ({ sql, params }: { sql: string; params: unknown[] }) => {
 				const cursor = state.storage.sql.exec(sql, ...params);
 				const returned = cursor.toArray().length;
 				return { returned, rowsRead: cursor.rowsRead };
 			};
 
-			for (const statement of [itemsPageStatement(null, 1_000, range), itemsPageStatement({ hk: kb("b"), sk: sk(60) }, 1_000, range)]) {
+			for (const statement of [itemsPageStatement(null, 1_000, range), itemsPageStatement(itemCursor("b", sk(60)), 1_000, range)]) {
 				const { returned, rowsRead } = run(statement);
 				expect(returned).toBeGreaterThan(0);
-				expect(rowsRead).toBeLessThanOrEqual(returned + 1);
+				// The seek reads a few rows at its bounds and at the cursor, past the rows that it returns.
+				expect(rowsRead).toBeLessThanOrEqual(returned + 3);
 			}
-			// The JOIN reads one `pending_tx_info` row for each lock that it returns. The seek on
-			// `(sk, transaction_id) > (?, ?)` also reads the cursor row, and then steps past it.
+			// The JOIN reads one `pending_tx_info` row for each lock that it returns.
 			{
 				const { returned, rowsRead } = run(pendingTxPageStatement(null, 1_000, range));
 				expect(returned).toBe(50);
-				expect(rowsRead).toBeLessThanOrEqual(2 * returned + 1);
+				expect(rowsRead).toBeLessThanOrEqual(2 * returned + 2);
 			}
 			{
-				const { returned, rowsRead } = run(pendingTxPageStatement({ hk: kb("b"), sk: sk(60), transaction_id: "tx-b-60" }, 1_000, range));
+				const { returned, rowsRead } = run(pendingTxPageStatement({ ...itemCursor("b", sk(60)), transaction_id: "tx-b-60" }, 1_000, range));
 				expect(returned).toBe(39);
-				expect(rowsRead).toBeLessThanOrEqual(2 * returned + 2);
+				expect(rowsRead).toBeLessThanOrEqual(2 * returned + 3);
 			}
 		});
 	});
 
-	it("a range page returns only the rows of its hash key in [start, end), and continues after its cursor", async () => {
+	it("a key range page returns only the rows of its hash key in [start, end), and continues after its cursor", async () => {
 		await withStore((store) => {
 			for (const [hk, sk] of [
 				["a", EMPTY],
@@ -2019,128 +2114,37 @@ describe("PartitionStore - migration pages", () => {
 				["b", kb("f")],
 				["b", kb("m")],
 				["b", kb("t")],
+				["b\0", EMPTY],
 				["c", EMPTY],
 			] as const) {
-				store.upsertItem({ hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			expect(pairs(store.queryItemsPage(null, 10, { hk: kb("b"), start: EMPTY, end: null }))).toEqual(["b/", "b/f", "b/m", "b/t"]);
-			expect(pairs(store.queryItemsPage(null, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/f", "b/m"]);
-			expect(pairs(store.queryItemsPage(null, 10, { hk: kb("b"), start: EMPTY, end: kb("f") }))).toEqual(["b/"]);
-			expect(pairs(store.queryItemsPage({ hk: kb("b"), sk: EMPTY }, 10, { hk: kb("b"), start: EMPTY, end: null }))).toEqual([
-				"b/f",
-				"b/m",
-				"b/t",
-			]);
-			expect(pairs(store.queryItemsPage({ hk: kb("b"), sk: kb("f") }, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/m"]);
+			expect(pairs(store.queryItemsPage(null, 10, keyRange("b", null, null)))).toEqual(["b/", "b/f", "b/m", "b/t"]);
+			expect(pairs(store.queryItemsPage(null, 10, keyRange("b", kb("f"), kb("t"))))).toEqual(["b/f", "b/m"]);
+			expect(pairs(store.queryItemsPage(null, 10, keyRange("b", null, kb("f"))))).toEqual(["b/"]);
+			expect(pairs(store.queryItemsPage(itemCursor("b", EMPTY), 10, keyRange("b", null, null)))).toEqual(["b/f", "b/m", "b/t"]);
+			expect(pairs(store.queryItemsPage(itemCursor("b", kb("f")), 10, keyRange("b", kb("f"), kb("t"))))).toEqual(["b/m"]);
 		});
 	});
 
-	// A hash child owns whole hash keys. The walk asks `owns` one time for each key, with the first row
-	// of the key, and steps past a key that it does not own with one entry.
-	it("the hash-key walk of items gives each row of an owned key, one entry for each other key, and continues after its cursor", async () => {
+	it("a prefix range page returns the rows of each prefix in [start, end) in storage order, and continues after its cursor", async () => {
 		await withStore((store) => {
-			for (const [hk, sk] of [
-				["a", EMPTY],
-				["a", kb("f")],
-				["a", kb("m")],
-				["b", kb("f")],
-				["b", kb("m")],
-				["c", kb("x")],
-				["c", kb("y")],
-				["d", EMPTY],
-			] as const) {
-				store.upsertItem({ hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
-			}
-			const asked: string[] = [];
-			const owns = (hk: KeyBytes, firstSk: KeyBytes) => {
-				asked.push(`${keyLabel(hk)}/${keyLabel(firstSk)}`);
-				return ["a", "c"].includes(keyLabel(hk));
-			};
-			const walk = (cursor: HashKeyWalkCursor<ScanCursor> | null, limit: number) =>
-				[...store.walkItemsByHashKey(cursor, limit, owns)].map((e: HashKeyWalkEntry<MigratedItem>) =>
-					e.kind === "row" ? `${keyLabel(e.row.hk)}/${keyLabel(e.row.sk)}` : `skip ${keyLabel(e.hk)}`,
-				);
-
-			expect(walk(null, 100)).toEqual(["a/", "a/f", "a/m", "skip b", "c/x", "c/y", "skip d"]);
-			expect(asked).toEqual(["a/", "b/f", "c/x", "d/"]);
-			// The limit counts both kinds of entry, and it can stop inside an owned key.
-			expect(walk(null, 2)).toEqual(["a/", "a/f"]);
-			expect(walk({ kind: "row", row: { hk: kb("a"), sk: kb("f") } }, 2)).toEqual(["a/m", "skip b"]);
-			// An `after_key` cursor continues after every row of its hash key.
-			expect(walk({ kind: "after_key", hk: kb("b") }, 10)).toEqual(["c/x", "c/y", "skip d"]);
-			expect(walk({ kind: "after_key", hk: kb("d") }, 10)).toEqual([]);
-		});
-	});
-
-	// Two transactions lock the same key. The cursor compares the transaction id too, so a page that
-	// stops between them loses neither lock.
-	it("the hash-key walk of locks gives each lock of an owned key, one entry for each other key, and continues after its cursor", async () => {
-		await withStore((store) => {
-			for (const [hk, sk, tx] of [
-				["a", kb("m"), "tx2"],
-				["a", kb("m"), "tx1"],
-				["a", kb("t"), "tx3"],
-				["b", EMPTY, "tx4"],
-				["b", kb("f"), "tx5"],
-				["c", kb("x"), "tx6"],
-			] as const) {
-				store.insertPendingLock(lockRow(kb(hk), sk, tx));
-			}
-			const asked: string[] = [];
-			const owns = (hk: KeyBytes, firstSk: KeyBytes) => {
-				asked.push(`${keyLabel(hk)}/${keyLabel(firstSk)}`);
-				return ["a", "c"].includes(keyLabel(hk));
-			};
-			const walk = (cursor: HashKeyWalkCursor<PendingTransactionCursor> | null, limit: number) =>
-				[...store.walkPendingTxByHashKey(cursor, limit, owns)].map((e: HashKeyWalkEntry<PendingTxItem>) =>
-					e.kind === "row" ? `${keyLabel(e.row.hk)}/${keyLabel(e.row.sk)}/${e.row.transaction_id}` : `skip ${keyLabel(e.hk)}`,
-				);
-
-			expect(walk(null, 100)).toEqual(["a/m/tx1", "a/m/tx2", "a/t/tx3", "skip b", "c/x/tx6"]);
-			expect(asked).toEqual(["a/m", "b/", "c/x"]);
-			expect(walk(null, 1)).toEqual(["a/m/tx1"]);
-			expect(walk({ kind: "row", row: { hk: kb("a"), sk: kb("m"), transaction_id: "tx1" } }, 2)).toEqual(["a/m/tx2", "a/t/tx3"]);
-			expect(walk({ kind: "row", row: { hk: kb("a"), sk: kb("t"), transaction_id: "tx3" } }, 10)).toEqual(["skip b", "c/x/tx6"]);
-			expect(walk({ kind: "after_key", hk: kb("b") }, 10)).toEqual(["c/x/tx6"]);
-		});
-	});
-
-	// One seek finds the next hash key. A statement that reads each row of the key returns the same
-	// row, so only the plan and the read count find that regression.
-	it("the next-key seek reads one index entry, also after a key with many rows", async () => {
-		await withStore((store, state) => {
-			for (const hk of ["a", "b", "c"]) {
-				for (let i = 0; i < 500; i++) {
-					const sk = kb(`s${String(i).padStart(4, "0")}`);
-					store.upsertItem({ hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
-					store.insertPendingLock(lockRow(kb(hk), sk, `tx-${hk}-${i}`));
+			const hks = inStorageOrder(["a", "b", "c", "d", "e", "f", "g", "h"]);
+			for (const hk of hks) {
+				for (const sk of [EMPTY, kb("x")]) {
+					store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 				}
 			}
-			const plan = ({ sql, params }: { sql: string; params: unknown[] }) =>
-				state.storage.sql
-					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
-					.toArray()
-					.map((r) => r.detail)
-					.join(" | ");
-			for (const table of ["items", "pending_transactions"] as const) {
-				expect(plan(nextHashKeyStatement(table, kb("a")))).toMatch(new RegExp(`^SEARCH ${table} USING COVERING INDEX \\w+ \\(hk>\\?\\)$`));
-
-				for (const [after, next] of [
-					[null, "a"],
-					[kb("a"), "b"],
-					[kb("b"), "c"],
-				] as const) {
-					const { sql, params } = nextHashKeyStatement(table, after);
-					const cursor = state.storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params);
-					const rows = cursor.toArray();
-					expect(rows.map((r) => new Uint8Array(r.hk))).toEqual([new Uint8Array(kb(next))]);
-					expect(cursor.rowsRead).toBe(1);
-				}
-			}
+			const rowsOf = (keys: string[]) => keys.flatMap((hk) => [`${hk}/`, `${hk}/x`]);
+			const interval: KeyRange = { start: { prefix: P(kb(hks[2])) }, end: { prefix: P(kb(hks[5])) } };
+			expect(pairs(store.queryItemsPage(null, 100, interval))).toEqual(rowsOf(hks.slice(2, 5)));
+			expect(pairs(store.queryItemsPage(itemCursor(hks[3], EMPTY), 100, interval))).toEqual([`${hks[3]}/x`, ...rowsOf([hks[4]])]);
+			// A null end has no upper bound.
+			expect(pairs(store.queryItemsPage(null, 100, { start: interval.start, end: null }))).toEqual(rowsOf(hks.slice(2)));
 		});
 	});
 
-	it("a range page of locks returns only the locks of its hash key in [start, end), and continues after its cursor", async () => {
+	it("a key range page of locks returns only the locks of its hash key in [start, end), and continues after its cursor", async () => {
 		await withStore((store) => {
 			for (const [hk, sk, tx] of [
 				["a", kb("m"), "tx1"],
@@ -2152,26 +2156,24 @@ describe("PartitionStore - migration pages", () => {
 			] as const) {
 				store.insertPendingLock(lockRow(kb(hk), sk, tx));
 			}
-			expect(pairs(store.queryPendingTxPage(null, 10, { hk: kb("b"), start: EMPTY, end: null }))).toEqual(["b/", "b/f", "b/m", "b/t"]);
-			expect(pairs(store.queryPendingTxPage(null, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/f", "b/m"]);
+			expect(pairs(store.queryPendingTxPage(null, 10, keyRange("b", null, null)))).toEqual(["b/", "b/f", "b/m", "b/t"]);
+			expect(pairs(store.queryPendingTxPage(null, 10, keyRange("b", kb("f"), kb("t"))))).toEqual(["b/f", "b/m"]);
 			expect(
-				pairs(
-					store.queryPendingTxPage({ hk: kb("b"), sk: kb("f"), transaction_id: "tx2" }, 10, { hk: kb("b"), start: kb("f"), end: null }),
-				),
+				pairs(store.queryPendingTxPage({ ...itemCursor("b", kb("f")), transaction_id: "tx2" }, 10, keyRange("b", kb("f"), null))),
 			).toEqual(["b/m", "b/t"]);
 		});
 	});
 
 	// Two transactions lock the same key. With a page of one row, the page boundary falls between them,
 	// so the cursor must compare the transaction id too, or the second lock is lost.
-	it("a range page of locks keeps two locks of one key that a page boundary separates", async () => {
+	it("a page of locks keeps two locks of one key that a page boundary separates", async () => {
 		await withStore((store) => {
 			store.insertPendingLock(lockRow(kb("b"), kb("m"), "tx2"));
 			store.insertPendingLock(lockRow(kb("b"), kb("m"), "tx1"));
 			store.insertPendingLock(lockRow(kb("b"), kb("t"), "tx3"));
-			const range: KeyRange = { hk: kb("b"), start: EMPTY, end: null };
+			const range = keyRange("b", null, null);
 			const seen: string[] = [];
-			let cursor: { hk: KeyBytes; sk: KeyBytes; transaction_id: string } | null = null;
+			let cursor: PendingTransactionCursor | null = null;
 			for (;;) {
 				const page: PendingTxItem[] = [...store.queryPendingTxPage(cursor, 1, range)];
 				if (page.length === 0) {
@@ -2179,7 +2181,7 @@ describe("PartitionStore - migration pages", () => {
 				}
 				const row = page[0];
 				seen.push(`${keyLabel(row.sk)}/${row.transaction_id}`);
-				cursor = { hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
+				cursor = { prefix: row.prefix, hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
 			}
 			expect(seen).toEqual(["m/tx1", "m/tx2", "t/tx3"]);
 		});
@@ -2212,8 +2214,8 @@ describe("PartitionStore - materialization outbox", () => {
 		state.storage.sql.exec(`UPDATE materialization_outbox SET is_local_only = 0, next_attempt_at = 99 WHERE hk = ?`, kb(hk));
 	}
 	const put = (store: PartitionStore, hk: string, ttlAt: number | null = null) =>
-		store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt, txOrderTs: 1 }).version;
-	const del = (store: PartitionStore, hk: string) => store.deleteItem({ hk: kb(hk), sk: kb("s"), txOrderTs: 1 });
+		store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt, txOrderTs: 1 }).version;
+	const del = (store: PartitionStore, hk: string) => store.deleteItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), txOrderTs: 1 });
 
 	it("writes no outbox row when capture is off", async () => {
 		await withCaptureStore(false, (store, state) => {
@@ -2268,17 +2270,17 @@ describe("PartitionStore - materialization outbox", () => {
 	it("updateItemSingleShot captures a create as local only and an update with its version", async () => {
 		await withCaptureStore(true, (store, state) => {
 			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
-			store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan, txOrderTs: 1 });
+			store.updateItemSingleShot({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), plan, txOrderTs: 1 });
 			expect(outboxRow(state, "x")).toMatchObject({ revision: 1, is_deleted: 0, is_local_only: 1 });
 			claim(state, "x");
-			store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan, txOrderTs: 2 });
+			store.updateItemSingleShot({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), plan, txOrderTs: 2 });
 			expect(outboxRow(state, "x")).toMatchObject({ revision: 2, is_deleted: 0, is_local_only: 0, next_attempt_at: 0 });
 		});
 	});
 
 	it("a delete of an absent item writes no outbox row", async () => {
 		await withCaptureStore(true, (store, state) => {
-			store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 1, bumpTxOrderTsAlways: true });
+			store.deleteItem({ prefix: P(kb("x")), hk: kb("x"), sk: kb("s"), txOrderTs: 1, bumpTxOrderTsAlways: true });
 			del(store, "y");
 			expect(outboxCount(state)).toBe(0);
 		});
@@ -2295,27 +2297,21 @@ describe("PartitionStore - materialization outbox", () => {
 		});
 	});
 
-	it("pages the outbox rows of a range and of a hash-key walk, and the copy is due and not local only", async () => {
+	it("pages the outbox rows of an interval, and the copy is due and not local only", async () => {
 		await withCaptureStore(true, (store, state) => {
 			for (const hk of ["a", "b", "c"]) {
 				put(store, hk);
 			}
 			claim(state, "b");
 			del(store, "b");
-			const range = [...store.queryOutboxPage(null, 10, { hk: kb("b"), start: KeyCodec.encodeOptional(undefined), end: null })];
-			expect(range).toEqual([{ hk: kb("b"), sk: kb("s"), revision: 2, is_deleted: 1 }]);
-
-			const walked = [...store.walkOutboxByHashKey(null, 10, (hk) => keyLabel(hk) !== "a")];
-			expect(walked.map((e) => (e.kind === "row" ? `row:${keyLabel(e.row.hk)}` : `skip:${keyLabel(e.hk)}`))).toEqual([
-				"skip:a",
-				"row:b",
-				"row:c",
-			]);
+			const range = [...store.queryOutboxPage(null, 10, keyInterval(kb("b"), null, null))];
+			expect(range).toEqual([{ prefix: P(kb("b")), hk: kb("b"), sk: kb("s"), revision: 2, is_deleted: 1 }]);
+			expect([...store.queryOutboxPage(null, 10, ALL)].map((row) => keyLabel(row.hk)).sort()).toEqual(["a", "b", "c"]);
 
 			// The copy on a child: a retried page keeps the first row.
 			state.storage.sql.exec(`DELETE FROM materialization_outbox`);
-			store.insertMigratedOutboxRow({ hk: kb("b"), sk: kb("s"), revision: 2, is_deleted: 1 });
-			store.insertMigratedOutboxRow({ hk: kb("b"), sk: kb("s"), revision: 1, is_deleted: 0 });
+			store.insertMigratedOutboxRow({ prefix: P(kb("b")), hk: kb("b"), sk: kb("s"), revision: 2, is_deleted: 1 });
+			store.insertMigratedOutboxRow({ prefix: P(kb("b")), hk: kb("b"), sk: kb("s"), revision: 1, is_deleted: 0 });
 			expect(outboxRow(state, "b")).toMatchObject({ revision: 2, is_deleted: 1, is_local_only: 0, next_attempt_at: 0 });
 		});
 	});
@@ -2323,14 +2319,163 @@ describe("PartitionStore - materialization outbox", () => {
 	it("deletes the outbox copies of one hash key or of all keys in bounded batches", async () => {
 		await withCaptureStore(true, (store, state) => {
 			for (const sk of ["1", "2", "3"]) {
-				store.upsertItem({ hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb("moved")), hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			put(store, "stays");
-			expect(store.deleteOutboxCopiesBatch(kb("moved"), 2)).toBe(false);
-			expect(store.deleteOutboxCopiesBatch(kb("moved"), 2)).toBe(true);
+			expect(store.deleteOutboxCopiesBatch(P(kb("moved")), 2)).toBe(false);
+			expect(store.deleteOutboxCopiesBatch(P(kb("moved")), 2)).toBe(true);
 			expect(outboxCount(state)).toBe(1);
 			expect(store.deleteOutboxCopiesBatch(null, 1)).toBe(true);
 			expect(outboxCount(state)).toBe(0);
+		});
+	});
+});
+describe("PartitionStore - the item-id counter", () => {
+	const put = (store: PartitionStore, hk: string, sk = "s", ttlAt: number | null = null) =>
+		store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt, txOrderTs: 1 });
+	const idOf = (state: DurableObjectState, hk: string, sk = "s") =>
+		state.storage.sql
+			.exec<{ item_id: number }>(`SELECT item_id FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`, P(kb(hk)), kb(hk), kb(sk))
+			.one().item_id;
+	const highWaterMark = (state: DurableObjectState) =>
+		state.storage.sql.exec<{ hwm: number }>(`SELECT hwm FROM item_id_counter WHERE id = 1`).one().hwm;
+
+	it("an overwrite keeps the id, and a new row after a delete gets a higher id", async () => {
+		await withStore((store, state) => {
+			put(store, "a");
+			put(store, "b");
+			const a = idOf(state, "a");
+			const b = idOf(state, "b");
+			expect(b).toBeGreaterThan(a);
+			put(store, "a");
+			expect(idOf(state, "a")).toBe(a);
+			// The row with the highest id goes, and its id never comes back.
+			store.deleteItem({ prefix: P(kb("b")), hk: kb("b"), sk: kb("s"), txOrderTs: 2 });
+			put(store, "b");
+			expect(idOf(state, "b")).toBeGreaterThan(b);
+			store.deleteItem({ prefix: P(kb("a")), hk: kb("a"), sk: kb("s"), txOrderTs: 3 });
+			put(store, "a");
+			expect(idOf(state, "a")).toBeGreaterThan(idOf(state, "b"));
+		});
+	});
+
+	it("reserves a block of 1024 ids with one row written, and a new store reserves above it", async () => {
+		await withStore((store, state) => {
+			expect(highWaterMark(state)).toBe(1);
+			put(store, "a");
+			expect(idOf(state, "a")).toBe(1);
+			expect(highWaterMark(state)).toBe(1025);
+			put(store, "b");
+			expect(highWaterMark(state)).toBe(1025);
+			// A restart loses the rest of the block, and the next row takes an id above it.
+			const restarted = new PartitionStore(state.storage);
+			put(restarted, "c");
+			expect(idOf(state, "c")).toBe(1025);
+			expect(highWaterMark(state)).toBe(2049);
+		});
+	});
+
+	// A reservation that rolls back must not stay in memory: the ids of that block are not reserved in
+	// storage, and a later reservation, also by another instance, gives them out again.
+	it("gives no id two times after a transaction that rolls back its reservation", async () => {
+		await withStore((store, state) => {
+			expect(() =>
+				store.transactionSync(() => {
+					put(store, "rolled-back");
+					throw new Error("roll back");
+				}),
+			).toThrow("roll back");
+			expect(highWaterMark(state)).toBe(1);
+			put(store, "a");
+			put(store, "b");
+			const restarted = new PartitionStore(state.storage);
+			put(restarted, "c");
+			put(restarted, "d");
+			const ids = ["a", "b", "c", "d"].map((hk) => idOf(state, hk));
+			expect(new Set(ids).size).toBe(4);
+		});
+	});
+
+	it("an ingest raises the mark above its copied ids, and the next row takes an id above them", async () => {
+		await withStore((store, state) => {
+			put(store, "local");
+			store.insertItemIfAbsent({
+				item_id: linkId(5_000),
+				prefix: P(kb("copied")),
+				hk: kb("copied"),
+				sk: kb("s"),
+				data: "d",
+				kind: "text",
+				ttl_epoch_utc_seconds: null,
+				v: 1,
+				last_read_ts: 1,
+				last_write_ts: 1,
+			});
+			store.raiseItemIdMark(5_000);
+			expect(highWaterMark(state)).toBe(5_001);
+			put(store, "next");
+			expect(idOf(state, "next")).toBe(5_001);
+			// A lower mark does not lower it.
+			store.raiseItemIdMark(10);
+			expect(highWaterMark(state)).toBe(6_025);
+		});
+	});
+
+	// One row for the table and one for each of `idx_items_scan` and `idx_items_item_id`, and one more for
+	// `idx_items_ttl` when the row has a TTL. The reservation of a block is a statement of its own.
+	it("an insert writes 3 rows without a TTL and 4 with a TTL", async () => {
+		await withStore((store) => {
+			put(store, "reserves-the-block");
+			expect(put(store, "a").rowsWritten).toBe(3);
+			expect(put(store, "b", "s", 2_000_000_000).rowsWritten).toBe(4);
+		});
+	});
+});
+
+describe("PartitionStore - plans of the storage order", () => {
+	const plan = (state: DurableObjectState, sql: string, ...params: unknown[]) =>
+		state.storage.sql
+			.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+			.toArray()
+			.map((r) => r.detail)
+			.join(" | ");
+
+	it("the range split scan reads only idx_items_scan, and the promotion delete uses the primary key", async () => {
+		await withStore((_store, state) => {
+			const hk = kb("hk");
+			expect(
+				plan(
+					state,
+					`SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan
+					  WHERE hash_prefix_bucket = ? AND hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
+					P(hk),
+					hk,
+					kb("a"),
+					kb("z"),
+				),
+			).toBe("SEARCH items USING COVERING INDEX idx_items_scan (hash_prefix_bucket=? AND hk=? AND sk>? AND sk<?)");
+			const deletePlan = plan(
+				state,
+				`DELETE FROM items WHERE hash_prefix_bucket = ?1 AND hk = ?2
+				    AND sk IN (SELECT sk FROM items WHERE hash_prefix_bucket = ?1 AND hk = ?2 ORDER BY sk LIMIT ?3)`,
+				P(hk),
+				hk,
+				10,
+			);
+			expect(deletePlan).toContain("SEARCH items USING PRIMARY KEY (hash_prefix_bucket=? AND hk=? AND sk=?)");
+			expect(deletePlan).not.toMatch(/SCAN items/);
+		});
+	});
+
+	it("the point reads use the primary key", async () => {
+		await withStore((_store, state) => {
+			const hk = kb("hk");
+			for (const sql of [
+				`SELECT data, data_kind, v FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
+				`DELETE FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`,
+			]) {
+				expect(plan(state, sql, P(hk), hk, kb("s"))).toBe("SEARCH items USING PRIMARY KEY (hash_prefix_bucket=? AND hk=? AND sk=?)");
+			}
 		});
 	});
 });

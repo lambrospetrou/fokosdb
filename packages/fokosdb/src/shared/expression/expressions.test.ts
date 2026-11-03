@@ -9,6 +9,10 @@ import type { DataKind } from "../types.js";
 import { compileConditionExpression } from "./compiler.js";
 import { evaluateConditionPlan } from "./runtime.js";
 import type { ConditionExpression, UpdateExpression } from "./types.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
 
 /**
  * The showcase suite for condition expressions. Every case here is a happy-path example of how a
@@ -94,6 +98,7 @@ beforeAll(async () => {
 		const store = new PartitionStore(state.storage);
 		for (const item of [shippedOrder, pendingOrder, note, binaryItem, stringLiteralItem]) {
 			store.upsertItem({
+				prefix: P(KeyCodec.encode(item.hashKey)),
 				hk: KeyCodec.encode(item.hashKey),
 				sk: KeyCodec.encodeOptional(item.sortKey),
 				data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
@@ -113,6 +118,7 @@ async function evaluate(item: ShowcaseItem, condition: ConditionExpression): Pro
 			compileConditionExpression(condition),
 			KeyCodec.encode(item.hashKey),
 			KeyCodec.encodeOptional(item.sortKey),
+			P(KeyCodec.encode(item.hashKey)),
 		);
 		return result.conditionOk;
 	});
@@ -690,10 +696,10 @@ async function applyUpdate(before: JsonValue | undefined, update: UpdateExpressi
 	return await runInDurableObject(partition, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		if (before !== undefined) {
-			store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, txOrderTs: 1 });
 		}
-		store.updateItemSingleShot({ hk, sk, plan: update, txOrderTs: 2 });
-		return JSON.parse(store.getItem(hk, sk).row?.data as string) as JsonValue;
+		store.updateItemSingleShot({ prefix: P(hk), hk, sk, plan: update, txOrderTs: 2 });
+		return JSON.parse(store.getItem(P(hk), hk, sk).row?.data as string) as JsonValue;
 	});
 }
 

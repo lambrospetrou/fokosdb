@@ -8,7 +8,6 @@
  * Workers runtime refuses I/O for one request from the context of another request.
  */
 import { LRUCache } from "../shared/cache-lru.js";
-import type { KeyBytes } from "./key-codec.js";
 import {
 	compareTopologyVersions,
 	parseHashBody,
@@ -18,6 +17,7 @@ import {
 	type TopologyVersion,
 } from "./topology-codec.js";
 import type { FokosTopology } from "./route-context.js";
+import type { HashPrefixBucket } from "./hash-primitives.js";
 
 export type FokosTopologyCacheOptions = {
 	/**
@@ -83,9 +83,12 @@ export function topologyGetPath(shardGroup: string): string {
 	return `/internal/v1/topology.Get?sg=${toBase64Url(utf8Encoder.encode(shardGroup))}`;
 }
 
-/** The path of `topology.GetForRange` for one hash key of a shard group. */
-export function topologyGetForRangePath(shardGroup: string, hashKey: KeyBytes): string {
-	return `${topologyGetPath(shardGroup).replace("topology.Get", "topology.GetForRange")}&hk=${toBase64Url(hashKey)}`;
+/**
+ * The path of `topology.GetForRange` for one hashPrefixBucket of a shard group, with its 16 hex
+ * characters. The path has a fixed length for each shard group.
+ */
+export function topologyGetForRangePath(shardGroup: string, hashPrefixBucket: HashPrefixBucket): string {
+	return `${topologyGetPath(shardGroup).replace("topology.Get", "topology.GetForRange")}&bk=${hashPrefixBucket.toHex()}`;
 }
 
 /** The scope part of a cache key. A JSON string ends at its closing quote, so no two scopes give the same prefix. */
@@ -125,16 +128,16 @@ export function cachedHashTopology(opts: FokosTopologyCacheOptions, topology: Fo
 	return entry;
 }
 
-/** The range entry of one hash key, or undefined. It starts a refresh when the entry is absent or old. */
+/** The range entry of one hashPrefixBucket, or undefined. It starts a refresh when the entry is absent or old. */
 export function cachedRangeTopology(
 	opts: FokosTopologyCacheOptions,
 	shardGroup: string,
-	hashKey: KeyBytes,
+	hashPrefixBucket: HashPrefixBucket,
 ): TopologyEntry<RangeTopologyView> | undefined {
-	const key = `r|${scopeOf(opts)}|${shardGroup}|${toBase64Url(hashKey)}`;
+	const key = `r|${scopeOf(opts)}|${shardGroup}|${hashPrefixBucket.toHex()}`;
 	const entry = cache.get(key) as TopologyEntry<RangeTopologyView> | undefined;
 	if (shouldRefresh(opts, key, entry)) {
-		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, hashKey), parseRangeBody));
+		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, hashPrefixBucket), parseRangeBody));
 	}
 	return entry;
 }

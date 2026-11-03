@@ -6,6 +6,7 @@ import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { kb, makeStub } from "./helpers.js";
 import { PROMOTION_TEST_MAX_SIZE_MB, TestPartition, drainUntil, makePartition } from "./partition-harness.js";
+import { ALL_ROWS, partitionPrefixOf, prefixOf } from "../storage-prefix.js";
 
 type OutboxRow = { hk: string; revision: number; is_deleted: number; is_local_only: number };
 
@@ -57,11 +58,17 @@ describe("FokosDBPartitionDO — outbox migration", () => {
 describe("FokosMigrationHost — the export fences of the outbox stream", () => {
 	type Page = { page: unknown; nextCursor: unknown };
 	const budget = { pageBytes: 1024 * 1024, pageRows: 1, scanRows: 100 };
-	const slice = { kind: "promoted_key" as const, hashKey: kb("moved") };
+	const slice = { kind: "promoted_hash_prefix_bucket" as const, hashPrefixBucket: prefixOf(kb("moved")) };
 	const inSlice = (key: { hashKey: KeyBytes }) => KeyCodec.compare(key.hashKey, kb("moved")) === 0;
 
-	function hostOf(store: PartitionStore, selfId: string): FokosMigrationHost {
-		return new FokosMigrationHost({ store, logParams: () => ({}), captureChanges: () => true, selfId: () => selfId });
+	function hostOf(store: PartitionStore, selfId: string, state: DurableObjectState): FokosMigrationHost {
+		return new FokosMigrationHost({
+			store,
+			logParams: () => ({}),
+			captureChanges: () => true,
+			selfId: () => selfId,
+			storagePrefix: partitionPrefixOf(state),
+		});
 	}
 
 	it("the last page gives each target the current epoch of the source and its fences, and the pages raise no epoch", async () => {
@@ -69,26 +76,27 @@ describe("FokosMigrationHost — the export fences of the outbox stream", () => 
 		const target = makeStub({ captureChanges: true });
 		const pages = await runInDurableObject(source.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage, { captureChanges: () => true });
+			const P = partitionPrefixOf(state);
 			for (const sk of ["1", "2"]) {
-				store.upsertItem({ hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ prefix: P(kb("moved")), hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			store.upsertItem({ hk: kb("stays"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ prefix: P(kb("stays")), hk: kb("stays"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			// The source is a split child too: its own inherited row keeps a fence of its parent.
-			store.insertMigratedOutboxRow({ hk: kb("old"), sk: kb("s"), revision: 1, is_deleted: 1 });
+			store.insertMigratedOutboxRow({ prefix: P(kb("old")), hk: kb("old"), sk: kb("s"), revision: 1, is_deleted: 1 });
 			store.importExportFences("grandparent", 3, []);
 			const before = store.exportState().epoch;
 
-			const host = hostOf(store, "source-id");
+			const host = hostOf(store, "source-id", state);
 			const out: Page[] = [];
 			let cursor: unknown = { stream: "outbox", cursor: null };
 			while (cursor !== null) {
-				const page = host.buildPage(cursor, slice, inSlice, budget);
+				const page = host.buildPage(cursor, slice, inSlice, budget, ALL_ROWS);
 				out.push(page);
 				cursor = page.nextCursor;
 			}
 			const after = store.exportState().epoch;
 			// A second target of the same split gets the same epoch.
-			const again = host.buildPage({ stream: "outbox", cursor: null }, slice, inSlice, { ...budget, pageRows: 10 });
+			const again = host.buildPage({ stream: "outbox", cursor: null }, slice, inSlice, { ...budget, pageRows: 10 }, ALL_ROWS);
 			return { pages: out, again, before, after };
 		});
 
@@ -99,7 +107,7 @@ describe("FokosMigrationHost — the export fences of the outbox stream", () => 
 
 		const stored = await runInDurableObject(target.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage, { captureChanges: () => true });
-			const host = hostOf(store, "target-id");
+			const host = hostOf(store, "target-id", state);
 			for (const { page } of pages.pages) {
 				host.applyPage(page, slice);
 			}

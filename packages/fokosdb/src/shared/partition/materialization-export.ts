@@ -14,6 +14,7 @@
  */
 import type { LatestImage } from "../../server/materialization/do-materialization.js";
 import { KeyCodec, KeyPairMap, type KeyBytes } from "../../sharding/key-codec.js";
+import type { HashPrefixBucket } from "../../sharding/hash-primitives.js";
 import invariant from "../invariant.js";
 import type { DueOutboxRow, ExportFence, PartitionStore } from "./partition-store.js";
 
@@ -78,8 +79,8 @@ function isRetryableUnprocessed(outcome: ExportItemOutcome): boolean {
 	return outcome.outcome === "unprocessed" && outcome.code !== PRODUCER_EPOCH_FENCED;
 }
 
-/** A claimed call and the keys of its items. */
-type ClaimedCall = { call: ExportCall; keys: KeyPairMap<true> };
+/** A claimed call and the keys of its items, each with the storage prefix of its outbox row. */
+type ClaimedCall = { call: ExportCall; keys: KeyPairMap<HashPrefixBucket> };
 
 export class MaterializationExporter {
 	readonly #deps: MaterializationExporterDeps;
@@ -223,13 +224,13 @@ export class MaterializationExporter {
 	}
 
 	/** The images of the due rows that the next call carries, within the item and byte limits. */
-	#claimRows(): { images: LatestImage[]; keys: KeyPairMap<true> } {
+	#claimRows(): { images: LatestImage[]; keys: KeyPairMap<HashPrefixBucket> } {
 		const { store } = this.#deps;
 		const config = this.#deps.config();
 		const now = this.#deps.now();
 		const owns = this.#deps.ownerCheck();
 		const images: LatestImage[] = [];
-		const keys = new KeyPairMap<true>();
+		const keys = new KeyPairMap<HashPrefixBucket>();
 		let bytes = 0;
 		for (const row of store.dueOutboxRows(now, config.maxScannedRows)) {
 			if (images.length >= config.maxItems) {
@@ -241,7 +242,7 @@ export class MaterializationExporter {
 			// A copy of a moved key: the new owner exports it. The wait keeps the copy from blocking the
 			// owned rows behind it, and from making the alarm due again at once.
 			if (!owns(row)) {
-				store.deferOutboxRow(row.hk, row.sk, row.revision, now + config.unownedRetryMs);
+				store.deferOutboxRow(row.prefix, row.hk, row.sk, row.revision, now + config.unownedRetryMs);
 				continue;
 			}
 			const claimed = this.#imageOf(row, images.length);
@@ -253,10 +254,10 @@ export class MaterializationExporter {
 			}
 			bytes += claimed.bytes;
 			images.push(claimed.image);
-			keys.set(row.hk, row.sk, true);
+			keys.set(row.hk, row.sk, row.prefix);
 			// From now on a receiver can hold this revision, so a delete must reach it.
 			if (row.isLocalOnly) {
-				store.markOutboxRowExported(row.hk, row.sk);
+				store.markOutboxRowExported(row.prefix, row.hk, row.sk);
 			}
 		}
 		return { images, keys };
@@ -272,14 +273,14 @@ export class MaterializationExporter {
 		if (row.isDeleted) {
 			return { image: { opIndex, hashKey: row.hk, sortKey: row.sk, revision: row.revision, deleted: true }, bytes: 0 };
 		}
-		const item = store.exportItemImage(row.hk, row.sk);
+		const item = store.exportItemImage(row.prefix, row.hk, row.sk);
 		if (item === undefined || item.v !== row.revision) {
 			this.#logError("fokos/partition: an outbox row does not match its item, and the export drops it", {
 				key: KeyCodec.pairForLog(row.hk, row.sk),
 				revision: row.revision,
 				itemVersion: item?.v ?? null,
 			});
-			store.discardOutboxRow(row.hk, row.sk);
+			store.discardOutboxRow(row.prefix, row.hk, row.sk);
 			return undefined;
 		}
 		const image: LatestImage = {
@@ -306,7 +307,7 @@ export class MaterializationExporter {
 			return;
 		}
 		const failedAsWhole = outcomes === null || outcomes.every((o) => o.outcome === "unknown" || isRetryableUnprocessed(o));
-		const applied = this.#deps.store.transactionSync(() => this.#applyAnswer(claimed.call, outcomes, failedAsWhole));
+		const applied = this.#deps.store.transactionSync(() => this.#applyAnswer(claimed, outcomes, failedAsWhole));
 		// A discarded answer says nothing about the receiver now: a call with the current epoch decides.
 		if (applied) {
 			this.#updateBackoff(failedAsWhole);
@@ -318,7 +319,7 @@ export class MaterializationExporter {
 	 * the current epoch is discarded: a call with the current epoch decides the outcome of its rows.
 	 * Each write is for a key that this partition still owns. Returns false when it discarded the answer.
 	 */
-	#applyAnswer(call: ExportCall, outcomes: ExportItemOutcome[] | null, failedAsWhole: boolean): boolean {
+	#applyAnswer({ call, keys }: ClaimedCall, outcomes: ExportItemOutcome[] | null, failedAsWhole: boolean): boolean {
 		const { store } = this.#deps;
 		const { epoch, isCallOpen } = store.exportState();
 		const closeCall = this.#inFlight.size === 0 && isCallOpen ? { callOpen: false } : {};
@@ -338,7 +339,9 @@ export class MaterializationExporter {
 			}
 			const image = call.images[i];
 			if (owns({ hk: image.hashKey, sk: image.sortKey })) {
-				this.#applyItemOutcome(image, o, failedAsWhole);
+				const prefix = keys.get(image.hashKey, image.sortKey);
+				invariant(prefix !== undefined, "fokos/export: an answered image is not a key of its call");
+				this.#applyItemOutcome(prefix, image, o, failedAsWhole);
 			}
 		}
 		store.updateExportState({ raiseEpoch: raise, ...closeCall });
@@ -346,17 +349,17 @@ export class MaterializationExporter {
 	}
 
 	/** The write for one owned item of the answer. A call that failed as a whole writes no row for an item. */
-	#applyItemOutcome(image: LatestImage, outcome: ExportItemOutcome, failedAsWhole: boolean): void {
+	#applyItemOutcome(prefix: HashPrefixBucket, image: LatestImage, outcome: ExportItemOutcome, failedAsWhole: boolean): void {
 		const { store } = this.#deps;
 		const config = this.#deps.config();
 		const now = this.#deps.now();
 		switch (outcome.outcome) {
 			case "acknowledged":
-				store.deleteOutboxRow(image.hashKey, image.sortKey, image.revision);
+				store.deleteOutboxRow(prefix, image.hashKey, image.sortKey, image.revision);
 				return;
 			case "unprocessed":
 				if (!failedAsWhole) {
-					store.deferOutboxRow(image.hashKey, image.sortKey, image.revision, now + config.unprocessedRetryMs);
+					store.deferOutboxRow(prefix, image.hashKey, image.sortKey, image.revision, now + config.unprocessedRetryMs);
 				}
 				return;
 			case "rejected":
@@ -365,7 +368,7 @@ export class MaterializationExporter {
 					revision: image.revision,
 					code: outcome.code,
 				});
-				store.deferOutboxRow(image.hashKey, image.sortKey, image.revision, now + config.rejectedRetryMs);
+				store.deferOutboxRow(prefix, image.hashKey, image.sortKey, image.revision, now + config.rejectedRetryMs);
 				return;
 			case "unknown":
 				return;

@@ -25,8 +25,6 @@ import {
 	estimateItemBytes,
 	estimatePendingTxBytes,
 	PartitionStore,
-	type HashKeyWalkCursor,
-	type HashKeyWalkEntry,
 	type KeyRange,
 	type MigratedItem,
 	type MigratedOutboxRow,
@@ -34,9 +32,10 @@ import {
 	type PendingTransactionCursor,
 	type PendingTxItem,
 	type ProducerFence,
-	type ScanCursor,
+	type StorageCursor,
 } from "./partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
+import { compareHashPrefixBuckets, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
 import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js";
 
@@ -47,10 +46,10 @@ const OUTBOX_ROW_FIXED_BYTES = 32;
 
 /** Where the host has got to. The flow stores it verbatim and never reads inside it. */
 export type FokosDBHostCursor =
-	| { stream: "items"; cursor: HashKeyWalkCursor<ScanCursor> | null }
-	| { stream: "pending_tx"; cursor: HashKeyWalkCursor<PendingTransactionCursor> | null }
+	| { stream: "items"; cursor: StorageCursor | null }
+	| { stream: "pending_tx"; cursor: PendingTransactionCursor | null }
 	| { stream: "producer_fences"; after: string | null }
-	| { stream: "outbox"; cursor: HashKeyWalkCursor<ScanCursor> | null };
+	| { stream: "outbox"; cursor: StorageCursor | null };
 
 type KeyStreamCursor = Exclude<FokosDBHostCursor, { stream: "producer_fences" }>;
 
@@ -80,35 +79,36 @@ export type FokosMigrationHostDeps = {
 	captureChanges: () => boolean;
 	/** The `DurableObjectId` of this partition, in hex: the producer ID of its export calls. */
 	selfId: () => string;
+	/** The storage prefix of a hash key in the shard group of this partition. */
+	storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket;
 };
 
 export class FokosMigrationHost implements MigrationHost {
 	constructor(private readonly deps: FokosMigrationHostDeps) {}
 
 	/**
-	 * The slice limits the read: a promoted key or a range slice reads only the rows of its key range.
-	 * A hash child has no key range, so each stream walks its table one hash key at a time.
-	 * `belongsToTarget` is the ownership function of the slice, and the flow owns it. A range read
-	 * passes each row through it. The hash-key walk passes the first row of each hash key through it.
-	 * `budget` holds the page budgets of the source. The request carries no budget.
+	 * Each key stream reads `interval`, the storage interval of the target, in storage order, and
+	 * passes each row through `belongsToTarget`, the ownership function of the slice, which the flow
+	 * owns. `budget` holds the page budgets of the source. The request carries no budget.
 	 */
 	buildPage(
 		cursor: unknown,
 		slice: FokosSlice,
 		belongsToTarget: BelongsToTarget,
 		budget: FokosMigrationPageBudget,
+		interval: KeyRange,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const from = asHostCursor(cursor);
-		const range = sliceKeyRange(slice);
+		const read: StreamRead = { interval, include: rowFilter(slice, belongsToTarget), budget };
 		switch (from.stream) {
 			case "items":
-				return this.#buildItemsPage(from.cursor, range, belongsToTarget, budget);
+				return this.#buildItemsPage(from.cursor, read);
 			case "pending_tx":
-				return this.#buildPendingTxPage(from.cursor, range, belongsToTarget, budget);
+				return this.#buildPendingTxPage(from.cursor, read);
 			case "producer_fences":
 				return this.#buildProducerFencesPage(from.after, budget);
 			case "outbox":
-				return this.#buildOutboxPage(from.cursor, range, belongsToTarget, budget);
+				return this.#buildOutboxPage(from.cursor, read);
 		}
 	}
 
@@ -154,25 +154,27 @@ export class FokosMigrationHost implements MigrationHost {
 					() => `fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)}, outside the slice`,
 				);
 			}
+			// The row is stored under the prefix it carries, so a wrong prefix puts it outside the range
+			// of its own hash key, where a later read by prefix cannot find it.
+			invariant(
+				compareHashPrefixBuckets(row.prefix, this.deps.storagePrefix(row.hk)) === 0,
+				() =>
+					`fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)} with a prefix that is not the storage prefix of the hash key`,
+			);
 		}
 	}
 
 	// ─── items ────────────────────────────────────────────────────────────────
 
-	#buildItemsPage(
-		cursor: HashKeyWalkCursor<ScanCursor> | null,
-		range: KeyRange | null,
-		belongsToTarget: BelongsToTarget,
-		budget: FokosMigrationPageBudget,
-	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
+	#buildItemsPage(cursor: StorageCursor | null, read: StreamRead): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
-		const reader: StreamReader<MigratedItem, ScanCursor> = {
-			readRange: (c, limit, r) => store.queryItemsPage(c, limit, r),
-			walk: (c, limit, owns) => store.walkItemsByHashKey(c, limit, owns),
-			cursorOf: (row) => ({ hk: row.hk, sk: row.sk }),
-			estimateBytes: estimateItemBytes,
+		const reader: StreamReader<MigratedItem, StorageCursor> = {
+			read: (c, limit, interval) => store.queryItemsPage(c, limit, interval),
+			cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk }),
+			// A migrated item carries its storage prefix on the wire beside the item fields.
+			estimateBytes: (row) => row.prefix.byteLength + estimateItemBytes(row),
 		};
-		const { rows, nextCursor } = collectStream(reader, cursor, range, belongsToTarget, budget);
+		const { rows, nextCursor } = collectStream(reader, cursor, read);
 		// A drained stream hands over to the next one with a fresh cursor. That costs one extra RPC and
 		// keeps each page to a single stream.
 		const next: FokosDBHostCursor = nextCursor ? { stream: "items", cursor: nextCursor } : { stream: "pending_tx", cursor: null };
@@ -184,32 +186,34 @@ export class FokosMigrationHost implements MigrationHost {
 		// The exact stored sizes, added per page, are what removes the whole-table estimate rebuild that
 		// used to close an import. A row already present contributes nothing, so a retried page cannot
 		// count its rows twice.
-		const added: Array<{ hk: KeyBytes; bytes: number }> = [];
+		const added: Array<{ prefix: HashPrefixBucket; hk: KeyBytes; bytes: number }> = [];
+		let maxItemId = 0;
 		for (const item of items) {
 			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);
 			if (inserted) {
-				added.push({ hk: item.hk, bytes: estRowBytes });
+				added.push({ prefix: item.prefix, hk: item.hk, bytes: estRowBytes });
 			}
+			maxItemId = Math.max(maxItemId, item.item_id);
 		}
 		store.keySizes.addRows(added);
+		if (items.length > 0) {
+			store.raiseItemIdMark(maxItemId);
+		}
 	}
 
 	// ─── pending transactions ─────────────────────────────────────────────────
 
 	#buildPendingTxPage(
-		cursor: HashKeyWalkCursor<PendingTransactionCursor> | null,
-		range: KeyRange | null,
-		belongsToTarget: BelongsToTarget,
-		budget: FokosMigrationPageBudget,
+		cursor: PendingTransactionCursor | null,
+		read: StreamRead,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const reader: StreamReader<PendingTxItem, PendingTransactionCursor> = {
-			readRange: (c, limit, r) => store.queryPendingTxPage(c, limit, r),
-			walk: (c, limit, owns) => store.walkPendingTxByHashKey(c, limit, owns),
-			cursorOf: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
+			read: (c, limit, interval) => store.queryPendingTxPage(c, limit, interval),
+			cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 			estimateBytes: estimatePendingTxBytes,
 		};
-		const { rows, nextCursor } = collectStream(reader, cursor, range, belongsToTarget, budget);
+		const { rows, nextCursor } = collectStream(reader, cursor, read);
 		// Each page of this stream carries the deletion metadata, so a slice with no lock receives it in
 		// one empty page. A promoted key carries the locks that it holds at cutover.
 		const page: FokosDBHostPage = { stream: "pending_tx", pendingTransactions: rows, deletionMetadata: store.getDeletionMetadata() };
@@ -243,20 +247,14 @@ export class FokosMigrationHost implements MigrationHost {
 	 * the current epoch E to the target. The target sends E with its inherited rows, so each receiver
 	 * rejects a late call of the source for those rows.
 	 */
-	#buildOutboxPage(
-		cursor: HashKeyWalkCursor<ScanCursor> | null,
-		range: KeyRange | null,
-		belongsToTarget: BelongsToTarget,
-		budget: FokosMigrationPageBudget,
-	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
+	#buildOutboxPage(cursor: StorageCursor | null, read: StreamRead): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
-		const reader: StreamReader<MigratedOutboxRow, ScanCursor> = {
-			readRange: (c, limit, r) => store.queryOutboxPage(c, limit, r),
-			walk: (c, limit, owns) => store.walkOutboxByHashKey(c, limit, owns),
-			cursorOf: (row) => ({ hk: row.hk, sk: row.sk }),
-			estimateBytes: (row) => row.hk.byteLength + row.sk.byteLength + OUTBOX_ROW_FIXED_BYTES,
+		const reader: StreamReader<MigratedOutboxRow, StorageCursor> = {
+			read: (c, limit, interval) => store.queryOutboxPage(c, limit, interval),
+			cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk }),
+			estimateBytes: (row) => row.prefix.byteLength + row.hk.byteLength + row.sk.byteLength + OUTBOX_ROW_FIXED_BYTES,
 		};
-		const { rows, nextCursor } = collectStream(reader, cursor, range, belongsToTarget, budget);
+		const { rows, nextCursor } = collectStream(reader, cursor, read);
 		if (nextCursor) {
 			return { page: { stream: "outbox", rows }, nextCursor: { stream: "outbox", cursor: nextCursor } };
 		}
@@ -276,8 +274,8 @@ export class FokosMigrationHost implements MigrationHost {
 	/**
 	 * Logs each quarantined lock that this page brings. The stale scan skips a guarded row, and the
 	 * guard writes its line only on the partition where the quarantine starts. This line gives the
-	 * operator the partition that owns the lock now. The stream pages in `(hk, sk, transaction_id)`
-	 * order, so a transaction that spans pages gets one line for each page.
+	 * operator the partition that owns the lock now. The stream pages in storage order, so a
+	 * transaction that spans pages gets one line for each page.
 	 *
 	 * The log must not fail the page: a throw rolls the page back on each retry and stops the import.
 	 * Thus the method reads the coordinator reference with no validation, and logs text that it cannot
@@ -322,78 +320,50 @@ export class FokosMigrationHost implements MigrationHost {
 	}
 }
 
-/** How the host reads the rows of one stream: as one key range, or as a walk over the hash keys. */
-export type StreamReader<T, C extends { hk: KeyBytes; sk: KeyBytes }> = {
-	readRange: (cursor: C | null, limit: number, range: KeyRange) => Iterable<T>;
-	walk: (
-		cursor: HashKeyWalkCursor<C> | null,
-		limit: number,
-		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
-	) => Iterable<HashKeyWalkEntry<T>>;
+/** How the host reads the rows of one stream: one page of the interval, strictly after a cursor. */
+export type StreamReader<T, C> = {
+	read: (cursor: C | null, limit: number, interval: KeyRange) => Iterable<T>;
 	cursorOf: (row: T) => C;
 	estimateBytes: (row: T) => number;
 };
 
+/** The parts of one page read that each key stream shares: the interval, the row filter, and the budgets. */
+type StreamRead = { interval: KeyRange; include: (row: { hk: KeyBytes; sk: KeyBytes }) => boolean; budget: FokosMigrationPageBudget };
+
 /**
- * Collects one page of a stream. With a key range, it reads the range and passes each row through
- * `belongsToTarget`. Without one (a hash child), it walks the hash keys. A hash-child slice owns whole
- * hash keys: the answer of `belongsToTarget` does not depend on the sort key. So the first row of a key
- * decides for each row of the key, and a key that the child does not own costs one seek and one
- * scanned entry.
+ * The row filter of a slice. A hash-child slice owns whole hash keys: the answer of `belongsToTarget`
+ * does not depend on the sort key. A read in storage order gives the rows of one hash key one after
+ * the other, so the first row of a key decides for each row of the key.
  */
-export function collectStream<T extends { hk: KeyBytes; sk: KeyBytes }, C extends { hk: KeyBytes; sk: KeyBytes }>(
-	reader: StreamReader<T, C>,
-	cursor: HashKeyWalkCursor<C> | null,
-	range: KeyRange | null,
-	belongsToTarget: BelongsToTarget,
-	budget: FokosMigrationPageBudget,
-): { rows: T[]; nextCursor: HashKeyWalkCursor<C> | null } {
-	const limits = { budgetBytes: budget.pageBytes, maxItems: budget.pageRows, maxScannedRows: budget.scanRows, pageSize: budget.pageRows };
-	if (range !== null) {
-		let start: C | null = null;
-		if (cursor !== null) {
-			invariant(cursor.kind === "row", "fokos/migration-host: a range read cannot continue after a skipped hash key");
-			start = cursor.row;
-		}
-		const { rows, nextCursor } = collectBatch<T, C>({
-			fetchPage: (c, limit) => reader.readRange(c, limit, range),
-			advanceCursor: reader.cursorOf,
-			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
-			estimateBytes: reader.estimateBytes,
-			...limits,
-			startCursor: start,
-		});
-		return { rows, nextCursor: nextCursor === null ? null : { kind: "row", row: nextCursor } };
+export function rowFilter(slice: FokosSlice, belongsToTarget: BelongsToTarget): (row: { hk: KeyBytes; sk: KeyBytes }) => boolean {
+	if (slice.kind !== "hash_child") {
+		return (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk });
 	}
-	const owns = (hk: KeyBytes, firstSk: KeyBytes) => belongsToTarget({ hashKey: hk, sortKey: firstSk });
-	const { rows, nextCursor } = collectBatch<HashKeyWalkEntry<T>, HashKeyWalkCursor<C>>({
-		fetchPage: (c, limit) => reader.walk(c, limit, owns),
-		advanceCursor: (entry) =>
-			entry.kind === "row" ? { kind: "row", row: reader.cursorOf(entry.row) } : { kind: "after_key", hk: entry.hk },
-		include: (entry) => entry.kind === "row",
-		estimateBytes: (entry) => (entry.kind === "row" ? reader.estimateBytes(entry.row) : 0),
-		...limits,
-		startCursor: cursor,
-	});
-	const page: T[] = [];
-	for (const entry of rows) {
-		if (entry.kind === "row") {
-			page.push(entry.row);
+	let lastHk: KeyBytes | null = null;
+	let lastAnswer = false;
+	return (row) => {
+		if (lastHk === null || KeyCodec.compare(lastHk, row.hk) !== 0) {
+			lastHk = row.hk;
+			lastAnswer = belongsToTarget({ hashKey: row.hk, sortKey: row.sk });
 		}
-	}
-	return { rows: page, nextCursor };
+		return lastAnswer;
+	};
 }
 
-/** The key range that holds every row of the slice, or null when the rows of the slice are not one key range. */
-export function sliceKeyRange(slice: FokosSlice): KeyRange | null {
-	switch (slice.kind) {
-		case "promoted_key":
-			return { hk: slice.hashKey, start: KeyCodec.encodeOptional(undefined), end: null };
-		case "range":
-			return { hk: slice.hashKey, start: slice.start ?? KeyCodec.encodeOptional(undefined), end: slice.end };
-		case "hash_child":
-			return null;
-	}
+/** Collects one page of a stream: the rows of the interval after `cursor` that `include` accepts. */
+export function collectStream<T, C>(reader: StreamReader<T, C>, cursor: C | null, read: StreamRead): { rows: T[]; nextCursor: C | null } {
+	const { interval, include, budget } = read;
+	return collectBatch<T, C>({
+		fetchPage: (c, limit) => reader.read(c, limit, interval),
+		advanceCursor: reader.cursorOf,
+		include: include as (row: T) => boolean,
+		estimateBytes: reader.estimateBytes,
+		budgetBytes: budget.pageBytes,
+		maxItems: budget.pageRows,
+		maxScannedRows: budget.scanRows,
+		pageSize: budget.pageRows,
+		startCursor: cursor,
+	});
 }
 
 /** The coordinator of a lock, for a log line only. It validates nothing, and keeps JSON that it cannot read as raw text. */
@@ -426,7 +396,7 @@ function asHostCursor(cursor: unknown): FokosDBHostCursor {
 
 /**
  * Throws when the position inside a stream is not a cursor that this host makes. A key that is not
- * bytes makes the seek `hk > ?` match no row, and the read would then end the stream with no error,
+ * bytes makes the row-value seek match no row, and the read would then end the stream with no error,
  * and the target would miss the rest of its rows.
  */
 function assertStreamCursor(c: FokosDBHostCursor): void {
@@ -438,17 +408,12 @@ function assertStreamCursor(c: FokosDBHostCursor): void {
 	if (cursor === null) {
 		return;
 	}
+	const row: { prefix?: unknown; hk?: unknown; sk?: unknown; transaction_id?: unknown } = cursor;
 	const isKey = (value: unknown) => value instanceof Uint8Array;
-	if (cursor.kind === "after_key") {
-		invariant(isKey(cursor.hk), () => `fokos/migration-host: the ${stream} cursor has no hash key`);
-		return;
-	}
 	invariant(
-		cursor.kind === "row",
-		() => `fokos/migration-host: unknown ${stream} cursor kind ${String((cursor as { kind?: unknown }).kind)}`,
+		isKey(row.prefix) && isKey(row.hk) && isKey(row.sk),
+		() => `fokos/migration-host: the ${stream} cursor has no storage prefix, hash key, or sort key`,
 	);
-	const row: { hk?: unknown; sk?: unknown; transaction_id?: unknown } = cursor.row;
-	invariant(isKey(row.hk) && isKey(row.sk), () => `fokos/migration-host: the ${stream} cursor has no hash key or no sort key`);
 	invariant(
 		stream !== "pending_tx" || typeof row.transaction_id === "string",
 		"fokos/migration-host: the pending_tx cursor has no transaction id",
@@ -504,20 +469,19 @@ function movesForward(requested: FokosDBHostCursor, next: FokosDBHostCursor): bo
 export type StreamPosition = NonNullable<KeyStreamCursor["cursor"]>;
 
 /**
- * Compares two positions of one stream in its read order: `(hk, sk)` for items, and
- * `(hk, sk, transaction_id)` for locks. `after_key` is after every row of its hash key. A
- * transaction id is ASCII, so the string order of JavaScript is the byte order of SQLite.
+ * Compares two positions of one stream in its read order: `(prefix, hk, sk)` for items, and
+ * `(prefix, hk, sk, transaction_id)` for locks. Each key compares by unsigned bytes, as SQLite
+ * compares a BLOB. A transaction id is ASCII, so the string order of JavaScript is the byte order of
+ * SQLite.
  */
 export function comparePositions(a: StreamPosition, b: StreamPosition): number {
-	const hk = (p: StreamPosition) => (p.kind === "row" ? p.row.hk : p.hk);
-	const byHashKey = KeyCodec.compare(hk(a), hk(b));
-	if (byHashKey !== 0 || a.kind === "after_key" || b.kind === "after_key") {
-		return byHashKey || Number(a.kind === "after_key") - Number(b.kind === "after_key");
+	const byKey =
+		KeyCodec.compare(KeyCodec.asKeyBytes(a.prefix), KeyCodec.asKeyBytes(b.prefix)) ||
+		KeyCodec.compare(a.hk, b.hk) ||
+		KeyCodec.compare(a.sk, b.sk);
+	if (byKey !== 0) {
+		return byKey;
 	}
-	const bySortKey = KeyCodec.compare(a.row.sk, b.row.sk);
-	if (bySortKey !== 0) {
-		return bySortKey;
-	}
-	const tx = (p: typeof a.row) => ("transaction_id" in p ? p.transaction_id : "");
-	return tx(a.row) < tx(b.row) ? -1 : tx(a.row) > tx(b.row) ? 1 : 0;
+	const tx = (p: StreamPosition) => ("transaction_id" in p ? p.transaction_id : "");
+	return tx(a) < tx(b) ? -1 : tx(a) > tx(b) ? 1 : 0;
 }

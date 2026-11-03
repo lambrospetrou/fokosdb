@@ -1,8 +1,15 @@
 import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext, FokosTopology } from "./route-context.js";
-import { hashPrefixBucketInterval, hashPrefixBucketSeedOf, maxHashDepth } from "./hash-primitives.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import {
+	asHashPrefixBucket,
+	HASH_PREFIX_BUCKET_BYTES,
+	hashPrefixBucketInterval,
+	hashPrefixBucketSeedOf,
+	maxHashDepth,
+	type HashPrefixBucket,
+} from "./hash-primitives.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
 import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
@@ -21,8 +28,8 @@ import { SHARDING_VALIDATION_CODES } from "./errors.js";
 export const SHARD_GROUP_SEPARATOR = "~";
 
 // Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
-// routing comparisons — there boundaries stay `KeyBytes | null` with null = unbounded). The component
-// encoding escapes "~", and base64url has no "~", so an encoded boundary never starts with "~m".
+// routing comparisons — there boundaries stay `FokosCompositeKey | null` with null = unbounded). The
+// component encoding escapes "~", and base64url has no "~", so an encoded component never starts with "~m".
 export const RANGE_MIN = "~min";
 export const RANGE_MAX = "~max";
 
@@ -176,26 +183,40 @@ export function encodeRangeComponent(bytes: KeyBytes): string {
 	return text;
 }
 
-// Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
-// three-component shape (the range root is <shardGroup>~r.<hk>.~min.~max, addressable from hashKey
-// alone). The "r." and "h." markers after the separator keep range and hash DO names disjoint.
-function rangePartitionDoName(shardGroup: string, hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): string {
-	const hk = encodeRangeComponent(hashKey);
-	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
-	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);
-	return `${shardGroup}${SHARD_GROUP_SEPARATOR}r.${hk}.${start}.${end}`;
+/** The DO name form of one boundary: `~min` or `~max` for an unbounded edge, else its two components. */
+function rangeBoundaryName(boundary: FokosCompositeKey | null, unbounded: string): string {
+	return boundary === null ? unbounded : `${encodeRangeComponent(boundary.hk)}.${encodeRangeComponent(boundary.sk)}`;
+}
+
+/**
+ * The DO name of a range partition: `<shardGroup>~r.<hashPrefixBucket hex>.<start>.<end>`. A bounded
+ * edge has two components, the hash key and the sort key, and an unbounded edge is `~min` or `~max`.
+ * No component contains "." and no component starts with "~m", so a reader knows the count of
+ * components of each edge, and the name is injective. A range root is `<shardGroup>~r.<hex>.~min.~max`.
+ * The "r." and "h." markers after the separator keep range and hash DO names disjoint.
+ */
+function rangePartitionDoName(
+	shardGroup: string,
+	hashPrefixBucket: HashPrefixBucket,
+	startBoundary: FokosCompositeKey | null,
+	endBoundary: FokosCompositeKey | null,
+): string {
+	// FIXME: when the two boundaries share leading bytes, the DO name stores those bytes two times.
+	const start = rangeBoundaryName(startBoundary, RANGE_MIN);
+	const end = rangeBoundaryName(endBoundary, RANGE_MAX);
+	return `${shardGroup}${SHARD_GROUP_SEPARATOR}r.${hashPrefixBucket.toHex()}.${start}.${end}`;
 }
 
 /** The route context of a range partition (root or child) of the same shard group as `base`. */
 export function resolveRangePartitionContext<P>(
 	base: FokosRouteContext<P>,
-	hashKey: KeyBytes,
-	startBoundary: KeyBytes | null,
-	endBoundary: KeyBytes | null,
+	hashPrefixBucket: HashPrefixBucket,
+	startBoundary: FokosCompositeKey | null,
+	endBoundary: FokosCompositeKey | null,
 ): FokosRouteContext<P> {
 	// The ID and the DO name come from the same keys, so no ID decode is necessary.
-	const partitionId = rangeBytesToPartitionId(encodeRangeBytes(hashKey, startBoundary, endBoundary));
-	const doName = rangePartitionDoName(base.topology.shardGroup, hashKey, startBoundary, endBoundary);
+	const partitionId = rangeBytesToPartitionId(encodeRangeBytes(hashPrefixBucket, startBoundary, endBoundary));
+	const doName = rangePartitionDoName(base.topology.shardGroup, hashPrefixBucket, startBoundary, endBoundary);
 	return { ...base, doName, partitionId };
 }
 
@@ -249,7 +270,7 @@ export function partitionIdentityFrom(
 		schema: 1,
 		ref,
 		kind: "range",
-		range: { hashKey: decoded.hashKey, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
+		range: { hashPrefixBucket: decoded.hashPrefixBucket, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
 		topology: ctx.topology,
 		hashPrefixBucketSeed: hashPrefixBucketSeedOf(ctx.topology.shardGroup),
 	};
@@ -262,14 +283,15 @@ export function identityDepth(identity: FokosPartitionIdentity): number {
 
 // The range ID is "01" + base64url(first) + "." + base64url(second), both parts unpadded. The dot is
 // a separator, not base64url data. The flat bytes are 0x01 + first + second:
-//   first:  flags u8 (bit0 = has start, bit1 = has end), hkLen u32 LE, startLen u32 LE (0 when no
-//           start), then hkLen hash-key bytes
-//   second: startLen start bytes when the start flag is set, then the end bytes when the end flag is set
-// A range root has an empty second part, so its ID ends with the dot. The first part holds all of the
-// hash key, so a reader can get the hash key without the boundary bytes.
-const RANGE_HEADER_LEN = 9;
+//   first:  flags u8 (bit0 = has start, bit1 = has end), then the 8 bytes of the hashPrefixBucket
+//   second: each present boundary, the start first: hkLen u32 LE, skLen u32 LE, the hash-key bytes,
+//           then the sort-key bytes
+// A range root has an empty second part, so its ID ends with the dot. The first part holds the
+// hashPrefixBucket, so a reader can get it without the boundary bytes.
+const RANGE_FIRST_LEN = 9;
 const RANGE_FLAG_START = 0x01;
 const RANGE_FLAG_END = 0x02;
+const RANGE_BOUNDARY_HEADER_LEN = 8;
 
 function writeU32LE(bytes: Uint8Array, offset: number, value: number): void {
 	bytes[offset] = value & 0xff;
@@ -308,34 +330,62 @@ function decodeBase64UrlInto(text: string, target: Uint8Array): void {
 	invariant(canonical, "fokos/topology: a range partition ID part is not canonical base64url");
 }
 
-const NO_BYTES = Object.freeze(new Uint8Array(0));
+/** The byte count of one boundary in the second part of a range ID. */
+function boundaryByteLength(boundary: FokosCompositeKey | null): number {
+	return boundary === null ? 0 : RANGE_BOUNDARY_HEADER_LEN + boundary.hk.length + boundary.sk.length;
+}
+
+/** Writes one boundary at `offset`, and returns the offset after it. */
+function writeBoundary(bytes: Uint8Array, offset: number, boundary: FokosCompositeKey | null): number {
+	if (boundary === null) {
+		return offset;
+	}
+	writeU32LE(bytes, offset, boundary.hk.length);
+	writeU32LE(bytes, offset + 4, boundary.sk.length);
+	bytes.set(boundary.hk, offset + RANGE_BOUNDARY_HEADER_LEN);
+	bytes.set(boundary.sk, offset + RANGE_BOUNDARY_HEADER_LEN + boundary.hk.length);
+	return offset + boundaryByteLength(boundary);
+}
+
+/** Reads one boundary at `offset` of the second part, and returns it with the offset after it. */
+function readBoundary(second: Uint8Array, offset: number): { boundary: FokosCompositeKey; next: number } {
+	invariant(second.length - offset >= RANGE_BOUNDARY_HEADER_LEN, "fokos/topology.decode: a range partition ID boundary is too short");
+	const hkLen = readU32LE(second, offset);
+	const skLen = readU32LE(second, offset + 4);
+	const hkStart = offset + RANGE_BOUNDARY_HEADER_LEN;
+	const next = hkStart + hkLen + skLen;
+	invariant(next <= second.length, "fokos/topology.decode: a range partition ID boundary length is inconsistent");
+	return {
+		boundary: {
+			hk: KeyCodec.asKeyBytes(second.subarray(hkStart, hkStart + hkLen)),
+			sk: KeyCodec.asKeyBytes(second.subarray(hkStart + hkLen, next)),
+		},
+		next,
+	};
+}
 
 /** The flat bytes of a range ID. null is an unbounded edge. */
-function encodeRangeBytes(hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): Uint8Array {
-	const start = startBoundary ?? NO_BYTES;
-	const end = endBoundary ?? NO_BYTES;
-	const split = 1 + RANGE_HEADER_LEN + hashKey.length;
-	const bytes = new Uint8Array(split + start.length + end.length);
+function encodeRangeBytes(
+	hashPrefixBucket: HashPrefixBucket,
+	startBoundary: FokosCompositeKey | null,
+	endBoundary: FokosCompositeKey | null,
+): Uint8Array {
+	invariant(hashPrefixBucket.length === HASH_PREFIX_BUCKET_BYTES, "fokos/topology: a hashPrefixBucket must be 8 bytes");
+	const split = 1 + RANGE_FIRST_LEN;
+	const bytes = new Uint8Array(split + boundaryByteLength(startBoundary) + boundaryByteLength(endBoundary));
 	bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
 	bytes[1] = (startBoundary ? RANGE_FLAG_START : 0) | (endBoundary ? RANGE_FLAG_END : 0);
-	writeU32LE(bytes, 2, hashKey.length);
-	writeU32LE(bytes, 6, start.length);
-	bytes.set(hashKey, 1 + RANGE_HEADER_LEN);
-	bytes.set(start, split);
-	bytes.set(end, split + start.length);
+	bytes.set(hashPrefixBucket, 2);
+	writeBoundary(bytes, writeBoundary(bytes, split, startBoundary), endBoundary);
 	return bytes;
 }
 
-/** Checks the header of a first part and returns its hash key and the start length. */
-function readRangeFirst(first: Uint8Array): { flags: number; hashKey: KeyBytes; startLen: number } {
-	invariant(first.length >= RANGE_HEADER_LEN, "fokos/topology: a range partition ID header is too short");
+/** Checks a first part and returns its flags and its hashPrefixBucket. */
+function readRangeFirst(first: Uint8Array): { flags: number; hashPrefixBucket: HashPrefixBucket } {
+	invariant(first.length === RANGE_FIRST_LEN, "fokos/topology: a range partition ID first part has the wrong length");
 	const flags = first[0];
 	invariant((flags & ~(RANGE_FLAG_START | RANGE_FLAG_END)) === 0, `fokos/topology: invalid range partition ID flags: ${flags}`);
-	const hkLen = readU32LE(first, 1);
-	const startLen = readU32LE(first, 5);
-	invariant(first.length === RANGE_HEADER_LEN + hkLen, "fokos/topology: a range partition ID hash-key length is inconsistent");
-	invariant((flags & RANGE_FLAG_START) !== 0 || startLen === 0, "fokos/topology: a range partition ID without a start has a start length");
-	return { flags, hashKey: KeyCodec.asKeyBytes(first.subarray(RANGE_HEADER_LEN)), startLen };
+	return { flags, hashPrefixBucket: asHashPrefixBucket(first.subarray(1)) };
 }
 
 /**
@@ -350,8 +400,7 @@ function splitRangePartitionId(partitionId: string): [string, string] {
 
 /** The range ID of the flat range bytes. */
 function rangeBytesToPartitionId(bytes: Uint8Array): string {
-	const hkLen = readU32LE(bytes, 2);
-	const split = 1 + RANGE_HEADER_LEN + hkLen;
+	const split = 1 + RANGE_FIRST_LEN;
 	return PartitionIdHelper.SCHEMA_RANGE_V1_STR + toBase64Url(bytes.subarray(1, split)) + "." + toBase64Url(bytes.subarray(split));
 }
 
@@ -407,14 +456,14 @@ export class PartitionIdHelper {
 	}
 
 	/**
-	 * The hash key of a range ID, from its first part only. The boundary part is not read, so the
-	 * cost does not grow with the boundaries.
+	 * The hashPrefixBucket of a range ID, from its first part only. The boundary part is not read, so
+	 * the cost does not grow with the boundaries.
 	 */
-	static rangeHashKey(partitionId: PartitionNodeId): KeyBytes {
+	static rangeHashPrefixBucket(partitionId: PartitionNodeId): HashPrefixBucket {
 		const [firstText] = splitRangePartitionId(partitionId);
 		const first = new Uint8Array(base64UrlByteLength(firstText.length));
 		decodeBase64UrlInto(firstText, first);
-		return readRangeFirst(first).hashKey;
+		return readRangeFirst(first).hashPrefixBucket;
 	}
 
 	static doName(shardGroup: string, bytes: Uint8Array): string {
@@ -427,7 +476,7 @@ export class PartitionIdHelper {
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		const decoded = PartitionIdHelper.decode(bytes);
 		invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology.doName: unreachable");
-		return rangePartitionDoName(shardGroup, decoded.hashKey, decoded.startBoundary, decoded.endBoundary);
+		return rangePartitionDoName(shardGroup, decoded.hashPrefixBucket, decoded.startBoundary, decoded.endBoundary);
 	}
 
 	// Decode a partition ID bytes to a schema-specific representation.
@@ -435,33 +484,39 @@ export class PartitionIdHelper {
 		bytes: Uint8Array,
 	):
 		| { schema: 0; rootIdx: number; depth: number }
-		| { schema: 1; hashKey: KeyBytes; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null } {
+		| { schema: 1; hashPrefixBucket: HashPrefixBucket; startBoundary: FokosCompositeKey | null; endBoundary: FokosCompositeKey | null } {
 		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
 			return { schema: 0, rootIdx: (bytes[1] << 8) | bytes[2], depth: bytes[3] };
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology.decode: unsupported schema version: ${bytes[0]}`);
 		// SCHEMA_RANGE_V1: 0x01, then the first part and the second part of the range ID, see
-		// `encodeRangeBytes`. The keys and the boundaries are raw canonical KeyBytes.
-		const split = 1 + RANGE_HEADER_LEN + readU32LE(bytes, 2);
-		const { flags, hashKey, startLen } = readRangeFirst(bytes.subarray(1, split));
+		// `encodeRangeBytes`. The keys of the boundaries are raw canonical KeyBytes.
+		invariant(bytes.length >= 1 + RANGE_FIRST_LEN, "fokos/topology.decode: a range partition ID is too short");
+		const split = 1 + RANGE_FIRST_LEN;
+		const { flags, hashPrefixBucket } = readRangeFirst(bytes.subarray(1, split));
 		const second = bytes.subarray(split);
-		invariant(second.length >= startLen, "fokos/topology.decode: a range partition ID start length is inconsistent");
-		const hasEnd = (flags & RANGE_FLAG_END) !== 0;
-		invariant(hasEnd || second.length === startLen, "fokos/topology.decode: a range partition ID without an end has end bytes");
-		const startBoundary = (flags & RANGE_FLAG_START) !== 0 ? KeyCodec.asKeyBytes(second.subarray(0, startLen)) : null;
-		const endBoundary = hasEnd ? KeyCodec.asKeyBytes(second.subarray(startLen)) : null;
-		return { schema: 1, hashKey, startBoundary, endBoundary };
+		let offset = 0;
+		let startBoundary: FokosCompositeKey | null = null;
+		let endBoundary: FokosCompositeKey | null = null;
+		if ((flags & RANGE_FLAG_START) !== 0) {
+			({ boundary: startBoundary, next: offset } = readBoundary(second, offset));
+		}
+		if ((flags & RANGE_FLAG_END) !== 0) {
+			({ boundary: endBoundary, next: offset } = readBoundary(second, offset));
+		}
+		invariant(offset === second.length, "fokos/topology.decode: a range partition ID has bytes after its boundaries");
+		return { schema: 1, hashPrefixBucket, startBoundary, endBoundary };
 	}
 
 	// Creates a PartitionIdHelper for a range-structure DO. null start/end = unbounded edge.
 	static fromRangePartition(
 		shardGroup: string,
-		hashKey: KeyBytes,
-		startBoundary: KeyBytes | null,
-		endBoundary: KeyBytes | null,
+		hashPrefixBucket: HashPrefixBucket,
+		startBoundary: FokosCompositeKey | null,
+		endBoundary: FokosCompositeKey | null,
 	): PartitionIdHelper {
 		// Boundaries are already canonical KeyBytes — store them raw (no TextEncoder).
-		return new PartitionIdHelper(shardGroup, encodeRangeBytes(hashKey, startBoundary, endBoundary));
+		return new PartitionIdHelper(shardGroup, encodeRangeBytes(hashPrefixBucket, startBoundary, endBoundary));
 	}
 
 	/**
@@ -554,10 +609,10 @@ export class PartitionIdHelper {
 		return id[3];
 	}
 	/** The hashPrefixBucket interval `[start, end)` of a hash partition. A null `end` has no upper bound. */
-	static hashInterval(
+	static hashPrefixBucketInterval(
 		partitionId: PartitionNodeId,
 		topology: Pick<FokosTopology, "rootTreesN" | "hashSplitN">,
-	): { start: Uint8Array; end: Uint8Array | null } {
+	): { start: HashPrefixBucket; end: HashPrefixBucket | null } {
 		const bytes = PartitionIdHelper.partitionIdToBytes(partitionId);
 		const depth = PartitionIdHelper.depth(bytes);
 		return hashPrefixBucketInterval(

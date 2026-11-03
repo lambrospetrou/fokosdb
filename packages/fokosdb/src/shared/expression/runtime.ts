@@ -1,4 +1,5 @@
 import { type KeyBytes } from "../../sharding/key-codec.js";
+import type { HashPrefixBucket } from "../../sharding/hash-primitives.js";
 import { materializedPlanBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "./projection.js";
@@ -43,6 +44,7 @@ export function evaluateConditionPlan(
 	plan: CompiledConditionPlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
+	prefix: HashPrefixBucket,
 ): ConditionEvaluationResult {
 	const statement = composeConditionStatement(plan.sql);
 	try {
@@ -51,7 +53,7 @@ export function evaluateConditionPlan(
 			condition_ok: number;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
-		}>(statement, hashKey, sortKey, ...materializedPlanBindings(plan));
+		}>(statement, hashKey, sortKey, prefix, ...materializedPlanBindings(plan));
 		const row = cursor.one();
 		return {
 			itemPresent: row.item_present === 1,
@@ -71,7 +73,7 @@ export function evaluateConditionPlan(
 
 /**
  * Runs a projected point read: one row of the items table through the plan's value and type
- * columns. The pool is `?1`, `hk` is `?2`, and `sk` is `?3` of the composed statement. An absent row
+ * columns. The pool is `?1`, `hk` is `?2`, `sk` is `?3`, and the storage prefix is `?4` of the composed statement. An absent row
  * is a `found: false` read. A projection has nothing to return for one, so no LEFT JOIN is needed.
  */
 export function readProjectedItem(
@@ -79,6 +81,7 @@ export function readProjectedItem(
 	plan: CompiledProjectionPlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
+	prefix: HashPrefixBucket,
 ): ProjectedReadResult {
 	const statement = composeProjectionStatement(plan);
 	try {
@@ -87,6 +90,7 @@ export function readProjectedItem(
 			...materializedPlanBindings(plan, "pool"),
 			hashKey,
 			sortKey,
+			prefix,
 		);
 		const row = tryOne(cursor);
 		if (row === undefined) {
@@ -114,6 +118,7 @@ export function probeUpdatePlan(
 	plan: CompiledUpdatePlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
+	prefix: HashPrefixBucket,
 ): UpdateProbeResult {
 	try {
 		const cursor = storage.sql.exec<{
@@ -123,7 +128,7 @@ export function probeUpdatePlan(
 			new_size: number | null;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
-		}>(plan.probeSql, hashKey, sortKey, ...materializedPlanBindings(plan));
+		}>(plan.probeSql, hashKey, sortKey, prefix, ...materializedPlanBindings(plan));
 		const row = cursor.one();
 		return {
 			itemPresent: row.item_present === 1,

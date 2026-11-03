@@ -187,7 +187,7 @@ export function compileConditionExpression(
 export function compileUpdateExpression(update: UpdateExpression): CompiledUpdatePlan {
 	const analysis = validateUpdateExpression(update);
 	const orderedActions = orderUpdateActions(update);
-	// The keys take ?1 and ?2 in every statement that runs this plan, as they do for a condition.
+	// The keys take ?1 and ?2 and the storage prefix ?3 in every statement that runs this plan, as they do for a condition.
 	const context = createContext("update-value", UPDATE_PRE_IMAGE, "direct", UPDATE_FIXED_BINDING_COUNT);
 
 	let accumulator = context.preImage.data;
@@ -241,7 +241,12 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	// keeps the stored TTL, and the lock row statement holds `documentSql` one time only.
 	const widestWrite = composeUpdateWriteStatement(
 		{ documentSql },
-		{ txOrderTsParam: `?${completeBindingCount + 1}`, ttlSql: UPDATE_STORED_TTL_SQL, limitParam: `?${completeBindingCount + 2}` },
+		{
+			txOrderTsParam: `?${completeBindingCount + 1}`,
+			ttlSql: UPDATE_STORED_TTL_SQL,
+			itemIdParam: `?${completeBindingCount + 2}`,
+			limitParam: `?${completeBindingCount + 3}`,
+		},
 	);
 	const probeSql = composeUpdateProbeStatement({ documentSql, applicableSql, valueTypeSql });
 	if (!utf8WithinLimit(probeSql, EXPRESSION_LIMITS.compiledSqlBytes) || !utf8WithinLimit(widestWrite, EXPRESSION_LIMITS.compiledSqlBytes)) {
@@ -291,7 +296,7 @@ export function compileProjectionExpression(projection: readonly ProjectionExpre
 	}
 	// The pool ?1 is bound always, with the text "[]" when the plan has no descriptor. Workers
 	// SQLite requires the bound value count to equal the statement's parameter count, and the
-	// statement's ?2 and ?3 keep ?1 in that count.
+	// statement's ?2, ?3, and ?4 keep ?1 in that count.
 	const completeBindingCount = POOL_PARAM + PROJECTION_FIXED_BINDING_COUNT;
 	return {
 		version: PROJECTION_PLAN_VERSION,

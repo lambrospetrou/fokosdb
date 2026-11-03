@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { AddResult } from "../shared/bloom-filter.js";
+import { hashPrefixBucketOf } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
 
-const kb = (s: string) => KeyCodec.encode(s);
+/** The hashPrefixBucket of a hash key in one test shard group. */
+const kb = (s: string) => hashPrefixBucketOf(KeyCodec.encode(s), "fokos.p.bloom-test");
 
 function createSmall() {
 	return PartialRangeTopology.create({ maxSizeBytes: 1024 * 1024, errorRate: 0.01, initialCapacityN: 100 });
@@ -17,7 +19,7 @@ describe("PartialRangeTopology", () => {
 
 		it("isEmpty() is false after adding a key", () => {
 			const prt = createSmall();
-			prt.learnPromotedKey(kb("user-123"));
+			prt.learnPromotedHashPrefixBucket(kb("user-123"));
 			expect(prt.isEmpty()).toBe(false);
 		});
 	});
@@ -30,54 +32,32 @@ describe("PartialRangeTopology", () => {
 
 		it("returns true for learned keys", () => {
 			const prt = createSmall();
-			prt.learnPromotedKey(kb("user-123"));
+			prt.learnPromotedHashPrefixBucket(kb("user-123"));
 			expect(prt.maybePromoted(kb("user-123"))).toBe(true);
 		});
 
 		it("returns true for all learned keys in a batch", () => {
 			const prt = createSmall();
 			const keys = ["a", "b", "c", "d"];
-			prt.learnPromotedKeys(keys.map(kb));
+			for (const key of keys) {
+				prt.learnPromotedHashPrefixBucket(kb(key));
+			}
 			for (const key of keys) {
 				expect(prt.maybePromoted(kb(key))).toBe(true);
 			}
 		});
 	});
 
-	describe("learnPromotedKey", () => {
+	describe("learnPromotedHashPrefixBucket", () => {
 		it("returns Added when key is new", () => {
 			const prt = createSmall();
-			expect(prt.learnPromotedKey(kb("key1"))).toBe(AddResult.Added);
+			expect(prt.learnPromotedHashPrefixBucket(kb("key1"))).toBe(AddResult.Added);
 		});
 
 		it("returns AlreadyPresent when key was already added", () => {
 			const prt = createSmall();
-			prt.learnPromotedKey(kb("key1"));
-			expect(prt.learnPromotedKey(kb("key1"))).toBe(AddResult.AlreadyPresent);
-		});
-	});
-
-	describe("learnPromotedKeys", () => {
-		it("returns true when at least one key is new", () => {
-			const prt = createSmall();
-			expect(prt.learnPromotedKeys(["a", "b"].map(kb))).toBe(true);
-		});
-
-		it("returns false when all keys are already present", () => {
-			const prt = createSmall();
-			prt.learnPromotedKey(kb("a"));
-			expect(prt.learnPromotedKeys(["a"].map(kb))).toBe(false);
-		});
-
-		it("returns true when mix of new and existing keys", () => {
-			const prt = createSmall();
-			prt.learnPromotedKey(kb("a"));
-			expect(prt.learnPromotedKeys(["a", "b"].map(kb))).toBe(true);
-		});
-
-		it("handles empty iterable", () => {
-			const prt = createSmall();
-			expect(prt.learnPromotedKeys([])).toBe(false);
+			prt.learnPromotedHashPrefixBucket(kb("key1"));
+			expect(prt.learnPromotedHashPrefixBucket(kb("key1"))).toBe(AddResult.AlreadyPresent);
 		});
 	});
 
@@ -85,7 +65,9 @@ describe("PartialRangeTopology", () => {
 		it("preserves learned keys across snapshot/restore", () => {
 			const prt = createSmall();
 			const keys = ["user-1", "user-2", "user-3"];
-			prt.learnPromotedKeys(keys.map(kb));
+			for (const key of keys) {
+				prt.learnPromotedHashPrefixBucket(kb(key));
+			}
 
 			const snapshot = prt.toSnapshot();
 			expect(snapshot.version).toBe(1);
@@ -102,7 +84,7 @@ describe("PartialRangeTopology", () => {
 			const restoredEmpty = PartialRangeTopology.fromSnapshot(empty.toSnapshot());
 			expect(restoredEmpty.isEmpty()).toBe(true);
 
-			empty.learnPromotedKey(kb("k"));
+			empty.learnPromotedHashPrefixBucket(kb("k"));
 			const restoredNonEmpty = PartialRangeTopology.fromSnapshot(empty.toSnapshot());
 			expect(restoredNonEmpty.isEmpty()).toBe(false);
 		});
@@ -118,14 +100,14 @@ describe("PartialRangeTopology", () => {
 
 		it("reports correct key count after adds", () => {
 			const prt = createSmall();
-			prt.learnPromotedKey(kb("a"));
-			prt.learnPromotedKey(kb("b"));
+			prt.learnPromotedHashPrefixBucket(kb("a"));
+			prt.learnPromotedHashPrefixBucket(kb("b"));
 			expect(prt.stats().bloomAdditionsCount).toBe(2);
 		});
 	});
 
 	describe("full bloom filter", () => {
-		it("learnPromotedKey returns Full when bloom filter is full", () => {
+		it("learnPromotedHashPrefixBucket returns Full when bloom filter is full", () => {
 			const prt = PartialRangeTopology.create({
 				maxSizeBytes: 256,
 				errorRate: 0.01,
@@ -134,7 +116,7 @@ describe("PartialRangeTopology", () => {
 			let added = 0;
 			let lastResult: AddResult = AddResult.Added;
 			for (let i = 0; i < 10_000 && lastResult !== AddResult.Full; i++) {
-				lastResult = prt.learnPromotedKey(kb(`key-${i}`));
+				lastResult = prt.learnPromotedHashPrefixBucket(kb(`key-${i}`));
 				if (lastResult !== AddResult.Full) {
 					added++;
 				}
@@ -144,22 +126,6 @@ describe("PartialRangeTopology", () => {
 
 			// Already-learned keys should still be found.
 			expect(prt.maybePromoted(kb("key-0"))).toBe(true);
-		});
-
-		it("learnPromotedKeys returns false when bloom filter is full", () => {
-			const prt = PartialRangeTopology.create({
-				maxSizeBytes: 256,
-				errorRate: 0.01,
-				initialCapacityN: 10,
-			});
-			// Fill it up.
-			for (let i = 0; i < 10_000; i++) {
-				if (prt.learnPromotedKey(kb(`fill-${i}`)) === AddResult.Full) {
-					break;
-				}
-			}
-			// Attempting to learn more returns false (no modification).
-			expect(prt.learnPromotedKeys(["new-a", "new-b"].map(kb))).toBe(false);
 		});
 	});
 });

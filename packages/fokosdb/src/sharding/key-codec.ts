@@ -203,6 +203,32 @@ function shortestSeparator(lo: KeyBytes, hi: KeyBytes): KeyBytes {
 	return asKeyBytes(hi.slice(0, lo.length + 1));
 }
 
+/** A position inside one hashPrefixBucket, in the order (hk, sk): a boundary of a range partition. */
+export type FokosCompositeKey = { hk: KeyBytes; sk: KeyBytes };
+
+/** The order of two composite keys: by `hk`, then by `sk`. */
+function compareComposite(a: FokosCompositeKey, b: FokosCompositeKey): number {
+	return compare(a.hk, b.hk) || compare(a.sk, b.sk);
+}
+
+/**
+ * The shortest composite key above `prev` and at or below `cur`. The precondition is `prev < cur`.
+ * With two hash keys, the separator is `(s, x'')`, with `s` the shortest key in `(prev.hk, cur.hk]`:
+ * `x''` is the smallest sort key, so `(s, x'')` is above `prev` and at or below `cur`. With one hash
+ * key, the separator keeps the hash key and separates the sort keys.
+ */
+function shortestCompositeSeparator(prev: FokosCompositeKey, cur: FokosCompositeKey): FokosCompositeKey {
+	if (compare(prev.hk, cur.hk) !== 0) {
+		return { hk: shortestSeparator(prev.hk, cur.hk), sk: EMPTY_KEY_BYTES };
+	}
+	return { hk: cur.hk, sk: shortestSeparator(prev.sk, cur.sk) };
+}
+
+/** A composite key for logs, as `pairForLog` renders an item key. */
+function compositeForLog(key: FokosCompositeKey | null): string {
+	return key === null ? "<unbounded>" : pairForLog(key.hk, key.sk);
+}
+
 /**
  * Human-readable rendering of a key for logs and error messages. Valid UTF-8
  * strings render as `"text"`; binary (0xFF-tagged) and the empty sentinel render as `b64:...`. Never
@@ -360,6 +386,9 @@ export const KeyCodec = {
 	successor,
 	publicSuccessor,
 	shortestSeparator,
+	compareComposite,
+	shortestCompositeSeparator,
+	compositeForLog,
 	asKeyBytes,
 	keyForLog,
 	pairForLog,

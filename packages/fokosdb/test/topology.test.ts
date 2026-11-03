@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { FokosDB, type FokosDBOptions } from "../src/client/db.js";
 import type { FokosDBAutoAdminDO } from "../src/server/do-auto-admin.js";
 import { KeyCodec } from "../src/sharding/key-codec.js";
+import { hashPrefixBucketOf } from "../src/sharding/hash-primitives.js";
 import { namespaceFingerprint, type DataNamespaceKey } from "../src/shared/do-stubs.js";
 import { topologyAdminName } from "../src/shared/partition-context.js";
 import { maybePromoted, parseHashBody } from "../src/sharding/topology-codec.js";
@@ -132,9 +133,10 @@ describe("FokosDB — encoded topology", () => {
 			state.storage.transactionSync(() => {
 				for (let i = 0; i < TOPOLOGY_BLOOM_MIN_CAPACITY; i++) {
 					state.storage.sql.exec(
-						`INSERT INTO fokos_topo_range_intervals (shard_group, hash_key, start, end_is_max, end, seq) VALUES (?1, ?2, x'', 1, x'', 1)`,
+						`INSERT INTO fokos_topo_range_intervals (shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
+							 VALUES (?1, ?2, x'', x'', 1, x'', x'', 1)`,
 						shardGroup,
-						KeyCodec.encode(`promoted-${i}`),
+						hashPrefixBucketOf(KeyCodec.encode(`promoted-${i}`), shardGroup),
 					);
 				}
 				state.storage.sql.exec(
@@ -150,9 +152,9 @@ describe("FokosDB — encoded topology", () => {
 		const view = parseHashBody((read as { body: Uint8Array }).body);
 		// A key that no repartition promoted, and that the Bloom filter holds: a false positive.
 		const candidates = Array.from({ length: 5_000 }, (_, i) => `fp-${i}`);
-		const falsePositive = candidates.find((key) => maybePromoted(view, KeyCodec.encode(key)));
+		const falsePositive = candidates.find((key) => maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode(key), shardGroup)));
 		expect(falsePositive).toBeDefined();
-		const plain = candidates.find((key) => !maybePromoted(view, KeyCodec.encode(key)))!;
+		const plain = candidates.find((key) => !maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode(key), shardGroup)))!;
 
 		// The client reads no topology, so only the coordinator and the partitions read it.
 		const db = new FokosDB(options(tableName, { useTopologyCache: false, singlePartitionFastPath: false }));

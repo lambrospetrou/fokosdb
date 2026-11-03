@@ -5,10 +5,11 @@
  */
 import { BloomFilter, bloomInitialLayerBytes } from "../shared/bloom-filter.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
+import { asHashPrefixBucket, HASH_PREFIX_BUCKET_BYTES, type HashPrefixBucket } from "./hash-primitives.js";
 import {
 	BODY_SCHEMA,
 	HASH_BODY_MAGIC,
@@ -60,6 +61,25 @@ function keyFromWire(value: unknown, field: string): KeyBytes {
 	}
 }
 
+function hashPrefixBucketFromWire(value: unknown): HashPrefixBucket {
+	const bucket = keyFromWire(value, "slice.hashPrefixBucket");
+	if (bucket.length !== HASH_PREFIX_BUCKET_BYTES) {
+		throw invalidEvent("slice.hashPrefixBucket must be 8 bytes");
+	}
+	return asHashPrefixBucket(bucket);
+}
+
+function boundaryFromWire(value: unknown): FokosCompositeKey | null {
+	if (value === null) {
+		return null;
+	}
+	const b = value as Record<string, unknown> | undefined;
+	if (typeof b !== "object") {
+		throw invalidEvent("a slice boundary must be null or an object with hk and sk");
+	}
+	return { hk: keyFromWire(b.hk, "slice boundary hk"), sk: keyFromWire(b.sk, "slice boundary sk") };
+}
+
 function sliceFromWire(value: unknown): FokosSlice {
 	const s = value as Record<string, unknown> | null;
 	if (typeof s !== "object" || s === null) {
@@ -74,12 +94,12 @@ function sliceFromWire(value: unknown): FokosSlice {
 		case "range":
 			return {
 				kind: "range",
-				hashKey: keyFromWire(s.hashKey, "slice.hashKey"),
-				start: s.start === null ? null : keyFromWire(s.start, "slice.start"),
-				end: s.end === null ? null : keyFromWire(s.end, "slice.end"),
+				hashPrefixBucket: hashPrefixBucketFromWire(s.hashPrefixBucket),
+				start: boundaryFromWire(s.start),
+				end: boundaryFromWire(s.end),
 			};
-		case "promoted_key":
-			return { kind: "promoted_key", hashKey: keyFromWire(s.hashKey, "slice.hashKey") };
+		case "promoted_hash_prefix_bucket":
+			return { kind: "promoted_hash_prefix_bucket", hashPrefixBucket: hashPrefixBucketFromWire(s.hashPrefixBucket) };
 		default:
 			throw invalidEvent("unknown slice kind", { kind: s.kind });
 	}
@@ -499,15 +519,16 @@ export function promotedKeysBloom(
 // ─── the range body ──────────────────────────────────────────────────────────
 
 /**
- * The known intervals of one promoted hash key. `boundaries` are the inner boundaries in key order,
- * `levels[j]` is the rank of the deepest known interval that has boundary j strictly inside it, and
- * `depths[i]` is the rank of the deepest known interval that holds segment i. No segment: the key is
- * not promoted.
+ * The known intervals of one promoted hashPrefixBucket. `boundaries` are the inner composite
+ * boundaries in key order, `levels[j]` is the rank of the deepest known interval that has boundary j
+ * strictly inside it, and `depths[i]` is the rank of the deepest known interval that holds segment i.
+ * No segment: the hashPrefixBucket is not promoted. Each boundary is two byte strings, so the offsets
+ * section holds `2n + 1` values.
  */
 export function encodeRangeBody(input: {
 	epoch: number;
 	version: bigint | number;
-	boundaries: readonly Uint8Array[];
+	boundaries: readonly FokosCompositeKey[];
 	levels: readonly number[];
 	depths: readonly number[];
 	truncatedAtRank: number | null;
@@ -518,12 +539,16 @@ export function encodeRangeBody(input: {
 		maxRank = Math.max(maxRank, r);
 	}
 	const rankBytes = maxRank < 65_535 ? 2 : 4;
-	const offsets = new Uint32Array(n + 1);
+	const offsets = new Uint32Array(2 * n + 1);
 	for (let j = 0; j < n; j++) {
-		offsets[j + 1] = offsets[j] + input.boundaries[j].length;
+		offsets[2 * j + 1] = offsets[2 * j] + input.boundaries[j].hk.length;
+		offsets[2 * j + 2] = offsets[2 * j + 1] + input.boundaries[j].sk.length;
 	}
-	const bytes = new Uint8Array(offsets[n]);
-	input.boundaries.forEach((b, j) => bytes.set(b, offsets[j]));
+	const bytes = new Uint8Array(offsets[2 * n]);
+	input.boundaries.forEach((b, j) => {
+		bytes.set(b.hk, offsets[2 * j]);
+		bytes.set(b.sk, offsets[2 * j + 1]);
+	});
 	const ranks = (values: readonly number[]) => {
 		const out = rankBytes === 2 ? new Uint16Array(values) : new Uint32Array(values);
 		return new Uint8Array(out.buffer);
@@ -532,7 +557,7 @@ export function encodeRangeBody(input: {
 		RANGE_BODY_MAGIC,
 		{ epoch: input.epoch, version: String(input.version), rankBytes, maxRank, truncatedAtRank: input.truncatedAtRank },
 		[
-			{ name: "boundaryOffsets", bytes: new Uint8Array(offsets.buffer), meta: { count: n + 1 } },
+			{ name: "boundaryOffsets", bytes: new Uint8Array(offsets.buffer), meta: { count: 2 * n + 1 } },
 			{ name: "boundaryBytes", bytes, meta: { length: bytes.length } },
 			{ name: "boundaryLevel", bytes: ranks(input.levels), meta: { count: n } },
 			{ name: "segmentDepth", bytes: ranks(input.depths), meta: { count: input.depths.length } },

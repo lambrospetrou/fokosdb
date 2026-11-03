@@ -16,7 +16,8 @@ import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migra
 import invariant from "../shared/invariant.js";
 import { DEFAULT_RUNTIME_CONFIG } from "./runtime-config.js";
 import { one, tryOne } from "../shared/sql-cursor.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
+import { asHashPrefixBucket, type HashPrefixBucket } from "./hash-primitives.js";
 import type { HashTopologySnapshot } from "./hash-topology.js";
 import type { PartialRangeTopologySnapshot } from "./partial-range-topology.js";
 import type { FokosPartitionIdentity, FokosStoredPolicy } from "./route-context.js";
@@ -59,7 +60,7 @@ export type FokosJobsRecord = Record<string, { nextRunAt: number; failed?: true 
 // Row and cursor types
 // ---------------------------------------------------------------------------
 
-/** What one repartition moves: every key, one sort-key interval, or one hash key. */
+/** What one repartition moves: every key, one composite interval, or one hashPrefixBucket. */
 export type RepartitionKind = "hash_split" | "range_split" | "key_promotion";
 
 /**
@@ -79,16 +80,16 @@ export type TargetInitialization = "pending" | "initializing" | "initialized";
  */
 export type RepartitionSlice =
 	| { kind: "hash_child"; childIndex: number }
-	| { kind: "range"; hashKey: KeyBytes; start: KeyBytes | null; end: KeyBytes | null }
-	| { kind: "promoted_key"; hashKey: KeyBytes };
+	| { kind: "range"; hashPrefixBucket: HashPrefixBucket; start: FokosCompositeKey | null; end: FokosCompositeKey | null }
+	| { kind: "promoted_hash_prefix_bucket"; hashPrefixBucket: HashPrefixBucket };
 
 export type RepartitionRow = {
 	id: string;
 	seq: number;
 	kind: RepartitionKind;
 	state: RepartitionState;
-	/** The promoted key of a `key_promotion`; null for a split. */
-	hashKey: KeyBytes | null;
+	/** The promoted hashPrefixBucket of a `key_promotion`; null for a split. */
+	hashPrefixBucket: HashPrefixBucket | null;
 	// The lifecycle stamps, in the order the state machine reaches them.
 	queuedAt: number;
 	cutoverAt: number | null;
@@ -124,8 +125,8 @@ export type RepartitionStatusRow = {
 	seq: number;
 	kind: RepartitionKind;
 	state: RepartitionState;
-	/** The key a promotion moves. Null for a split. */
-	hashKey: KeyBytes | null;
+	/** The hashPrefixBucket a promotion moves. Null for a split. */
+	hashPrefixBucket: HashPrefixBucket | null;
 	targetIndex: number;
 	partitionId: string | null;
 	doName: string | null;
@@ -136,15 +137,15 @@ export type RepartitionStatusRow = {
 /** One row of the admin outbox. `eventJson` is the JSON text of the event. */
 export type AdminOutboxRow = { eventType: string; id: string; eventJson: string; attempt: number };
 
-/** Scan checkpoint of the route-override stream, in `hash_key` order. */
-export type PromotedKeyCursor = { hashKey: KeyBytes };
+/** Scan checkpoint of the route-override stream, in `hash_prefix_bucket` order. */
+export type PromotedKeyCursor = { hashPrefixBucket: HashPrefixBucket };
 
-/** The deepest learned range slice that contains a sort key. `null` boundaries are unbounded edges. */
-export type LearnedRangeSlice = { depth: number; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null };
+/** One learned range slice of a range tree. `null` boundaries are unbounded edges. */
+export type LearnedRangeSlice = { depth: number; startBoundary: FokosCompositeKey | null; endBoundary: FokosCompositeKey | null };
 
 export type FokosShardingStoreOptions = {
 	/**
-	 * The row bound of `fokos_range_hierarchy`. A row holds two boundary keys and one hash key. Read at
+	 * The row bound of `fokos_range_hierarchy`. A row holds two composite boundaries. Read at
 	 * each insert. Default: `DEFAULT_RUNTIME_CONFIG`.
 	 */
 	rangeHierarchyMaxRows?: () => number;
@@ -174,17 +175,37 @@ function fromSqlKey(value: ArrayBuffer | Uint8Array): KeyBytes {
 	return KeyCodec.asKeyBytes(value instanceof Uint8Array ? value : new Uint8Array(value));
 }
 
+/** The unbounded edge of a stored boundary: the empty hash key, which `KeyCodec` never makes for a real key. */
+const UNBOUNDED = KeyCodec.encodeOptional(undefined);
+
+/** A stored boundary: null is the empty hash key and the empty sort key. */
+function boundaryColumns(boundary: FokosCompositeKey | null): [KeyBytes, KeyBytes] {
+	return boundary === null ? [UNBOUNDED, UNBOUNDED] : [boundary.hk, boundary.sk];
+}
+
+/** A boundary from its stored columns. The empty hash key is the unbounded edge. */
+function boundaryOf(hk: ArrayBuffer | Uint8Array, sk: ArrayBuffer | Uint8Array): FokosCompositeKey | null {
+	const key = fromSqlKey(hk);
+	return key.length === 0 ? null : { hk: key, sk: fromSqlKey(sk) };
+}
+
+/** A stored hashPrefixBucket as bytes. */
+function fromSqlBytes(value: ArrayBuffer | Uint8Array): Uint8Array {
+	return value instanceof Uint8Array ? value : new Uint8Array(value);
+}
+
 const REPARTITION_SELECT = `SELECT r.id, r.seq, r.kind, r.state, r.queued_at, r.cutover_at, r.completed_at,
-	r.attempts, r.next_attempt_at, r.hash_key FROM fokos_repartitions r`;
+	r.attempts, r.next_attempt_at, r.hash_prefix_bucket FROM fokos_repartitions r`;
 
 const TARGET_SELECT = `SELECT repartition_id, target_index, initialization, start_notified, acknowledged, attempts, next_attempt_at,
-	slice_child_idx, partition_id, do_name, slice_hash_key, slice_start, slice_end FROM fokos_repartition_targets`;
+	slice_child_idx, partition_id, do_name, slice_hash_prefix_bucket, slice_start_hk, slice_start_sk, slice_end_hk, slice_end_sk
+	FROM fokos_repartition_targets`;
 
 /** The slice kind each repartition kind hands its targets. The one place the relation is written down. */
 const SLICE_KIND_OF: Record<RepartitionKind, RepartitionSlice["kind"]> = {
 	hash_split: "hash_child",
 	range_split: "range",
-	key_promotion: "promoted_key",
+	key_promotion: "promoted_hash_prefix_bucket",
 };
 
 type SqlRepartitionRow = {
@@ -197,7 +218,7 @@ type SqlRepartitionRow = {
 	completed_at: number | null;
 	attempts: number;
 	next_attempt_at: number;
-	hash_key: ArrayBuffer | null;
+	hash_prefix_bucket: ArrayBuffer | null;
 };
 
 type SqlTargetRow = {
@@ -211,9 +232,11 @@ type SqlTargetRow = {
 	slice_child_idx: number | null;
 	partition_id: string;
 	do_name: string;
-	slice_hash_key: ArrayBuffer | null;
-	slice_start: ArrayBuffer | null;
-	slice_end: ArrayBuffer | null;
+	slice_hash_prefix_bucket: ArrayBuffer | null;
+	slice_start_hk: ArrayBuffer | null;
+	slice_start_sk: ArrayBuffer | null;
+	slice_end_hk: ArrayBuffer | null;
+	slice_end_sk: ArrayBuffer | null;
 };
 
 function toRepartitionRow(r: SqlRepartitionRow): RepartitionRow {
@@ -222,7 +245,7 @@ function toRepartitionRow(r: SqlRepartitionRow): RepartitionRow {
 		seq: r.seq,
 		kind: r.kind,
 		state: r.state,
-		hashKey: r.hash_key === null ? null : fromSqlKey(r.hash_key),
+		hashPrefixBucket: r.hash_prefix_bucket === null ? null : asHashPrefixBucket(fromSqlBytes(r.hash_prefix_bucket)),
 		queuedAt: r.queued_at,
 		cutoverAt: r.cutover_at,
 		completedAt: r.completed_at,
@@ -237,16 +260,16 @@ function toTargetSlice(r: SqlTargetRow, kind: RepartitionKind): RepartitionSlice
 			invariant(r.slice_child_idx !== null, "fokos/sharding-store: hash_child target slice has no child index");
 			return { kind: "hash_child", childIndex: r.slice_child_idx };
 		case "range":
-			invariant(r.slice_hash_key !== null, "fokos/sharding-store: range target slice has no hash key");
+			invariant(r.slice_hash_prefix_bucket !== null, "fokos/sharding-store: range target slice has no hashPrefixBucket");
 			return {
 				kind: "range",
-				hashKey: fromSqlKey(r.slice_hash_key),
-				start: r.slice_start === null ? null : fromSqlKey(r.slice_start),
-				end: r.slice_end === null ? null : fromSqlKey(r.slice_end),
+				hashPrefixBucket: asHashPrefixBucket(fromSqlBytes(r.slice_hash_prefix_bucket)),
+				start: r.slice_start_hk === null ? null : { hk: fromSqlKey(r.slice_start_hk), sk: fromSqlKey(r.slice_start_sk!) },
+				end: r.slice_end_hk === null ? null : { hk: fromSqlKey(r.slice_end_hk), sk: fromSqlKey(r.slice_end_sk!) },
 			};
-		case "promoted_key":
-			invariant(r.slice_hash_key !== null, "fokos/sharding-store: promoted_key target slice has no hash key");
-			return { kind: "promoted_key", hashKey: fromSqlKey(r.slice_hash_key) };
+		case "promoted_hash_prefix_bucket":
+			invariant(r.slice_hash_prefix_bucket !== null, "fokos/sharding-store: a promotion target slice has no hashPrefixBucket");
+			return { kind: "promoted_hash_prefix_bucket", hashPrefixBucket: asHashPrefixBucket(fromSqlBytes(r.slice_hash_prefix_bucket)) };
 	}
 }
 
@@ -293,8 +316,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   is pending, and `cleaned` means that cleanup finished. A split reclaims no item rows, so its
 		//   cleanup step deletes nothing and reports itself done, which keeps one code path for all three
 		//   kinds. No separate "cleanup has started" flag: `completed` already implies it.
-		// - `hash_key` is the promoted key of a key_promotion, and NULL for a split: a hash split moves
-		//   every key, and a range split moves an interval of the key the partition identity already holds.
+		// - `hash_prefix_bucket` is the promoted hashPrefixBucket of a key_promotion, and NULL for a split: a
+		//   hash split moves every key, and a range split moves an interval of the hashPrefixBucket that the
+		//   partition identity already holds.
 		// - `next_attempt_at` is the deadline of this row's NEXT source step, so the due-row scan and the
 		//   alarm both read one column. idx_fokos_repartitions_due serves that ordered scan.
 		// - idx_fokos_repartitions_split makes "does a split row exist?" — asked by every arbitration —
@@ -304,25 +328,26 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - The slice is columns, not one blob: migration filters rows by it and range routing orders
 		//   children by it, and both are SQL.
 		// - No slice_kind column. A repartition never mixes slice kinds, so the parent row's `kind` gives
-		//   it: hash_split means hash_child, range_split means range, key_promotion means promoted_key.
-		//   Storing it again on every target would also make a range slice with two unbounded edges
-		//   indistinguishable from a promoted_key slice by its columns alone.
+		//   it: hash_split means hash_child, range_split means range, key_promotion means
+		//   promoted_hash_prefix_bucket. Storing it again on every target would also make a range slice
+		//   with two unbounded edges indistinguishable from a promotion slice by its columns alone.
+		// - A range boundary is two columns, the hash key and the sort key. NULL in both is unbounded.
 		// - `target_index` defines target order. Range partition IDs do not sort by boundary.
 		// - No depth column for a hash_child slice: the depth is the source depth plus one, and the
 		//   target partition_id already encodes it.
 		//
 		// fokos_route_overrides:
-		// - The forward pointer for one hash key whose data now lives in a range tree. It joins to its
-		//   repartition row for the state, so a point lookup on the routing path is one indexed join.
-		// - WITHOUT ROWID: the row is its own index entry, so a rowid table would store the hash key
-		//   twice. There is nothing to move last — the key must lead the primary key, and the only other
-		//   column is the short repartition id.
+		// - The forward pointer for one hashPrefixBucket whose data now lives in a range tree. It joins to
+		//   its repartition row for the state, so a point lookup on the routing path is one indexed join.
 		//
 		// fokos_range_hierarchy:
 		// - The learned descendant boundaries of range trees. A hash partition holds the boundaries of
-		//   many promoted keys in one table, so every row names the hash key it describes.
+		//   many promoted hashPrefixBuckets in one table, so every row names its hashPrefixBucket.
 		// - Unbounded edges are stored as the empty key `x''`, which KeyCodec never produces for a real
 		//   key. `findDeepestKnownRangeSlice` decodes the sentinel back to null.
+		// - The primary key is `(hash_prefix_bucket, depth, start)`, and the end is not in a key. The
+		//   nodes of one depth do not overlap, so two nodes of one depth never have one start, and a node
+		//   never changes its boundaries. Only the start sorts correctly with the `x''` sentinel.
 		// - `learned_at` is the eviction order. The table is row-bounded, and the oldest rows go first.
 		sql: `
             CREATE TABLE IF NOT EXISTS fokos_repartitions (
@@ -334,8 +359,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 cutover_at      INTEGER,
                 completed_at    INTEGER,
                 attempts        INTEGER NOT NULL DEFAULT 0,
-                next_attempt_at INTEGER NOT NULL,
-                hash_key        BLOB
+                next_attempt_at    INTEGER NOT NULL,
+                hash_prefix_bucket BLOB
             ) STRICT;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_fokos_repartitions_seq
                 ON fokos_repartitions (seq);
@@ -355,28 +380,30 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 slice_child_idx    INTEGER,
                 partition_id       TEXT    NOT NULL,
                 do_name            TEXT    NOT NULL,
-                slice_hash_key     BLOB,
-                slice_start        BLOB,
-                slice_end          BLOB,
+                slice_hash_prefix_bucket BLOB,
+                slice_start_hk     BLOB,
+                slice_start_sk     BLOB,
+                slice_end_hk       BLOB,
+                slice_end_sk       BLOB,
                 PRIMARY KEY (repartition_id, partition_id),
                 UNIQUE (repartition_id, target_index)
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS fokos_route_overrides (
-                hash_key       BLOB NOT NULL PRIMARY KEY,
-                repartition_id TEXT NOT NULL
+                hash_prefix_bucket BLOB NOT NULL PRIMARY KEY,
+                repartition_id     TEXT NOT NULL
             ) WITHOUT ROWID, STRICT;
 
             CREATE TABLE IF NOT EXISTS fokos_range_hierarchy (
-                hk                BLOB    NOT NULL DEFAULT x'',
-                sk_start_boundary BLOB    NOT NULL DEFAULT x'',
-                sk_end_boundary   BLOB    NOT NULL DEFAULT x'',
-                depth             INTEGER NOT NULL,
-                learned_at        INTEGER NOT NULL,
-                PRIMARY KEY (hk, sk_start_boundary, sk_end_boundary)
-            ) WITHOUT ROWID, STRICT;
-            CREATE INDEX IF NOT EXISTS idx_fokos_range_hierarchy_depth
-                ON fokos_range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary);`,
+                hash_prefix_bucket BLOB    NOT NULL,
+                depth              INTEGER NOT NULL,
+                start_hk           BLOB    NOT NULL DEFAULT x'',
+                start_sk           BLOB    NOT NULL DEFAULT x'',
+                end_hk             BLOB    NOT NULL DEFAULT x'',
+                end_sk             BLOB    NOT NULL DEFAULT x'',
+                learned_at         INTEGER NOT NULL,
+                PRIMARY KEY (hash_prefix_bucket, depth, start_hk, start_sk)
+            ) WITHOUT ROWID, STRICT;`,
 	},
 	{
 		idMonotonicInc: 2,
@@ -592,14 +619,14 @@ export class FokosShardingStore {
 		seq: number;
 		kind: RepartitionKind;
 		state: RepartitionState;
-		hashKey: KeyBytes | null;
+		hashPrefixBucket: HashPrefixBucket | null;
 		queuedAt: number;
 		cutoverAt?: number | null;
 		completedAt?: number | null;
 		nextAttemptAt: number;
 	}): void {
 		this.#storage.sql.exec(
-			`INSERT INTO fokos_repartitions (id, seq, kind, state, queued_at, cutover_at, completed_at, attempts, next_attempt_at, hash_key)
+			`INSERT INTO fokos_repartitions (id, seq, kind, state, queued_at, cutover_at, completed_at, attempts, next_attempt_at, hash_prefix_bucket)
 			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)`,
 			row.id,
 			row.seq,
@@ -609,7 +636,7 @@ export class FokosShardingStore {
 			row.cutoverAt ?? null,
 			row.completedAt ?? null,
 			row.nextAttemptAt,
-			row.hashKey,
+			row.hashPrefixBucket,
 		);
 	}
 
@@ -751,8 +778,8 @@ export class FokosShardingStore {
 		this.#storage.sql.exec(
 			`INSERT INTO fokos_repartition_targets
 			   (repartition_id, target_index, initialization, start_notified, acknowledged, attempts, next_attempt_at,
-			    slice_child_idx, partition_id, do_name, slice_hash_key, slice_start, slice_end)
-			 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+			    slice_child_idx, partition_id, do_name, slice_hash_prefix_bucket, slice_start_hk, slice_start_sk, slice_end_hk, slice_end_sk)
+			 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
 			target.repartitionId,
 			target.targetIndex,
 			target.initialization ?? "pending",
@@ -762,9 +789,11 @@ export class FokosShardingStore {
 			s.kind === "hash_child" ? s.childIndex : null,
 			target.partitionId,
 			target.doName,
-			s.kind === "hash_child" ? null : s.hashKey,
-			s.kind === "range" ? s.start : null,
-			s.kind === "range" ? s.end : null,
+			s.kind === "hash_child" ? null : s.hashPrefixBucket,
+			s.kind === "range" && s.start ? s.start.hk : null,
+			s.kind === "range" && s.start ? s.start.sk : null,
+			s.kind === "range" && s.end ? s.end.hk : null,
+			s.kind === "range" && s.end ? s.end.sk : null,
 		);
 	}
 
@@ -879,7 +908,7 @@ export class FokosShardingStore {
 
 	// ─── fokos_route_overrides ──────────────────────────────────────────────
 
-	/** False when this partition holds no route override, so a lookup of one hash key can skip its read. */
+	/** False when this partition holds no route override, so a lookup of one hashPrefixBucket can skip its read. */
 	#anyRouteOverride(): boolean {
 		let maybeHasOverride = mayHaveRouteOverrides.get(this.#storage);
 		if (maybeHasOverride === undefined) {
@@ -889,16 +918,20 @@ export class FokosShardingStore {
 		return maybeHasOverride;
 	}
 
-	insertRouteOverride(hashKey: KeyBytes, repartitionId: string): void {
+	insertRouteOverride(hashPrefixBucket: HashPrefixBucket, repartitionId: string): void {
 		mayHaveRouteOverrides.set(this.#storage, true);
-		this.#storage.sql.exec(`INSERT OR IGNORE INTO fokos_route_overrides (hash_key, repartition_id) VALUES (?, ?)`, hashKey, repartitionId);
+		this.#storage.sql.exec(
+			`INSERT OR IGNORE INTO fokos_route_overrides (hash_prefix_bucket, repartition_id) VALUES (?, ?)`,
+			hashPrefixBucket,
+			repartitionId,
+		);
 	}
 
 	/**
-	 * The routing answer for one hash key: the promotion that owns it and how far that promotion has
-	 * got. One indexed join on the hot point-read path.
+	 * The routing answer for one hashPrefixBucket: the promotion that owns it and how far that promotion
+	 * has got. One indexed join on the hot point-read path.
 	 */
-	routeOverrideFor(hashKey: KeyBytes): { repartitionId: string; state: RepartitionState } | undefined {
+	routeOverrideFor(hashPrefixBucket: HashPrefixBucket): { repartitionId: string; state: RepartitionState } | undefined {
 		if (!this.#anyRouteOverride()) {
 			return undefined;
 		}
@@ -906,25 +939,28 @@ export class FokosShardingStore {
 			this.#storage.sql.exec<{ repartition_id: string; state: RepartitionState }>(
 				`SELECT o.repartition_id, r.state FROM fokos_route_overrides o
 				   JOIN fokos_repartitions r ON r.id = o.repartition_id
-				  WHERE o.hash_key = ?`,
-				hashKey,
+				  WHERE o.hash_prefix_bucket = ?`,
+				hashPrefixBucket,
 			),
 		);
 		return row && { repartitionId: row.repartition_id, state: row.state };
 	}
 
-	hasRouteOverride(hashKey: KeyBytes): boolean {
+	hasRouteOverride(hashPrefixBucket: HashPrefixBucket): boolean {
 		if (!this.#anyRouteOverride()) {
 			return false;
 		}
-		return this.#storage.sql.exec(`SELECT 1 FROM fokos_route_overrides WHERE hash_key = ? LIMIT 1`, hashKey).toArray().length > 0;
+		return (
+			this.#storage.sql.exec(`SELECT 1 FROM fokos_route_overrides WHERE hash_prefix_bucket = ? LIMIT 1`, hashPrefixBucket).toArray()
+				.length > 0
+		);
 	}
 
 	/**
 	 * A terminal override is one whose promotion reached `completed` or `cleaned`. A hash split exports
-	 * exactly these to its children and excludes exactly their keys from the item stream.
+	 * exactly these to its children and excludes exactly their hashPrefixBuckets from the item stream.
 	 */
-	hasTerminalRouteOverride(hashKey: KeyBytes): boolean {
+	hasTerminalRouteOverride(hashPrefixBucket: HashPrefixBucket): boolean {
 		if (!this.#anyRouteOverride()) {
 			return false;
 		}
@@ -932,25 +968,25 @@ export class FokosShardingStore {
 			this.#storage.sql
 				.exec(
 					`SELECT 1 FROM fokos_route_overrides o JOIN fokos_repartitions r ON r.id = o.repartition_id
-					  WHERE o.hash_key = ? AND r.state IN ('completed', 'cleaned') LIMIT 1`,
-					hashKey,
+					  WHERE o.hash_prefix_bucket = ? AND r.state IN ('completed', 'cleaned') LIMIT 1`,
+					hashPrefixBucket,
 				)
 				.toArray().length > 0
 		);
 	}
 
-	/** Pages the terminal overrides in `hash_key` order, strictly after `cursor`. */
-	queryTerminalRouteOverridesPage(cursor: PromotedKeyCursor | null, limit: number): { hashKey: KeyBytes }[] {
-		const where = cursor ? `AND o.hash_key > ?2` : ``;
-		const params: unknown[] = cursor ? [limit, cursor.hashKey] : [limit];
+	/** Pages the terminal overrides in `hash_prefix_bucket` order, strictly after `cursor`. */
+	queryTerminalRouteOverridesPage(cursor: PromotedKeyCursor | null, limit: number): { hashPrefixBucket: HashPrefixBucket }[] {
+		const where = cursor ? `AND o.hash_prefix_bucket > ?2` : ``;
+		const params: unknown[] = cursor ? [limit, cursor.hashPrefixBucket] : [limit];
 		return this.#storage.sql
-			.exec<{ hash_key: ArrayBuffer }>(
-				`SELECT o.hash_key FROM fokos_route_overrides o JOIN fokos_repartitions r ON r.id = o.repartition_id
-				  WHERE r.state IN ('completed', 'cleaned') ${where} ORDER BY o.hash_key LIMIT ?1`,
+			.exec<{ hash_prefix_bucket: ArrayBuffer }>(
+				`SELECT o.hash_prefix_bucket FROM fokos_route_overrides o JOIN fokos_repartitions r ON r.id = o.repartition_id
+				  WHERE r.state IN ('completed', 'cleaned') ${where} ORDER BY o.hash_prefix_bucket LIMIT ?1`,
 				...params,
 			)
 			.toArray()
-			.map((r) => ({ hashKey: fromSqlKey(r.hash_key) }));
+			.map((r) => ({ hashPrefixBucket: asHashPrefixBucket(fromSqlBytes(r.hash_prefix_bucket)) }));
 	}
 
 	// ─── repartition status view ────────────────────────────────────────────
@@ -979,14 +1015,14 @@ export class FokosShardingStore {
 				seq: number;
 				kind: RepartitionKind;
 				state: RepartitionState;
-				hash_key: ArrayBuffer | null;
+				hash_prefix_bucket: ArrayBuffer | null;
 				target_index: number | null;
 				partition_id: string | null;
 				do_name: string | null;
 				initialization: TargetInitialization | null;
 				acknowledged: number | null;
 			}>(
-				`SELECT r.id, r.seq, r.kind, r.state, r.hash_key, t.target_index,
+				`SELECT r.id, r.seq, r.kind, r.state, r.hash_prefix_bucket, t.target_index,
 				        t.partition_id, t.do_name, t.initialization, t.acknowledged
 				   FROM fokos_repartitions r
 				   LEFT JOIN fokos_repartition_targets t ON t.repartition_id = r.id
@@ -999,7 +1035,7 @@ export class FokosShardingStore {
 				seq: r.seq,
 				kind: r.kind,
 				state: r.state,
-				hashKey: r.hash_key === null ? null : fromSqlKey(r.hash_key),
+				hashPrefixBucket: r.hash_prefix_bucket === null ? null : asHashPrefixBucket(fromSqlBytes(r.hash_prefix_bucket)),
 				targetIndex: r.target_index ?? -1,
 				partitionId: r.partition_id,
 				doName: r.do_name,
@@ -1073,39 +1109,45 @@ export class FokosShardingStore {
 	 * Learns one range boundary, or refreshes its eviction stamp when it is already known and older
 	 * than `refreshMs`. Every forwarded request learns the boundaries of the partition that answered, so
 	 * an unconditional refresh would be one write per forward; `refreshMs` keeps a hot row at two seeks
-	 * and no write. Every row is written under the real hash key it describes, so
-	 * a hash partition can hold the boundaries of many promoted keys in one table.
+	 * and no write. Every row is written under the hashPrefixBucket it describes, so a hash partition
+	 * can hold the boundaries of many promoted hashPrefixBuckets in one table.
 	 *
 	 * The table is bounded by `rangeHierarchyMaxRows`.
 	 * A partition's own ancestors are in its identity, so eviction cannot change its route evidence;
 	 * a lost row costs one more hop on a later request.
 	 */
 	learnRangeBoundary(
-		hk: KeyBytes,
-		startBoundary: KeyBytes,
-		endBoundary: KeyBytes,
+		hashPrefixBucket: HashPrefixBucket,
+		startBoundary: FokosCompositeKey | null,
+		endBoundary: FokosCompositeKey | null,
 		depth: number,
 		refreshMs: number,
 		now = Date.now(),
 	): void {
+		const [startHk, startSk] = boundaryColumns(startBoundary);
+		const [endHk, endSk] = boundaryColumns(endBoundary);
 		const inserted =
 			this.#storage.sql.exec(
-				`INSERT INTO fokos_range_hierarchy (hk, sk_start_boundary, sk_end_boundary, depth, learned_at) VALUES (?1, ?2, ?3, ?4, ?5)
-				 ON CONFLICT (hk, sk_start_boundary, sk_end_boundary) DO NOTHING`,
-				hk,
-				startBoundary,
-				endBoundary,
+				`INSERT INTO fokos_range_hierarchy (hash_prefix_bucket, depth, start_hk, start_sk, end_hk, end_sk, learned_at)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+				 ON CONFLICT (hash_prefix_bucket, depth, start_hk, start_sk) DO NOTHING`,
+				hashPrefixBucket,
 				depth,
+				startHk,
+				startSk,
+				endHk,
+				endSk,
 				now,
 			).rowsWritten > 0;
 		// Only an insert can grow the table, so a refresh does not count the rows.
 		if (!inserted) {
 			this.#storage.sql.exec(
-				`UPDATE fokos_range_hierarchy SET learned_at = ?4
-				  WHERE hk = ?1 AND sk_start_boundary = ?2 AND sk_end_boundary = ?3 AND learned_at < ?4 - ?5`,
-				hk,
-				startBoundary,
-				endBoundary,
+				`UPDATE fokos_range_hierarchy SET learned_at = ?5
+				  WHERE hash_prefix_bucket = ?1 AND depth = ?2 AND start_hk = ?3 AND start_sk = ?4 AND learned_at < ?5 - ?6`,
+				hashPrefixBucket,
+				depth,
+				startHk,
+				startSk,
 				now,
 				refreshMs,
 			);
@@ -1128,8 +1170,8 @@ export class FokosShardingStore {
 		const excess = exact - (maxRows - Math.floor(maxRows / 10));
 		if (excess > 0) {
 			this.#storage.sql.exec(
-				`DELETE FROM fokos_range_hierarchy WHERE (hk, sk_start_boundary, sk_end_boundary) IN (
-				     SELECT hk, sk_start_boundary, sk_end_boundary FROM fokos_range_hierarchy ORDER BY learned_at, depth DESC LIMIT ?1)`,
+				`DELETE FROM fokos_range_hierarchy WHERE (hash_prefix_bucket, depth, start_hk, start_sk) IN (
+				     SELECT hash_prefix_bucket, depth, start_hk, start_sk FROM fokos_range_hierarchy ORDER BY learned_at, depth DESC LIMIT ?1)`,
 				excess,
 			);
 		}
@@ -1141,30 +1183,32 @@ export class FokosShardingStore {
 		return one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n;
 	}
 
-	/** Every learned slice of one hash key, so the frontier planner can overlay them on its base cover. */
-	listLearnedRangeSlices(hk: KeyBytes): LearnedRangeSlice[] {
+	/** Every learned slice of one hashPrefixBucket, so the frontier planner can overlay them on its base cover. */
+	listLearnedRangeSlices(hashPrefixBucket: HashPrefixBucket): LearnedRangeSlice[] {
 		return this.#storage.sql
-			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
-				`SELECT depth, sk_start_boundary, sk_end_boundary FROM fokos_range_hierarchy WHERE hk = ? ORDER BY depth, sk_start_boundary`,
-				hk,
+			.exec<{ depth: number; start_hk: ArrayBuffer; start_sk: ArrayBuffer; end_hk: ArrayBuffer; end_sk: ArrayBuffer }>(
+				`SELECT depth, start_hk, start_sk, end_hk, end_sk FROM fokos_range_hierarchy
+				  WHERE hash_prefix_bucket = ? ORDER BY depth, start_hk, start_sk`,
+				hashPrefixBucket,
 			)
 			.toArray()
-			.map((row) => {
-				const start = fromSqlKey(row.sk_start_boundary);
-				const end = fromSqlKey(row.sk_end_boundary);
-				return { depth: row.depth, startBoundary: start.length === 0 ? null : start, endBoundary: end.length === 0 ? null : end };
-			});
+			.map((row) => ({
+				depth: row.depth,
+				startBoundary: boundaryOf(row.start_hk, row.start_sk),
+				endBoundary: boundaryOf(row.end_hk, row.end_sk),
+			}));
 	}
 
 	/** Forgets one learned slice, after the partition it names answered that it does not exist. */
-	deleteLearnedRangeSlice(hk: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): void {
-		const unbounded = KeyCodec.encodeOptional(undefined);
+	deleteLearnedRangeSlice(hashPrefixBucket: HashPrefixBucket, slice: LearnedRangeSlice): void {
+		const [startHk, startSk] = boundaryColumns(slice.startBoundary);
 		const deleted = this.#storage.sql
 			.exec(
-				`DELETE FROM fokos_range_hierarchy WHERE hk = ?1 AND sk_start_boundary = ?2 AND sk_end_boundary = ?3 RETURNING 1`,
-				hk,
-				startBoundary ?? unbounded,
-				endBoundary ?? unbounded,
+				`DELETE FROM fokos_range_hierarchy WHERE hash_prefix_bucket = ?1 AND depth = ?2 AND start_hk = ?3 AND start_sk = ?4 RETURNING 1`,
+				hashPrefixBucket,
+				slice.depth,
+				startHk,
+				startSk,
 			)
 			.toArray().length;
 		const known = rangeHierarchyRows.get(this.#storage);
@@ -1174,54 +1218,45 @@ export class FokosShardingStore {
 	}
 
 	/**
-	 * Returns the deepest learned range slice that contains `sortKey` for the given hash key, or
-	 * `null` when nothing is known that covers it. Used to skip intermediate range router hops: the
-	 * returned `[startBoundary, endBoundary)` slice resolves deterministically to a DO.
+	 * Returns the deepest learned range slice of `hashPrefixBucket` that contains `key`, or `null` when
+	 * nothing is known that covers it. Used to skip intermediate range router hops: the returned
+	 * `[startBoundary, endBoundary)` slice resolves deterministically to a DO.
 	 */
-	findDeepestKnownRangeSlice(hk: KeyBytes, sortKey: KeyBytes): LearnedRangeSlice | null {
-		// Boundaries are stored with the empty sentinel `[]` for unbounded edges. `[]` is the byte
-		// minimum, which is correct for an unbounded start (`start <= sortKey` always holds) but NOT for
-		// an unbounded end — hence the explicit sentinel check on the end. Real keys are never empty
-		// (KeyCodec rejects empty input), so `[]` is an unambiguous "unbounded" tag. The result decodes
-		// `[]` back to `null` for both edges, so callers can feed `resolveRangePartitionContext` directly.
-		const unbounded = KeyCodec.encodeOptional(undefined);
+	findDeepestKnownRangeSlice(hashPrefixBucket: HashPrefixBucket, key: FokosCompositeKey): LearnedRangeSlice | null {
 		const deepest = tryOne(
-			this.#storage.sql.exec<{ depth: number }>(`SELECT depth FROM fokos_range_hierarchy WHERE hk = ? ORDER BY depth DESC LIMIT 1`, hk),
+			this.#storage.sql.exec<{ depth: number }>(
+				`SELECT depth FROM fokos_range_hierarchy WHERE hash_prefix_bucket = ? ORDER BY depth DESC LIMIT 1`,
+				hashPrefixBucket,
+			),
 		);
 		if (!deepest) {
 			return null;
 		}
 
 		// The slices of one depth do not overlap. Thus at each depth, only the slice with the largest
-		// start at or before the sort key can contain it, and one index seek finds that slice. The end
-		// test is outside the seek, so a seek reads at most one row. A lookup costs at most one seek for
-		// each depth, and eviction gaps do not change this. Learned depths start at 1, because the range
-		// root is never stored. If rows of one depth overlap, the result can only be a shallower slice,
-		// which is safe: it costs one more forward.
+		// start at or before the key can contain it, and one primary-key seek finds that slice. The
+		// unbounded start `(x'', x'')` is the minimum, so it is at or before each key. The end test is
+		// outside the seek, so a seek reads at most one row, and the unbounded end `x''` passes it.
+		// Learned depths start at 1, because the range root is never stored. If rows of one depth
+		// overlap, the result can only be a shallower slice, which is safe: it costs one more forward.
 		for (let depth = deepest.depth; depth >= 1; depth--) {
 			const row = tryOne(
-				this.#storage.sql.exec<{ sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
-					`SELECT sk_start_boundary, sk_end_boundary FROM (
-					     SELECT sk_start_boundary, sk_end_boundary
+				this.#storage.sql.exec<{ start_hk: ArrayBuffer; start_sk: ArrayBuffer; end_hk: ArrayBuffer; end_sk: ArrayBuffer }>(
+					`SELECT start_hk, start_sk, end_hk, end_sk FROM (
+					     SELECT start_hk, start_sk, end_hk, end_sk
 					     FROM fokos_range_hierarchy
-					     WHERE hk = ?1 AND depth = ?2 AND sk_start_boundary <= ?3
-					     ORDER BY sk_start_boundary DESC
+					     WHERE hash_prefix_bucket = ?1 AND depth = ?2 AND (start_hk, start_sk) <= (?3, ?4)
+					     ORDER BY start_hk DESC, start_sk DESC
 					     LIMIT 1)
-					 WHERE sk_end_boundary > ?3 OR sk_end_boundary = ?4`,
-					hk,
+					 WHERE end_hk = x'' OR (end_hk, end_sk) > (?3, ?4)`,
+					hashPrefixBucket,
 					depth,
-					sortKey,
-					unbounded,
+					key.hk,
+					key.sk,
 				),
 			);
 			if (row) {
-				const start = fromSqlKey(row.sk_start_boundary);
-				const end = fromSqlKey(row.sk_end_boundary);
-				return {
-					depth,
-					startBoundary: start.length === 0 ? null : start,
-					endBoundary: end.length === 0 ? null : end,
-				};
+				return { depth, startBoundary: boundaryOf(row.start_hk, row.start_sk), endBoundary: boundaryOf(row.end_hk, row.end_sk) };
 			}
 		}
 		return null;

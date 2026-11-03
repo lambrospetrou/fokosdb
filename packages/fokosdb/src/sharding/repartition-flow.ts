@@ -30,7 +30,8 @@
  */
 import { collectBatch } from "./batch-scan.js";
 import invariant from "../shared/invariant.js";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { KeyCodec, type FokosCompositeKey } from "./key-codec.js";
+
 import { refOf, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
 import { identityDepth, PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
 import { selectRangeAncestors } from "./range-ancestors.js";
@@ -47,7 +48,8 @@ import type {
 	RepartitionTargetRow,
 } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
-import { sliceIncludesHashKey, sliceIncludesItem } from "./repartition-slice.js";
+import { hashStorageInterval, rangeStorageInterval, sliceIncludesHashPrefixBucket, sliceIncludesItem } from "./repartition-slice.js";
+import { compareHashPrefixBuckets, hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
 import type {
 	FokosImportRecord,
 	FokosImportState,
@@ -64,9 +66,12 @@ import type {
 	FokosStoredRepartitionPlan,
 	RouteKey,
 } from "./repartition-types.js";
-import type { FokosRepartitionPlan, FokosShardingHooks } from "./runtime-types.js";
+import type { FokosRepartitionPlan, FokosShardingHooks, FokosStorageInterval } from "./runtime-types.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfig } from "./runtime-config.js";
 import { jitterBackoff } from "durable-utils/retries";
+
+/** The stored form of an unbounded ancestor edge: the empty hash key, which `KeyCodec` never makes for a real key. */
+const UNBOUNDED_BOUNDARY: FokosCompositeKey = { hk: KeyCodec.encodeOptional(undefined), sk: KeyCodec.encodeOptional(undefined) };
 
 /**
  * The Workers runtime allows six simultaneous outgoing connections per request, so one source step
@@ -170,16 +175,16 @@ export class RepartitionSource {
 	}
 
 	/**
-	 * How far the promotion of one hash key has got, or undefined when this partition still owns it.
-	 * One indexed join on the point-read path.
+	 * How far the promotion of one hashPrefixBucket has got, or undefined when this partition still
+	 * owns it. One indexed join on the point-read path.
 	 */
-	overrideFor(hashKey: KeyBytes): RepartitionState | undefined {
-		return this.store.routeOverrideFor(hashKey)?.state;
+	overrideFor(hashPrefixBucket: HashPrefixBucket): RepartitionState | undefined {
+		return this.store.routeOverrideFor(hashPrefixBucket)?.state;
 	}
 
-	/** Whether the range tree, not this partition, owns the key. True from cutover onwards. */
-	ownedByRangeTree(hashKey: KeyBytes): boolean {
-		const state = this.overrideFor(hashKey);
+	/** Whether the range tree, not this partition, owns the hashPrefixBucket. True from cutover onwards. */
+	ownedByRangeTree(hashPrefixBucket: HashPrefixBucket): boolean {
+		const state = this.overrideFor(hashPrefixBucket);
 		return state === "cutover" || state === "completed" || state === "cleaned";
 	}
 
@@ -187,7 +192,7 @@ export class RepartitionSource {
 	 * Says whether a queue request can pass arbitration now, without a write. The queue transaction
 	 * repeats the check, so a request that passes here can still be refused there.
 	 */
-	canQueue(request: { kind: RepartitionKind; hashKey?: KeyBytes }): boolean {
+	canQueue(request: { kind: RepartitionKind; hashPrefixBucket?: HashPrefixBucket }): boolean {
 		const { identity } = this.deps.identity();
 		if (this.store.getSplitRepartition()) {
 			return false;
@@ -198,7 +203,7 @@ export class RepartitionSource {
 			case "range_split":
 				return identity.kind === "range";
 			case "key_promotion":
-				return identity.kind === "hash" && request.hashKey !== undefined && !this.store.hasRouteOverride(request.hashKey);
+				return identity.kind === "hash" && request.hashPrefixBucket !== undefined && !this.store.hasRouteOverride(request.hashPrefixBucket);
 		}
 	}
 
@@ -213,7 +218,10 @@ export class RepartitionSource {
 	 * The transaction also writes the plan head with the host policy and data of this moment, so every
 	 * later hook reads the values of queue time.
 	 */
-	queue(request: { kind: RepartitionKind; hashKey?: KeyBytes; data?: unknown }, now = Date.now()): RepartitionRow | undefined {
+	queue(
+		request: { kind: RepartitionKind; hashPrefixBucket?: HashPrefixBucket; data?: unknown },
+		now = Date.now(),
+	): RepartitionRow | undefined {
 		const { ctx, identity } = this.deps.identity();
 		const row = this.store.transactionSync((): RepartitionRow | undefined => {
 			if (this.store.getSplitRepartition()) {
@@ -240,8 +248,8 @@ export class RepartitionSource {
 					if (identity.kind !== "hash") {
 						return undefined;
 					}
-					invariant(request.hashKey, "fokos/repartition.queue: a key promotion needs its hash key");
-					if (this.store.hasRouteOverride(request.hashKey)) {
+					invariant(request.hashPrefixBucket, "fokos/repartition.queue: a key promotion needs its hashPrefixBucket");
+					if (this.store.hasRouteOverride(request.hashPrefixBucket)) {
 						return undefined;
 					}
 					break;
@@ -254,14 +262,14 @@ export class RepartitionSource {
 				seq,
 				kind: request.kind,
 				state: "queued",
-				hashKey: request.hashKey ?? null,
+				hashPrefixBucket: request.hashPrefixBucket ?? null,
 				queuedAt: now,
 				nextAttemptAt: now,
 			});
 			// The override exists from the moment the promotion is queued, so a second request for the
-			// same key finds it and no key is ever queued twice.
+			// same hashPrefixBucket finds it and no hashPrefixBucket is ever queued twice.
 			if (request.kind === "key_promotion") {
-				this.store.insertRouteOverride(request.hashKey!, id);
+				this.store.insertRouteOverride(request.hashPrefixBucket!, id);
 			}
 			this.store.putPlanHead(id, {
 				schema: 1,
@@ -355,7 +363,7 @@ export class RepartitionSource {
 				invariant(n >= 2, "fokos/repartition.plan: rangeSplitN must be at least 2");
 				const boundaries =
 					this.deps.hooks.computeRangeBoundaries?.({
-						hashKey: rp.hashKey,
+						hashPrefixBucket: rp.hashPrefixBucket,
 						start: rp.start,
 						end: rp.end,
 						childCount: n,
@@ -371,42 +379,50 @@ export class RepartitionSource {
 				// The children tile [start, end) with these boundaries. A boundary out of order or out of the
 				// interval gives a key no owner, or two owners. The hook is host code, so the flow checks it.
 				invariant(boundaries.length === n - 1, () => `fokos/repartition.plan: ${boundaries.length} boundaries for ${n} children`);
-				boundaries.forEach((b, i) =>
+				boundaries.forEach((b, i) => {
+					const previous = i === 0 ? rp.start : boundaries[i - 1];
 					invariant(
-						KeyCodec.compare(b, i === 0 ? (rp.start ?? KeyCodec.encodeOptional(undefined)) : boundaries[i - 1]) > 0 &&
-							(rp.end === null || KeyCodec.compare(b, rp.end) < 0),
-						() => `fokos/repartition.plan: boundary ${i} (${KeyCodec.keyForLog(b)}) is out of order or outside the interval`,
-					),
-				);
-				const starts: (KeyBytes | null)[] = [rp.start, ...boundaries];
-				const ends: (KeyBytes | null)[] = [...boundaries, rp.end];
+						(previous === null || KeyCodec.compareComposite(b, previous) > 0) &&
+							(rp.end === null || KeyCodec.compareComposite(b, rp.end) < 0),
+						() => `fokos/repartition.plan: boundary ${i} (${KeyCodec.compositeForLog(b)}) is out of order or outside the interval`,
+					);
+					// A boundary of the hashPrefixBucket must hold a hash key of it, or a child would own no key.
+					invariant(
+						compareHashPrefixBuckets(hashPrefixBucketOf(b.hk, ctx.topology.shardGroup), rp.hashPrefixBucket) === 0 || b.sk.length === 0,
+						() =>
+							`fokos/repartition.plan: boundary ${i} (${KeyCodec.compositeForLog(b)}) has a hash key of another hashPrefixBucket and a sort key`,
+					);
+				});
+				const starts: (FokosCompositeKey | null)[] = [rp.start, ...boundaries];
+				const ends: (FokosCompositeKey | null)[] = [...boundaries, rp.end];
 				planned.rangeDepth = depth + 1;
 				planned.rangeAncestors = selectRangeAncestors(
 					depth,
 					rp.ancestors,
-					{
-						depth,
-						startBoundary: rp.start ?? KeyCodec.encodeOptional(undefined),
-						endBoundary: rp.end ?? KeyCodec.encodeOptional(undefined),
-					},
+					{ depth, startBoundary: rp.start ?? UNBOUNDED_BOUNDARY, endBoundary: rp.end ?? UNBOUNDED_BOUNDARY },
 					ctx.rangeConfig.rangeAncestors,
 				);
 				targets = starts.map((start, i) => {
-					const child = resolveRangePartitionContext(ctx, rp.hashKey, start, ends[i]);
+					const child = resolveRangePartitionContext(ctx, rp.hashPrefixBucket, start, ends[i]);
 					return {
 						ref: { partitionId: child.partitionId, doName: child.doName },
-						slice: { kind: "range", hashKey: rp.hashKey, start, end: ends[i] },
+						slice: { kind: "range", hashPrefixBucket: rp.hashPrefixBucket, start, end: ends[i] },
 					};
 				});
 				break;
 			}
 			case "key_promotion": {
-				const hashKey = row.hashKey;
-				invariant(hashKey, "fokos/repartition.plan: a key promotion needs its hash key");
-				const root = resolveRangePartitionContext(ctx, hashKey, null, null);
+				const hashPrefixBucket = row.hashPrefixBucket;
+				invariant(hashPrefixBucket, "fokos/repartition.plan: a key promotion needs its hashPrefixBucket");
+				const root = resolveRangePartitionContext(ctx, hashPrefixBucket, null, null);
 				planned.rangeDepth = 0;
 				planned.rangeAncestors = [];
-				targets = [{ ref: { partitionId: root.partitionId, doName: root.doName }, slice: { kind: "promoted_key", hashKey } }];
+				targets = [
+					{
+						ref: { partitionId: root.partitionId, doName: root.doName },
+						slice: { kind: "promoted_hash_prefix_bucket", hashPrefixBucket },
+					},
+				];
 				break;
 			}
 		}
@@ -655,7 +671,7 @@ export class RepartitionSource {
 		const slice = target.slice;
 		const start = slice.kind === "range" ? slice.start : null;
 		const end = slice.kind === "range" ? slice.end : null;
-		return resolveRangePartitionContext(ctx, slice.hashKey, start, end);
+		return resolveRangePartitionContext(ctx, slice.hashPrefixBucket, start, end);
 	}
 
 	#deferSource(row: RepartitionRow, now: number, delayMs: number): void {
@@ -841,8 +857,27 @@ export class RepartitionSource {
 			pageRows: config.migrationPageRows,
 			scanRows: config.migrationScanRows,
 		};
-		const { page, nextCursor } = this.deps.hooks.migration.buildPage(cursor.inner, slice, this.belongsToTarget(slice), budget);
+		const interval = this.#targetInterval(slice, target.partitionId);
+		const { page, nextCursor } = this.deps.hooks.migration.buildPage(cursor.inner, slice, this.belongsToTarget(slice), budget, interval);
 		return { phase: "host", page, nextCursor: nextCursor === null ? null : { phase: "host", inner: nextCursor } };
+	}
+
+	/**
+	 * The storage interval of one validated target: the node interval of a hash child, the composite
+	 * interval of a range slice, or every row of a promoted hashPrefixBucket.
+	 */
+	#targetInterval(slice: FokosSlice, targetPartitionId: string): FokosStorageInterval {
+		const { topology } = this.deps.identity().ctx;
+		switch (slice.kind) {
+			case "hash_child": {
+				const { start, end } = PartitionIdHelper.hashPrefixBucketInterval(targetPartitionId, topology);
+				return hashStorageInterval(start, end);
+			}
+			case "range":
+				return rangeStorageInterval(slice.hashPrefixBucket, slice.start, slice.end);
+			case "promoted_hash_prefix_bucket":
+				return rangeStorageInterval(slice.hashPrefixBucket, null, null);
+		}
 	}
 
 	/**
@@ -854,7 +889,7 @@ export class RepartitionSource {
 		const topology = this.deps.identity().ctx.topology;
 		return (key) =>
 			sliceIncludesItem(slice, key.hashKey, key.sortKey, topology) &&
-			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(key.hashKey));
+			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(hashPrefixBucketOf(key.hashKey, topology.shardGroup)));
 	}
 
 	/**
@@ -868,11 +903,11 @@ export class RepartitionSource {
 
 		const topology = this.deps.identity().ctx.topology;
 		const config = this.deps.config();
-		const { rows, nextCursor } = collectBatch<{ hashKey: KeyBytes }, PromotedKeyCursor>({
+		const { rows, nextCursor } = collectBatch<{ hashPrefixBucket: HashPrefixBucket }, PromotedKeyCursor>({
 			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize),
-			advanceCursor: (r) => ({ hashKey: r.hashKey }),
-			include: (r) => sliceIncludesHashKey(slice, r.hashKey, topology),
-			estimateBytes: (r) => r.hashKey.byteLength + 64,
+			advanceCursor: (r) => ({ hashPrefixBucket: r.hashPrefixBucket }),
+			include: (r) => sliceIncludesHashPrefixBucket(slice, r.hashPrefixBucket, topology),
+			estimateBytes: (r) => r.hashPrefixBucket.byteLength + 64,
 			budgetBytes: config.migrationPageBytes,
 			maxItems: config.migrationPageRows,
 			maxScannedRows: config.migrationScanRows,
@@ -951,7 +986,10 @@ export class RepartitionTarget {
 		// A row outside the slice of this target belongs to a sibling or to the source, and two partitions
 		// would then own it.
 		const topology = this.deps.identity().ctx.topology;
-		if (page.phase === "overrides" && !page.overrides.every((o) => sliceIncludesHashKey(rec.slice, o.hashKey, topology))) {
+		if (
+			page.phase === "overrides" &&
+			!page.overrides.every((o) => sliceIncludesHashPrefixBucket(rec.slice, o.hashPrefixBucket, topology))
+		) {
 			this.#deferImport(rec, now, new Error("the overrides page holds a hash key outside the slice of this target"));
 			return "stopped";
 		}
@@ -1031,19 +1069,19 @@ export class RepartitionTarget {
 	}
 
 	/**
-	 * Adopts the promotions the source already finished, for the keys this target now owns.
+	 * Adopts the promotions the source already finished, for the hashPrefixBuckets this target now owns.
 	 *
 	 * The child receives the forward pointer and no item copy: the data lives in a range tree that
 	 * neither partition owns. The row exists so routing, status and destroy traversal can all see the
 	 * link — which is why it is written as a finished promotion rather than as a bare override.
 	 */
-	#applyOverrides(overrides: readonly { hashKey: KeyBytes }[], now: number): void {
+	#applyOverrides(overrides: readonly { hashPrefixBucket: HashPrefixBucket }[], now: number): void {
 		if (overrides.length === 0) {
 			return;
 		}
 		const { ctx } = this.deps.identity();
-		for (const { hashKey } of overrides) {
-			if (this.store.hasRouteOverride(hashKey)) {
+		for (const { hashPrefixBucket } of overrides) {
+			if (this.store.hasRouteOverride(hashPrefixBucket)) {
 				continue;
 			}
 			const seq = this.store.nextRepartitionSeq();
@@ -1053,26 +1091,26 @@ export class RepartitionTarget {
 				seq,
 				kind: "key_promotion",
 				state: "cleaned",
-				hashKey,
+				hashPrefixBucket,
 				queuedAt: now,
 				cutoverAt: now,
 				completedAt: now,
 				nextAttemptAt: now,
 			});
-			const root = resolveRangePartitionContext(ctx, hashKey, null, null);
+			const root = resolveRangePartitionContext(ctx, hashPrefixBucket, null, null);
 			this.store.insertRepartitionTarget({
 				repartitionId: id,
 				kind: "key_promotion",
 				partitionId: root.partitionId,
 				doName: root.doName,
 				targetIndex: 0,
-				slice: { kind: "promoted_key", hashKey },
+				slice: { kind: "promoted_hash_prefix_bucket", hashPrefixBucket },
 				initialization: "initialized",
 				startNotified: true,
 				acknowledged: true,
 				nextAttemptAt: now,
 			});
-			this.store.insertRouteOverride(hashKey, id);
+			this.store.insertRouteOverride(hashPrefixBucket, id);
 		}
 	}
 
@@ -1300,9 +1338,9 @@ const PHASE_ORDER: Record<FokosMigrationCursor["phase"], number> = { overrides: 
 
 const IMPORT_ORDER: Record<FokosImportState, number> = { awaiting_data: 0, importing: 1, imported: 2, active: 3 };
 
-/** True when `next` is strictly after `requested` in the `hash_key` order of the overrides stream. */
+/** True when `next` is strictly after `requested` in the `hash_prefix_bucket` order of the overrides stream. */
 function overridesCursorAfter(next: PromotedKeyCursor | null, requested: PromotedKeyCursor | null): boolean {
-	return next !== null && (requested === null || KeyCodec.compare(next.hashKey, requested.hashKey) > 0);
+	return next !== null && (requested === null || compareHashPrefixBuckets(next.hashPrefixBucket, requested.hashPrefixBucket) > 0);
 }
 
 function notCutOver(repartitionId: string): FokosUnavailableError {
@@ -1314,7 +1352,7 @@ function notCutOver(repartitionId: string): FokosUnavailableError {
 
 function toStatusEntry(r: RepartitionStatusRow): FokosStatusEntry {
 	return {
-		repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, hashKey: r.hashKey },
+		repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, hashPrefixBucket: r.hashPrefixBucket },
 		target:
 			r.targetIndex < 0 || r.partitionId === null || r.doName === null || r.initialization === null
 				? null
@@ -1334,7 +1372,7 @@ function toStatusEntry(r: RepartitionStatusRow): FokosStatusEntry {
  */
 function statusEntryBytes(entry: FokosStatusEntry): number {
 	const ids = entry.repartition.id.length + (entry.target ? entry.target.ref.doName.length + entry.target.ref.partitionId.length : 0);
-	return 256 + 2 * ids + (entry.repartition.hashKey?.byteLength ?? 0);
+	return 256 + 2 * ids + (entry.repartition.hashPrefixBucket?.byteLength ?? 0);
 }
 
 /** Compares two migration cursors by value. Both ends survive a KV structured-clone round trip. */
@@ -1349,7 +1387,7 @@ function cursorsEqual(a: FokosMigrationCursor | null, b: FokosMigrationCursor | 
 		if (a.inner === null || b.inner === null) {
 			return a.inner === b.inner;
 		}
-		return KeyCodec.compare(a.inner.hashKey, b.inner.hashKey) === 0;
+		return compareHashPrefixBuckets(a.inner.hashPrefixBucket, b.inner.hashPrefixBucket) === 0;
 	}
 	// The host cursor is opaque, so it is compared as its serialized form rather than field by field.
 	return JSON.stringify(a.inner ?? null) === JSON.stringify(b.inner ?? null);
@@ -1359,13 +1397,19 @@ function slicesEqual(a: FokosSlice, b: FokosSlice): boolean {
 	if (a.kind !== b.kind) {
 		return false;
 	}
-	const keyEq = (x: KeyBytes | null, y: KeyBytes | null) => (x === null || y === null ? x === y : KeyCodec.compare(x, y) === 0);
+	const keyEq = (x: FokosCompositeKey | null, y: FokosCompositeKey | null) =>
+		x === null || y === null ? x === y : KeyCodec.compareComposite(x, y) === 0;
 	switch (a.kind) {
 		case "hash_child":
 			return b.kind === "hash_child" && a.childIndex === b.childIndex && a.depth === b.depth;
-		case "promoted_key":
-			return b.kind === "promoted_key" && keyEq(a.hashKey, b.hashKey);
+		case "promoted_hash_prefix_bucket":
+			return b.kind === "promoted_hash_prefix_bucket" && compareHashPrefixBuckets(a.hashPrefixBucket, b.hashPrefixBucket) === 0;
 		case "range":
-			return b.kind === "range" && keyEq(a.hashKey, b.hashKey) && keyEq(a.start, b.start) && keyEq(a.end, b.end);
+			return (
+				b.kind === "range" &&
+				compareHashPrefixBuckets(a.hashPrefixBucket, b.hashPrefixBucket) === 0 &&
+				keyEq(a.start, b.start) &&
+				keyEq(a.end, b.end)
+			);
 	}
 }

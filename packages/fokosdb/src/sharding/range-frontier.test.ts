@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import { planRangeFrontier, type FrontierBase } from "./range-frontier.js";
 import type { FokosPartitionRef } from "./route-context.js";
 import type { LearnedRangeSlice } from "./sharding-store.js";
@@ -7,6 +7,9 @@ import type { SkInterval } from "./sk-interval.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const k = (s: string | null): KeyBytes | null => (s === null ? null : kb(s));
+/** The one hash key of each test request and boundary. */
+const HK = kb("h");
+const ck = (s: string | null): FokosCompositeKey | null => (s === null ? null : { hk: HK, sk: kb(s) });
 const keyLabel = (key: KeyBytes): string => {
 	const decoded = KeyCodec.decode(key);
 	return typeof decoded === "string" ? decoded : `b64:${decoded.toBase64({ alphabet: "base64url" })}`;
@@ -19,14 +22,27 @@ function refOf(start: KeyBytes | null, end: KeyBytes | null): FokosPartitionRef 
 }
 
 function base(start: string | null, end: string | null, target: "local" | "ref" = "ref", speculative = false): FrontierBase {
-	return { target: target === "local" ? "local" : refOf(k(start), k(end)), start: k(start), end: k(end), speculative };
+	return { target: target === "local" ? "local" : refOf(k(start), k(end)), start: ck(start), end: ck(end), speculative };
 }
 
 function learned(start: string | null, end: string | null, depth: number): LearnedRangeSlice {
-	return { startBoundary: k(start), endBoundary: k(end), depth };
+	return { startBoundary: ck(start), endBoundary: ck(end), depth };
 }
 
 const ALL: SkInterval = {};
+
+/** `planRangeFrontier` for the hash key `HK`, with a reference from the sort keys of a learned slice. */
+function plan(
+	bases: readonly FrontierBase[],
+	slices: readonly LearnedRangeSlice[],
+	interval: SkInterval,
+	descending: boolean,
+	ref: (start: KeyBytes | null, end: KeyBytes | null) => FokosPartitionRef,
+) {
+	return planRangeFrontier(HK, bases, slices, interval, descending, (slice) =>
+		ref(slice.startBoundary?.sk ?? null, slice.endBoundary?.sk ?? null),
+	);
+}
 
 /** The visits as `[target, start, end]` names. */
 function shape(visits: ReturnType<typeof planRangeFrontier>) {
@@ -39,7 +55,7 @@ function shape(visits: ReturnType<typeof planRangeFrontier>) {
 
 describe("planRangeFrontier", () => {
 	it("returns the base cover unchanged when nothing is learned", () => {
-		const visits = planRangeFrontier([base(null, "m"), base("m", null)], [], ALL, false, refOf);
+		const visits = plan([base(null, "m"), base("m", null)], [], ALL, false, refOf);
 		expect(shape(visits)).toEqual([
 			["r.min.m", null, "m"],
 			["r.m.max", "m", null],
@@ -49,16 +65,14 @@ describe("planRangeFrontier", () => {
 
 	it("drops the bases that the requested interval does not touch, and honours an inclusive upper bound on a start boundary", () => {
 		const bases = [base(null, "m"), base("m", null)];
-		expect(shape(planRangeFrontier(bases, [], { upper: { value: kb("m"), inclusive: false } }, false, refOf))).toEqual([
-			["r.min.m", null, "m"],
-		]);
+		expect(shape(plan(bases, [], { upper: { value: kb("m"), inclusive: false } }, false, refOf))).toEqual([["r.min.m", null, "m"]]);
 		// `<= m` needs the child that starts at m: it owns the key m.
-		expect(shape(planRangeFrontier(bases, [], { upper: { value: kb("m"), inclusive: true } }, false, refOf))).toHaveLength(2);
+		expect(shape(plan(bases, [], { upper: { value: kb("m"), inclusive: true } }, false, refOf))).toHaveLength(2);
 	});
 
 	it("overlays learned descendants and keeps the base target for every gap", () => {
 		// The root covers everything. Two learned leaves cover [c, f) and [f, k); the rest stays on the root.
-		const visits = planRangeFrontier([base(null, null)], [learned("c", "f", 2), learned("f", "k", 2)], ALL, false, refOf);
+		const visits = plan([base(null, null)], [learned("c", "f", 2), learned("f", "k", 2)], ALL, false, refOf);
 		expect(shape(visits)).toEqual([
 			["r.min.max", null, "c"],
 			["r.c.f", "c", "f"],
@@ -70,7 +84,7 @@ describe("planRangeFrontier", () => {
 	});
 
 	it("selects the deepest learned slice that contains a segment", () => {
-		const visits = planRangeFrontier([base(null, null)], [learned("c", "k", 1), learned("f", "k", 2)], ALL, false, refOf);
+		const visits = plan([base(null, null)], [learned("c", "k", 1), learned("f", "k", 2)], ALL, false, refOf);
 		expect(shape(visits)).toEqual([
 			["r.min.max", null, "c"],
 			["r.c.k", "c", "f"],
@@ -80,7 +94,7 @@ describe("planRangeFrontier", () => {
 	});
 
 	it("bypasses the root when the learned leaves cover the whole interval", () => {
-		const visits = planRangeFrontier([base(null, null)], [learned(null, "m", 1), learned("m", null, 1)], ALL, false, refOf);
+		const visits = plan([base(null, null)], [learned(null, "m", 1), learned("m", null, 1)], ALL, false, refOf);
 		expect(shape(visits)).toEqual([
 			["r.min.m", null, "m"],
 			["r.m.max", "m", null],
@@ -88,14 +102,14 @@ describe("planRangeFrontier", () => {
 	});
 
 	it("ignores a learned slice that is not a strict sub-slice of a base, such as an ancestor or the base itself", () => {
-		const visits = planRangeFrontier([base("c", "k")], [learned(null, null, 0), learned("c", "k", 1)], ALL, false, refOf);
+		const visits = plan([base("c", "k")], [learned(null, null, 0), learned("c", "k", 1)], ALL, false, refOf);
 		expect(shape(visits)).toEqual([["r.c.k", "c", "k"]]);
 	});
 
 	it("keeps the visits disjoint, in order, and equal to the requested interval inside the cover", () => {
 		const bases = [base(null, "m"), base("m", null)];
 		const rows = [learned("c", "f", 2), learned("f", "m", 2), learned("m", "p", 2), learned("x", null, 2)];
-		const visits = planRangeFrontier(
+		const visits = plan(
 			bases,
 			rows,
 			{ lower: { value: kb("d"), inclusive: true }, upper: { value: kb("y"), inclusive: false } },
@@ -116,7 +130,7 @@ describe("planRangeFrontier", () => {
 	});
 
 	it("reverses the order for a descending request", () => {
-		const visits = planRangeFrontier([base(null, "m"), base("m", null)], [learned("c", "f", 2)], ALL, true, refOf);
+		const visits = plan([base(null, "m"), base("m", null)], [learned("c", "f", 2)], ALL, true, refOf);
 		expect(shape(visits)).toEqual([
 			["r.m.max", "m", null],
 			["r.min.m", "f", "m"],
@@ -126,7 +140,7 @@ describe("planRangeFrontier", () => {
 	});
 
 	it("marks every visit of a speculative base as speculative", () => {
-		const visits = planRangeFrontier([base(null, null, "ref", true)], [learned("c", "f", 2)], ALL, false, refOf);
+		const visits = plan([base(null, null, "ref", true)], [learned("c", "f", 2)], ALL, false, refOf);
 		expect(visits.map((v) => v.visit.speculative)).toEqual([true, true, true]);
 		expect(visits.every((v) => v.base.speculative)).toBe(true);
 	});
@@ -138,7 +152,7 @@ describe("planRangeFrontier", () => {
 	// The reader is interval-based instead, and a slice narrower than the request can only ever
 	// overlay its own segment.
 	it("keeps the base cover beside a left-edge slice that a point read taught", () => {
-		const visits = planRangeFrontier([base(null, null)], [learned(null, "c", 2)], ALL, false, refOf);
+		const visits = plan([base(null, null)], [learned(null, "c", 2)], ALL, false, refOf);
 		expect(shape(visits)).toEqual([
 			["r.min.c", null, "c"],
 			["r.min.max", "c", null],
@@ -150,7 +164,7 @@ describe("planRangeFrontier", () => {
 
 	it("picks the deepest left-edge slice that fully contains each segment, and covers the rest from the base", () => {
 		// Two levels on the left edge, as a tree whose first leaf split again would teach them.
-		const visits = planRangeFrontier([base(null, null)], [learned(null, "f", 1), learned(null, "c", 2)], ALL, false, refOf);
+		const visits = plan([base(null, null)], [learned(null, "f", 1), learned(null, "c", 2)], ALL, false, refOf);
 		expect(shape(visits)).toEqual([
 			["r.min.c", null, "c"],
 			["r.min.f", "c", "f"],
@@ -161,6 +175,47 @@ describe("planRangeFrontier", () => {
 	});
 
 	it("plans one local visit for a leaf", () => {
-		expect(shape(planRangeFrontier([base("c", "k", "local")], [], ALL, false, refOf))).toEqual([["local", "c", "k"]]);
+		expect(shape(plan([base("c", "k", "local")], [], ALL, false, refOf))).toEqual([["local", "c", "k"]]);
+	});
+});
+
+describe("planRangeFrontier with two hash keys in one hashPrefixBucket", () => {
+	const split: FokosCompositeKey = { hk: kb("b"), sk: KeyCodec.encodeOptional(undefined) };
+	const bases: FrontierBase[] = [
+		{ target: { partitionId: "left", doName: "left" }, start: null, end: split, speculative: false },
+		{ target: { partitionId: "right", doName: "right" }, start: split, end: null, speculative: false },
+	];
+	const targets = (hashKey: string, interval: SkInterval) =>
+		planRangeFrontier(kb(hashKey), bases, [], interval, false, () => {
+			throw new Error("no learned slice");
+		}).map(({ visit }) => [visit.target === "local" ? "local" : visit.target.doName, visit.start, visit.end]);
+
+	it("sends each hash key only to the child of its own sort keys, over the whole sort-key axis", () => {
+		expect(targets("a", ALL)).toEqual([["left", null, null]]);
+		expect(targets("b", ALL)).toEqual([["right", null, null]]);
+		expect(targets("b", { lower: { value: kb("x"), inclusive: true } })).toEqual([["right", null, null]]);
+	});
+
+	it("splits the sort keys of one hash key at a boundary inside it", () => {
+		const inside: FrontierBase[] = [
+			{ ...bases[0], end: { hk: kb("a"), sk: kb("m") } },
+			{ ...bases[1], start: { hk: kb("a"), sk: kb("m") } },
+		];
+		const visits = planRangeFrontier(kb("a"), inside, [], ALL, false, () => {
+			throw new Error("no learned slice");
+		});
+		expect(
+			visits.map(({ visit }) => [
+				visit.start === null ? null : KeyCodec.decode(visit.start),
+				visit.end === null ? null : KeyCodec.decode(visit.end),
+			]),
+		).toEqual([
+			[null, "m"],
+			["m", null],
+		]);
+		// The other hash key is fully above the boundary.
+		expect(planRangeFrontier(kb("b"), inside, [], ALL, false, () => ({ partitionId: "", doName: "" })).map((v) => v.visit.target)).toEqual([
+			inside[1].target,
+		]);
 	});
 });

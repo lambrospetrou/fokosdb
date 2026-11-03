@@ -72,7 +72,12 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 			const childState = await children[i].status();
 			expect(childState.identityStored).toMatchObject({
 				kind: "hash",
-				hash: { rootIndex: 0, path: [i], depth: 1, ...PartitionIdHelper.hashInterval(children[i].ctx.partitionId, partition.ctx.topology) },
+				hash: {
+					rootIndex: 0,
+					path: [i],
+					depth: 1,
+					...PartitionIdHelper.hashPrefixBucketInterval(children[i].ctx.partitionId, partition.ctx.topology),
+				},
 				ref: { doName: children[i].doName },
 			});
 			expect(childState.depth).toBe(1);

@@ -234,14 +234,15 @@ not carry over.
 
 1. **M1 — The hashPrefixBucket and the seed** (Section 4.2.4). The functions `hashPrefixBucket` and
    `hashPrefixBucketSeedOf`, the seed in the partition identity, and its check. Routing does not change yet.
+   **DONE.**
 2. **M2 — Hash routing by digits** (Section 4.2.5). Every hash route uses the digits of the hashPrefixBucket. Each
-   hash partition knows its node interval. The depth limit is a split floor. Storage does not change yet.
+   hash partition knows its node interval. The depth limit is a split floor. Storage does not change yet. **DONE.**
 3. **M3 — The storage layout** (Section 4.2.6). `items` is `WITHOUT ROWID` on `(hash_prefix_bucket, hk, sk)`, with
    the item-id counter and a TTL sweep by primary key. `pending_transactions`, `materialization_outbox`, and
-   `key_size_estimates` lead with the hashPrefixBucket. A hash child reads its migration rows as one interval.
+   `key_size_estimates` lead with the hashPrefixBucket. A hash child reads its migration rows as one interval. **DONE.**
 4. **M4 — Promotions by hashPrefixBucket** (Section 4.2.7). A promotion moves one hashPrefixBucket. Range names,
    overrides, slices, the hierarchy, caches, events, and range topology encodings use the hashPrefixBucket and composite
-   boundaries. The size estimates become one indexed total for each hashPrefixBucket.
+   boundaries. The size estimates become one indexed total for each hashPrefixBucket. **DONE.**
 5. **M5 — The promoted set in the hash topology encoding** (Section 4.2.8). The hash topology encoding holds a sorted
    list of hashPrefixBuckets up to `N`, and a Bloom filter above `N`. Each positive answer fetches the range item in
    the background.

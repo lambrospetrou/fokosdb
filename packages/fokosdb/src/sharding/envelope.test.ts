@@ -103,7 +103,7 @@ describe("RouteCollector", () => {
 
 	it("drops the nodes that cross the byte cap, keeps the earlier ones, and never drops the count", () => {
 		const collector = new RouteCollector();
-		const boundary = KeyCodec.encode("k".repeat(2000));
+		const boundary = { hk: KeyCodec.encode("k".repeat(1000)), sk: KeyCodec.encode("k".repeat(1000)) };
 		let nodes = 0;
 		for (let i = 0; i < 20; i++) {
 			const leaf = { ...node(`leaf${i}`, "executed", 1), _rangeAncestors: [{ depth: 1, startBoundary: boundary, endBoundary: boundary }] };
@@ -122,7 +122,7 @@ describe("RouteCollector", () => {
 	describe("the node that the byte cap always keeps", () => {
 		/** A node that crosses `ROUTE_EVIDENCE_MAX_BYTES` by itself. */
 		const oversized = (name: string, role: FokosServedRole = "executed"): FokosRouteNode => {
-			const boundary = KeyCodec.encode("k".repeat(ROUTE_EVIDENCE_MAX_BYTES));
+			const boundary = { hk: KeyCodec.encode("k".repeat(ROUTE_EVIDENCE_MAX_BYTES)), sk: KeyCodec.encodeOptional(undefined) };
 			return { ...node(name, role), _rangeAncestors: [{ depth: 1, startBoundary: boundary, endBoundary: boundary }] };
 		};
 

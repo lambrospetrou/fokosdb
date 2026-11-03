@@ -14,6 +14,10 @@ import type { TargetImage } from "./materialization-store.js";
 import invariant from "../../shared/invariant.js";
 import type { ExpressionValue } from "../../shared/expression/types.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
+import { prefixOf } from "../../../test/storage-prefix.js";
+
+/** The storage prefix of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => prefixOf(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);
@@ -135,7 +139,7 @@ async function withRunner(
 			runner,
 			calls,
 			ingest: (hk, revision, { deleted = false, data = `v${revision}` } = {}) => {
-				const current = store.storedImage(kb(hk), NO_SK);
+				const current = store.storedImage(P(kb(hk)), kb(hk), NO_SK);
 				if (current !== undefined && revision <= current.revision) {
 					return;
 				}
@@ -143,7 +147,7 @@ async function withRunner(
 					cursor: row.cursorSeq,
 					read: Math.max(row.cursorSeq, runner.readPosition(row.targetId) ?? row.cursorSeq),
 				}));
-				store.putLatestImage(image(hk, revision, deleted, data), now, current, positions);
+				store.putLatestImage(P(image(hk, revision, deleted, data).hashKey), image(hk, revision, deleted, data), now, current, positions);
 				if (deleted && positions.length === 0) {
 					cleanup.tombstoneUnblocked();
 				}
@@ -209,6 +213,7 @@ describe("TargetRunner — batches and cursors", () => {
 			const jsonb = new Uint8Array(h.sql.exec<{ b: ArrayBuffer }>(`SELECT jsonb(?) AS b`, `{"n":1}`).one().b);
 			const position = h.store.targetRows().map((row) => ({ cursor: row.cursorSeq, read: row.cursorSeq }));
 			h.store.putLatestImage(
+				P(kb("j")),
 				{ opIndex: 0, hashKey: kb("j"), sortKey: kb("s"), revision: 3, deleted: false, data: jsonb, kind: "json", ttlAt: 99 },
 				h.now(),
 				undefined,
@@ -352,7 +357,7 @@ describe("TargetRunner — failed items", () => {
 			async (h) => {
 				// Each item has the same size. A batch holds 2 items and a half by bytes.
 				h.ingest("r1", 1, { data });
-				config.maxBytesPerStep = Math.floor(2.5 * h.store.storedImage(kb("r1"), NO_SK)!.estRowBytes);
+				config.maxBytesPerStep = Math.floor(2.5 * h.store.storedImage(P(kb("r1")), kb("r1"), NO_SK)!.estRowBytes);
 				h.ingest("o1", 1, { data });
 				await h.drain();
 				h.ingest("r2", 1, { data });
@@ -692,14 +697,14 @@ describe("TargetRunner — splits", () => {
 			const fences = () => h.sql.exec(`SELECT ancestor_id FROM ancestor_fences`).toArray();
 			h.sql.exec(`INSERT INTO ancestor_fences (target_id, ancestor_id, min_epoch, until_id) VALUES ('t1', ?, 3, 2)`, ANCESTOR);
 			// The promotion child starts from the snapshot cursor 0, so it needs the fence up to 2.
-			h.store.storeCursorSnapshot(kb("p"));
+			h.store.storeCursorSnapshot(P(kb("p")));
 			h.ingest("a", 1);
 			h.ingest("b", 1);
 			await h.drain();
 			expect(h.target("t1").cursorSeq).toBe(2);
 			expect(fences()).toEqual([{ ancestor_id: ANCESTOR }]);
 
-			h.store.deleteCursorSnapshot(kb("p"));
+			h.store.deleteCursorSnapshot(P(kb("p")));
 			h.runner.wake();
 			await h.drain();
 			expect(fences()).toEqual([]);
@@ -718,7 +723,7 @@ describe("TargetRunner — splits", () => {
 			const calls = h.calls.length;
 
 			moved = true;
-			h.store.storeCursorSnapshot(kb("a"));
+			h.store.storeCursorSnapshot(P(kb("a")));
 			h.advance(CONFIG.retryBackoffMaxMs);
 			h.runner.wake();
 			await h.drain();
@@ -726,7 +731,7 @@ describe("TargetRunner — splits", () => {
 			expect(h.retryRows()).toMatchObject([{ hk: "a", not_before: h.now() + CONFIG.retryBackoffMaxMs }]);
 
 			// After the completion, the child has the row, so the source deletes it.
-			h.store.deleteCursorSnapshot(kb("a"));
+			h.store.deleteCursorSnapshot(P(kb("a")));
 			h.advance(CONFIG.retryBackoffMaxMs);
 			h.runner.wake();
 			await h.drain();
@@ -737,14 +742,14 @@ describe("TargetRunner — splits", () => {
 
 	it("keeps the positions above a promotion snapshot until the promotion completes", async () => {
 		await withRunner({}, async (h) => {
-			h.store.storeCursorSnapshot(kb("p"));
+			h.store.storeCursorSnapshot(P(kb("p")));
 			h.ingest("a", 1);
 			h.ingest("b", 1);
 			await h.drain();
 			expect(h.target("t1").cursorSeq).toBe(2);
 			expect(h.count("change_positions")).toBe(2);
 
-			h.store.deleteCursorSnapshot(kb("p"));
+			h.store.deleteCursorSnapshot(P(kb("p")));
 			h.runner.wake();
 			await h.drain();
 			expect(h.count("change_positions")).toBe(0);
@@ -763,7 +768,7 @@ describe("TargetRunner — GSI targets", () => {
 	const entries = (calls: GsiWriteEntriesRequest[]) =>
 		calls.map((call) => call.items.map((item) => `${item.op}:${String(KeyCodec.decode(item.hashKey))}`));
 	const keySet = (h: Harness, hk: string) => {
-		const itemId = h.store.storedImage(kb(hk), NO_SK)?.itemId;
+		const itemId = h.store.storedImage(P(kb(hk)), kb(hk), NO_SK)?.itemId;
 		return itemId === undefined ? [] : h.store.indexKeys("t1", itemId).map((key) => String(KeyCodec.decode(key.hk)));
 	};
 
@@ -808,9 +813,10 @@ describe("TargetRunner — GSI targets", () => {
 								read: Math.max(row.cursorSeq, h.runner.readPosition(row.targetId) ?? row.cursorSeq),
 							}));
 							store.putLatestImage(
+								P(kb(hk)),
 								{ opIndex: 0, hashKey: kb(hk), sortKey: NO_SK, revision, deleted: false, data: jsonb, kind: "json", ttlAt: null },
 								h.now(),
-								store.storedImage(kb(hk), NO_SK),
+								store.storedImage(P(kb(hk)), kb(hk), NO_SK),
 								positions,
 							);
 							h.runner.wake();

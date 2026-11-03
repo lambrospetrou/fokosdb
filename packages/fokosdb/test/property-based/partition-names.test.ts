@@ -12,16 +12,18 @@
 //   - An ASCII component keeps the percent-encoding that the names used before the text form.
 //
 // The oracle never calls the encoder. It parses the name form: `<shardGroup>~h.<root>[.<child>...]`
-// and `<shardGroup>~r.<hk>.<start>.<end>`, where a component is `~min`, `~max`, `~b` and base64url,
-// or text with `%XX` escapes. The escape set of the oracle is its own copy, so a change to the escape
+// and `<shardGroup>~r.<bucket hex>.<start>.<end>`, where an edge is `~min`, `~max`, or the two
+// components of a hash key and a sort key, and a component is `~b` and base64url, or text with `%XX`
+// escapes. The escape set of the oracle is its own copy, so a change to the escape
 // set of the encoder fails here.
 //
 // No property uses a Durable Object, so a run costs microseconds and the default run count is high.
 // harness.ts says how to replay a failure.
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { encodeRangeComponent, isHashPartition, isRangePartition, PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { asHashPrefixBucket, type HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
 import { propertyRuns, textEncoder } from "./harness.js";
 
 const PROPERTY_RUNS = propertyRuns(2_000);
@@ -84,7 +86,9 @@ function parseComponent(component: string): Uint8Array | null {
 
 type ParsedName =
 	| { shardGroup: string; kind: "h"; root: number; path: number[] }
-	| { shardGroup: string; kind: "r"; hashKey: Uint8Array; start: Uint8Array | null; end: Uint8Array | null };
+	| { shardGroup: string; kind: "r"; hashPrefixBucket: Uint8Array; start: ParsedBoundary | null; end: ParsedBoundary | null };
+
+type ParsedBoundary = { hk: Uint8Array; sk: Uint8Array };
 
 /** The shard group and the identity of a DO name. */
 function parseDoName(name: string): ParsedName {
@@ -101,14 +105,25 @@ function parseDoName(name: string): ParsedName {
 		return { shardGroup, kind: "h", root, path };
 	}
 	expect(rest.startsWith("r.")).toBe(true);
-	const components = rest.slice(2).split(".");
-	expect(components).toHaveLength(3);
-	const [hashKey, start, end] = components.map(parseComponent);
-	expect(hashKey).not.toBeNull();
-	// "~min" is only a start, and "~max" is only an end.
-	expect(components[1]).not.toBe("~max");
-	expect(components[2]).not.toBe("~min");
-	return { shardGroup, kind: "r", hashKey: hashKey!, start, end };
+	const [bucketHex, ...components] = rest.slice(2).split(".");
+	expect(bucketHex).toMatch(/^[0-9a-f]{16}$/);
+	// "~min" is only a start, and "~max" is only an end. A bounded edge has two components.
+	const edge = (unbounded: string): ParsedBoundary | null => {
+		if (components[0] === unbounded) {
+			components.shift();
+			return null;
+		}
+		const [hk, sk] = components.splice(0, 2);
+		expect(sk).toBeDefined();
+		const parsed = { hk: parseComponent(hk), sk: parseComponent(sk) };
+		expect(parsed.hk).not.toBeNull();
+		expect(parsed.sk).not.toBeNull();
+		return { hk: parsed.hk!, sk: parsed.sk! };
+	};
+	const start = edge("~min");
+	const end = edge("~max");
+	expect(components).toHaveLength(0);
+	return { shardGroup, kind: "r", hashPrefixBucket: Uint8Array.fromHex(bucketHex), start, end };
 }
 
 /** The percent-encoding of each byte: printable ASCII except `"`, `%`, `.`, `\` and `~` stays literal. */
@@ -159,7 +174,25 @@ const arbComponent: fc.Arbitrary<KeyBytes> = fc.oneof(
 	fc.uint8Array({ maxLength: 16 }).map((bytes) => KeyCodec.asKeyBytes(bytes)),
 );
 
-const arbOptionalBoundary = fc.option(arbBoundary, { nil: null });
+/**
+ * A composite range boundary: the shortest separator of two composite keys, or a hash key with any
+ * sort key component, also the empty sort key.
+ */
+const arbCompositeBoundary: fc.Arbitrary<FokosCompositeKey> = fc.oneof(
+	fc
+		.tuple(arbKey, arbKey, arbKey, arbKey)
+		.map(([ahk, ask, bhk, bsk]) => [
+			{ hk: ahk, sk: ask },
+			{ hk: bhk, sk: bsk },
+		])
+		.filter(([a, b]) => KeyCodec.compareComposite(a, b) !== 0)
+		.map(([a, b]) =>
+			KeyCodec.compareComposite(a, b) < 0 ? KeyCodec.shortestCompositeSeparator(a, b) : KeyCodec.shortestCompositeSeparator(b, a),
+		),
+	fc.tuple(arbKey, arbComponent).map(([hk, sk]) => ({ hk, sk })),
+);
+
+const arbOptionalBoundary = fc.option(arbCompositeBoundary, { nil: null });
 
 /** A shard group: any text without "~", with dots, and with the prefixes of FokosDB. */
 const arbShardGroup = fc
@@ -173,7 +206,7 @@ const arbHashIdxs = fc.tuple(fc.integer({ min: 0, max: 0xffff }), fc.array(fc.in
 
 type Partition =
 	| { shardGroup: string; kind: "h"; root: number; path: number[] }
-	| { shardGroup: string; kind: "r"; hashKey: KeyBytes; start: KeyBytes | null; end: KeyBytes | null };
+	| { shardGroup: string; kind: "r"; hashPrefixBucket: HashPrefixBucket; start: FokosCompositeKey | null; end: FokosCompositeKey | null };
 
 const arbPartition: fc.Arbitrary<Partition> = fc.oneof(
 	fc
@@ -187,7 +220,7 @@ const arbPartition: fc.Arbitrary<Partition> = fc.oneof(
 	fc.record({
 		shardGroup: arbShardGroup,
 		kind: fc.constant("r" as const),
-		hashKey: arbKey,
+		hashPrefixBucket: fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asHashPrefixBucket),
 		start: arbOptionalBoundary,
 		end: arbOptionalBoundary,
 	}),
@@ -197,7 +230,7 @@ function encodePartition(partition: Partition): { bytes: Uint8Array; opaque: str
 	const helper =
 		partition.kind === "h"
 			? PartitionIdHelper.fromHashIdxs(partition.shardGroup, [partition.root, ...partition.path])
-			: PartitionIdHelper.fromRangePartition(partition.shardGroup, partition.hashKey, partition.start, partition.end);
+			: PartitionIdHelper.fromRangePartition(partition.shardGroup, partition.hashPrefixBucket, partition.start, partition.end);
 	const { bytes, opaque, doName } = helper.encode(true);
 	return { bytes, opaque, doName: doName! };
 }
@@ -207,11 +240,11 @@ function expectedParse(partition: Partition): ParsedName {
 	if (partition.kind === "h") {
 		return partition;
 	}
-	const copy = (bytes: KeyBytes | null) => (bytes === null ? null : new Uint8Array(bytes));
+	const copy = (key: FokosCompositeKey | null) => (key === null ? null : { hk: new Uint8Array(key.hk), sk: new Uint8Array(key.sk) });
 	return {
 		shardGroup: partition.shardGroup,
 		kind: "r",
-		hashKey: copy(partition.hashKey)!,
+		hashPrefixBucket: new Uint8Array(partition.hashPrefixBucket),
 		start: copy(partition.start),
 		end: copy(partition.end),
 	};
@@ -232,8 +265,13 @@ describe("partition IDs and DO names — properties", () => {
 					expect(decoded).toEqual({ schema: 0, rootIdx: partition.root, depth: partition.path.length });
 					expect(Array.from(bytes.subarray(4))).toEqual(partition.path);
 				} else {
-					expect(decoded).toEqual({ schema: 1, hashKey: partition.hashKey, startBoundary: partition.start, endBoundary: partition.end });
-					expect(PartitionIdHelper.rangeHashKey(opaque)).toEqual(partition.hashKey);
+					expect(decoded).toEqual({
+						schema: 1,
+						hashPrefixBucket: partition.hashPrefixBucket,
+						startBoundary: partition.start,
+						endBoundary: partition.end,
+					});
+					expect(PartitionIdHelper.rangeHashPrefixBucket(opaque)).toEqual(partition.hashPrefixBucket);
 				}
 				// The DO name of the decoded ID is the DO name of the partition.
 				expect(new PartitionIdHelper(partition.shardGroup, opaque).encode(true).doName).toBe(encodePartition(partition).doName);

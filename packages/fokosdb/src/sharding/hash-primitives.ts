@@ -6,12 +6,39 @@ const hashers = await xxhash();
 
 import type { KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
+import { CORE_INTERNAL_CODES, FokosInternalError } from "../shared/errors.js";
 
 // Golden Ratio constant for better hash scattering.
 // See https://softwareengineering.stackexchange.com/a/402543
 export const GOLDEN_RATIO = 0x9e3779b1;
 // The default base seed of `hashPrefixBucketSeedOf`, so a change moves every stored hashPrefixBucket. It must never change.
 export const GOLDEN_RATIO_BIGINT = BigInt(0x9e3779b1);
+
+declare const HASH_PREFIX_BUCKET_BRAND: unique symbol;
+
+/**
+ * A storage prefix: the xxHash64 of an encoded hash key, seeded per shard group, as 8 bytes,
+ * most significant byte first. The brand separates it from `KeyBytes` and from the interval bounds
+ * of `FokosStorageKey`, which are positions in the storage order and can be shorter.
+ */
+export type HashPrefixBucket = Uint8Array & { readonly [HASH_PREFIX_BUCKET_BRAND]: true };
+
+/** The byte length of a hashPrefixBucket. */
+export const HASH_PREFIX_BUCKET_BYTES = 8;
+
+/**
+ * Brands `bytes` as a hashPrefixBucket after the length check, so a wrong-length value fails where it
+ * enters, not later in a routing or a storage read.
+ */
+export function asHashPrefixBucket(bytes: Uint8Array): HashPrefixBucket {
+	if (bytes.length !== HASH_PREFIX_BUCKET_BYTES) {
+		throw new FokosInternalError(CORE_INTERNAL_CODES.invariant_failed, {
+			message: "an internal invariant failed",
+			attributes: { detail: `fokos/hash-primitives: a hashPrefixBucket is ${HASH_PREFIX_BUCKET_BYTES} bytes, got ${bytes.length}` },
+		});
+	}
+	return bytes as HashPrefixBucket;
+}
 
 export function hash64(data: string | Uint8Array, seed?: bigint): bigint {
 	if (typeof data === "string") {
@@ -30,7 +57,7 @@ export function hashPrefixBucketSeedOf(shardGroup: string, baseSeed: bigint = GO
 }
 
 /** The hashPrefixBucket of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
-export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): Uint8Array {
+export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): HashPrefixBucket {
 	return bucketBytes(hashers.h64Raw(hashKey, seed));
 }
 
@@ -39,7 +66,7 @@ const shardGroupSeeds = new Map<string, bigint>();
 const SHARD_GROUP_SEEDS_MAX = 1024;
 
 /** The hashPrefixBucket of an encoded hash key in `shardGroup`, with the seed `hashPrefixBucketSeedOf(shardGroup)`. */
-export function hashPrefixBucketOf(hashKey: KeyBytes, shardGroup: string): Uint8Array {
+export function hashPrefixBucketOf(hashKey: KeyBytes, shardGroup: string): HashPrefixBucket {
 	let seed = shardGroupSeeds.get(shardGroup);
 	if (seed === undefined) {
 		// The oldest seed goes. A hit stays one lookup, and a seed is cheap to compute again.
@@ -70,7 +97,7 @@ export class HashPrefixBucketDigitCursor {
 	#lo: number;
 	readonly root: number;
 
-	constructor(hashPrefixBucket: Uint8Array, rootTreesN: number) {
+	constructor(hashPrefixBucket: HashPrefixBucket, rootTreesN: number) {
 		// Read the bytes directly: a `DataView` for each cursor costs more than the whole walk.
 		const b = hashPrefixBucket;
 		this.#hi = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
@@ -91,7 +118,7 @@ export class HashPrefixBucketDigitCursor {
 
 /** The digits of a hashPrefixBucket: the root digit, then one digit for each level, `depth` levels. */
 export function hashPrefixBucketDigits(
-	hashPrefixBucket: Uint8Array,
+	hashPrefixBucket: HashPrefixBucket,
 	rootTreesN: number,
 	hashSplitN: number,
 	depth: number,
@@ -135,7 +162,7 @@ export function hashPrefixBucketInterval(
 	hashSplitN: number,
 	root: number,
 	path: ArrayLike<number>,
-): { start: Uint8Array; end: Uint8Array | null } {
+): { start: HashPrefixBucket; end: HashPrefixBucket | null } {
 	invariant(root < rootTreesN, "fokos/hash-primitives: the hash node is outside the topology");
 	const k = BigInt(hashSplitN);
 	let numer = BigInt(root);
@@ -159,15 +186,14 @@ const scratchView = new DataView(new ArrayBuffer(8));
 const scratchBytes = new Uint8Array(scratchView.buffer);
 
 /** The 8 bytes of `value`, most significant byte first, in a new array. */
-function bucketBytes(value: bigint): Uint8Array {
+function bucketBytes(value: bigint): HashPrefixBucket {
 	scratchView.setBigUint64(0, value, false);
-	return scratchBytes.slice();
+	return scratchBytes.slice() as HashPrefixBucket;
 }
 
 /** The unsigned byte order of two hashPrefixBuckets, which is their numeric order. */
-export function compareHashPrefixBuckets(a: Uint8Array, b: Uint8Array): number {
-	invariant(a.length === 8 && b.length === 8, "fokos/hash-primitives: hashPrefixBuckets must be 8 bytes");
-	for (let i = 0; i < 8; i++) {
+export function compareHashPrefixBuckets(a: HashPrefixBucket, b: HashPrefixBucket): number {
+	for (let i = 0; i < HASH_PREFIX_BUCKET_BYTES; i++) {
 		if (a[i] !== b[i]) {
 			return a[i] - b[i];
 		}
@@ -176,7 +202,11 @@ export function compareHashPrefixBuckets(a: Uint8Array, b: Uint8Array): number {
 }
 
 /** True when `hashPrefixBucket` is in `[start, end)`. A null `end` has no upper bound. */
-export function inHashPrefixBucketInterval(hashPrefixBucket: Uint8Array, start: Uint8Array, end: Uint8Array | null): boolean {
+export function inHashPrefixBucketInterval(
+	hashPrefixBucket: HashPrefixBucket,
+	start: HashPrefixBucket,
+	end: HashPrefixBucket | null,
+): boolean {
 	return compareHashPrefixBuckets(hashPrefixBucket, start) >= 0 && (end === null || compareHashPrefixBuckets(hashPrefixBucket, end) < 0);
 }
 

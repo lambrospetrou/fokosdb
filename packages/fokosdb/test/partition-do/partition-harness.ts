@@ -21,6 +21,7 @@ import {
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { childDigit, hashDigits } from "../hash-digits.js";
+import { hashPrefixBucketOf, type HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
@@ -81,16 +82,19 @@ export class TestPartition {
 	readonly stub: DurableObjectStub<FokosDBPartitionDO>;
 	/** The same stub with every envelope opened, as a test reads a response. */
 	readonly rpc: OpenedPartitionRpc;
+	/** The one hash key of a range tree that a test promoted, or null for a hash partition. */
+	readonly rangeHashKey: string | null;
 
-	private constructor(ctx: FokosDBRouteContext, stub?: DurableObjectStub<FokosDBPartitionDO>) {
+	private constructor(ctx: FokosDBRouteContext, stub?: DurableObjectStub<FokosDBPartitionDO>, rangeHashKey: string | null = null) {
 		this.ctx = ctx;
 		this.stub = stub ?? testPartitionStub(ctx.doName, ctx.policy.ns);
 		this.rpc = openedRpc(this.stub);
+		this.rangeHashKey = rangeHashKey;
 	}
 
 	/** Wraps a context that another partition (or a pure resolver) produced. */
-	static at(ctx: FokosDBRouteContext, stub?: DurableObjectStub<FokosDBPartitionDO>): TestPartition {
-		return new TestPartition(ctx, stub);
+	static at(ctx: FokosDBRouteContext, stub?: DurableObjectStub<FokosDBPartitionDO>, rangeHashKey: string | null = null): TestPartition {
+		return new TestPartition(ctx, stub, rangeHashKey);
 	}
 
 	get doName(): string {
@@ -149,7 +153,7 @@ export class TestPartition {
 
 	/** The children this partition reports after splitting, hash or range. */
 	async children(): Promise<TestPartition[]> {
-		return (await this.splitStatus()).childPartitionContexts.map((ctx) => TestPartition.at(ctx));
+		return (await this.splitStatus()).childPartitionContexts.map((ctx) => TestPartition.at(ctx, undefined, this.rangeHashKey));
 	}
 
 	/** The hash child that owns `hashKey`, one level down. */
@@ -188,9 +192,14 @@ export class TestPartition {
 		});
 	}
 
+	/** The hashPrefixBucket of `hashKey` in the shard group of this partition. */
+	bucketOf(hashKey: string): HashPrefixBucket {
+		return hashPrefixBucketOf(kb(hashKey), this.ctx.topology.shardGroup);
+	}
+
 	/** The range root of `hashKey`: the partition a promotion of that key creates. */
 	rangeRoot(hashKey: string): TestPartition {
-		return TestPartition.at(resolveRangePartitionContext(this.ctx, kb(hashKey), null, null));
+		return TestPartition.at(resolveRangePartitionContext(this.ctx, this.bucketOf(hashKey), null, null), undefined, hashKey);
 	}
 
 	/** Runs the partition's scheduled alarm once, through the runtime test API. A no-op if none is set. */
@@ -311,7 +320,9 @@ export class TestPartition {
 	async triggerRangeSplit(sortKey: (i: number) => string): Promise<string[]> {
 		invariant(isRangePartition(this.ctx), `${this.doName}: not a range partition`);
 		invariant(!(await this.status()).splitStatus, `${this.doName}: already splitting`);
-		const { hashKey, startBoundary, endBoundary } = rangeOf(this.ctx);
+		invariant(this.rangeHashKey !== null, `${this.doName}: the range hash key is not known`);
+		const hashKey = kb(this.rangeHashKey);
+		const { startBoundary, endBoundary } = rangeOf(this.ctx);
 		const data = "x".repeat(Math.min(RANGE_ITEM_DATA.length, Math.floor((this.maxSizeMb("range") * 1024 * 1024) / 20)));
 		const sks: string[] = [];
 		for (let i = 0; i < MAX_RANGE_FILLER_WRITES; i++) {
@@ -438,11 +449,16 @@ export class TestPartition {
 	}
 }
 
-/** The immutable range a range partition owns, decoded from its partition ID. */
+/**
+ * The immutable range a range partition owns, decoded from its partition ID. A test range tree holds
+ * the rows of one hash key, so each boundary is a sort key of that hash key, and this gives the sort keys.
+ */
 export function rangeOf(ctx: FokosDBRouteContext) {
 	const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(ctx.partitionId));
 	invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, `${ctx.doName}: not a range partition`);
-	return decoded;
+	const { startBoundary: start, endBoundary: end } = decoded;
+	invariant(start === null || end === null || KeyCodec.compare(start.hk, end.hk) === 0, `${ctx.doName}: the range has two hash keys`);
+	return { ...decoded, startBoundary: start?.sk ?? null, endBoundary: end?.sk ?? null };
 }
 
 /** What one scheduler pass on one partition left behind. */

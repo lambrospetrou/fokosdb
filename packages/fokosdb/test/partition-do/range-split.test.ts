@@ -1,3 +1,5 @@
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import invariant from "../../src/shared/invariant.js";
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
@@ -132,12 +134,12 @@ describe.concurrent("FokosDBPartitionDO — range split", () => {
 			// A depth-2 grandchild's expected ancestor is its depth-1 parent's own boundaries, decoded to
 			// wire form. Split both the leftmost child (start=null) and a non-leftmost one (start=KeyBytes)
 			// so both the null and the decode-from-KeyBytes startBoundary paths are exercised.
+			// An ancestor stores an unbounded edge as the empty composite key.
+			const empty = { hk: KeyCodec.encodeOptional(undefined), sk: KeyCodec.encodeOptional(undefined) };
 			const expectAncestor = (childCtx: FokosDBRouteContext) => {
-				return {
-					depth: 1,
-					startBoundary: rangeOf(childCtx).startBoundary ?? KeyCodec.encodeOptional(undefined),
-					endBoundary: rangeOf(childCtx).endBoundary ?? KeyCodec.encodeOptional(undefined),
-				};
+				const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(childCtx.partitionId));
+				invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "not a range partition");
+				return { depth: 1, startBoundary: decoded.startBoundary ?? empty, endBoundary: decoded.endBoundary ?? empty };
 			};
 
 			for (const child of children) {

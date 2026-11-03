@@ -226,7 +226,7 @@ describe("topology cache — hash entries", () => {
 describe("topology cache — scope", () => {
 	it("keeps the hash and range entries of two scopes apart, also for one topology object", async () => {
 		const topology = { shardGroup: `tc_${crypto.randomUUID()}`, rootTreesN: 2, hashSplitN: 2 };
-		const hashKey = KeyCodec.encode("scoped");
+		const hashKey = hashPrefixBucketOf(KeyCodec.encode("scoped"), topology.shardGroup);
 		const pending: Promise<unknown>[] = [];
 		const fetched: string[] = [];
 		const options = (scope: string | undefined, version: number): FokosTopologyCacheOptions => ({
@@ -352,57 +352,63 @@ describe("topology cache — bounded fallback", () => {
 describe("topology cache — range entries", () => {
 	const hashKey = KeyCodec.encode("u42");
 	const k = (s: string) => KeyCodec.encode(s);
-	// R [~min, ~max) into A [~min, g), B [g, p), C [p, ~max); B into [g, k), [k, p).
+	/** A boundary of the hash key `u42`. */
+	const b = (s: string) => ({ hk: hashKey, sk: k(s) });
+	// R [~min, ~max) into A [~min, g), B [g, p), C [p, ~max); B into [g, k), [k, p). Each boundary is of `u42`.
 	const rangeBody = () =>
 		encodeRangeBody({
 			epoch: 1,
 			version: 1,
-			boundaries: [k("g"), k("k"), k("p")],
+			boundaries: [b("g"), b("k"), b("p")],
 			levels: [0, 1, 0],
 			depths: [1, 2, 2, 1],
 			truncatedAtRank: null,
 		});
 	const emptyRange = () => encodeRangeBody({ epoch: 1, version: 1, boundaries: [], levels: [], depths: [], truncatedAtRank: null });
-	const hash = () => hashBody({ version: 1, promoted: [hashKey] });
-	const name = (sg: string, start: string | null, end: string | null) =>
-		resolveRangePartitionContext(
-			{ topology: { shardGroup: sg } } as FokosRouteContext<null>,
-			hashKey,
-			start === null ? null : k(start),
-			end === null ? null : k(end),
-		).doName;
-	const RANGE = topologyGetForRangePath("SG", hashKey);
+	/** The bodies of a new shard group: the promoted set and the range path hold the hashPrefixBucket of `u42` in it. */
+	const fixture = (range: (() => Uint8Array) | null) => {
+		const shardGroup = newShardGroup();
+		const bucket = hashPrefixBucketOf(hashKey, shardGroup);
+		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [KeyCodec.asKeyBytes(bucket)] })]]);
+		if (range) {
+			bodies.set(topologyGetForRangePath("SG", bucket), range);
+		}
+		const name = (start: string | null, end: string | null) =>
+			resolveRangePartitionContext(
+				{ topology: { shardGroup } } as FokosRouteContext<null>,
+				bucket,
+				start === null ? null : b(start),
+				end === null ? null : b(end),
+			).doName;
+		return { shardGroup, bodies, name };
+	};
 
 	it("enters at the range root before the range entry, then at the deepest known range partition", async () => {
-		const t = setup(
-			new Map([
-				[GET, hash],
-				[RANGE, rangeBody],
-			]),
-		);
+		const f = fixture(rangeBody);
+		const t = setup(f.bodies, undefined, {}, f.shardGroup);
 		t.client.resolve({ hashKey, sortKey: k("h") });
 		await t.settle();
-		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toBe(name(t.shardGroup, null, null));
+		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toBe(f.name(null, null));
 		await t.settle();
-		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toBe(name(t.shardGroup, "g", "k"));
-		expect(t.client.resolve({ hashKey, sortKey: k("a") }).doName).toBe(name(t.shardGroup, null, "g"));
+		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toBe(f.name("g", "k"));
+		expect(t.client.resolve({ hashKey, sortKey: k("a") }).doName).toBe(f.name(null, "g"));
 		const range = (lo: string, hi: string) =>
 			t.client.resolveRange({
 				hashKey,
 				descending: false,
 				interval: { lower: { value: k(lo), inclusive: true }, upper: { value: k(hi), inclusive: false } },
 			}).doName;
-		expect(range("h", "m")).toBe(name(t.shardGroup, "g", "p"));
-		expect(range("a", "h")).toBe(name(t.shardGroup, null, null));
+		expect(range("h", "m")).toBe(f.name("g", "p"));
+		expect(range("a", "h")).toBe(f.name(null, null));
+		// With no upper bound, the request ends below the next hash key.
+		expect(t.client.resolveRange({ hashKey, descending: false, interval: { lower: { value: k("q"), inclusive: true } } }).doName).toBe(
+			f.name("p", null),
+		);
 	});
 
 	it("uses the hash path when the range entry is empty", async () => {
-		const t = setup(
-			new Map([
-				[GET, hash],
-				[RANGE, emptyRange],
-			]),
-		);
+		const f = fixture(emptyRange);
+		const t = setup(f.bodies, undefined, {}, f.shardGroup);
 		t.client.resolve({ hashKey, sortKey: k("h") });
 		await t.settle();
 		t.client.resolve({ hashKey, sortKey: k("h") });
@@ -413,13 +419,19 @@ describe("topology cache — range entries", () => {
 	});
 
 	it("completes through the hash path when the range root of a Bloom hit does not exist", async () => {
-		let shardGroup = "";
-		const t = setup(new Map([[GET, hash]]), (doName) =>
-			doName === name(shardGroup, null, null)
-				? new FokosRoutingError(SHARDING_ROUTING_CODES.range_partition_not_initialized, { message: "no identity", attributes: { doName } })
-				: null,
+		const f = fixture(null);
+		const t = setup(
+			f.bodies,
+			(doName) =>
+				doName === f.name(null, null)
+					? new FokosRoutingError(SHARDING_ROUTING_CODES.range_partition_not_initialized, {
+							message: "no identity",
+							attributes: { doName },
+						})
+					: null,
+			{},
+			f.shardGroup,
 		);
-		shardGroup = t.shardGroup;
 		t.client.resolve({ hashKey, sortKey: k("h") });
 		await t.settle();
 		const result = await t.client.point("op", { hashKey, sortKey: k("h") }, { n: 1 });

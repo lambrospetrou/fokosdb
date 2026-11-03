@@ -16,6 +16,7 @@ import type { FokosImportRecord } from "../../src/sharding/repartition-types.js"
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
+import { partitionPrefixOf } from "../storage-prefix.js";
 import { captureConsoleError } from "../partition-do/helpers.js";
 import {
 	controlledPartition,
@@ -228,6 +229,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		await rpc.status(pCtx);
 		await runInDurableObject(stub, async (_instance, state: DurableObjectState) => {
 			new PartitionStore(state.storage).insertPendingLock({
+				prefix: partitionPrefixOf(state)(KeyCodec.encode(lockKey.hashKey)),
 				hk: KeyCodec.encode(lockKey.hashKey),
 				sk: KeyCodec.encode(lockKey.sortKey),
 				transaction_id: first.transactionId,
