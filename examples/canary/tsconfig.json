@@ -1,0 +1,9 @@
+{
+	"extends": "../../packages/fokosdb/tsconfig.json",
+	"compilerOptions": {
+		// This worker is a separate wrangler project, so it has its own generated Env.
+		"types": ["./worker-configuration.d.ts", "node"]
+	},
+	"include": ["./**/*.ts", "./worker-configuration.d.ts"],
+	"exclude": []
+}

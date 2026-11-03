@@ -15,6 +15,28 @@ importers:
         specifier: 3.8.3
         version: 3.8.3
 
+  examples/canary:
+    dependencies:
+      fokosdb:
+        specifier: workspace:*
+        version: link:../../packages/fokosdb
+      hono:
+        specifier: ^4.12.22
+        version: 4.13.5
+      valibot:
+        specifier: ^1.4.0
+        version: 1.4.2(typescript@5.9.3)
+    devDependencies:
+      '@types/node':
+        specifier: ^25.6.0
+        version: 25.9.5
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: ^4.140.0
+        version: 4.140.0(@types/node@25.9.5)
+
   examples/http-api:
     dependencies:
       fokosdb:
