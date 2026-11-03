@@ -5,12 +5,14 @@ const ITEMS_PER_BATCH = 100;
 /**
  * `batchWriteItems` of 100 puts, then `batchGetItems` of the same 100 keys: read-your-writes across
  * the partitions the keys spread over.
- * `iter` doubles: write_ms, read_ms, write_ok, write_unprocessed, read_found, read_not_found, read_unprocessed.
+ * `iter` doubles: total_ms, write_ms, read_ms, write_ok_n, write_unprocessed_n, read_found_n,
+ * read_not_found_n, read_unprocessed_n.
  */
 export const batch: Workload = {
 	defaults: { iterations: 15, concurrency: 3, budgetMs: 35_000 },
 	async tick(s) {
 		const iterationsDone = await s.runIterations(async (i) => {
+			const start = Date.now();
 			const keys = Array.from({ length: ITEMS_PER_BATCH }, (_, j) => `b:${s.names.instance}:${i}:${j}`);
 			const write = await s.op(() =>
 				s.db.batchWriteItems({
@@ -23,6 +25,7 @@ export const batch: Workload = {
 			const readRes = read.result?.items ?? [];
 			s.iter(
 				[
+					Date.now() - start,
 					write.ms,
 					read.ms,
 					count(writeRes, "ok"),

@@ -49,22 +49,46 @@ calls `tick` on instance `DEMO_CRON_INSTANCE`. Runs are independent objects, so 
 
 ## Analytics Engine points
 
-Dataset `fokos_canary`, bound as `ANALYTICS`. Blobs always start
-`blob1=pointType, blob2=workload, blob3=placement, blob4=instance, blob5=outcome`; the index is
-`placement|workload|instance`.
+Dataset `fokos_canary`, bound as `ANALYTICS`. Every point carries
+`blob1=pointType, blob2=workload, blob3=placement, blob4=instance, blob5=outcome,
+blob6=actor_id, blob7=actor_name, blob8=colo, blob9=loc` — the runner object that publishes the
+point and the region its isolate runs in — and the index `placement|workload|instance`. An
+invocation publishes at most 250 points; overruns count in `tick`'s `dropped_n`.
 
-- `runner` — `[boot_age_ms]`; blob6=colo, blob7=loc.
-- `seed` — `[seeded_items, seed_ms]`.
-- `iter` — per iteration; doubles per workload:
-  - `crud`: `[put_ms, get_ms, delete_ms, get_miss_ms, database_size, forwards]`
-  - `tx`: `[ms, partitions, forwards]`, blob6 = lane (`write` | `read` | `ordered`)
-  - `query`: `[pages, items, ms_total, forwards, partition_visits]`, blob6 = pattern
-  - `batch`: `[write_ms, read_ms, write_ok, write_unprocessed, read_found, read_not_found, read_unprocessed]`
-  - `ttl`: `[lag_ms, polls]` (`lag_ms` = −1 when the item outlived the budget; outcome `ttl_pending`)
-- `cold` — first call served by a partition name: `[op_ms, database_size]`, blob6 = actor name.
-- `tick` — run summary: `[iterations_done, elapsed_ms, ops, errors, dropped_points]`.
-- `busy` — a `tick` that found a phase already running.
-- `cleanup` — `[elapsed_ms]`.
+Doubles follow one convention everywhere: `*_ms` durations first, then `*_n` counts, then `*_bytes`
+sizes. In `iter` points `double1` is always `total_ms`, the wall-clock duration of one iteration —
+for a workload that runs its ops in parallel it is the elapsed span, not a sum of the op durations —
+so one chart can plot iteration latency across all workloads.
+
+### Runner events, in publish order within a `tick`
+
+- `runner` — a `tick` starts. No doubles; the point marks the run and carries the actor and
+  location blobs.
+- `seed` — the lazy setup seeded the table. Published only on the first `tick` of a table, or the
+  first `tick` after a `cleanup`. `[seed_ms, items_n]`.
+- `cold` — a partition actor name served this table for the first time. `[op_ms, database_bytes]`,
+  blob10 = actor name. The runner persists the seen set and reports each actor once until `cleanup`
+  resets it: this is the new-partition signal (split children, cold starts).
+- `iter` — one per workload iteration. See below for the per-workload doubles.
+- `tick` — the run summary. `[elapsed_ms, iterations_n, ops_n, errors_n, dropped_n]`.
+
+### Other runner events
+
+- `busy` — a `tick` arrived while a phase already ran; the run was skipped. No doubles.
+- `cleanup` — the `cleanup` phase destroyed the table. `[elapsed_ms]`.
+
+### `iter` doubles per workload
+
+| workload | doubles                                                                                                            | blob10                           |
+| -------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------- |
+| `crud`   | `total_ms, put_ms, get_ms, delete_ms, miss_ms, forwards_n, database_bytes`                                         | —                                |
+| `tx`     | `total_ms, partitions_n, forwards_n`                                                                               | lane: `write`, `read`, `ordered` |
+| `query`  | `total_ms, pages_n, items_n, forwards_n, visits_n`                                                                 | query pattern                    |
+| `batch`  | `total_ms, write_ms, read_ms, write_ok_n, write_unprocessed_n, read_found_n, read_not_found_n, read_unprocessed_n` | —                                |
+| `ttl`    | `total_ms, lag_ms, polls_n`                                                                                        | —                                |
+
+The `outcome` blob reports the first non-ok outcome of the iteration (a FokosDB error code, or
+`ttl_pending` when the item outlived the budget). `transaction_cancelled` is a normal `tx` outcome.
 
 ## Layout
 
@@ -81,6 +105,7 @@ Dataset `fokos_canary`, bound as `ANALYTICS`. Blobs always start
 
 - `hash-grow` workload: uniform writes that grow partitions toward the real 500 MB split cap.
 - `range-grow` workload: one hot hash key to exercise promotion and range splits.
+- Runner cold-start measure: caller-side `tick` latency that includes isolate boot.
 - Migration telemetry: `partition_migrating` windows and `awaiting_data` durations per child partition.
 - `walk()` census point: tree depth, router/owner counts, `importState` per table per tick.
 - Coordinator split visibility: sustained unique-token transactions on a small coordinator cap.

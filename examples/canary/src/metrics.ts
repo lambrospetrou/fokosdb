@@ -3,21 +3,32 @@ import type { DemoNames } from "./shared.js";
 
 /**
  * Workers Analytics Engine accepts at most 250 data points per invocation, 20 blobs, 20 doubles and
- * one index per point. Every point carries `pointType, workload, placement, instance, outcome` as its
- * first blobs, so a dashboard can select and decode the doubles by point type.
+ * one index per point. Every point carries `pointType, workload, placement, instance, outcome,
+ * actor_id, actor_name, colo, loc` as its first blobs, so a dashboard can select and decode the
+ * doubles by point type.
  */
 const POINT_CAP = 250;
+
+/** Who publishes a point: the runner Durable Object and the region its isolate runs in. */
+export type MetricsActor = {
+	id: string;
+	name: string;
+	colo: string;
+	loc: string;
+};
 
 export class Metrics {
 	#env: Env;
 	#base: string[];
+	#actor: string[];
 	#index: string[];
 	#written = 0;
 	#dropped = 0;
 
-	constructor(env: Env, names: DemoNames) {
+	constructor(env: Env, names: DemoNames, actor: MetricsActor) {
 		this.#env = env;
 		this.#base = [names.workload, names.placement, names.instance];
+		this.#actor = [actor.id, actor.name, actor.colo, actor.loc];
 		this.#index = [`${names.placement}|${names.workload}|${names.instance}`];
 	}
 
@@ -28,7 +39,7 @@ export class Metrics {
 		}
 		this.#written++;
 		this.#env.ANALYTICS.writeDataPoint({
-			blobs: [pointType, ...this.#base, outcome, ...blobs],
+			blobs: [pointType, ...this.#base, outcome, ...this.#actor, ...blobs],
 			doubles,
 			indexes: this.#index,
 		});

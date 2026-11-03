@@ -26,7 +26,7 @@ const BALANCE_PLUS_ONE = [
  * - `write`: a multi-partition `transactWriteItems` — put, update, check over three accounts.
  * - `read`: a `transactGetItems` over four accounts.
  * - `ordered`: an `ordered_per_item` chain on one account.
- * `iter` doubles: ms, partitions, forwards. blob6 is the lane. `transaction_cancelled` is a normal outcome.
+ * `iter` doubles: total_ms, partitions_n, forwards_n. blob10 is the lane. `transaction_cancelled` is a normal outcome.
  */
 export const tx: Workload = {
 	defaults: { iterations: 10, concurrency: 1, budgetMs: 35_000 },
