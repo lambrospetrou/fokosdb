@@ -9,13 +9,14 @@ import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js"
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
-import { asHashPrefixBucket, HASH_PREFIX_BUCKET_BYTES, type HashPrefixBucket } from "./hash-primitives.js";
+import { asHashPrefixBucket, compareHashPrefixBuckets, HASH_PREFIX_BUCKET_BYTES, type HashPrefixBucket } from "./hash-primitives.js";
 import {
 	BODY_SCHEMA,
 	HASH_BODY_MAGIC,
 	hashBit,
 	hashRank1,
 	popcount32,
+	promotedBucketsInOrder,
 	RANGE_BODY_MAGIC,
 	TOPOLOGY_RANK_BLOCK_WORDS,
 	type FokosTopologyEvent,
@@ -451,19 +452,76 @@ function rankIndex(bits: Uint8Array, bitCount: number): Uint32Array {
 
 export type TopologyBloomSection = { bits: Uint8Array; k: number; m: number; capacity: number; count: number; errorRate: number };
 
+/** The hashPrefixBuckets of a parsed `promoted` section, in their stored order. */
+export function* promotedSectionBuckets(section: { bytes: Uint8Array; count: number }): Iterable<HashPrefixBucket> {
+	for (let i = 0; i < section.count; i++) {
+		yield asHashPrefixBucket(section.bytes.subarray(i * HASH_PREFIX_BUCKET_BYTES, (i + 1) * HASH_PREFIX_BUCKET_BYTES));
+	}
+}
+
+/**
+ * The merge of two sorted hashPrefixBucket streams, packed for a `promoted` section. An equal value
+ * goes in once, from the same stream or from the two streams.
+ */
+export function mergePromotedBuckets(base: Iterable<HashPrefixBucket>, added: Iterable<HashPrefixBucket>): Uint8Array {
+	const a = base[Symbol.iterator]();
+	const b = added[Symbol.iterator]();
+	let x = a.next();
+	let y = b.next();
+	const chunks: HashPrefixBucket[] = [];
+	const take = (v: HashPrefixBucket) => {
+		// The output is sorted, so a repeated value is equal to the last value that went in.
+		if (chunks.length === 0 || compareHashPrefixBuckets(chunks[chunks.length - 1], v) !== 0) {
+			chunks.push(v);
+		}
+	};
+	while (!x.done || !y.done) {
+		if (y.done || (!x.done && compareHashPrefixBuckets(x.value, y.value) <= 0)) {
+			take(x.value!);
+			x = a.next();
+		} else {
+			take(y.value);
+			y = b.next();
+		}
+	}
+	const out = new Uint8Array(chunks.length * HASH_PREFIX_BUCKET_BYTES);
+	chunks.forEach((chunk, i) => out.set(chunk, i * HASH_PREFIX_BUCKET_BYTES));
+	return out;
+}
+
 export function encodeHashBody(input: {
 	epoch: number;
 	version: bigint | number;
 	rootTreesN: number;
 	hashSplitN: number;
 	bitmap: { bits: Uint8Array; bitCount: number };
+	/** The packed sorted hashPrefixBuckets of the `promoted` section, or null when the body uses `bloom`. */
+	promoted: Uint8Array | null;
 	bloom: TopologyBloomSection | null;
 }): Uint8Array {
+	// The promoted set is the list or the Bloom filter: a body carries only one of the two sections.
+	invariant(
+		input.promoted === null || input.bloom === null,
+		"fokos/topology-encode: a hash body has a promoted list or a Bloom filter, not both",
+	);
 	const rank = rankIndex(input.bitmap.bits, input.bitmap.bitCount);
 	const sections: BodySection[] = [
 		{ name: "bitmap", bytes: input.bitmap.bits, meta: { bitCount: input.bitmap.bitCount } },
 		{ name: "rank", bytes: new Uint8Array(rank.buffer), meta: { count: rank.length } },
 	];
+	if (input.promoted) {
+		invariant(
+			input.promoted.length % HASH_PREFIX_BUCKET_BYTES === 0,
+			"fokos/topology-encode: the promoted section is not packed hashPrefixBuckets",
+		);
+		// A reader refuses an unordered section, so the keeper must not store one.
+		invariant(promotedBucketsInOrder(input.promoted), "fokos/topology-encode: the promoted section is not in strict order");
+		sections.push({
+			name: "promoted",
+			bytes: input.promoted,
+			meta: { count: input.promoted.length / HASH_PREFIX_BUCKET_BYTES, width: HASH_PREFIX_BUCKET_BYTES },
+		});
+	}
 	if (input.bloom) {
 		const { bits, ...meta } = input.bloom;
 		sections.push({ name: "bloom", bytes: bits, meta: { length: bits.length, ...meta } });

@@ -1,8 +1,14 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { asHashPrefixBucket, hashPrefixBucketDigits, hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
+import {
+	asHashPrefixBucket,
+	compareHashPrefixBuckets,
+	hashPrefixBucketDigits,
+	hashPrefixBucketOf,
+	type HashPrefixBucket,
+} from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
-import { findLeaf, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
+import { findLeaf, isPromotedHashPrefixBucket, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import {
 	encodeHashBitmap,
@@ -10,7 +16,9 @@ import {
 	encodeRangeBody,
 	hashNodeKey,
 	mergeHashBitmap,
+	mergePromotedBuckets,
 	promotedKeysBloom,
+	promotedSectionBuckets,
 	TOPOLOGY_BLOOM_MIN_CAPACITY,
 } from "./topology-encode.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
@@ -82,6 +90,7 @@ function encodeForest(forest: Forest): Uint8Array {
 		rootTreesN: forest.R,
 		hashSplitN: forest.K,
 		bitmap: encodeHashBitmap(forest.R, forest.K, keys.length, () => keys),
+		promoted: null,
 		bloom: null,
 	});
 }
@@ -121,7 +130,15 @@ describe("topology codec — hash body", () => {
 
 	it("gives the root for a body with no split", () => {
 		const view = parseHashBody(
-			encodeHashBody({ epoch: 0, version: 0, rootTreesN: 0, hashSplitN: 0, bitmap: { bits: new Uint8Array(0), bitCount: 0 }, bloom: null }),
+			encodeHashBody({
+				epoch: 0,
+				version: 0,
+				rootTreesN: 0,
+				hashSplitN: 0,
+				bitmap: { bits: new Uint8Array(0), bitCount: 0 },
+				promoted: null,
+				bloom: null,
+			}),
 		);
 		expect(view.bitCount).toBe(0);
 		const bucket = bk("k");
@@ -163,6 +180,154 @@ describe("topology codec — hash body", () => {
 	});
 });
 
+describe("topology codec — the promoted list", () => {
+	const emptyBody = (promoted: Uint8Array | null) =>
+		encodeHashBody({
+			epoch: 1,
+			version: 1,
+			rootTreesN: 0,
+			hashSplitN: 0,
+			bitmap: { bits: new Uint8Array(0), bitCount: 0 },
+			promoted,
+			bloom: null,
+		});
+
+	const bucketArb = fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asHashPrefixBucket);
+
+	it("finds each bucket of the list and no other, at every size up to the limit", () => {
+		fc.assert(
+			fc.property(fc.uniqueArray(bucketArb, { maxLength: 4_096 }), fc.array(bucketArb, { maxLength: 20 }), (members, probes) => {
+				const sorted = [...members].sort(compareHashPrefixBuckets);
+				const view = parseHashBody(emptyBody(mergePromotedBuckets([], sorted)));
+				for (const bucket of members) {
+					expect(isPromotedHashPrefixBucket(view, bucket)).toBe("exact");
+				}
+				const held = new Set(members.map((b) => b.toHex()));
+				for (const probe of probes) {
+					expect(isPromotedHashPrefixBucket(view, probe)).toBe(held.has(probe.toHex()) ? "exact" : false);
+				}
+			}),
+			{ numRuns: 30 },
+		);
+	});
+
+	it("finds each bucket of the largest list", () => {
+		const members = Array.from({ length: 4_096 }, (_, i) => {
+			const bucket = new Uint8Array(8);
+			new DataView(bucket.buffer).setUint32(4, i);
+			return asHashPrefixBucket(bucket);
+		});
+		const view = parseHashBody(emptyBody(mergePromotedBuckets([], members)));
+		expect(view.promoted?.count).toBe(4_096);
+		for (const bucket of members) {
+			expect(isPromotedHashPrefixBucket(view, bucket)).toBe("exact");
+		}
+		const absent = new Uint8Array(8);
+		new DataView(absent.buffer).setUint32(4, 4_096);
+		expect(isPromotedHashPrefixBucket(view, asHashPrefixBucket(absent))).toBe(false);
+	});
+
+	it("refuses a section with another width, a count outside the body, or values out of order", () => {
+		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b2 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
+		const ordered = mergePromotedBuckets([], [b1, b2]);
+		// The header is JSON, so a one-digit field changes in place, at the same length.
+		const patched = (from: string, to: string) => {
+			const body = emptyBody(ordered);
+			const i = new TextDecoder().decode(body).indexOf(from);
+			expect(i).toBeGreaterThanOrEqual(0);
+			body.set(new TextEncoder().encode(to), i);
+			return body;
+		};
+		expect(() => parseHashBody(patched('"width":8', '"width":9'))).toThrow(/promoted section/);
+		// `count` 9 needs 72 bytes, more than the 16 of the section.
+		expect(() => parseHashBody(patched('"count":2', '"count":9'))).toThrow(/promoted section/);
+		// The encoder refuses an unordered list, so the test changes the last byte of b1 in the body.
+		// The section is the last one, so b1 ends 9 bytes before the end of the body.
+		const withFirstLastByte = (value: number) => {
+			const body = emptyBody(ordered);
+			body[body.length - 9] = value;
+			return body;
+		};
+		// Values out of order: 3 before 2.
+		expect(() => parseHashBody(withFirstLastByte(3))).toThrow(/not in order/);
+		// A repeated value is not in order either.
+		expect(() => parseHashBody(withFirstLastByte(2))).toThrow(/not in order/);
+	});
+
+	it("refuses a body with a promoted section and a bloom section", () => {
+		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const body = encodeHashBody({
+			epoch: 1,
+			version: 1,
+			rootTreesN: 0,
+			hashSplitN: 0,
+			bitmap: { bits: new Uint8Array(0), bitCount: 0 },
+			promoted: null,
+			bloom: promotedKeysBloom(1, () => [b1]),
+		});
+		// The encoder refuses both sections, so the test writes a new header with an empty promoted
+		// section. The sections move 256 bytes to the back, which gives space for the longer header.
+		const shift = 256;
+		const headerLength = new DataView(body.buffer, body.byteOffset).getUint32(4, true);
+		const header = JSON.parse(new TextDecoder().decode(body.subarray(8, 8 + headerLength)));
+		const sectionsStart = (8 + headerLength + 7) & ~7;
+		for (const section of Object.values<{ offset: number }>(header.sections)) {
+			section.offset += shift;
+		}
+		header.sections.promoted = { offset: header.sections.bloom.offset, count: 0, width: 8 };
+		const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+		expect(8 + headerBytes.length).toBeLessThanOrEqual(sectionsStart + shift);
+		const both = new Uint8Array(body.length + shift);
+		both.set(body.subarray(0, 4), 0);
+		new DataView(both.buffer).setUint32(4, headerBytes.length, true);
+		both.set(headerBytes, 8);
+		both.set(body.subarray(sectionsStart), sectionsStart + shift);
+		expect(() => parseHashBody(both)).toThrow(/promoted section and a bloom section/);
+	});
+
+	it("does not encode a list out of order, or a body with both sections", () => {
+		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b2 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
+		expect(() => emptyBody(new Uint8Array([...b2, ...b1]))).toThrow(invariantFailure(/not in strict order/));
+		expect(() => emptyBody(new Uint8Array([...b1, ...b1]))).toThrow(invariantFailure(/not in strict order/));
+		expect(() =>
+			encodeHashBody({
+				epoch: 1,
+				version: 1,
+				rootTreesN: 0,
+				hashSplitN: 0,
+				bitmap: { bits: new Uint8Array(0), bitCount: 0 },
+				promoted: new Uint8Array(b1),
+				bloom: promotedKeysBloom(1, () => [b1]),
+			}),
+		).toThrow(invariantFailure(/not both/));
+	});
+
+	it("writes a repeated value once, from one stream or from both", () => {
+		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b2 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
+		const once = new Uint8Array([...b1, ...b2]);
+		expect(mergePromotedBuckets([], [b1, b1, b2])).toEqual(once);
+		expect(mergePromotedBuckets([b1, b1], [b2, b2])).toEqual(once);
+		expect(mergePromotedBuckets([b1, b2], [b1, b2])).toEqual(once);
+	});
+
+	it("merges a stored list and new roots in one pass, equal to a build of every root", () => {
+		fc.assert(
+			fc.property(fc.uniqueArray(bucketArb, { maxLength: 200 }), fc.uniqueArray(bucketArb, { maxLength: 200 }), (base, added) => {
+				const stored = mergePromotedBuckets([], [...base].sort(compareHashPrefixBuckets));
+				const view = parseHashBody(emptyBody(stored));
+				// The keeper sorts the reported roots before the merge; the index gives them in seq order.
+				const merged = mergePromotedBuckets(promotedSectionBuckets(view.promoted!), [...added].sort(compareHashPrefixBuckets));
+				const all = mergePromotedBuckets([], [...base, ...added].sort(compareHashPrefixBuckets));
+				expect(merged).toEqual(all);
+			}),
+			{ numRuns: 50 },
+		);
+	});
+});
+
 describe("topology codec — merge of new hash splits", () => {
 	function merged(before: Forest, after: Forest): Uint8Array {
 		const added = sortedNodeKeys([...after.children.keys()].filter((node) => !before.children.has(node)));
@@ -172,6 +337,7 @@ describe("topology codec — merge of new hash splits", () => {
 			rootTreesN: after.R,
 			hashSplitN: after.K,
 			bitmap: mergeHashBitmap(parseHashBody(encodeForest(before)), after.children.size, added),
+			promoted: null,
 			bloom: null,
 		});
 	}

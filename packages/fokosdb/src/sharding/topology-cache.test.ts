@@ -15,19 +15,35 @@ import {
 	topologyGetPath,
 	type FokosTopologyCacheOptions,
 } from "./topology-cache.js";
-import { findLeaf } from "./topology-codec.js";
-import { encodeHashBitmap, encodeHashBody, encodeRangeBody, hashNodeKey, promotedKeysBloom } from "./topology-encode.js";
+import { findLeaf, isPromotedHashPrefixBucket, parseHashBody } from "./topology-codec.js";
+import {
+	encodeHashBitmap,
+	encodeHashBody,
+	encodeRangeBody,
+	hashNodeKey,
+	mergePromotedBuckets,
+	promotedKeysBloom,
+} from "./topology-encode.js";
 import { hashDigits } from "../../test/hash-digits.js";
-import { hashPrefixBucketOf } from "./hash-primitives.js";
+import { compareHashPrefixBuckets, hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
 
 type Ops = { op: { req: { n: number }; res: string } };
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 
-function hashBody(opts: { version: number; R?: number; K?: number; splits?: Uint8Array[]; promoted?: KeyBytes[] }): Uint8Array {
+function hashBody(opts: {
+	version: number;
+	R?: number;
+	K?: number;
+	splits?: Uint8Array[];
+	promoted?: HashPrefixBucket[];
+	/** The section the promoted set goes into, as the keeper picks by its count. Default "list". */
+	promotedAs?: "list" | "bloom";
+}): Uint8Array {
 	const R = opts.R ?? 2;
 	const K = opts.K ?? 2;
 	const promoted = opts.promoted ?? [];
+	const asList = (opts.promotedAs ?? "list") === "list";
 	// Each test splits roots only, so the order of `splits` is the byte order of the node keys.
 	const nodes = (opts.splits ?? []).map(hashNodeKey);
 	return encodeHashBody({
@@ -36,7 +52,8 @@ function hashBody(opts: { version: number; R?: number; K?: number; splits?: Uint
 		rootTreesN: R,
 		hashSplitN: K,
 		bitmap: encodeHashBitmap(R, K, nodes.length, () => nodes),
-		bloom: promotedKeysBloom(promoted.length, () => promoted),
+		promoted: asList ? mergePromotedBuckets([], [...promoted].sort(compareHashPrefixBuckets)) : null,
+		bloom: asList ? null : promotedKeysBloom(promoted.length, () => promoted),
 	});
 }
 
@@ -182,6 +199,7 @@ describe("topology cache — hash entries", () => {
 					rootTreesN: 2,
 					hashSplitN: 2,
 					bitmap: { bits, bitCount: bits.length * 8 },
+					promoted: null,
 					bloom: null,
 				});
 			},
@@ -281,6 +299,7 @@ describe("topology cache — bounded fallback", () => {
 			rootTreesN: 2,
 			hashSplitN: 2,
 			bitmap: encodeHashBitmap(2, 2, nodes.length, () => nodes),
+			promoted: null,
 			bloom: promotedKeysBloom(0, () => []),
 		});
 		const t = setup(
@@ -369,7 +388,7 @@ describe("topology cache — range entries", () => {
 	const fixture = (range: (() => Uint8Array) | null) => {
 		const shardGroup = newShardGroup();
 		const bucket = hashPrefixBucketOf(hashKey, shardGroup);
-		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [KeyCodec.asKeyBytes(bucket)] })]]);
+		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [bucket] })]]);
 		if (range) {
 			bodies.set(topologyGetForRangePath("SG", bucket), range);
 		}
@@ -406,18 +425,6 @@ describe("topology cache — range entries", () => {
 		);
 	});
 
-	it("uses the hash path when the range entry is empty", async () => {
-		const f = fixture(emptyRange);
-		const t = setup(f.bodies, undefined, {}, f.shardGroup);
-		t.client.resolve({ hashKey, sortKey: k("h") });
-		await t.settle();
-		t.client.resolve({ hashKey, sortKey: k("h") });
-		await t.settle();
-		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toBe(
-			PartitionIdHelper.hashId(t.shardGroup, childOf(t.shardGroup, hashKey).root).doName,
-		);
-	});
-
 	it("completes through the hash path when the range root of a Bloom hit does not exist", async () => {
 		const f = fixture(null);
 		const t = setup(
@@ -437,5 +444,78 @@ describe("topology cache — range entries", () => {
 		const result = await t.client.point("op", { hashKey, sortKey: k("h") }, { n: 1 });
 		expect(result.clientRpcs).toBe(2);
 		expect(result.value).toBe(PartitionIdHelper.hashId(t.shardGroup, childOf(t.shardGroup, hashKey).root).doName);
+	});
+
+	it.each(["list", "bloom"] as const)("starts one range fetch on a positive %s answer, and none on a negative", async (promotedAs) => {
+		const shardGroup = newShardGroup();
+		const hit = hashPrefixBucketOf(hashKey, shardGroup);
+		const body = hashBody({ version: 1, promoted: [hit], promotedAs });
+		// A Bloom filter can hold a key that is not promoted, so the miss comes from the built body.
+		const view = parseHashBody(body);
+		const missKey = Array.from({ length: 500 }, (_, i) => `miss-${i}`).find(
+			(candidate) => !isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode(candidate), shardGroup)),
+		)!;
+		const miss = { hashKey: KeyCodec.encode(missKey), sortKey: k("h") };
+		const bodies = new Map([[GET, () => body]]);
+		bodies.set(topologyGetForRangePath("SG", hit), rangeBody);
+		// The entries stay fresh, so only a promoted-set hit starts a read.
+		const t = setup(bodies, undefined, { refreshMs: Number.MAX_SAFE_INTEGER }, shardGroup);
+		t.client.resolve({ hashKey, sortKey: k("h") });
+		await t.settle();
+		expect(t.fetched).toEqual([topologyGetPath(shardGroup)]);
+		// The hit needs two reads: the hash body, then the range body.
+		t.client.resolve({ hashKey, sortKey: k("h") });
+		await t.settle();
+		expect(t.fetched).toEqual([topologyGetPath(shardGroup), topologyGetForRangePath(shardGroup, hit)]);
+		expect(t.client.resolve({ hashKey, sortKey: k("h") }).doName).toContain("~r.");
+		// The miss stops at the hash body: no range fetch, and the answer is the hash partition.
+		t.client.resolve(miss);
+		await t.settle();
+		expect(t.fetched).toHaveLength(2);
+		expect(t.client.resolve(miss).doName).toBe(PartitionIdHelper.hashId(shardGroup, childOf(shardGroup, miss.hashKey).root).doName);
+	});
+
+	it.each([
+		["list", true],
+		["bloom", false],
+	] as const)("with speculative false, sends a %s hit with no range entry to the range root: %s", async (promotedAs, toRangeRoot) => {
+		const shardGroup = newShardGroup();
+		const hit = hashPrefixBucketOf(hashKey, shardGroup);
+		// No range body: the range entry is not in the cache.
+		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [hit], promotedAs })]]);
+		const t = setup(bodies, undefined, { refreshMs: Number.MAX_SAFE_INTEGER }, shardGroup);
+		t.client.resolve({ hashKey, sortKey: k("h") });
+		await t.settle();
+		const doName = t.client.resolve({ hashKey, sortKey: k("h") }, { speculative: false }).doName;
+		// A list hit is exact, so its range root exists. A Bloom hit can be false, so it stays at the hash partition.
+		if (toRangeRoot) {
+			expect(doName).toContain("~r.");
+		} else {
+			expect(doName).toBe(PartitionIdHelper.hashId(shardGroup, childOf(shardGroup, hashKey).root).doName);
+		}
+	});
+
+	it.each([
+		["list", true],
+		["bloom", false],
+	] as const)("sends a %s hit with a range entry that has no segment to the range root: %s", async (promotedAs, toRangeRoot) => {
+		const shardGroup = newShardGroup();
+		const hit = hashPrefixBucketOf(hashKey, shardGroup);
+		// The keeper serves a range body with no segment until it builds the range body of the bucket.
+		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [hit], promotedAs })]]);
+		bodies.set(topologyGetForRangePath("SG", hit), emptyRange);
+		const t = setup(bodies, undefined, { refreshMs: Number.MAX_SAFE_INTEGER }, shardGroup);
+		t.client.resolve({ hashKey, sortKey: k("h") });
+		await t.settle();
+		t.client.resolve({ hashKey, sortKey: k("h") });
+		await t.settle();
+		expect(t.fetched).toEqual([topologyGetPath(shardGroup), topologyGetForRangePath(shardGroup, hit)]);
+		const doName = t.client.resolve({ hashKey, sortKey: k("h") }).doName;
+		// A list hit is exact, so the range root exists. For a Bloom hit, the entry shows a false positive.
+		if (toRangeRoot) {
+			expect(doName).toContain("~r.");
+		} else {
+			expect(doName).toBe(PartitionIdHelper.hashId(shardGroup, childOf(shardGroup, hashKey).root).doName);
+		}
 	});
 });

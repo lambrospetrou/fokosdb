@@ -13,7 +13,7 @@ import {
 	type KeyBytes,
 } from "../../src/sharding/index-server.js";
 import {
-	maybePromoted,
+	isPromotedHashPrefixBucket,
 	parseHashBody,
 	parseRangeBody,
 	rangeBoundaryAt,
@@ -24,10 +24,11 @@ import {
 	type RangeTopologyView,
 } from "../../src/sharding/topology-codec.js";
 import { bucketPromotionReport, hashSplitReport, promotionReport, rangeSplitReport } from "./topology-events.js";
-import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import { asHashPrefixBucket, compareHashPrefixBuckets, hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
 import type { FokosCompositeKey } from "../../src/sharding/key-codec.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
-import { fokosErrorWith } from "../errors-matchers.js";
+import { fokosErrorWith, invariantFailure } from "../errors-matchers.js";
+import { promotedSectionBuckets } from "../../src/sharding/topology-encode.js";
 
 const LATER = Number.MAX_SAFE_INTEGER;
 
@@ -202,13 +203,67 @@ describe("topology keeper — reports", () => {
 		});
 	});
 
-	it("puts the promoted keys in the Bloom filter of the hash body", async () => {
+	it("puts the promoted hashPrefixBuckets in the promoted list of the hash body", async () => {
 		await withKeeper(async (keeper, { sg }) => {
 			await keeper.registerRepartition(promotionReport(sg, KeyCodec.encode("u42"), 0, 2, 2));
 			keeper.runDueBuilds(LATER);
 			const view = parseHashBody(body(keeper.getTopology(sg)));
-			expect(maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode("u42"), sg))).toBe(true);
-			expect(maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode("u43"), sg))).toBe(false);
+			expect(isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode("u42"), sg))).toBe("exact");
+			expect(isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode("u43"), sg))).toBe(false);
+		});
+	});
+
+	it("merges the reports of later builds into the promoted list, equal to a full build", async () => {
+		await withKeeper(async (keeper, { sg }) => {
+			const buckets = Array.from({ length: 30 }, () => asHashPrefixBucket(crypto.getRandomValues(new Uint8Array(8))));
+			// Register the buckets in three unordered batches, with a build after each one.
+			for (const batch of [buckets.slice(20), buckets.slice(0, 10), buckets.slice(10, 20)]) {
+				for (const bucket of batch) {
+					await keeper.registerRepartition(bucketPromotionReport(sg, bucket, 0, 2, 2));
+				}
+				keeper.runDueBuilds(LATER);
+			}
+			// A repeated report adds nothing.
+			await keeper.registerRepartition(bucketPromotionReport(sg, buckets[0], 0, 2, 2));
+			keeper.runDueBuilds(LATER);
+			const view = parseHashBody(body(keeper.getTopology(sg)));
+			expect(view.bloom).toBeNull();
+			expect([...promotedSectionBuckets(view.promoted!)]).toEqual([...buckets].sort(compareHashPrefixBuckets));
+		});
+	});
+
+	it("moves the promoted set into a Bloom filter once it is above promotedListMax", async () => {
+		await withKeeper(
+			async (keeper, { sg, storage }) => {
+				const buckets = Array.from({ length: 5 }, () => asHashPrefixBucket(crypto.getRandomValues(new Uint8Array(8))));
+				for (const bucket of buckets.slice(0, 4)) {
+					await keeper.registerRepartition(bucketPromotionReport(sg, bucket, 0, 2, 2));
+				}
+				keeper.runDueBuilds(LATER);
+				let view = parseHashBody(body(keeper.getTopology(sg)));
+				expect([view.promoted?.count, view.bloom === null]).toEqual([4, true]);
+				// The build after the fifth report takes the first four roots from the stored list, and
+				// reads only the new root. The test deletes the stored root rows to show that the build
+				// does not read them.
+				storage.sql.exec(`DELETE FROM fokos_topo_range_intervals WHERE shard_group = ?1`, sg);
+				await keeper.registerRepartition(bucketPromotionReport(sg, buckets[4], 0, 2, 2));
+				keeper.runDueBuilds(LATER);
+				view = parseHashBody(body(keeper.getTopology(sg)));
+				expect([view.promoted, view.bloom === null]).toEqual([null, false]);
+				for (const bucket of buckets) {
+					expect(isPromotedHashPrefixBucket(view, bucket)).toBe("maybe");
+				}
+			},
+			{ promotedListMax: 4 },
+		);
+	});
+
+	it.each([-1, Number.NaN, 1.5])("refuses promotedListMax %s", async (promotedListMax) => {
+		const stub = env.TOPOLOGY_ADMIN_DO.getByName(`keeper-${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: FokosDBAutoAdminDO, state) => {
+			expect(() => new FokosTopologyKeeper(state.storage, { promotedListMax, scheduleBuild: () => {} })).toThrow(
+				invariantFailure(/promotedListMax must be an integer of at least 0/),
+			);
 		});
 	});
 });

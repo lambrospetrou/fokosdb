@@ -245,7 +245,7 @@ not carry over.
    boundaries. The size estimates become one indexed total for each hashPrefixBucket. **DONE.**
 5. **M5 — The promoted set in the hash topology encoding** (Section 4.2.8). The hash topology encoding holds a sorted
    list of hashPrefixBuckets up to `N`, and a Bloom filter above `N`. Each positive answer fetches the range item in
-   the background.
+   the background. **DONE.**
 6. **M6 — The coordinator storage** (Section 4.2.9). The `tc_*` tables lead with the hashPrefixBucket of the token.
 7. **M7 — The materialization storage** (Section 4.2.10). `latest_items` is `WITHOUT ROWID` on
    `(hash_prefix_bucket, base_hk, base_sk)`. A local counter assigns `item_id`, and `UNIQUE (item_id)` keeps the

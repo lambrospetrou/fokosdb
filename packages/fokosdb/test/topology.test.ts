@@ -7,7 +7,7 @@ import { KeyCodec } from "../src/sharding/key-codec.js";
 import { hashPrefixBucketOf } from "../src/sharding/hash-primitives.js";
 import { namespaceFingerprint, type DataNamespaceKey } from "../src/shared/do-stubs.js";
 import { topologyAdminName } from "../src/shared/partition-context.js";
-import { maybePromoted, parseHashBody } from "../src/sharding/topology-codec.js";
+import { isPromotedHashPrefixBucket, parseHashBody } from "../src/sharding/topology-codec.js";
 import { TOPOLOGY_BLOOM_MIN_CAPACITY } from "../src/sharding/topology-encode.js";
 import type { FokosTopologyRead } from "../src/sharding/topology-keeper.js";
 import { TARGET_WAIT } from "./partition-do/helpers.js";
@@ -152,9 +152,9 @@ describe("FokosDB — encoded topology", () => {
 		const view = parseHashBody((read as { body: Uint8Array }).body);
 		// A key that no repartition promoted, and that the Bloom filter holds: a false positive.
 		const candidates = Array.from({ length: 5_000 }, (_, i) => `fp-${i}`);
-		const falsePositive = candidates.find((key) => maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode(key), shardGroup)));
+		const falsePositive = candidates.find((key) => isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode(key), shardGroup)));
 		expect(falsePositive).toBeDefined();
-		const plain = candidates.find((key) => !maybePromoted(view, hashPrefixBucketOf(KeyCodec.encode(key), shardGroup)))!;
+		const plain = candidates.find((key) => !isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode(key), shardGroup)))!;
 
 		// The client reads no topology, so only the coordinator and the partitions read it.
 		const db = new FokosDB(options(tableName, { useTopologyCache: false, singlePartitionFastPath: false }));

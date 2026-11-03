@@ -28,7 +28,9 @@ import {
 	hashNodeKey,
 	encodeRangeBody,
 	mergeHashBitmap,
+	mergePromotedBuckets,
 	promotedKeysBloom,
+	promotedSectionBuckets,
 	topologyEventFromWire,
 	topologyEventToJson,
 } from "./topology-encode.js";
@@ -38,6 +40,16 @@ export const TOPOLOGY_BODY_CHUNK_BYTES = 1024 * 1024;
 
 const DEFAULT_BUILD_DELAY_MS = 2_000;
 const DEFAULT_BUILD_ERROR_RETRY_MS = 60_000;
+/**
+ * The default `promotedListMax`. A list of 4,096 hashPrefixBuckets is 32 KiB, and a search takes 12
+ * compares in the loop and 1 compare after it.
+ *
+ * A list near this limit is larger than the smallest Bloom filter (about 22.6 KiB, at a capacity of
+ * `TOPOLOGY_BLOOM_MIN_CAPACITY` and the error rate `TOPOLOGY_BLOOM_ERROR_RATE`). Above about 2,800
+ * buckets, the list is the larger section. This is intentional: the list gives exact answers, and the
+ * Bloom filter also becomes larger when the count increases, by the selected error rate.
+ */
+const DEFAULT_PROMOTED_LIST_MAX = 4_096;
 const DEFAULT_MAX_RANGE_BODY_BYTES = 1024 * 1024;
 const DEFAULT_BUILD_STEP_ROWS = 100_000;
 
@@ -51,6 +63,12 @@ export type FokosTopologyKeeperOptions = {
 	buildErrorRetryMs?: number;
 	/** The largest range body. A larger body drops its deepest boundaries. Default 1 MiB. */
 	maxRangeBodyBytes?: number;
+	/**
+	 * The largest count of promoted hashPrefixBuckets that the hash body stores as a sorted `promoted`
+	 * section instead of a Bloom filter. A reader reads both sections, so a change changes only the
+	 * next body the keeper builds, and needs no migration. Default 4,096.
+	 */
+	promotedListMax?: number;
 	/**
 	 * The rows that one `runDueBuilds` call reads before it stops and leaves the rest of the build due.
 	 * It always builds at least one body. Default 100,000.
@@ -83,9 +101,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   until the next reset.
 		// - `build_due_at` is set by the first report with a new fact after a build, and cleared by the
 		//   step that finds the hash body built and no dirty hash key.
-		// - `promoted_n` is the number of promoted hash keys, so a build can size the Bloom filter
-		//   before it reads the keys. `hash_nodes_n` is the number of rows in fokos_topo_hash_nodes, so
-		//   a build can size the bitmap before it reads the rows.
+		// - `promoted_n` is the number of promoted hashPrefixBuckets, so a build picks the section of
+		//   the promoted set and sizes it before it reads the keys. `hash_nodes_n` is the number of
+		//   rows in fokos_topo_hash_nodes, so a build can size the bitmap before it reads the rows.
 		//
 		// fokos_topo_repartitions:
 		// - One row for each report, of every kind, for idempotency. `repartition_key` is the source
@@ -233,6 +251,7 @@ export class FokosTopologyKeeper {
 	/** The wait of a failed build until its next step. The alarm uses it for its own retry as well. */
 	readonly buildErrorRetryMs: number;
 	readonly #maxRangeBodyBytes: number;
+	readonly #promotedListMax: number;
 	readonly #buildStepRows: number;
 	readonly #scheduleBuild: FokosTopologyKeeperOptions["scheduleBuild"];
 	/** The last hash body of each shard group, so a read answers with no SQL. */
@@ -243,6 +262,12 @@ export class FokosTopologyKeeper {
 		this.#buildDelayMs = opts.buildDelayMs ?? DEFAULT_BUILD_DELAY_MS;
 		this.buildErrorRetryMs = Math.max(1, opts.buildErrorRetryMs ?? DEFAULT_BUILD_ERROR_RETRY_MS);
 		this.#maxRangeBodyBytes = opts.maxRangeBodyBytes ?? DEFAULT_MAX_RANGE_BODY_BYTES;
+		this.#promotedListMax = opts.promotedListMax ?? DEFAULT_PROMOTED_LIST_MAX;
+		// A negative value or NaN makes each body a Bloom filter, and no error shows the bad option.
+		invariant(
+			Number.isSafeInteger(this.#promotedListMax) && this.#promotedListMax >= 0,
+			() => `fokos/topology-keeper: promotedListMax must be an integer of at least 0, got ${this.#promotedListMax}`,
+		);
 		this.#buildStepRows = opts.buildStepRows ?? DEFAULT_BUILD_STEP_ROWS;
 		this.#scheduleBuild = opts.scheduleBuild;
 	}
@@ -364,7 +389,16 @@ export class FokosTopologyKeeper {
 			const builtVersion = group?.built_version ?? 0;
 			const stored = builtVersion > 0 ? this.#readBody(shardGroup, "hash", NO_KEY) : undefined;
 			const body =
-				stored ?? encodeHashBody({ epoch, version: 0, rootTreesN: 0, hashSplitN: 0, bitmap: { bits: NO_KEY, bitCount: 0 }, bloom: null });
+				stored ??
+				encodeHashBody({
+					epoch,
+					version: 0,
+					rootTreesN: 0,
+					hashSplitN: 0,
+					bitmap: { bits: NO_KEY, bitCount: 0 },
+					promoted: null,
+					bloom: null,
+				});
 			cached = { etag: etagOf(epoch, stored ? builtVersion : 0), body };
 			this.#hashBodies.set(shardGroup, cached);
 		}
@@ -488,19 +522,25 @@ export class FokosTopologyKeeper {
 	 */
 	#insertRangeIntervals(event: FokosTopologyEvent, source: DecodedId, seq: number): { roots: number; intervals: number } {
 		const sql = this.#storage.sql;
+		// `rowsWritten` counts the index write of a root as well, so it is 2 for a root row. The
+		// promoted list switch needs the exact count of new rows, so `insert` counts the RETURNING row.
 		const insert = (bucket: HashPrefixBucket, start: FokosCompositeKey | null, end: FokosCompositeKey | null): number =>
-			sql.exec(
-				`INSERT OR IGNORE INTO fokos_topo_range_intervals (shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
-				event.shardGroup,
-				bucket,
-				start?.hk ?? NO_KEY,
-				start?.sk ?? NO_KEY,
-				end === null ? 1 : 0,
-				end?.hk ?? NO_KEY,
-				end?.sk ?? NO_KEY,
-				seq,
-			).rowsWritten;
+			tryOne(
+				sql.exec<{ seq: number }>(
+					`INSERT OR IGNORE INTO fokos_topo_range_intervals (shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
+					 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING seq`,
+					event.shardGroup,
+					bucket,
+					start?.hk ?? NO_KEY,
+					start?.sk ?? NO_KEY,
+					end === null ? 1 : 0,
+					end?.hk ?? NO_KEY,
+					end?.sk ?? NO_KEY,
+					seq,
+				),
+			) === undefined
+				? 0
+				: 1;
 		if (event.kind === "hash_split") {
 			return { roots: 0, intervals: 0 };
 		}
@@ -616,8 +656,9 @@ export class FokosTopologyKeeper {
 	 *
 	 * With a stored hash body, the build reads only the hash nodes and the range roots with
 	 * `seq > built_version`, which the stored body does not have. It merges the new nodes into the
-	 * stored bitmap (`mergeHashBitmap`), and adds the new roots to a copy of the stored Bloom filter.
-	 * The first build of an epoch reads all the rows.
+	 * stored bitmap (`mergeHashBitmap`), and the new roots into the promoted set: into the stored
+	 * `promoted` list (`mergePromotedBuckets`), or into a copy of the stored Bloom filter once the
+	 * count is above `promotedListMax`. The first build of an epoch reads all the rows.
 	 */
 	#buildHashBody(group: GroupRow, rootTreesN: number, hashSplitN: number): number {
 		const sql = this.#storage.sql;
@@ -644,15 +685,19 @@ export class FokosTopologyKeeper {
 				yield new Uint8Array(row.node);
 			}
 		};
-		const promoted = function* (afterSeq: number) {
+		// The index is in `seq` order, so a build reads only the new roots. The `promoted` list merge
+		// needs the roots in byte order, so that path asks SQLite to sort the rows that it reads. The
+		// sort reads no more rows. The Bloom filter does not need an order, so that path does not sort.
+		const promoted = function* (afterSeq: number, inBucketOrder = false): Iterable<HashPrefixBucket> {
 			for (const row of sql.exec<{ hash_prefix_bucket: ArrayBuffer }>(
 				`SELECT hash_prefix_bucket FROM fokos_topo_range_intervals INDEXED BY idx_fokos_topo_range_roots
-				  WHERE shard_group = ?1 AND seq > ?2 AND start_hk = x'' AND end_is_max = 1`,
+				  WHERE shard_group = ?1 AND seq > ?2 AND start_hk = x'' AND end_is_max = 1
+				  ${inBucketOrder ? "ORDER BY hash_prefix_bucket" : ""}`,
 				shardGroup,
 				afterSeq,
 			)) {
 				rows += 1;
-				yield new Uint8Array(row.hash_prefix_bucket);
+				yield asHashPrefixBucket(new Uint8Array(row.hash_prefix_bucket));
 			}
 		};
 		let old: HashTopologyView | undefined;
@@ -662,6 +707,23 @@ export class FokosTopologyKeeper {
 			invariant(body !== undefined, "fokos/topology-keeper: a built hash body is not stored");
 			old = parseHashBody(body);
 		}
+		// A stored `promoted` section holds every root up to `builtVersion`, so the build reads only the
+		// new roots, for a new list and for a new Bloom filter. A stored body with a Bloom filter (its
+		// count was above `promotedListMax`, and the limit went up after that build) has no list to
+		// merge, so the build reads every root again.
+		const oldList = old?.promoted ?? null;
+		const allPromoted = function* (): Iterable<HashPrefixBucket> {
+			if (oldList === null) {
+				yield* promoted(0);
+				return;
+			}
+			yield* promotedSectionBuckets(oldList);
+			yield* promoted(builtVersion);
+		};
+		const promotedSection =
+			group.promoted_n <= this.#promotedListMax
+				? mergePromotedBuckets(oldList ? promotedSectionBuckets(oldList) : [], promoted(oldList ? builtVersion : 0, true))
+				: null;
 		const hashBody = encodeHashBody({
 			epoch: group.epoch,
 			version: group.hash_version,
@@ -670,11 +732,15 @@ export class FokosTopologyKeeper {
 			bitmap: old
 				? mergeHashBitmap(old, group.hash_nodes_n, nodes(builtVersion))
 				: encodeHashBitmap(rootTreesN, hashSplitN, group.hash_nodes_n, allNodes),
-			bloom: promotedKeysBloom(
-				group.promoted_n,
-				() => promoted(0),
-				old?.bloom ? { base: old.bloom, added: () => promoted(builtVersion) } : undefined,
-			),
+			promoted: promotedSection,
+			bloom:
+				promotedSection === null
+					? promotedKeysBloom(
+							group.promoted_n,
+							allPromoted,
+							old?.bloom ? { base: old.bloom, added: () => promoted(builtVersion) } : undefined,
+						)
+					: null,
 		});
 		this.#storage.transactionSync(() => {
 			this.#writeBody(shardGroup, "hash", NO_KEY, hashBody);

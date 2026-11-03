@@ -15,7 +15,7 @@ import type { RepartitionKind } from "./sharding-store.js";
 import { cachedHashTopology, cachedRangeTopology, cutTopologyHint, type FokosTopologyCacheOptions } from "./topology-cache.js";
 import {
 	findLeaf,
-	maybePromoted,
+	isPromotedHashPrefixBucket,
 	rangeBoundaryAt,
 	rangeCutKey,
 	rangeIntervalLookup,
@@ -170,13 +170,15 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	}
 
 	/**
-	 * A key with a Bloom hit enters its range tree: at the deepest known range partition, or at the
-	 * range root when the range entry is not cached yet. Every other key enters at the deepest known
-	 * hash partition. `bloom` false skips the range tree, after the range root answered that it does
-	 * not exist or has no data yet. `speculative` false skips the range root of a key with no range
-	 * entry, which can be a Bloom false positive. Every other entry names a partition that exists,
-	 * because the keeper records only completed repartitions. The hash leaf of a promoted key forwards
-	 * to its range tree.
+	 * A key with a hit in the promoted set enters its range tree: at the deepest known range
+	 * partition, or at the range root when the range entry has no segment. Only an exact hit from the
+	 * `promoted` list uses the range root when the entry is in the cache with no segment; for a Bloom
+	 * hit, such an entry shows a false positive. Every other key enters at the deepest known hash
+	 * partition. `bloom` false skips the range tree, after the range root answered that it does not
+	 * exist or has no data yet. `speculative` false skips the range root of a key with a Bloom hit and
+	 * no range entry, because the hit can be a false positive. Every other entry names a partition
+	 * that exists, because the keeper records only completed repartitions. The hash leaf of a promoted
+	 * key forwards to its range tree.
 	 */
 	#resolveKey(hashKey: KeyBytes, rangeLookup: RangeLookup, bloom: boolean, speculative: boolean): FokosRouteContext<TPolicy> {
 		const root = this.#router.rootContext(hashKey);
@@ -192,10 +194,26 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		// A promotion moves the whole hashPrefixBucket of a key, so the promoted set and the range
 		// entries are by hashPrefixBucket.
 		const bucket = hashPrefixBucketOf(hashKey, topology.shardGroup);
-		if (bloom && maybePromoted(hash.view, bucket)) {
-			const range = cachedRangeTopology(opts, topology.shardGroup, bucket);
-			// A range entry with no segment says that the Bloom hit is a false positive.
-			if (range ? range.view.depths.length > 0 : speculative) {
+		const hit = bloom ? isPromotedHashPrefixBucket(hash.view, bucket) : false;
+		if (hit) {
+			const cached = cachedRangeTopology(opts, topology.shardGroup, bucket);
+			// A range entry with no segment comes from a Bloom false positive, or from a promoted
+			// bucket whose range body the keeper did not build yet. Both cases have no range
+			// boundaries to use, so the code below uses the entry only when it has a segment.
+			const range = cached && cached.view.depths.length > 0 ? cached : undefined;
+			// The hit is "exact" when it came from the `promoted` list, and "maybe" when it came
+			// from the Bloom filter, which can give a false positive.
+			//
+			// Four cases decide if the key goes to its range tree:
+			// 1. The range entry has a segment. The key goes to the deepest known range partition.
+			// 2. The range entry has no segment, and the hit is "maybe". The entry shows that the hit
+			//    was a false positive, so the key goes to its hash partition.
+			// 3. The range entry is not in the cache or has no segment, and the hit is "exact". The
+			//    keeper records only completed promotions, so the range root exists. The key goes to
+			//    the range root, also when `speculative` is false.
+			// 4. The range entry is not in the cache, and the hit is "maybe". The range root possibly
+			//    does not exist. The key goes to the range root only when `speculative` is true.
+			if (range || hit === "exact" || (!cached && speculative)) {
 				const target = range ? rangeLookup(range.view, range.cut) : { start: 0, end: 1, rank: 0 };
 				if (target) {
 					const start = range ? rangeBoundaryAt(range.view, target.start) : null;

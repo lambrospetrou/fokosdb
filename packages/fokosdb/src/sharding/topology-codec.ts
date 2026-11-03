@@ -3,7 +3,8 @@
  * Durable Object, the framing of the two bodies that the admin Durable Object serves, and the readers
  * that a caller uses on the fetched bytes.
  *
- * - The hash body holds the hash split bitmap and the Bloom filter of the promoted hashPrefixBuckets.
+ * - The hash body holds the hash split bitmap and the promoted hashPrefixBuckets, as a sorted list
+ *   below the keeper's list limit and as a Bloom filter above it.
  * - The range body holds the known range intervals of one promoted hashPrefixBucket.
  *
  * A reader makes typed-array views over the fetched bytes and does not decode them into objects.
@@ -11,7 +12,7 @@
  * in `topology-encode.ts`, so a caller does not ship it.
  */
 import { layerHas } from "../shared/bloom-filter.js";
-import { HashPrefixBucketDigitCursor, type HashPrefixBucket } from "./hash-primitives.js";
+import { HASH_PREFIX_BUCKET_BYTES, HashPrefixBucketDigitCursor, type HashPrefixBucket } from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
@@ -130,6 +131,12 @@ export type HashTopologyView = TopologyVersion & {
 	words: Uint32Array;
 	/** The count of 1 bits before each block of 512 bits, and the total at the end. A view over the body. */
 	rank: Uint32Array;
+	/**
+	 * The sorted hashPrefixBuckets of the `promoted` section, packed 8 bytes each, or null when the
+	 * body has a `bloom` section for the promoted set (the keeper uses a list up to its
+	 * `promotedListMax` buckets).
+	 */
+	promoted: { bytes: Uint8Array; count: number } | null;
 	bloom: { bits: Uint8Array; k: number; m: number; layerIndex: 0 } | null;
 	/** The bytes that the view holds: the body. */
 	byteLength: number;
@@ -169,9 +176,30 @@ export function parseHashBody(input: Uint8Array): HashTopologyView {
 	if (bitCount > 0 && bitCount !== (rootTreesN as number) + (hashSplitN as number) * rank[rankCount - 1]) {
 		throw new Error("fokos/topology: the rank section does not agree with the bitmap");
 	}
+	let promoted: HashTopologyView["promoted"] = null;
+	const promotedSection = header.sections.promoted;
+	if (promotedSection !== undefined) {
+		const count = intField(promotedSection, "count");
+		const width = intField(promotedSection, "width");
+		if (width !== HASH_PREFIX_BUCKET_BYTES) {
+			throw new Error("fokos/topology: the promoted section is not valid");
+		}
+		const offset = sectionOffset(body, promotedSection, count * width, "promoted");
+		const bytes = body.subarray(offset, offset + count * width);
+		// The binary search of isPromotedHashPrefixBucket is wrong on an unordered section, so a
+		// reader must refuse one.
+		if (!promotedBucketsInOrder(bytes)) {
+			throw new Error("fokos/topology: the promoted section is not in order");
+		}
+		promoted = { bytes, count };
+	}
 	let bloom: HashTopologyView["bloom"] = null;
 	const bloomSection = header.sections.bloom;
 	if (bloomSection !== undefined) {
+		// A reader uses only the list when a body has both sections, so it must refuse such a body.
+		if (promoted !== null) {
+			throw new Error("fokos/topology: the hash body has a promoted section and a bloom section");
+		}
 		const length = intField(bloomSection, "length");
 		const m = intField(bloomSection, "m");
 		const k = intField(bloomSection, "k");
@@ -189,6 +217,7 @@ export function parseHashBody(input: Uint8Array): HashTopologyView {
 		bitCount,
 		words,
 		rank,
+		promoted,
 		bloom,
 		byteLength: body.byteLength,
 	};
@@ -237,9 +266,49 @@ export function findLeaf(
 	return { pos, root, path };
 }
 
-/** True when the Bloom filter of the body holds `hashPrefixBucket`, which can be a false positive. */
-export function maybePromoted(view: HashTopologyView, hashPrefixBucket: HashPrefixBucket): boolean {
-	return view.bloom !== null && layerHas(view.bloom, hashPrefixBucket);
+/**
+ * True when the packed hashPrefixBuckets of a `promoted` section are in strict ascending byte order,
+ * with no repeated value. It compares the bytes in place: it makes no views and no copies.
+ */
+export function promotedBucketsInOrder(bytes: Uint8Array): boolean {
+	const width = HASH_PREFIX_BUCKET_BYTES;
+	for (let cur = width; cur < bytes.length; cur += width) {
+		// The same compare as the search of isPromotedHashPrefixBucket, so the two agree on the order.
+		if (KeyCodec.compareSlices(bytes, cur - width, cur, bytes, cur, cur + width) >= 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Whether the promoted set of the body holds `hashPrefixBucket`:
+ * - "exact": the `promoted` section holds it. This answer is always correct.
+ * - "maybe": the `bloom` section holds it. This answer can be a false positive.
+ * - false: the body does not hold it. This answer is always correct.
+ *
+ * The search compares each candidate in place: nothing is copied out of the section.
+ */
+export function isPromotedHashPrefixBucket(view: HashTopologyView, hashPrefixBucket: HashPrefixBucket): "exact" | "maybe" | false {
+	const promoted = view.promoted;
+	if (promoted === null) {
+		return view.bloom !== null && layerHas(view.bloom, hashPrefixBucket) ? "maybe" : false;
+	}
+	const bytes = promoted.bytes;
+	const key = KeyCodec.asKeyBytes(hashPrefixBucket);
+	let a = 0;
+	let b = promoted.count;
+	while (a < b) {
+		// `a + (b - a) / 2` stays below `b`, so it does not overflow the 32 bits of `>>>`.
+		const mid = a + ((b - a) >>> 1);
+		if (KeyCodec.compareSlice(bytes, mid * HASH_PREFIX_BUCKET_BYTES, (mid + 1) * HASH_PREFIX_BUCKET_BYTES, key) < 0) {
+			a = mid + 1;
+		} else {
+			b = mid;
+		}
+	}
+	const found = a < promoted.count && KeyCodec.compareSlice(bytes, a * HASH_PREFIX_BUCKET_BYTES, (a + 1) * HASH_PREFIX_BUCKET_BYTES, key) === 0;
+	return found ? "exact" : false;
 }
 
 // ─── the range body ──────────────────────────────────────────────────────────

@@ -111,18 +111,27 @@ function compare(a: KeyBytes, b: KeyBytes): number {
 }
 
 /**
+ * `compare(a[aStart..aEnd), b[bStart..bEnd))` without a view object: a reader can compare two keys
+ * that are stored inside larger buffers, or inside the same buffer.
+ */
+function compareSlices(a: Uint8Array, aStart: number, aEnd: number, b: Uint8Array, bStart: number, bEnd: number): number {
+	const aLen = aEnd - aStart;
+	const bLen = bEnd - bStart;
+	const minLen = Math.min(aLen, bLen);
+	for (let i = 0; i < minLen; i++) {
+		if (a[aStart + i] !== b[bStart + i]) {
+			return a[aStart + i] - b[bStart + i];
+		}
+	}
+	return aLen - bLen;
+}
+
+/**
  * `compare(bytes[start..end), key)` without a view object: a reader can compare a key with a key that
  * is stored inside a larger buffer.
  */
 function compareSlice(bytes: Uint8Array, start: number, end: number, key: KeyBytes): number {
-	const len = end - start;
-	const minLen = Math.min(len, key.length);
-	for (let i = 0; i < minLen; i++) {
-		if (bytes[start + i] !== key[i]) {
-			return bytes[start + i] - key[i];
-		}
-	}
-	return len - key.length;
+	return compareSlices(bytes, start, end, key, 0, key.length);
 }
 
 /**
@@ -383,6 +392,7 @@ export const KeyCodec = {
 	decode,
 	compare,
 	compareSlice,
+	compareSlices,
 	successor,
 	publicSuccessor,
 	shortestSeparator,
