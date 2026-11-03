@@ -1,0 +1,67 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "fokos-canary",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-05-23",
+	"migrations": [
+		{
+			"new_sqlite_classes": ["DemoPartitionDO", "DemoTransactionCoordinatorDO", "DemoAutoAdminDO", "WorkloadRunnerDO"],
+			"tag": "v1",
+		},
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "DemoPartitionDO",
+				"name": "DEMO_PARTITION_DO",
+			},
+			{
+				"class_name": "DemoTransactionCoordinatorDO",
+				"name": "DEMO_TX_DO",
+			},
+			{
+				"class_name": "DemoAutoAdminDO",
+				"name": "FOKOS_ADMIN_DO",
+			},
+			{
+				"class_name": "WorkloadRunnerDO",
+				"name": "WORKLOAD_RUNNER_DO",
+			},
+		],
+	},
+	// The cached entrypoint of the encoded topology. Only `ctx.exports` reaches it: no route names it.
+	"exports": {
+		"FokosDBTopologyCache": {
+			"type": "worker",
+			"cache": { "enabled": true },
+		},
+	},
+	"analytics_engine_datasets": [
+		{
+			"binding": "ANALYTICS",
+			"dataset": "fokos_canary",
+		},
+	],
+	"triggers": {
+		"crons": ["* * * * *"],
+	},
+	"observability": {
+		"enabled": true,
+	},
+	"compatibility_flags": ["nodejs_compat"],
+	"vars": {
+		// The placements the cron fans out to: Durable Object location hints and jurisdictions.
+		// https://developers.cloudflare.com/durable-objects/reference/data-location/
+		"DEMO_PLACEMENTS": "wnam,enam,weur,eeur,apac,apac-ne,apac-se,oc,eu,us",
+		// The workloads the cron runs on every placement. Other workloads run through the HTTP API.
+		"DEMO_CRON_WORKLOADS": "crud,tx,query,batch,ttl",
+		// The default instance name of the cron run. External runners use their own instance names.
+		"DEMO_CRON_INSTANCE": "0",
+		// The HTTP API requires the `x-fokos-secret-token` header only when this is set.
+		"DEMO_API_TOKEN": "",
+	},
+}
