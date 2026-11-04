@@ -39,11 +39,14 @@ route module for each top-level path under `/api`. `src/<path>/` holds the code 
 
 ## Durable Objects
 
-`src/index.ts` re-exports the classes because wrangler resolves bindings against the Worker's own entry
-module:
+`src/index.ts` exports a subclass of each FokosDB Durable Object class, because wrangler resolves
+bindings against the Worker's own entry module. Each binding uses a subclass, so you can add hooks to
+it later without a change to the class name of the namespace:
 
 ```ts
-export { FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
+export class AppPartitionDO extends FokosDBPartitionDO {}
+export class AppTransactionCoordinatorDO extends FokosDBTransactionCoordinatorDO {}
+export class AppAutoAdminDO extends FokosDBAutoAdminDO {}
 ```
 
 `CustomPartitionDO` is a `FokosDBPartitionDO` subclass, declared here to exercise the subclassing path. It

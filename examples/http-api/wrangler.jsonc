@@ -14,7 +14,7 @@
 	},
 	"migrations": [
 		{
-			"new_sqlite_classes": ["FokosDBPartitionDO", "FokosDBTransactionCoordinatorDO", "CustomPartitionDO"],
+			"new_sqlite_classes": ["AppPartitionDO", "AppTransactionCoordinatorDO", "CustomPartitionDO"],
 			"tag": "v1",
 		},
 		{
@@ -22,18 +22,18 @@
 			"tag": "v2",
 		},
 		{
-			"new_sqlite_classes": ["FokosDBAutoAdminDO"],
+			"new_sqlite_classes": ["AppAutoAdminDO"],
 			"tag": "v3",
 		},
 	],
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "FokosDBPartitionDO",
+				"class_name": "AppPartitionDO",
 				"name": "PARTITION_DO",
 			},
 			{
-				"class_name": "FokosDBTransactionCoordinatorDO",
+				"class_name": "AppTransactionCoordinatorDO",
 				"name": "TRANSACTION_COORDINATOR_DO",
 			},
 			{
@@ -49,7 +49,7 @@
 				"name": "SEARCH_PARTITION_DO",
 			},
 			{
-				"class_name": "FokosDBAutoAdminDO",
+				"class_name": "AppAutoAdminDO",
 				"name": "FOKOS_ADMIN_DO",
 			},
 		],

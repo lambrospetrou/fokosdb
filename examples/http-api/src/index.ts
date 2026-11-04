@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { FokosConditionCheckError, FokosError, FokosTransactionCancelledError } from "fokosdb/client";
-import { FokosDBPartitionDO } from "fokosdb/server";
+import { FokosDBAutoAdminDO, FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
 import { databasesRoutes } from "./databases/routes.js";
 import { demo2Routes } from "./demo2/index.js";
 import { helloRoutes } from "./hello/routes.js";
@@ -10,9 +10,14 @@ import { rpcRoutes } from "./rpc/routes.js";
 import { serializeConditionFailedReason, serializeTransactWriteResults } from "./rpc/serialize.js";
 import type { AppEnv } from "./shared.js";
 
-// Wrangler resolves Durable Object bindings against this module, so the classes must be re-exported
+// Wrangler resolves Durable Object bindings against this module, so the classes must be exported
 // from the worker entry even though the implementations live in the library.
-export { FokosDBAutoAdminDO, FokosDBTopologyCache, FokosDBPartitionDO, FokosDBTransactionCoordinatorDO } from "fokosdb/server";
+// Each binding uses a subclass of the FokosDB class. Thus hooks can be added to the subclass later,
+// and the class name of the namespace does not change.
+export class AppPartitionDO extends FokosDBPartitionDO {}
+export class AppTransactionCoordinatorDO extends FokosDBTransactionCoordinatorDO {}
+export class AppAutoAdminDO extends FokosDBAutoAdminDO {}
+export { FokosDBTopologyCache } from "fokosdb/server";
 export { CounterPartitionDO, SearchPartitionDO } from "./demo2/index.js";
 
 const api = new Hono<AppEnv>().basePath("/api");

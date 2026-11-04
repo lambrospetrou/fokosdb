@@ -120,15 +120,20 @@ npm install https://pkg.pr.new/fokosdb@main
 
 `@main` moves with each commit. For an install that you can reproduce, pin a commit SHA, for example `https://pkg.pr.new/lambrospetrou/fokosdb@afce6cb`.
 
-**2. Re-export the Durable Object classes from the main module of your Worker.** Wrangler finds a Durable Object class only in your own entry module. An import is not sufficient.
+**2. Make a subclass of each Durable Object class, and export the subclasses from the main module of your Worker.** Wrangler finds a Durable Object class only in your own entry module. An import is not sufficient.
 
 ```ts
 // src/index.ts
-export {
+import {
   FokosDBPartitionDO,
   FokosDBTransactionCoordinatorDO,
 } from "fokosdb/server";
+
+export class MyPartitionDO extends FokosDBPartitionDO {}
+export class MyTransactionCoordinatorDO extends FokosDBTransactionCoordinatorDO {}
 ```
+
+Always use your own subclasses, also when they are empty. The class name identifies the Durable Object namespace. With your own class, you can add hooks to it later without a change to the class name. If you export the FokosDB classes directly, a later subclass needs a `renamed_classes` migration.
 
 **3. Add the bindings and the migration to `wrangler.jsonc`.**
 
@@ -136,20 +141,17 @@ export {
 {
   "durable_objects": {
     "bindings": [
-      { "name": "FOKOSDB_PARTITION_DO", "class_name": "FokosDBPartitionDO" },
+      { "name": "FOKOSDB_PARTITION_DO", "class_name": "MyPartitionDO" },
       {
         "name": "FOKOSDB_TRANSACTION_COORDINATOR_DO",
-        "class_name": "FokosDBTransactionCoordinatorDO",
+        "class_name": "MyTransactionCoordinatorDO",
       },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": [
-        "FokosDBPartitionDO",
-        "FokosDBTransactionCoordinatorDO",
-      ],
+      "new_sqlite_classes": ["MyPartitionDO", "MyTransactionCoordinatorDO"],
     },
   ],
 }
@@ -157,16 +159,18 @@ export {
 
 **4. Create the client and use it.** The client gets the bindings from the `env` of `cloudflare:workers`, so you can create it one time at module scope.
 
-In this example, one Worker is both the client and the server: `src/index.ts` exports the Durable Object classes that store the data, and its `fetch` handler uses the `FokosDB` client to read and write it. A Worker that only reads and writes can import `fokosdb/client` alone and use the Durable Objects of another Worker.
+In this example, one Worker is both the client and the server: `src/index.ts` exports the Durable Object subclasses that store the data, and its `fetch` handler uses the `FokosDB` client to read and write it. A Worker that only reads and writes can import `fokosdb/client` alone and use the Durable Objects of another Worker.
 
 ```ts
 // src/index.ts: both the client and the server of FokosDB
 import { FokosDB } from "fokosdb/client";
-
-export {
+import {
   FokosDBPartitionDO,
   FokosDBTransactionCoordinatorDO,
 } from "fokosdb/server";
+
+export class MyPartitionDO extends FokosDBPartitionDO {}
+export class MyTransactionCoordinatorDO extends FokosDBTransactionCoordinatorDO {}
 
 const db = new FokosDB({
   // The identity of the table.
@@ -326,7 +330,7 @@ examples/
 `fokosdb` publishes four subpath exports: `fokosdb/client` and `fokosdb/server` for FokosDB, and
 `fokosdb/sharding/client` and `fokosdb/sharding/server` for the sharding library. There is no bare
 `fokosdb` import. See [`packages/fokosdb/README.md`](./packages/fokosdb/README.md) for the API
-and for the Durable Object re-export that wrangler requires.
+and for the Durable Object subclasses that wrangler requires.
 
 ### Commands
 
