@@ -319,7 +319,9 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			const now = lock.created_at + IDEMPOTENCY_WINDOW_MS + 1;
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = 0 WHERE transaction_id = ?`, transactionId);
-			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+			// The scheduled time is on the real clock. The mocked clock is ahead of it, and a scheduled
+			// time ahead of the real clock makes the alarm handler wait for it.
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 			expect(store.listPendingTxKeys(transactionId)).toHaveLength(0);
 			expect(store.getItemStamp(P(key.hashKey), key.hashKey, key.sortKey).row?.last_read_ts).toBe(transactionTimestamp);
 		});

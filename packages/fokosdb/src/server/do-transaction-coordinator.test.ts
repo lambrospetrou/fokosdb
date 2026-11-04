@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FokosDBTransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { FokosDBPartitionDO } from "./do-partition.js";
 import * as doStubs from "../shared/do-stubs.js";
-import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
+import { testControlledCoordinatorStub, testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import {
 	EXPRESSION_CODES,
 	FokosError,
@@ -295,8 +295,11 @@ const BUDGET_MS = DEFAULT_COORDINATOR_CONFIG.fanoutRequestBudgetMs;
 async function withCoordinator(
 	fn: (tc: CoordinatorInternals, state: DurableObjectState, ctx: FokosDBRouteContext) => void | Promise<void>,
 ): Promise<void> {
-	const ctx = testCoordinatorContext();
-	const stub = testCoordinatorStubByName(ctx.doName);
+	const ctx = testCoordinatorContext("CONTROLLED_TRANSACTION_COORDINATOR_DO");
+	const stub = testControlledCoordinatorStub(ctx.doName);
+	// A retry of a failed participant call waits at most 2 ms. The tests count the retries and do not
+	// need the real waits.
+	await stub.testConfig({ participantRetry: { baseDelayMs: 1, maxDelayMs: 2 } });
 	await stub.recoverTransaction(ctx, { transactionId: "no-such-transaction", idempotencyToken: TOKEN });
 	await runInDurableObject(stub, async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 		await fn(instance as unknown as CoordinatorInternals, state, ctx);

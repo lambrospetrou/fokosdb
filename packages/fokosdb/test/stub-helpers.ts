@@ -5,10 +5,16 @@
 import { env } from "cloudflare:workers";
 import type { FokosDBPartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBTransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
-import { createTableConfig, type FokosDBRouteContext, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
+import {
+	createTableConfig,
+	type FokosDBRouteContext,
+	type PartitionNamespaceKey,
+	type TransactionCoordinatorNamespaceKey,
+} from "../src/shared/partition-context.js";
 import { FokosRouter } from "../src/sharding/router.js";
 import { COORDINATOR_REF_VERSION, type CoordinatorRef } from "../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO } from "./controlled-partition-do.js";
+import type { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
 
 /** A name is a string and an id is an object, so one function serves both. */
 export function testPartitionStub(
@@ -28,10 +34,15 @@ export function testCoordinatorStubByName(doName: string): DurableObjectStub<Fok
 	return env.TRANSACTION_COORDINATOR_DO.getByName(doName);
 }
 
+/** A coordinator of `ControlledTransactionCoordinatorDO`, with the RPCs of its test controls. */
+export function testControlledCoordinatorStub(doName: string): DurableObjectStub<ControlledTransactionCoordinatorDO> {
+	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(doName);
+}
+
 /** The route context of a root coordinator in a new coordinator group. */
-export function testCoordinatorContext(): FokosDBRouteContext {
+export function testCoordinatorContext(nsTx: TransactionCoordinatorNamespaceKey = "TRANSACTION_COORDINATOR_DO"): FokosDBRouteContext {
 	const table = createTableConfig({
-		table: { name: `tc-test.${crypto.randomUUID()}`, ns: "PARTITION_DO", nsTx: "TRANSACTION_COORDINATOR_DO", rootTreesN: 1, hashSplitN: 2 },
+		table: { name: `tc-test.${crypto.randomUUID()}`, ns: "PARTITION_DO", nsTx, rootTreesN: 1, hashSplitN: 2 },
 		hashSplitConditions: { maxSizeMb: 100 },
 	});
 	return new FokosRouter(table.topology, table.rangeConfig, table.policy).allRoots()[0];
