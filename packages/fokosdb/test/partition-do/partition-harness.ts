@@ -21,7 +21,7 @@ import {
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { childDigit, hashDigits } from "../hash-digits.js";
-import { hashPrefixBucketOf, type HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
+import { routingHashOf, type RoutingHash } from "../../src/sharding/hash-primitives.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
@@ -192,14 +192,14 @@ export class TestPartition {
 		});
 	}
 
-	/** The hashPrefixBucket of `hashKey` in the shard group of this partition. */
-	bucketOf(hashKey: string): HashPrefixBucket {
-		return hashPrefixBucketOf(kb(hashKey), this.ctx.topology.shardGroup);
+	/** The routingHash of `hashKey` in the shard group of this partition. */
+	routingHashOf(hashKey: string): RoutingHash {
+		return routingHashOf(kb(hashKey), this.ctx.topology.shardGroup);
 	}
 
 	/** The range root of `hashKey`: the partition a promotion of that key creates. */
 	rangeRoot(hashKey: string): TestPartition {
-		return TestPartition.at(resolveRangePartitionContext(this.ctx, this.bucketOf(hashKey), null, null), undefined, hashKey);
+		return TestPartition.at(resolveRangePartitionContext(this.ctx, this.routingHashOf(hashKey), null, null), undefined, hashKey);
 	}
 
 	/** Runs the partition's scheduled alarm once, through the runtime test API. A no-op if none is set. */
@@ -285,7 +285,7 @@ export class TestPartition {
 	 * must be owned or the test stores items that production routing could never deliver here.
 	 * Reads routed through the tree would then look in a different leaf and miss them. Each
 	 * candidate is resolved through the full path (root → this node) by the digits of its
-	 * hashPrefixBucket, and kept only when it lands here. Spread: the `emitted % hashSplitN` check
+	 * routingHash, and kept only when it lands here. Spread: the `emitted % hashSplitN` check
 	 * admits keys in round-robin order over this partition's children, so the split leaves every
 	 * child with a roughly equal share and none of them immediately crosses the threshold again.
 	 */

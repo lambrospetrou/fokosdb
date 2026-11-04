@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { queryScanStatement } from "../partition/partition-store.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
-import { asHashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { asRoutingHash } from "../../sharding/hash-primitives.js";
 import { materializeExpressionBindings } from "./bindings.js";
 import { compileProjectionExpression, compileQueryExpression } from "./compiler.js";
 import { ExpressionError, type ExpressionErrorCode } from "./errors.js";
@@ -298,7 +298,7 @@ describe("query compiler", () => {
 	it("keeps the widest scan tail in step with the store's scan shape", () => {
 		// The widest scan tail in the plan module must follow the store's scan shape.
 		const { sql } = queryScanStatement({
-			prefix: asHashPrefixBucket(new Uint8Array(8)),
+			prefix: asRoutingHash(new Uint8Array(8)),
 			hk: KeyCodec.encode("h"),
 			lower: KeyCodec.encode("a"),
 			lowerInclusive: true,

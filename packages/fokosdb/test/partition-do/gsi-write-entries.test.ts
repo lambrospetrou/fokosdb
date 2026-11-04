@@ -116,7 +116,7 @@ describe("FokosDBPartitionDO — gsiWriteEntries", () => {
 		const source = gsiTable();
 		await source.write({ epoch: 7, items: [put(0, "g", "a", "u1")] });
 		await source.write({ producerId: OTHER, epoch: 2, items: [put(0, "h", "a", "u1")] });
-		const slice = { kind: "promoted_hash_prefix_bucket" as const, hashPrefixBucket: prefixOf(kb("none")) };
+		const slice = { kind: "promoted_routing_hash" as const, routingHash: prefixOf(kb("none")) };
 		const inSlice = () => false;
 		const budget = { pageBytes: 1 << 20, pageRows: 1, scanRows: 100 };
 		const host = (store: PartitionStore, state: DurableObjectState) =>

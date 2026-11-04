@@ -258,7 +258,7 @@ describe("compiled condition runtime", () => {
 				)
 				.toArray();
 			expect(
-				queryPlan.some((row) => /SEARCH i USING PRIMARY KEY \(hash_prefix_bucket=\? AND hk=\? AND sk=\?\)/.test(row.detail)),
+				queryPlan.some((row) => /SEARCH i USING PRIMARY KEY \(routing_hash=\? AND hk=\? AND sk=\?\)/.test(row.detail)),
 				JSON.stringify(queryPlan),
 			).toBe(true);
 			const existing = evaluateConditionPlan(state.storage, plan, hashKey, sortKey, P(hashKey));
@@ -336,7 +336,7 @@ describe("compiled condition runtime", () => {
 				)
 				.toArray();
 			expect(
-				queryPlan.some((row) => /SEARCH i USING PRIMARY KEY \(hash_prefix_bucket=\? AND hk=\? AND sk=\?\)/.test(row.detail)),
+				queryPlan.some((row) => /SEARCH i USING PRIMARY KEY \(routing_hash=\? AND hk=\? AND sk=\?\)/.test(row.detail)),
 				JSON.stringify(queryPlan),
 			).toBe(true);
 		});

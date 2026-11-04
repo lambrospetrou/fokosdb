@@ -276,7 +276,7 @@ export function prepareCase(
 			const sql = composeQueryStatement(plan, {
 				select: "projection",
 				direction: "asc",
-				scanConditions: ["hash_prefix_bucket = ?", "hk = ?"],
+				scanConditions: ["routing_hash = ?", "hk = ?"],
 			});
 			return {
 				sql,

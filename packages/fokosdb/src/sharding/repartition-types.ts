@@ -8,7 +8,7 @@
  * application defines its own streams.
  */
 import type { FokosMigrationPageBudget } from "./runtime-config.js";
-import type { HashPrefixBucket } from "./hash-primitives.js";
+import type { RoutingHash } from "./hash-primitives.js";
 import type { KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { RangeAncestorInfo } from "./types.js";
@@ -118,7 +118,7 @@ export type FokosMigrationAckRequest = {
 
 /** One bounded page of one phase. A `host` page also holds exactly one of the host's own streams. */
 export type FokosMigrationPage =
-	| { phase: "overrides"; overrides: { hashPrefixBucket: HashPrefixBucket }[]; nextCursor: FokosMigrationCursor | null }
+	| { phase: "overrides"; overrides: { routingHash: RoutingHash }[]; nextCursor: FokosMigrationCursor | null }
 	| { phase: "host"; page: unknown; nextCursor: FokosMigrationCursor | null };
 
 /**
@@ -172,10 +172,10 @@ export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteL
  * what each page carries; it ends the phase by answering with a null cursor.
  *
  * `belongsToTarget` is the ownership function of the slice, and the host must filter its rows with
- * it. For a `hash_child` slice it returns false for a hash key whose hashPrefixBucket has a terminal
- * route override, because a range tree owns that hashPrefixBucket; the child receives the override
- * pointer and no data copy. For a `range` slice it tests the hashPrefixBucket and the composite
- * interval `[start, end)`. For a `promoted_hash_prefix_bucket` slice it tests the hashPrefixBucket.
+ * it. For a `hash_child` slice it returns false for a hash key whose routingHash has a terminal
+ * route override, because a range tree owns that routingHash; the child receives the override
+ * pointer and no data copy. For a `range` slice it tests the routingHash and the composite
+ * interval `[start, end)`. For a `promoted_routing_hash` slice it tests the routingHash.
  *
  * `budget` holds the active page budgets of the runtime. The host keeps each page inside them.
  *
@@ -204,8 +204,8 @@ export interface MigrationHost {
 
 /** One repartition, and one of its targets when it has one. */
 export type FokosStatusEntry = {
-	/** `hashPrefixBucket` is the hashPrefixBucket a promotion moves, and null for a split. */
-	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState; hashPrefixBucket: HashPrefixBucket | null };
+	/** `routingHash` is the routingHash a promotion moves, and null for a split. */
+	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState; routingHash: RoutingHash | null };
 	target: null | {
 		index: number;
 		ref: FokosPartitionRef;

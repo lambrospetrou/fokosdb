@@ -7,13 +7,13 @@ import {
 	gsiTableConfig,
 	materializationShardGroup,
 	materializationTableConfig,
-	hashPrefixBucketTopologyAdminName,
+	routingHashTopologyAdminName,
 	topologyAdminName,
 	type FokosTableIdentity,
 	type FokosTableOptions,
 } from "./partition-context.js";
 import { structurallyEqual } from "../sharding/route-context.js";
-import { asHashPrefixBucket, hashPrefixBucketSeedOf } from "../sharding/hash-primitives.js";
+import { asRoutingHash, routingHashSeedOf } from "../sharding/hash-primitives.js";
 import { FokosRouter } from "../sharding/router.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 
@@ -139,7 +139,7 @@ describe("createTableConfig — the shard groups of a table", () => {
 			materializationTableConfig(cfg, FP).topology.shardGroup,
 			gsiTableConfig(cfg, "byStatus").topology.shardGroup,
 		];
-		expect(new Set(groups.map((group) => hashPrefixBucketSeedOf(group))).size).toBe(4);
+		expect(new Set(groups.map((group) => routingHashSeedOf(group))).size).toBe(4);
 	});
 
 	it("reads the table name of a materialization group with a fingerprint", () => {
@@ -158,22 +158,22 @@ describe("createTableConfig — the shard groups of a table", () => {
 		expect(() => topologyAdminName(cfg.topology.shardGroup, "short")).toThrow(/invariant_failed/);
 	});
 
-	it("names the admin Durable Object of a hashPrefixBucket <admin name of the shard group>.rh.<16 hex>, one name for each set of values", () => {
+	it("names the admin Durable Object of a routingHash <admin name of the shard group>.rh.<16 hex>, one name for each set of values", () => {
 		const shardGroup = createTableConfig(makeOpts({ tableName: "orders" })).topology.shardGroup;
-		const a = asHashPrefixBucket(Uint8Array.fromHex("00112233445566ff"));
-		const b = asHashPrefixBucket(Uint8Array.fromHex("00112233445566fe"));
+		const a = asRoutingHash(Uint8Array.fromHex("00112233445566ff"));
+		const b = asRoutingHash(Uint8Array.fromHex("00112233445566fe"));
 		const other = "o".repeat(43);
-		expect(hashPrefixBucketTopologyAdminName(shardGroup, FP, a)).toBe(`fokos.topo.p.orders~${FP}.rh.00112233445566ff`);
+		expect(routingHashTopologyAdminName(shardGroup, FP, a)).toBe(`fokos.topo.p.orders~${FP}.rh.00112233445566ff`);
 		const names = [
 			topologyAdminName(shardGroup, FP),
 			topologyAdminName(shardGroup, other),
-			hashPrefixBucketTopologyAdminName(shardGroup, FP, a),
-			hashPrefixBucketTopologyAdminName(shardGroup, FP, b),
-			hashPrefixBucketTopologyAdminName(shardGroup, other, a),
-			hashPrefixBucketTopologyAdminName("fokos.p.orders.rh", FP, a),
+			routingHashTopologyAdminName(shardGroup, FP, a),
+			routingHashTopologyAdminName(shardGroup, FP, b),
+			routingHashTopologyAdminName(shardGroup, other, a),
+			routingHashTopologyAdminName("fokos.p.orders.rh", FP, a),
 		];
 		expect(new Set(names).size).toBe(names.length);
-		expect(() => hashPrefixBucketTopologyAdminName(shardGroup, "short", a)).toThrow(/invariant_failed/);
+		expect(() => routingHashTopologyAdminName(shardGroup, "short", a)).toThrow(/invariant_failed/);
 	});
 });
 

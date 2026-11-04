@@ -11,7 +11,7 @@ import { describe, it, vi } from "vitest";
 import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
-import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
@@ -92,7 +92,7 @@ describe.concurrent("FokosDBPartitionDO — fokosStatus", () => {
 		const entries = await allPromotionEntries(partition);
 		expect(entries).toHaveLength(1);
 		expect(entries[0].repartition.kind).toBe("key_promotion");
-		expect(entries[0].repartition.hashPrefixBucket).toEqual(hashPrefixBucketOf(kb("alice"), partition.ctx.topology.shardGroup));
+		expect(entries[0].repartition.routingHash).toEqual(routingHashOf(kb("alice"), partition.ctx.topology.shardGroup));
 		expect(entries[0].target?.ref.doName).toBe(rangeRoot.doName);
 	});
 

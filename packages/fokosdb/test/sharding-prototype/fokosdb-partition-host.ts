@@ -501,8 +501,8 @@ function partitionHooks(host: FokosDBPartitionDO): FokosShardingHooks<FokosDBPol
 			const cap = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions).maxSizeMb * 1024 * 1024;
 			return store.databaseSize > cap ? {} : false;
 		},
-		computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) =>
-			todo(`store.rangeBoundaries(${hashPrefixBucket.toHex()}, ${childCount}, ${JSON.stringify([start, end]) ?? "null"})`),
+		computeRangeBoundaries: ({ routingHash, start, end, childCount }) =>
+			todo(`store.rangeBoundaries(${routingHash.toHex()}, ${childCount}, ${JSON.stringify([start, end]) ?? "null"})`),
 		migration: todo("FokosDBMigrationHost, unchanged"),
 		// No `beforeCutover`: a lock moves with its key, so nothing here holds a cutover back.
 		beforeComplete: (plan) => (plan.kind === "key_promotion" ? todo("store.deleteKeySizeEstimate of the key") : undefined),

@@ -1,5 +1,5 @@
 import { AddResult, BloomFilter, type BloomFilterSnapshot } from "../shared/bloom-filter.js";
-import type { HashPrefixBucket } from "./hash-primitives.js";
+import type { RoutingHash } from "./hash-primitives.js";
 
 export type PartialRangeTopologySnapshot = {
 	version: 1;
@@ -22,15 +22,15 @@ export class PartialRangeTopology {
 	}
 
 	/**
-	 * @returns True if the hashPrefixBucket is probably promoted (may be a false positive), false if
+	 * @returns True if the routingHash is probably promoted (may be a false positive), false if
 	 * definitely not promoted.
 	 */
-	maybePromoted(hashPrefixBucket: HashPrefixBucket): boolean {
-		return this.bloom.has(hashPrefixBucket);
+	maybePromoted(routingHash: RoutingHash): boolean {
+		return this.bloom.has(routingHash);
 	}
 
-	learnPromotedHashPrefixBucket(hashPrefixBucket: HashPrefixBucket): AddResult {
-		return this.bloom.add(hashPrefixBucket);
+	learnPromotedRoutingHash(routingHash: RoutingHash): AddResult {
+		return this.bloom.add(routingHash);
 	}
 
 	toSnapshot(): PartialRangeTopologySnapshot {

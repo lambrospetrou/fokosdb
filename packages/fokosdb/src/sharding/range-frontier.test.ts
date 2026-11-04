@@ -179,7 +179,7 @@ describe("planRangeFrontier", () => {
 	});
 });
 
-describe("planRangeFrontier with two hash keys in one hashPrefixBucket", () => {
+describe("planRangeFrontier with two hash keys in one routingHash", () => {
 	const split: FokosCompositeKey = { hk: kb("b"), sk: KeyCodec.encodeOptional(undefined) };
 	const bases: FrontierBase[] = [
 		{ target: { partitionId: "left", doName: "left" }, start: null, end: split, speculative: false },

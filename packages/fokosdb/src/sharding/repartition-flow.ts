@@ -48,8 +48,8 @@ import type {
 	RepartitionTargetRow,
 } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
-import { hashStorageInterval, rangeStorageInterval, sliceIncludesHashPrefixBucket, sliceIncludesItem } from "./repartition-slice.js";
-import { compareHashPrefixBuckets, hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
+import { hashStorageInterval, rangeStorageInterval, sliceIncludesRoutingHash, sliceIncludesItem } from "./repartition-slice.js";
+import { compareRoutingHashes, routingHashOf, type RoutingHash } from "./hash-primitives.js";
 import type {
 	FokosImportRecord,
 	FokosImportState,
@@ -175,16 +175,16 @@ export class RepartitionSource {
 	}
 
 	/**
-	 * How far the promotion of one hashPrefixBucket has got, or undefined when this partition still
+	 * How far the promotion of one routingHash has got, or undefined when this partition still
 	 * owns it. One indexed join on the point-read path.
 	 */
-	overrideFor(hashPrefixBucket: HashPrefixBucket): RepartitionState | undefined {
-		return this.store.routeOverrideFor(hashPrefixBucket)?.state;
+	overrideFor(routingHash: RoutingHash): RepartitionState | undefined {
+		return this.store.routeOverrideFor(routingHash)?.state;
 	}
 
-	/** Whether the range tree, not this partition, owns the hashPrefixBucket. True from cutover onwards. */
-	ownedByRangeTree(hashPrefixBucket: HashPrefixBucket): boolean {
-		const state = this.overrideFor(hashPrefixBucket);
+	/** Whether the range tree, not this partition, owns the routingHash. True from cutover onwards. */
+	ownedByRangeTree(routingHash: RoutingHash): boolean {
+		const state = this.overrideFor(routingHash);
 		return state === "cutover" || state === "completed" || state === "cleaned";
 	}
 
@@ -192,7 +192,7 @@ export class RepartitionSource {
 	 * Says whether a queue request can pass arbitration now, without a write. The queue transaction
 	 * repeats the check, so a request that passes here can still be refused there.
 	 */
-	canQueue(request: { kind: RepartitionKind; hashPrefixBucket?: HashPrefixBucket }): boolean {
+	canQueue(request: { kind: RepartitionKind; routingHash?: RoutingHash }): boolean {
 		const { identity } = this.deps.identity();
 		if (this.store.getSplitRepartition()) {
 			return false;
@@ -203,7 +203,7 @@ export class RepartitionSource {
 			case "range_split":
 				return identity.kind === "range";
 			case "key_promotion":
-				return identity.kind === "hash" && request.hashPrefixBucket !== undefined && !this.store.hasRouteOverride(request.hashPrefixBucket);
+				return identity.kind === "hash" && request.routingHash !== undefined && !this.store.hasRouteOverride(request.routingHash);
 		}
 	}
 
@@ -218,10 +218,7 @@ export class RepartitionSource {
 	 * The transaction also writes the plan head with the host policy and data of this moment, so every
 	 * later hook reads the values of queue time.
 	 */
-	queue(
-		request: { kind: RepartitionKind; hashPrefixBucket?: HashPrefixBucket; data?: unknown },
-		now = Date.now(),
-	): RepartitionRow | undefined {
+	queue(request: { kind: RepartitionKind; routingHash?: RoutingHash; data?: unknown }, now = Date.now()): RepartitionRow | undefined {
 		const { ctx, identity } = this.deps.identity();
 		const row = this.store.transactionSync((): RepartitionRow | undefined => {
 			if (this.store.getSplitRepartition()) {
@@ -248,8 +245,8 @@ export class RepartitionSource {
 					if (identity.kind !== "hash") {
 						return undefined;
 					}
-					invariant(request.hashPrefixBucket, "fokos/repartition.queue: a key promotion needs its hashPrefixBucket");
-					if (this.store.hasRouteOverride(request.hashPrefixBucket)) {
+					invariant(request.routingHash, "fokos/repartition.queue: a key promotion needs its routingHash");
+					if (this.store.hasRouteOverride(request.routingHash)) {
 						return undefined;
 					}
 					break;
@@ -262,14 +259,14 @@ export class RepartitionSource {
 				seq,
 				kind: request.kind,
 				state: "queued",
-				hashPrefixBucket: request.hashPrefixBucket ?? null,
+				routingHash: request.routingHash ?? null,
 				queuedAt: now,
 				nextAttemptAt: now,
 			});
 			// The override exists from the moment the promotion is queued, so a second request for the
-			// same hashPrefixBucket finds it and no hashPrefixBucket is ever queued twice.
+			// same routingHash finds it and no routingHash is ever queued twice.
 			if (request.kind === "key_promotion") {
-				this.store.insertRouteOverride(request.hashPrefixBucket!, id);
+				this.store.insertRouteOverride(request.routingHash!, id);
 			}
 			this.store.putPlanHead(id, {
 				schema: 1,
@@ -363,7 +360,7 @@ export class RepartitionSource {
 				invariant(n >= 2, "fokos/repartition.plan: rangeSplitN must be at least 2");
 				const boundaries =
 					this.deps.hooks.computeRangeBoundaries?.({
-						hashPrefixBucket: rp.hashPrefixBucket,
+						routingHash: rp.routingHash,
 						start: rp.start,
 						end: rp.end,
 						childCount: n,
@@ -386,11 +383,11 @@ export class RepartitionSource {
 							(rp.end === null || KeyCodec.compareComposite(b, rp.end) < 0),
 						() => `fokos/repartition.plan: boundary ${i} (${KeyCodec.compositeForLog(b)}) is out of order or outside the interval`,
 					);
-					// A boundary of the hashPrefixBucket must hold a hash key of it, or a child would own no key.
+					// A boundary of the routingHash must hold a hash key of it, or a child would own no key.
 					invariant(
-						compareHashPrefixBuckets(hashPrefixBucketOf(b.hk, ctx.topology.shardGroup), rp.hashPrefixBucket) === 0 || b.sk.length === 0,
+						compareRoutingHashes(routingHashOf(b.hk, ctx.topology.shardGroup), rp.routingHash) === 0 || b.sk.length === 0,
 						() =>
-							`fokos/repartition.plan: boundary ${i} (${KeyCodec.compositeForLog(b)}) has a hash key of another hashPrefixBucket and a sort key`,
+							`fokos/repartition.plan: boundary ${i} (${KeyCodec.compositeForLog(b)}) has a hash key of another routingHash and a sort key`,
 					);
 				});
 				const starts: (FokosCompositeKey | null)[] = [rp.start, ...boundaries];
@@ -403,24 +400,24 @@ export class RepartitionSource {
 					ctx.rangeConfig.rangeAncestors,
 				);
 				targets = starts.map((start, i) => {
-					const child = resolveRangePartitionContext(ctx, rp.hashPrefixBucket, start, ends[i]);
+					const child = resolveRangePartitionContext(ctx, rp.routingHash, start, ends[i]);
 					return {
 						ref: { partitionId: child.partitionId, doName: child.doName },
-						slice: { kind: "range", hashPrefixBucket: rp.hashPrefixBucket, start, end: ends[i] },
+						slice: { kind: "range", routingHash: rp.routingHash, start, end: ends[i] },
 					};
 				});
 				break;
 			}
 			case "key_promotion": {
-				const hashPrefixBucket = row.hashPrefixBucket;
-				invariant(hashPrefixBucket, "fokos/repartition.plan: a key promotion needs its hashPrefixBucket");
-				const root = resolveRangePartitionContext(ctx, hashPrefixBucket, null, null);
+				const routingHash = row.routingHash;
+				invariant(routingHash, "fokos/repartition.plan: a key promotion needs its routingHash");
+				const root = resolveRangePartitionContext(ctx, routingHash, null, null);
 				planned.rangeDepth = 0;
 				planned.rangeAncestors = [];
 				targets = [
 					{
 						ref: { partitionId: root.partitionId, doName: root.doName },
-						slice: { kind: "promoted_hash_prefix_bucket", hashPrefixBucket },
+						slice: { kind: "promoted_routing_hash", routingHash },
 					},
 				];
 				break;
@@ -671,7 +668,7 @@ export class RepartitionSource {
 		const slice = target.slice;
 		const start = slice.kind === "range" ? slice.start : null;
 		const end = slice.kind === "range" ? slice.end : null;
-		return resolveRangePartitionContext(ctx, slice.hashPrefixBucket, start, end);
+		return resolveRangePartitionContext(ctx, slice.routingHash, start, end);
 	}
 
 	#deferSource(row: RepartitionRow, now: number, delayMs: number): void {
@@ -864,19 +861,19 @@ export class RepartitionSource {
 
 	/**
 	 * The storage interval of one validated target: the node interval of a hash child, the composite
-	 * interval of a range slice, or every row of a promoted hashPrefixBucket.
+	 * interval of a range slice, or every row of a promoted routingHash.
 	 */
 	#targetInterval(slice: FokosSlice, targetPartitionId: string): FokosStorageInterval {
 		const { topology } = this.deps.identity().ctx;
 		switch (slice.kind) {
 			case "hash_child": {
-				const { start, end } = PartitionIdHelper.hashPrefixBucketInterval(targetPartitionId, topology);
+				const { start, end } = PartitionIdHelper.routingHashInterval(targetPartitionId, topology);
 				return hashStorageInterval(start, end);
 			}
 			case "range":
-				return rangeStorageInterval(slice.hashPrefixBucket, slice.start, slice.end);
-			case "promoted_hash_prefix_bucket":
-				return rangeStorageInterval(slice.hashPrefixBucket, null, null);
+				return rangeStorageInterval(slice.routingHash, slice.start, slice.end);
+			case "promoted_routing_hash":
+				return rangeStorageInterval(slice.routingHash, null, null);
 		}
 	}
 
@@ -889,7 +886,7 @@ export class RepartitionSource {
 		const topology = this.deps.identity().ctx.topology;
 		return (key) =>
 			sliceIncludesItem(slice, key.hashKey, key.sortKey, topology) &&
-			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(hashPrefixBucketOf(key.hashKey, topology.shardGroup)));
+			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(routingHashOf(key.hashKey, topology.shardGroup)));
 	}
 
 	/**
@@ -903,11 +900,11 @@ export class RepartitionSource {
 
 		const topology = this.deps.identity().ctx.topology;
 		const config = this.deps.config();
-		const { rows, nextCursor } = collectBatch<{ hashPrefixBucket: HashPrefixBucket }, PromotedKeyCursor>({
+		const { rows, nextCursor } = collectBatch<{ routingHash: RoutingHash }, PromotedKeyCursor>({
 			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize),
-			advanceCursor: (r) => ({ hashPrefixBucket: r.hashPrefixBucket }),
-			include: (r) => sliceIncludesHashPrefixBucket(slice, r.hashPrefixBucket, topology),
-			estimateBytes: (r) => r.hashPrefixBucket.byteLength + 64,
+			advanceCursor: (r) => ({ routingHash: r.routingHash }),
+			include: (r) => sliceIncludesRoutingHash(slice, r.routingHash, topology),
+			estimateBytes: (r) => r.routingHash.byteLength + 64,
 			budgetBytes: config.migrationPageBytes,
 			maxItems: config.migrationPageRows,
 			maxScannedRows: config.migrationScanRows,
@@ -986,10 +983,7 @@ export class RepartitionTarget {
 		// A row outside the slice of this target belongs to a sibling or to the source, and two partitions
 		// would then own it.
 		const topology = this.deps.identity().ctx.topology;
-		if (
-			page.phase === "overrides" &&
-			!page.overrides.every((o) => sliceIncludesHashPrefixBucket(rec.slice, o.hashPrefixBucket, topology))
-		) {
+		if (page.phase === "overrides" && !page.overrides.every((o) => sliceIncludesRoutingHash(rec.slice, o.routingHash, topology))) {
 			this.#deferImport(rec, now, new Error("the overrides page holds a hash key outside the slice of this target"));
 			return "stopped";
 		}
@@ -1069,19 +1063,19 @@ export class RepartitionTarget {
 	}
 
 	/**
-	 * Adopts the promotions the source already finished, for the hashPrefixBuckets this target now owns.
+	 * Adopts the promotions the source already finished, for the routingHashes this target now owns.
 	 *
 	 * The child receives the forward pointer and no item copy: the data lives in a range tree that
 	 * neither partition owns. The row exists so routing, status and destroy traversal can all see the
 	 * link — which is why it is written as a finished promotion rather than as a bare override.
 	 */
-	#applyOverrides(overrides: readonly { hashPrefixBucket: HashPrefixBucket }[], now: number): void {
+	#applyOverrides(overrides: readonly { routingHash: RoutingHash }[], now: number): void {
 		if (overrides.length === 0) {
 			return;
 		}
 		const { ctx } = this.deps.identity();
-		for (const { hashPrefixBucket } of overrides) {
-			if (this.store.hasRouteOverride(hashPrefixBucket)) {
+		for (const { routingHash } of overrides) {
+			if (this.store.hasRouteOverride(routingHash)) {
 				continue;
 			}
 			const seq = this.store.nextRepartitionSeq();
@@ -1091,26 +1085,26 @@ export class RepartitionTarget {
 				seq,
 				kind: "key_promotion",
 				state: "cleaned",
-				hashPrefixBucket,
+				routingHash,
 				queuedAt: now,
 				cutoverAt: now,
 				completedAt: now,
 				nextAttemptAt: now,
 			});
-			const root = resolveRangePartitionContext(ctx, hashPrefixBucket, null, null);
+			const root = resolveRangePartitionContext(ctx, routingHash, null, null);
 			this.store.insertRepartitionTarget({
 				repartitionId: id,
 				kind: "key_promotion",
 				partitionId: root.partitionId,
 				doName: root.doName,
 				targetIndex: 0,
-				slice: { kind: "promoted_hash_prefix_bucket", hashPrefixBucket },
+				slice: { kind: "promoted_routing_hash", routingHash },
 				initialization: "initialized",
 				startNotified: true,
 				acknowledged: true,
 				nextAttemptAt: now,
 			});
-			this.store.insertRouteOverride(hashPrefixBucket, id);
+			this.store.insertRouteOverride(routingHash, id);
 		}
 	}
 
@@ -1338,9 +1332,9 @@ const PHASE_ORDER: Record<FokosMigrationCursor["phase"], number> = { overrides: 
 
 const IMPORT_ORDER: Record<FokosImportState, number> = { awaiting_data: 0, importing: 1, imported: 2, active: 3 };
 
-/** True when `next` is strictly after `requested` in the `hash_prefix_bucket` order of the overrides stream. */
+/** True when `next` is strictly after `requested` in the `routing_hash` order of the overrides stream. */
 function overridesCursorAfter(next: PromotedKeyCursor | null, requested: PromotedKeyCursor | null): boolean {
-	return next !== null && (requested === null || compareHashPrefixBuckets(next.hashPrefixBucket, requested.hashPrefixBucket) > 0);
+	return next !== null && (requested === null || compareRoutingHashes(next.routingHash, requested.routingHash) > 0);
 }
 
 function notCutOver(repartitionId: string): FokosUnavailableError {
@@ -1352,7 +1346,7 @@ function notCutOver(repartitionId: string): FokosUnavailableError {
 
 function toStatusEntry(r: RepartitionStatusRow): FokosStatusEntry {
 	return {
-		repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, hashPrefixBucket: r.hashPrefixBucket },
+		repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, routingHash: r.routingHash },
 		target:
 			r.targetIndex < 0 || r.partitionId === null || r.doName === null || r.initialization === null
 				? null
@@ -1372,7 +1366,7 @@ function toStatusEntry(r: RepartitionStatusRow): FokosStatusEntry {
  */
 function statusEntryBytes(entry: FokosStatusEntry): number {
 	const ids = entry.repartition.id.length + (entry.target ? entry.target.ref.doName.length + entry.target.ref.partitionId.length : 0);
-	return 256 + 2 * ids + (entry.repartition.hashPrefixBucket?.byteLength ?? 0);
+	return 256 + 2 * ids + (entry.repartition.routingHash?.byteLength ?? 0);
 }
 
 /** Compares two migration cursors by value. Both ends survive a KV structured-clone round trip. */
@@ -1387,7 +1381,7 @@ function cursorsEqual(a: FokosMigrationCursor | null, b: FokosMigrationCursor | 
 		if (a.inner === null || b.inner === null) {
 			return a.inner === b.inner;
 		}
-		return compareHashPrefixBuckets(a.inner.hashPrefixBucket, b.inner.hashPrefixBucket) === 0;
+		return compareRoutingHashes(a.inner.routingHash, b.inner.routingHash) === 0;
 	}
 	// The host cursor is opaque, so it is compared as its serialized form rather than field by field.
 	return JSON.stringify(a.inner ?? null) === JSON.stringify(b.inner ?? null);
@@ -1402,14 +1396,11 @@ function slicesEqual(a: FokosSlice, b: FokosSlice): boolean {
 	switch (a.kind) {
 		case "hash_child":
 			return b.kind === "hash_child" && a.childIndex === b.childIndex && a.depth === b.depth;
-		case "promoted_hash_prefix_bucket":
-			return b.kind === "promoted_hash_prefix_bucket" && compareHashPrefixBuckets(a.hashPrefixBucket, b.hashPrefixBucket) === 0;
+		case "promoted_routing_hash":
+			return b.kind === "promoted_routing_hash" && compareRoutingHashes(a.routingHash, b.routingHash) === 0;
 		case "range":
 			return (
-				b.kind === "range" &&
-				compareHashPrefixBuckets(a.hashPrefixBucket, b.hashPrefixBucket) === 0 &&
-				keyEq(a.start, b.start) &&
-				keyEq(a.end, b.end)
+				b.kind === "range" && compareRoutingHashes(a.routingHash, b.routingHash) === 0 && keyEq(a.start, b.start) && keyEq(a.end, b.end)
 			);
 	}
 }

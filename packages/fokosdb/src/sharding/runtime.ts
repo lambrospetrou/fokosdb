@@ -17,13 +17,13 @@ import { AddResult } from "../shared/bloom-filter.js";
 import { attachRouting, envelope, RouteCollector, routedError } from "./envelope.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import {
-	compareHashPrefixBuckets,
-	HashPrefixBucketDigitCursor,
-	hashPrefixBucketDigits,
-	hashPrefixBucketOf,
-	hashPrefixBucketSeedOf,
-	inHashPrefixBucketInterval,
-	type HashPrefixBucket,
+	compareRoutingHashes,
+	RoutingHashDigitCursor,
+	routingHashDigits,
+	routingHashOf,
+	routingHashSeedOf,
+	inRoutingHashInterval,
+	type RoutingHash,
 } from "./hash-primitives.js";
 import { HashTopology } from "./hash-topology.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
@@ -283,9 +283,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				if (identity && stored) {
 					this.#setIdentity(identity, stored);
 					// The identity stays in memory, so `fokosStatus` and the destroy RPCs still work.
-					const seed = hashPrefixBucketSeedOf(identity.topology.shardGroup);
-					if (identity.hashPrefixBucketSeed !== seed) {
-						throw contextMismatch({ doName: identity.ref.doName, hashPrefixBucketSeed: identity.hashPrefixBucketSeed, expected: seed });
+					const seed = routingHashSeedOf(identity.topology.shardGroup);
+					if (identity.routingHashSeed !== seed) {
+						throw contextMismatch({ doName: identity.ref.doName, routingHashSeed: identity.routingHashSeed, expected: seed });
 					}
 				}
 				const bloom = this.#store.getPromotionBloom();
@@ -540,7 +540,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
 		const awaitingData = isAwaitingData(e);
 		if (resolution.learned && notInitialized) {
-			this.#store.deleteLearnedRangeSlice(this.#bucket(hashKey), resolution.learned);
+			this.#store.deleteLearnedRangeSlice(this.#routingHash(hashKey), resolution.learned);
 			return retry({ bloom: resolution.via === "bloom", learnedRange: true });
 		}
 		// A Bloom hit can name the range root of a key whose promotion has not cut over. The exact
@@ -558,7 +558,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				cutTopologyHint(resolution.topologyHint.entry, resolution.topologyHint.pos);
 			}
 			const arena = this.#arena();
-			if (arena?.invalidate(this.#bucket(hashKey), resolution.relDepth!)) {
+			if (arena?.invalidate(this.#routingHash(hashKey), resolution.relDepth!)) {
 				this.#store.putHashArena(arena.toSnapshot());
 			}
 			return retry(HINTED);
@@ -639,7 +639,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#groupByOwner(op: string, entries: readonly GroupEntry[], opts: ResolveOptions): { local: GroupEntry[]; remote: RemoteGroup[] } {
 		const groups: Groups = { local: [], remote: new Map() };
 		// The entries with a Bloom hit wait for the guard, by hash key. `KeyCodec.mapKey` is a hash and
-		// not an identity, so a bucket holds each hash key of one hash value.
+		// not an identity, so a group holds each hash key of one hash value.
 		let bloomHits: Map<bigint, BloomHashKey[]> | undefined;
 		const view = this.#routerView();
 		for (const entry of entries) {
@@ -653,15 +653,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			bloomHits ??= new Map();
 			const id = KeyCodec.mapKey(entry.key.hashKey);
-			let bucket = bloomHits.get(id);
-			if (bucket === undefined) {
-				bucket = [];
-				bloomHits.set(id, bucket);
+			let hits = bloomHits.get(id);
+			if (hits === undefined) {
+				hits = [];
+				bloomHits.set(id, hits);
 			}
-			let hit = bucket.find((b) => KeyCodec.compare(b.hashKey, entry.key.hashKey) === 0);
+			let hit = hits.find((b) => KeyCodec.compare(b.hashKey, entry.key.hashKey) === 0);
 			if (hit === undefined) {
 				hit = { hashKey: entry.key.hashKey, entries: [] };
-				bucket.push(hit);
+				hits.push(hit);
 			}
 			hit.entries.push({ entry, resolution });
 		}
@@ -712,9 +712,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#guardBloomHits(bloomHits: Map<bigint, BloomHashKey[]>, groups: Groups, router: boolean): void {
 		const owners: Array<{ hit: BloomHashKey; owner: OwnedResolution; id: string }> = [];
 		const hashKeysAt = new Map<string, number>();
-		for (const bucket of bloomHits.values()) {
-			for (const hit of bucket) {
-				const owner = this.#hashTopologyOwner(this.#bucket(hit.hashKey), router);
+		for (const hits of bloomHits.values()) {
+			for (const hit of hits) {
+				const owner = this.#hashTopologyOwner(this.#routingHash(hit.hashKey), router);
 				const id = owner.kind === "local" ? "local" : owner.target.partitionId;
 				owners.push({ hit, owner, id });
 				hashKeysAt.set(id, (hashKeysAt.get(id) ?? 0) + 1);
@@ -1163,8 +1163,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * The storage prefix of a hash key in this partition: the first primary-key column of its rows. The
 	 * host treats it as opaque bytes, and must not keep it for a key of another call.
 	 */
-	storagePrefix(hashKey: KeyBytes): HashPrefixBucket {
-		return this.#bucket(hashKey);
+	storagePrefix(hashKey: KeyBytes): RoutingHash {
+		return this.#routingHash(hashKey);
 	}
 
 	/**
@@ -1176,8 +1176,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (identity.kind === "hash") {
 			return hashStorageInterval(identity.hash!.start, identity.hash!.end);
 		}
-		const { hashPrefixBucket, start, end } = identity.range!;
-		return rangeStorageInterval(hashPrefixBucket, start, end);
+		const { routingHash, start, end } = identity.range!;
+		return rangeStorageInterval(routingHash, start, end);
 	}
 
 	/**
@@ -1257,7 +1257,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * A hash child holds the promotions it inherited from its parent too. One primary-key read.
 	 */
 	promotionState(hashKey: KeyBytes): RepartitionState | undefined {
-		return this.#store.routeOverrideFor(this.#bucket(hashKey))?.state;
+		return this.#store.routeOverrideFor(this.#routingHash(hashKey))?.state;
 	}
 
 	/** Routes to the current owner of the key first, then queues the promotion there. */
@@ -1355,9 +1355,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// A promoted key's rows live in the range tree; the local copies are stale or already
 			// collected. Only a hash-child caller can reach one: a range or promoted-key slice is itself
 			// inside a range tree.
-			const bucket = this.#bucket(key.hashKey);
-			if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(bucket)) {
-				const owner = this.#rangeOwner(bucket, { hk: key.hashKey, sk: key.sortKey }, "override", false, true);
+			const routingHash = this.#routingHash(key.hashKey);
+			if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash)) {
+				const owner = this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "override", false, true);
 				const value = await this.#forwardTo(collector, owner.target, req.op, req.request, [key.hashKey]);
 				return envelope(value, collector.build());
 			}
@@ -1376,9 +1376,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				if (!sliceIncludesItem(slice, hashKey, sortKey, topology)) {
 					throw misrouted(req.op, "key outside the caller slice");
 				}
-				const bucket = this.#bucket(hashKey);
-				const promoted = slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(bucket);
-				addToGroups(groups, entry, promoted ? this.#rangeOwner(bucket, { hk: hashKey, sk: sortKey }, "override", false, true) : LOCAL);
+				const routingHash = this.#routingHash(hashKey);
+				const promoted = slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash);
+				addToGroups(groups, entry, promoted ? this.#rangeOwner(routingHash, { hk: hashKey, sk: sortKey }, "override", false, true) : LOCAL);
 			}
 			const remote = [...groups.remote.values()];
 			const run = await this.#runGroups(req.op, descriptor, req.request, groups.local, remote, collector, 0, [], false);
@@ -1404,11 +1404,11 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			request = descriptor.clip(req.request, { target: "local", start: segment.start, end: segment.end, speculative: false });
 		}
-		const bucket = this.#bucket(input.hashKey);
-		if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(bucket)) {
+		const routingHash = this.#routingHash(input.hashKey);
+		if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash)) {
 			// A range request spans sort keys, so it carries no one key that could select a deeper range
 			// slice; it enters at the range root and the routers below it fan out.
-			const root = refOf(resolveRangePartitionContext(routeCtx, bucket, null, null));
+			const root = refOf(resolveRangePartitionContext(routeCtx, routingHash, null, null));
 			const value = await this.#forwardTo(collector, root, req.op, request, [input.hashKey]);
 			return envelope(value, collector.build());
 		}
@@ -1448,9 +1448,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return { owner, queued: false, reason: "already_promoted", state: "cleaned" };
 		}
 
-		// A promotion moves the whole hashPrefixBucket of the key, with every hash key of it.
-		const hashPrefixBucket = this.#bucket(hashKey);
-		const override = this.#store.routeOverrideFor(hashPrefixBucket);
+		// A promotion moves the whole routingHash of the key, with every hash key of it.
+		const routingHash = this.#routingHash(hashKey);
+		const override = this.#store.routeOverrideFor(routingHash);
 		if (override) {
 			// A promotion in flight gets its fallback alarm back and one pass now: a request that asks
 			// about it is the one signal a partition gets when an eviction lost its alarm.
@@ -1467,21 +1467,21 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (resolution.kind === "remote") {
 			return await this.#peer(resolution.target).fokosRequestPromotion({ target: resolution.target, hashKey, data });
 		}
-		if (!this.#source.canQueue({ kind: "key_promotion", hashPrefixBucket })) {
+		if (!this.#source.canQueue({ kind: "key_promotion", routingHash })) {
 			return { owner, queued: false, reason: "split_in_progress" };
 		}
 		// The fallback alarm moves earlier BEFORE the queue transaction, so a crash between the two
 		// leaves an alarm that reads the new row. A failed alarm write creates no row.
 		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
-		const row = this.#source.queue({ kind: "key_promotion", hashPrefixBucket, data });
+		const row = this.#source.queue({ kind: "key_promotion", routingHash, data });
 		if (!row) {
 			return { owner, queued: false, reason: "split_in_progress" };
 		}
 		console.log({
 			...this.#logParams(),
-			message: "fokos/runtime: hashPrefixBucket queued for promotion.",
+			message: "fokos/runtime: routingHash queued for promotion.",
 			hashKey: KeyCodec.keyForLog(hashKey),
-			hashPrefixBucket: hashPrefixBucket.toHex(),
+			routingHash: routingHash.toHex(),
 			repartitionId: row.id,
 		});
 		this.#scheduler.wake();
@@ -1725,7 +1725,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return;
 		}
 		const range = identity.range!;
-		if (compareHashPrefixBuckets(this.#bucket(input.hashKey), range.hashPrefixBucket) !== 0) {
+		if (compareRoutingHashes(this.#routingHash(input.hashKey), range.routingHash) !== 0) {
 			throw misrouted(op, "hash key outside this range partition");
 		}
 		const segment = projectOnHashKey(input.hashKey, range.start, range.end);
@@ -1742,19 +1742,19 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		const range = identity.range!;
 		return (
-			compareHashPrefixBuckets(this.#bucket(key.hashKey), range.hashPrefixBucket) === 0 &&
+			compareRoutingHashes(this.#routingHash(key.hashKey), range.routingHash) === 0 &&
 			compositeInInterval({ hk: key.hashKey, sk: key.sortKey }, range.start, range.end)
 		);
 	}
 
 	#hashesHere(hashKey: KeyBytes, identity: FokosPartitionIdentity): boolean {
 		const { start, end } = identity.hash!;
-		return inHashPrefixBucketInterval(this.#bucket(hashKey), start, end);
+		return inRoutingHashInterval(this.#routingHash(hashKey), start, end);
 	}
 
-	/** The hashPrefixBucket of a hash key in the shard group of this partition. It is not kept after the call. */
-	#bucket(hashKey: KeyBytes): HashPrefixBucket {
-		return hashPrefixBucketOf(hashKey, this.identity().topology.shardGroup);
+	/** The routingHash of a hash key in the shard group of this partition. It is not kept after the call. */
+	#routingHash(hashKey: KeyBytes): RoutingHash {
+		return routingHashOf(hashKey, this.identity().topology.shardGroup);
 	}
 
 	/** `view` is read here when the caller does not give one. A hash key with a cut-over override does not need it. */
@@ -1766,15 +1766,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		if (identity.kind === "hash") {
 			// One hash of the key for each resolve: the override, the Bloom filter, and the topology use it.
-			const bucket = this.#bucket(key.hashKey);
-			const override = this.#store.routeOverrideFor(bucket);
+			const routingHash = this.#routingHash(key.hashKey);
+			const override = this.#store.routeOverrideFor(routingHash);
 			if (override && cutOver(override.state)) {
-				return this.#rangeOwner(bucket, { hk: key.hashKey, sk: key.sortKey }, "override", false, opts.learnedRange);
+				return this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "override", false, opts.learnedRange);
 			}
-			if (opts.bloom && this.#bloom?.maybePromoted(bucket)) {
-				return this.#rangeOwner(bucket, { hk: key.hashKey, sk: key.sortKey }, "bloom", true, opts.learnedRange);
+			if (opts.bloom && this.#bloom?.maybePromoted(routingHash)) {
+				return this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "bloom", true, opts.learnedRange);
 			}
-			return this.#hashTopologyOwner(bucket, (view ?? this.#routerView()).router);
+			return this.#hashTopologyOwner(routingHash, (view ?? this.#routerView()).router);
 		}
 
 		const { router, rangeChildren } = view ?? this.#routerView();
@@ -1784,16 +1784,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const range = identity.range!;
 		const composite = { hk: key.hashKey, sk: key.sortKey };
 		const child = this.#rangeChildFor(composite, rangeChildren);
-		const learned = opts.learnedRange ? this.#store.findDeepestKnownRangeSlice(range.hashPrefixBucket, composite) : null;
+		const learned = opts.learnedRange ? this.#store.findDeepestKnownRangeSlice(range.routingHash, composite) : null;
 		const jump = learned && isStrictSubSlice(learned, child.start, child.end) ? learned : null;
 		const target = jump
-			? refOf(resolveRangePartitionContext(this.routeContext(), range.hashPrefixBucket, jump.startBoundary, jump.endBoundary))
+			? refOf(resolveRangePartitionContext(this.routeContext(), range.routingHash, jump.startBoundary, jump.endBoundary))
 			: child.ref;
 		return { kind: "remote", target, speculative: false, via: "range", learned: jump };
 	}
 
 	/**
-	 * The owner of a hashPrefixBucket that has no cut-over route override on this hash partition: local on an
+	 * The owner of a routingHash that has no cut-over route override on this hash partition: local on an
 	 * owner, else the deeper of the hash descendants that the hash arena and the topology cache name.
 	 * `router` is `routerRole()`, which reads SQLite, so a caller that asks for many keys reads it once.
 	 *
@@ -1801,17 +1801,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * and its depth below this partition is the depth of the walk minus the depth of this partition. An
 	 * older topology can stop above this partition, and then it gives no hint.
 	 */
-	#hashTopologyOwner(bucket: HashPrefixBucket, router: boolean): OwnedResolution {
+	#hashTopologyOwner(routingHash: RoutingHash, router: boolean): OwnedResolution {
 		if (!router) {
 			return { kind: "local" };
 		}
-		let relDepth = Math.max(1, this.#arena()?.findLeaf(bucket) ?? 0);
+		let relDepth = Math.max(1, this.#arena()?.findLeaf(routingHash) ?? 0);
 		let topologyHint: RemoteResolution["topologyHint"];
 		const cacheOptions = this.#topologyCache?.();
 		const entry = cacheOptions && cachedHashTopology(cacheOptions, this.identity().topology);
 		if (entry) {
 			const { rootTreesN, hashSplitN } = this.identity().topology;
-			const leaf = findLeaf(entry.view, rootTreesN, hashSplitN, bucket, entry.cut);
+			const leaf = findLeaf(entry.view, rootTreesN, hashSplitN, routingHash, entry.cut);
 			const topologyDepth = leaf.path.length - identityDepth(this.identity());
 			if (topologyDepth >= relDepth) {
 				relDepth = topologyDepth;
@@ -1820,7 +1820,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		return {
 			kind: "remote",
-			target: this.#hashDescendant(bucket, relDepth),
+			target: this.#hashDescendant(routingHash, relDepth),
 			speculative: false,
 			via: "hash",
 			relDepth,
@@ -1829,29 +1829,29 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		};
 	}
 
-	/** The range partition that serves a promoted hashPrefixBucket: the deepest learned slice that holds the key, or the root. */
+	/** The range partition that serves a promoted routingHash: the deepest learned slice that holds the key, or the root. */
 	#rangeOwner(
-		hashPrefixBucket: HashPrefixBucket,
+		routingHash: RoutingHash,
 		key: FokosCompositeKey,
 		via: "override" | "bloom",
 		speculative: boolean,
 		learnedRange: boolean,
 	): RemoteResolution {
 		const routeCtx = this.routeContext();
-		const learned = learnedRange ? this.#store.findDeepestKnownRangeSlice(hashPrefixBucket, key) : null;
+		const learned = learnedRange ? this.#store.findDeepestKnownRangeSlice(routingHash, key) : null;
 		const jump = learned && (learned.startBoundary !== null || learned.endBoundary !== null) ? learned : null;
 		const target = jump
-			? refOf(resolveRangePartitionContext(routeCtx, hashPrefixBucket, jump.startBoundary, jump.endBoundary))
-			: refOf(resolveRangePartitionContext(routeCtx, hashPrefixBucket, null, null));
+			? refOf(resolveRangePartitionContext(routeCtx, routingHash, jump.startBoundary, jump.endBoundary))
+			: refOf(resolveRangePartitionContext(routeCtx, routingHash, null, null));
 		return { kind: "remote", target, speculative, via, learned: jump };
 	}
 
-	/** The hash descendant `relDepth` levels below this partition that owns a hashPrefixBucket. */
-	#hashDescendant(hashPrefixBucket: HashPrefixBucket, relDepth: number): FokosPartitionRef {
+	/** The hash descendant `relDepth` levels below this partition that owns a routingHash. */
+	#hashDescendant(routingHash: RoutingHash, relDepth: number): FokosPartitionRef {
 		const identity = this.identity();
 		const { rootTreesN, hashSplitN } = identity.topology;
 		const depth = identityDepth(identity);
-		const idxs = hashPrefixBucketDigits(hashPrefixBucket, rootTreesN, hashSplitN, depth + relDepth).path.slice(depth);
+		const idxs = routingHashDigits(routingHash, rootTreesN, hashSplitN, depth + relDepth).path.slice(depth);
 		return refOf(resolveDescendantHashPartitionContext(this.routeContext(), idxs));
 	}
 
@@ -1896,20 +1896,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		let learned: LearnedRangeSlice[] = [];
 		this.#assertCanOwnRange(op, input);
 
-		// The range tree of the key, if it has one, is the tree of this hashPrefixBucket.
-		const bucket = this.#bucket(input.hashKey);
+		// The range tree of the key, if it has one, is the tree of this routingHash.
+		const routingHash = this.#routingHash(input.hashKey);
 		if (identity.kind === "hash") {
-			const override = this.#store.routeOverrideFor(bucket);
-			const root = refOf(resolveRangePartitionContext(routeCtx, bucket, null, null));
+			const override = this.#store.routeOverrideFor(routingHash);
+			const root = refOf(resolveRangePartitionContext(routeCtx, routingHash, null, null));
 			if (override && cutOver(override.state)) {
 				bases = [{ target: root, start: null, end: null, speculative: false }];
-				learned = this.#store.listLearnedRangeSlices(bucket);
-			} else if (bloom && this.#bloom?.maybePromoted(bucket)) {
+				learned = this.#store.listLearnedRangeSlices(routingHash);
+			} else if (bloom && this.#bloom?.maybePromoted(routingHash)) {
 				bases = [{ target: root, start: null, end: null, speculative: true }];
-				learned = this.#store.listLearnedRangeSlices(bucket);
+				learned = this.#store.listLearnedRangeSlices(routingHash);
 			} else if (this.#source.routerRole()) {
-				const relDepth = Math.max(1, this.#arena()?.findLeaf(bucket) ?? 0);
-				bases = [{ target: this.#hashDescendant(bucket, relDepth), start: null, end: null, speculative: false }];
+				const relDepth = Math.max(1, this.#arena()?.findLeaf(routingHash) ?? 0);
+				bases = [{ target: this.#hashDescendant(routingHash, relDepth), start: null, end: null, speculative: false }];
 			} else {
 				bases = [{ target: "local", start: null, end: null, speculative: false }];
 			}
@@ -1918,14 +1918,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const { router, rangeChildren } = this.#routerView();
 			if (router) {
 				bases = rangeChildren.map((child) => ({ target: child.ref, start: child.start, end: child.end, speculative: false }));
-				learned = this.#store.listLearnedRangeSlices(range.hashPrefixBucket);
+				learned = this.#store.listLearnedRangeSlices(range.routingHash);
 			} else {
 				bases = [{ target: "local", start: range.start, end: range.end, speculative: false }];
 			}
 		}
 
 		const planned = planRangeFrontier(input.hashKey, bases, learned, input.interval, input.descending, (slice) =>
-			refOf(resolveRangePartitionContext(routeCtx, bucket, slice.startBoundary, slice.endBoundary)),
+			refOf(resolveRangePartitionContext(routeCtx, routingHash, slice.startBoundary, slice.endBoundary)),
 		);
 		for (const p of planned) {
 			this.#plans.set(p.visit, p);
@@ -1965,7 +1965,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
 				const awaitingData = isAwaitingData(e);
 				if (plan.learned && notInitialized) {
-					this.#store.deleteLearnedRangeSlice(this.#bucket(input.hashKey), plan.learned);
+					this.#store.deleteLearnedRangeSlice(this.#routingHash(input.hashKey), plan.learned);
 					invariant(plan.base.target !== "local", "fokos/runtime.forwardRangeVisit: a learned slice never overlays a local base");
 					target = plan.base.target;
 					plan = { visit, base: plan.base, learned: null };
@@ -2084,39 +2084,39 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const arena = identity.kind === "hash" ? this.#arena() : null;
 		let arenaChanged = false;
 		let bloomChanged = false;
-		const learnDepth = (hashPrefixBucket: HashPrefixBucket, hashDepth: number) => {
+		const learnDepth = (routingHash: RoutingHash, hashDepth: number) => {
 			const relDepth = hashDepth - myDepth;
 			if (arena && relDepth > 0) {
-				arenaChanged = arena.updateFromHint(hashPrefixBucket, relDepth) || arenaChanged;
+				arenaChanged = arena.updateFromHint(routingHash, relDepth) || arenaChanged;
 			}
 		};
 		for (const node of nodes) {
 			if (isRangePartition(node.ref)) {
 				const shouldLearnNode = node.rangeDepth >= minRangeDepth;
-				// A range partition uses the hashPrefixBucket only to store a slice, so it skips the decode when it stores none.
+				// A range partition uses the routingHash only to store a slice, so it skips the decode when it stores none.
 				if (identity.kind !== "hash" && !shouldLearnNode && !node._rangeAncestors?.some((a) => a.depth >= minRangeDepth)) {
 					continue;
 				}
-				let hashPrefixBucket: HashPrefixBucket;
+				let routingHash: RoutingHash;
 				if (shouldLearnNode) {
 					const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(node.ref.partitionId));
 					invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/runtime.learn: a range node has a hash partition ID");
-					hashPrefixBucket = decoded.hashPrefixBucket;
-					this.#store.learnRangeBoundary(hashPrefixBucket, decoded.startBoundary, decoded.endBoundary, node.rangeDepth, refreshMs);
+					routingHash = decoded.routingHash;
+					this.#store.learnRangeBoundary(routingHash, decoded.startBoundary, decoded.endBoundary, node.rangeDepth, refreshMs);
 				} else {
 					// Only the first part of the ID, because the own slice of the node is not stored.
-					hashPrefixBucket = PartitionIdHelper.rangeHashPrefixBucket(node.ref.partitionId);
+					routingHash = PartitionIdHelper.rangeRoutingHash(node.ref.partitionId);
 				}
 				for (const ancestor of node._rangeAncestors ?? []) {
 					if (ancestor.depth >= minRangeDepth) {
-						this.#store.learnRangeBoundary(hashPrefixBucket, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth, refreshMs);
+						this.#store.learnRangeBoundary(routingHash, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth, refreshMs);
 					}
 				}
 				if (identity.kind !== "hash") {
 					continue;
 				}
 				// Only hash partitions are relevant for the promotions and the hash splits.
-				const added = this.#bloomForLearning().learnPromotedHashPrefixBucket(hashPrefixBucket);
+				const added = this.#bloomForLearning().learnPromotedRoutingHash(routingHash);
 				if (added === AddResult.Added) {
 					bloomChanged = true;
 				} else if (added === AddResult.Full) {
@@ -2125,14 +2125,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 						message: "fokos/runtime: the promotion Bloom filter is full, cannot learn a promoted key.",
 					});
 				}
-				learnDepth(hashPrefixBucket, node.hashDepth);
+				learnDepth(routingHash, node.hashDepth);
 				continue;
 			}
 			const bytes = Uint8Array.fromHex(node.ref.partitionId);
 			for (const hashKey of hashKeys) {
-				const bucket = this.#bucket(hashKey);
-				if (hashPathOwns(bytes, bucket, identity.topology)) {
-					learnDepth(bucket, node.hashDepth);
+				const routingHash = this.#routingHash(hashKey);
+				if (hashPathOwns(bytes, routingHash, identity.topology)) {
+					learnDepth(routingHash, node.hashDepth);
 				}
 			}
 		}
@@ -2607,17 +2607,13 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 	return typeof value === "object" && value !== null && typeof (value as { then?: unknown }).then === "function";
 }
 
-/** True when the digits of a hashPrefixBucket follow the whole path a hash partition id encodes: the root index, then one child index per level. */
-function hashPathOwns(
-	idBytes: Uint8Array,
-	hashPrefixBucket: HashPrefixBucket,
-	topology: { rootTreesN: number; hashSplitN: number },
-): boolean {
+/** True when the digits of a routingHash follow the whole path a hash partition id encodes: the root index, then one child index per level. */
+function hashPathOwns(idBytes: Uint8Array, routingHash: RoutingHash, topology: { rootTreesN: number; hashSplitN: number }): boolean {
 	const decoded = PartitionIdHelper.decode(idBytes);
 	if (decoded.schema !== PartitionIdHelper.SCHEMA_HASH_V1) {
 		return false;
 	}
-	const digits = new HashPrefixBucketDigitCursor(hashPrefixBucket, topology.rootTreesN);
+	const digits = new RoutingHashDigitCursor(routingHash, topology.rootTreesN);
 	if (digits.root !== decoded.rootIdx) {
 		return false;
 	}
@@ -2707,7 +2703,7 @@ function rangeForLog(identity: FokosPartitionIdentity | undefined): Record<strin
 		return undefined;
 	}
 	return {
-		hashPrefixBucket: range.hashPrefixBucket.toHex(),
+		routingHash: range.routingHash.toHex(),
 		start: KeyCodec.compositeForLog(range.start),
 		end: KeyCodec.compositeForLog(range.end),
 		depth: range.depth,

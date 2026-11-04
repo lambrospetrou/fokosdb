@@ -35,7 +35,7 @@ describe("planRangeBoundaries", () => {
 	});
 });
 
-describe("planRangeBoundaries over two hash keys of one hashPrefixBucket", () => {
+describe("planRangeBoundaries over two hash keys of one routingHash", () => {
 	it("puts a boundary between the hash keys, with the empty sort key", () => {
 		const two = [
 			{ hk: kb("alpha"), sk: kb("1"), bytes: 20 },
@@ -69,17 +69,17 @@ describe("SplitPlanner at the hash depth limit", () => {
 			kind: "hash",
 			hash: { rootIndex: 0, path: Array.from({ length: depth }, () => 0), depth, start: new Uint8Array(8), end: null },
 			topology: { shardGroup: "fokos.p.limit", rootTreesN: 65_000, hashSplitN: 255 },
-			hashPrefixBucketSeed: "",
+			routingHashSeed: "",
 		}) as FokosPartitionIdentity;
 	/**
-	 * A planner over the limit. `keys` holds one hash key for each hashPrefixBucket, and `large` the
-	 * representatives of the hashPrefixBuckets whose total is above the threshold.
+	 * A planner over the limit. `keys` holds one hash key for each routingHash, and `large` the
+	 * representatives of the routingHashes whose total is above the threshold.
 	 */
 	const planner = (keys: KeyBytes[], large: KeyBytes[]) =>
 		new SplitPlanner({
 			keySizes: { largestAtLeast: () => large, bytesOf: () => 0 } as unknown as KeySizeStats,
 			source: {
-				probeHashPrefixBuckets: () => (keys.length === 0 ? null : { first: keys[0], more: keys.length > 1 }),
+				probeRoutingHashes: () => (keys.length === 0 ? null : { first: keys[0], more: keys.length > 1 }),
 				compositeKeySizes: () => [],
 			},
 			databaseSize: () => 2 * MB,
@@ -95,8 +95,8 @@ describe("SplitPlanner at the hash depth limit", () => {
 		expect(error).toHaveBeenCalledWith(expect.objectContaining({ reason: "max_depth" }));
 	});
 
-	// Each hash key of a hashPrefixBucket can be below the threshold while the total is above it.
-	it("promotes the large hashPrefixBuckets of a leaf at the limit, and the one hashPrefixBucket at any estimate", () => {
+	// Each hash key of a routingHash can be below the threshold while the total is above it.
+	it("promotes the large routingHashes of a leaf at the limit, and the one routingHash at any estimate", () => {
 		expect(planner([kb("a"), kb("b")], [kb("b")]).evaluateSplit({ identity: leafAt(6), policy })).toEqual({ promote: [kb("b")] });
 		expect(planner([kb("a")], []).evaluateSplit({ identity: leafAt(6), policy })).toEqual({ promote: [kb("a")] });
 	});
@@ -107,8 +107,8 @@ describe("SplitPlanner at the hash depth limit", () => {
 });
 
 describe("SplitPlanner over a PartitionStore at the hash depth limit", () => {
-	// Each hash key is below the promotion threshold, but the total of each hashPrefixBucket is above it.
-	it("promotes two hashPrefixBuckets of small hash keys, and the write path reports the same totals", async () => {
+	// Each hash key is below the promotion threshold, but the total of each routingHash is above it.
+	it("promotes two routingHashes of small hash keys, and the write path reports the same totals", async () => {
 		const group = "fokos.p.limit";
 		const MB = 1024 * 1024;
 		const policy = { hashSplitConditions: { maxSizeMb: 1 }, rangeSplitConditions: { maxSizeMb: 1 } } as FokosDBPolicy;
@@ -118,10 +118,10 @@ describe("SplitPlanner over a PartitionStore at the hash depth limit", () => {
 			kind: "hash",
 			hash: { rootIndex: 0, path: [0, 0, 0, 0, 0, 0], depth: 6, start: new Uint8Array(8), end: null },
 			topology: { shardGroup: group, rootTreesN: 65_000, hashSplitN: 255 },
-			hashPrefixBucketSeed: "",
+			routingHashSeed: "",
 		} as FokosPartitionIdentity;
 		const threshold = MB * 0.5;
-		const buckets = [collidingHashKeys(group), collidingHashKeys(group)].map((pair) => pair.map((raw) => KeyCodec.encode(raw)));
+		const collidingPairs = [collidingHashKeys(group), collidingHashKeys(group)].map((pair) => pair.map((raw) => KeyCodec.encode(raw)));
 
 		const stub = testPartitionStub(`split-planner.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
@@ -129,8 +129,8 @@ describe("SplitPlanner over a PartitionStore at the hash depth limit", () => {
 			const planner = new SplitPlanner({
 				keySizes: store.keySizes,
 				source: {
-					probeHashPrefixBuckets: () => store.probeHashPrefixBuckets("items"),
-					compositeKeySizes: (bucket, start, end) => store.compositeKeySizes(bucket, start, end),
+					probeRoutingHashes: () => store.probeRoutingHashes("items"),
+					compositeKeySizes: (routingHash, start, end) => store.compositeKeySizes(routingHash, start, end),
 				},
 				databaseSize: () => 2 * MB,
 				promotionFraction: () => 0.5,
@@ -139,20 +139,22 @@ describe("SplitPlanner over a PartitionStore at the hash depth limit", () => {
 				logParams: () => ({}),
 			});
 			const data = "x".repeat(300 * 1024);
-			for (const [first, second] of buckets) {
+			for (const [first, second] of collidingPairs) {
 				const prefix = prefixOf(first, group);
 				const put = (hk: KeyBytes) => store.upsertItem({ prefix, hk, sk: kb("s"), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 				const one = put(first).keyEstBytes;
 				const both = put(second).keyEstBytes;
 				expect(one).toBeLessThan(threshold);
 				expect(both).toBeGreaterThanOrEqual(threshold);
-				// The write path signals a promotion for the total of the hashPrefixBucket, not for the hash key.
+				// The write path signals a promotion for the total of the routingHash, not for the hash key.
 				expect(planner.promotionCandidates(identity, policy, [{ hashKey: first, keyEstBytes: one }])).toEqual([]);
 				expect(planner.promotionCandidates(identity, policy, [{ hashKey: second, keyEstBytes: both }])).toEqual([{ hashKey: second }]);
 			}
 			const answer = planner.evaluateSplit({ identity, policy });
-			// Each hashPrefixBucket is promoted by the hash key of its first row.
-			expect(answer && "promote" in answer ? answer.promote : answer).toEqual(expect.arrayContaining([buckets[0][0], buckets[1][0]]));
+			// Each routingHash is promoted by the hash key of its first row.
+			expect(answer && "promote" in answer ? answer.promote : answer).toEqual(
+				expect.arrayContaining([collidingPairs[0][0], collidingPairs[1][0]]),
+			);
 			expect(answer && "promote" in answer ? answer.promote.length : 0).toBe(2);
 		});
 	});

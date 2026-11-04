@@ -12,13 +12,13 @@ import {
 	resolveRangePartitionContext,
 } from "./partition-id.js";
 import { FokosRouter } from "./router.js";
-import { asHashPrefixBucket, hashPrefixBucketSeedOf, MAX_HASH_DEPTH } from "./hash-primitives.js";
+import { asRoutingHash, routingHashSeedOf, MAX_HASH_DEPTH } from "./hash-primitives.js";
 import { validateTopology, type FokosRouteContext } from "./route-context.js";
 import { fokosErrorWith, invariantFailure } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
-const BUCKET = asHashPrefixBucket(Uint8Array.fromHex("00112233445566ff"));
-const BUCKET_HEX = "00112233445566ff";
+const ROUTING_HASH = asRoutingHash(Uint8Array.fromHex("00112233445566ff"));
+const ROUTING_HASH_HEX = "00112233445566ff";
 /** A composite boundary. The empty string is the empty sort key. */
 const c = (hk: string, sk: string): FokosCompositeKey => ({ hk: kb(hk), sk: KeyCodec.encodeOptional(sk === "" ? undefined : sk) });
 
@@ -123,7 +123,7 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 
 	it("encode throws with nothing to encode and when appending to a range ID", () => {
 		expect(() => new PartitionIdHelper(base).encode(false)).toThrow(invariantFailure(/no bytes or appended hash indexes/));
-		const range = PartitionIdHelper.fromRangePartition(base, BUCKET, null, null).encode(false);
+		const range = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, null, null).encode(false);
 		expect(() => new PartitionIdHelper(base, range.bytes).appendHashIdx(1).encode(false)).toThrow(
 			invariantFailure(/cannot append hash indexes/),
 		);
@@ -148,7 +148,7 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	it("hashDescendantId rejects a parent that is not a hash ID, a child index or a depth out of range", () => {
 		const root = PartitionIdHelper.fromHashIdxs(base, [1]).encode(true);
 		const ref = { partitionId: root.opaque, doName: root.doName!, topology: DEEPEST };
-		const range = PartitionIdHelper.fromRangePartition(base, BUCKET, null, null).encode(true);
+		const range = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, null, null).encode(true);
 		const notHash = [
 			{ partitionId: range.opaque, doName: range.doName!, topology: DEEPEST },
 			// The depth byte says 1, but the ID has no child index.
@@ -214,16 +214,16 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 			[c("alice", "b1"), c("alice", "b2")],
 			[c("alice", ""), c("bob", "")],
 		] as const) {
-			const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, BUCKET, start, end).encode(false);
+			const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, start, end).encode(false);
 			expect(isRangePartition({ partitionId: opaque })).toBe(true);
 			const decoded = PartitionIdHelper.decode(bytes);
-			expect(decoded).toEqual({ schema: 1, hashPrefixBucket: BUCKET, startBoundary: start, endBoundary: end });
+			expect(decoded).toEqual({ schema: 1, routingHash: ROUTING_HASH, startBoundary: start, endBoundary: end });
 		}
 	});
 
 	it("doName formats range IDs via rangePartitionDoName", () => {
-		const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, BUCKET, c("alice", "b1"), null).encode(true);
-		expect(doName).toBe(`iddb~r.${BUCKET_HEX}.alice.b1.~max`);
+		const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, c("alice", "b1"), null).encode(true);
+		expect(doName).toBe(`iddb~r.${ROUTING_HASH_HEX}.alice.b1.~max`);
 		expect(PartitionIdHelper.doName(base, bytes)).toBe(doName);
 	});
 
@@ -236,7 +236,7 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 	});
 
 	it("depth rejects a hex ID that is not a hash ID or that has no valid depth", () => {
-		const { opaque } = PartitionIdHelper.fromRangePartition(base, BUCKET, null, null).encode(true);
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, null, null).encode(true);
 		expect(() => PartitionIdHelper.depth(opaque)).toThrow(invariantFailure(/expected hash schema/));
 		for (const malformed of ["000001", "000001g0", "0000010"]) {
 			expect(() => PartitionIdHelper.depth(malformed)).toThrow(invariantFailure(/has no valid depth/));
@@ -244,7 +244,7 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 	});
 
 	it("hash-only readers reject range IDs", () => {
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, BUCKET, null, null).encode(false);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(invariantFailure(/expected hash schema/));
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow(invariantFailure(/expected hash schema/));
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow(invariantFailure(/expected hash schema/));
@@ -253,12 +253,12 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 
 describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	it("fromRangePartition root: encode then decode round-trips (both boundaries null)", () => {
-		const { bytes, opaque, doName } = PartitionIdHelper.fromRangePartition(base, BUCKET, null, null).encode(true);
+		const { bytes, opaque, doName } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, null, null).encode(true);
 		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_RANGE_V1);
 		// A range root has a fixed length for each shard group.
-		expect(doName).toBe(`iddb~r.${BUCKET_HEX}.~min.~max`);
+		expect(doName).toBe(`iddb~r.${ROUTING_HASH_HEX}.~min.~max`);
 		const decoded = PartitionIdHelper.decode(bytes);
-		expect(decoded).toEqual({ schema: 1, hashPrefixBucket: BUCKET, startBoundary: null, endBoundary: null });
+		expect(decoded).toEqual({ schema: 1, routingHash: ROUTING_HASH, startBoundary: null, endBoundary: null });
 		expect(opaque).toMatch(/^01[A-Za-z0-9_-]+\.$/);
 		expect(PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(opaque))).toEqual(decoded);
 	});
@@ -270,26 +270,26 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 			[c("alice", "m"), null, "alice.m.~max"],
 			[c("alice", ""), c("bob", ""), "alice..bob."],
 		] as const) {
-			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, BUCKET, start, end).encode(true);
-			expect(doName).toBe(`iddb~r.${BUCKET_HEX}.${tail}`);
-			expect(PartitionIdHelper.decode(bytes)).toEqual({ schema: 1, hashPrefixBucket: BUCKET, startBoundary: start, endBoundary: end });
+			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, start, end).encode(true);
+			expect(doName).toBe(`iddb~r.${ROUTING_HASH_HEX}.${tail}`);
+			expect(PartitionIdHelper.decode(bytes)).toEqual({ schema: 1, routingHash: ROUTING_HASH, startBoundary: start, endBoundary: end });
 		}
 	});
 
 	it("handles unicode in the boundaries", () => {
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, BUCKET, c("café☕", "töst"), c("café☕", "zünd")).encode(false);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, c("café☕", "töst"), c("café☕", "zünd")).encode(false);
 		expect(PartitionIdHelper.decode(bytes)).toEqual({
 			schema: 1,
-			hashPrefixBucket: BUCKET,
+			routingHash: ROUTING_HASH,
 			startBoundary: c("café☕", "töst"),
 			endBoundary: c("café☕", "zünd"),
 		});
 	});
 
 	it("doName dispatches correctly for range ID loaded from its opaque ID", () => {
-		const { opaque } = PartitionIdHelper.fromRangePartition(base, BUCKET, c("mykey", "start1"), c("mykey", "end1")).encode(false);
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, c("mykey", "start1"), c("mykey", "end1")).encode(false);
 		const bytes = PartitionIdHelper.partitionIdToBytes(opaque);
-		expect(PartitionIdHelper.doName(base, bytes)).toBe(`iddb~r.${BUCKET_HEX}.mykey.start1.mykey.end1`);
+		expect(PartitionIdHelper.doName(base, bytes)).toBe(`iddb~r.${ROUTING_HASH_HEX}.mykey.start1.mykey.end1`);
 	});
 });
 
@@ -307,14 +307,14 @@ describe("PartitionIdHelper — range ID base64url parts", () => {
 	];
 
 	it.each(cases)("round-trips byte for byte: %s", (_, start, end) => {
-		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], BUCKET, start, end);
-		const { bytes, opaque, doName } = PartitionIdHelper.fromRangePartition(base, BUCKET, start, end).encode(true);
+		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], ROUTING_HASH, start, end);
+		const { bytes, opaque, doName } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, start, end).encode(true);
 		expect(ctx.partitionId).toBe(opaque);
 		expect(ctx.doName).toBe(doName);
 		expect(opaque).toMatch(/^01[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/);
 		expect(PartitionIdHelper.partitionIdToBytes(opaque)).toEqual(bytes);
-		expect(PartitionIdHelper.decode(bytes)).toEqual({ schema: 1, hashPrefixBucket: BUCKET, startBoundary: start, endBoundary: end });
-		expect(PartitionIdHelper.rangeHashPrefixBucket(opaque)).toEqual(BUCKET);
+		expect(PartitionIdHelper.decode(bytes)).toEqual({ schema: 1, routingHash: ROUTING_HASH, startBoundary: start, endBoundary: end });
+		expect(PartitionIdHelper.rangeRoutingHash(opaque)).toEqual(ROUTING_HASH);
 		// The name from the keys equals the name from a full ID decode.
 		expect(PartitionIdHelper.doName(base, PartitionIdHelper.partitionIdToBytes(opaque))).toBe(ctx.doName);
 		expect(new PartitionIdHelper(base, opaque).encode(true)).toEqual({ bytes, opaque, doName });
@@ -323,8 +323,8 @@ describe("PartitionIdHelper — range ID base64url parts", () => {
 	it("keeps the flat byte layout and puts the boundaries in the second part only", () => {
 		const start = c("hk", "s");
 		const end = c("hk", "e");
-		const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, BUCKET, start, end).encode(false);
-		const first = new Uint8Array([0x03, ...BUCKET]);
+		const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, start, end).encode(false);
+		const first = new Uint8Array([0x03, ...ROUTING_HASH]);
 		const boundary = (b: FokosCompositeKey) => [b.hk.length, 0, 0, 0, b.sk.length, 0, 0, 0, ...b.hk, ...b.sk];
 		const second = new Uint8Array([...boundary(start), ...boundary(end)]);
 		expect(bytes).toEqual(new Uint8Array([0x01, ...first, ...second]));
@@ -336,15 +336,15 @@ describe("PartitionIdHelper — range ID base64url parts", () => {
 		);
 	});
 
-	it("reads the hashPrefixBucket without the boundary part", () => {
-		const { opaque } = PartitionIdHelper.fromRangePartition(base, BUCKET, c("alice", "b1"), c("alice", "b2")).encode(false);
+	it("reads the routingHash without the boundary part", () => {
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, c("alice", "b1"), c("alice", "b2")).encode(false);
 		const firstOnly = opaque.slice(0, opaque.indexOf(".") + 1) + "!!!";
-		expect(PartitionIdHelper.rangeHashPrefixBucket(firstOnly)).toEqual(BUCKET);
+		expect(PartitionIdHelper.rangeRoutingHash(firstOnly)).toEqual(ROUTING_HASH);
 		expect(() => PartitionIdHelper.partitionIdToBytes(firstOnly)).toThrow(invariantFailure(/not canonical base64url/));
 	});
 
 	it("rejects malformed separators and non-canonical base64url", () => {
-		const { opaque } = PartitionIdHelper.fromRangePartition(base, BUCKET, c("alice", "b1"), c("alice", "b2")).encode(false);
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, c("alice", "b1"), c("alice", "b2")).encode(false);
 		const [firstText, secondText] = opaque.slice(2).split(".");
 		const decode = (id: string) => () => PartitionIdHelper.partitionIdToBytes(id);
 		expect(decode("01" + firstText + secondText)).toThrow(invariantFailure(/no separator/));
@@ -362,28 +362,30 @@ describe("PartitionIdHelper — range ID base64url parts", () => {
 		const b64 = (...values: number[]) => new Uint8Array(values).toBase64({ alphabet: "base64url", omitPadding: true });
 		const decode = (first: number[], second: number[]) => () =>
 			PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes("01" + b64(...first) + "." + b64(...second)));
-		// flags, then the hashPrefixBucket; each boundary: hkLen u32 LE, skLen u32 LE, hk, sk
+		// flags, then the routingHash; each boundary: hkLen u32 LE, skLen u32 LE, hk, sk
 		const one = [1, 0, 0, 0, 1, 0, 0, 0, 0x6b, 0x61];
-		expect(decode([0x01, ...BUCKET], one)).not.toThrow();
-		expect(decode([0x03, ...BUCKET], [...one, ...one])).not.toThrow();
-		expect(decode([0x04, ...BUCKET], [])).toThrow(invariantFailure(/invalid range partition ID flags/));
-		expect(decode([0x00, ...BUCKET.subarray(1)], [])).toThrow(invariantFailure(/too short|wrong length/));
-		expect(decode([0x00, ...BUCKET], [0x61])).toThrow(invariantFailure(/bytes after its boundaries/));
-		expect(decode([0x01, ...BUCKET], [1, 0, 0, 0, 2, 0, 0, 0, 0x6b, 0x61])).toThrow(invariantFailure(/boundary length is inconsistent/));
-		expect(decode([0x01, ...BUCKET], [1, 0, 0])).toThrow(invariantFailure(/boundary is too short/));
-		expect(decode([0x01, ...BUCKET], [...one, 0x62])).toThrow(invariantFailure(/bytes after its boundaries/));
-		expect(() => PartitionIdHelper.rangeHashPrefixBucket("01" + b64(0x08, ...BUCKET) + ".")).toThrow(
+		expect(decode([0x01, ...ROUTING_HASH], one)).not.toThrow();
+		expect(decode([0x03, ...ROUTING_HASH], [...one, ...one])).not.toThrow();
+		expect(decode([0x04, ...ROUTING_HASH], [])).toThrow(invariantFailure(/invalid range partition ID flags/));
+		expect(decode([0x00, ...ROUTING_HASH.subarray(1)], [])).toThrow(invariantFailure(/too short|wrong length/));
+		expect(decode([0x00, ...ROUTING_HASH], [0x61])).toThrow(invariantFailure(/bytes after its boundaries/));
+		expect(decode([0x01, ...ROUTING_HASH], [1, 0, 0, 0, 2, 0, 0, 0, 0x6b, 0x61])).toThrow(
+			invariantFailure(/boundary length is inconsistent/),
+		);
+		expect(decode([0x01, ...ROUTING_HASH], [1, 0, 0])).toThrow(invariantFailure(/boundary is too short/));
+		expect(decode([0x01, ...ROUTING_HASH], [...one, 0x62])).toThrow(invariantFailure(/bytes after its boundaries/));
+		expect(() => PartitionIdHelper.rangeRoutingHash("01" + b64(0x08, ...ROUTING_HASH) + ".")).toThrow(
 			invariantFailure(/invalid range partition ID flags/),
 		);
 	});
 
 	it("partitionIdentityFrom decodes both parts of a range ID", () => {
-		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], BUCKET, c("alice", "b1"), null);
+		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], ROUTING_HASH, c("alice", "b1"), null);
 		const identity = partitionIdentityFrom(ctx, { depth: 1, ancestors: [] });
-		expect(identity.range).toEqual({ hashPrefixBucket: BUCKET, start: c("alice", "b1"), end: null, depth: 1, ancestors: [] });
+		expect(identity.range).toEqual({ routingHash: ROUTING_HASH, start: c("alice", "b1"), end: null, depth: 1, ancestors: [] });
 	});
 
-	it("gives one DO name for each hashPrefixBucket and pair of composite boundaries", () => {
+	it("gives one DO name for each routingHash and pair of composite boundaries", () => {
 		// Short random keys from a small alphabet that holds the separator, the sentinel bytes, and the
 		// escape byte, so near collisions are frequent. The empty sort key is common.
 		const alphabet = [0x2e, 0x7e, 0x6d, 0x25, 0x61, 0xff];
@@ -392,13 +394,13 @@ describe("PartitionIdHelper — range ID base64url parts", () => {
 				Uint8Array.from({ length: min + Math.floor(Math.random() * 3) }, () => alphabet[Math.floor(Math.random() * alphabet.length)]),
 			);
 		const randomBoundary = (): FokosCompositeKey | null => (Math.random() < 0.2 ? null : { hk: randomKey(1), sk: randomKey(0) });
-		const buckets = [BUCKET, asHashPrefixBucket(Uint8Array.fromHex("00112233445566fe"))];
+		const routingHashes = [ROUTING_HASH, asRoutingHash(Uint8Array.fromHex("00112233445566fe"))];
 		const seen = new Map<string, string>();
 		for (let i = 0; i < 5_000; i++) {
-			const bucket = buckets[i % 2];
+			const routingHash = routingHashes[i % 2];
 			const start = randomBoundary();
 			const end = randomBoundary();
-			const { doName, opaque } = PartitionIdHelper.fromRangePartition(base, bucket, start, end).encode(true);
+			const { doName, opaque } = PartitionIdHelper.fromRangePartition(base, routingHash, start, end).encode(true);
 			const previous = seen.get(doName!);
 			expect(previous === undefined || previous === opaque, doName).toBe(true);
 			seen.set(doName!, opaque);
@@ -434,7 +436,7 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 	});
 
 	it("rootIdx, depth, lastChildIdx assert SCHEMA_HASH_V1", () => {
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, BUCKET, null, null).encode(false);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, ROUTING_HASH, null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow();
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow();
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow();
@@ -479,36 +481,36 @@ describe("rangePartitionDoName", () => {
 	function makeName(hashKey: string, start: string | null, end: string | null) {
 		return PartitionIdHelper.fromRangePartition(
 			base,
-			BUCKET,
+			ROUTING_HASH,
 			start === null ? null : c(hashKey, start),
 			end === null ? null : c(hashKey, end),
 		).encode(true).doName!;
 	}
 
 	it("produces root name (null start/end → ~min/~max sentinels)", () => {
-		expect(makeName("alice", null, null)).toBe(`iddb~r.${BUCKET_HEX}.~min.~max`);
+		expect(makeName("alice", null, null)).toBe(`iddb~r.${ROUTING_HASH_HEX}.~min.~max`);
 	});
 
 	it("produces child name with explicit start and end boundaries", () => {
-		expect(makeName("alice", "b1", "b2")).toBe(`iddb~r.${BUCKET_HEX}.alice.b1.alice.b2`);
+		expect(makeName("alice", "b1", "b2")).toBe(`iddb~r.${ROUTING_HASH_HEX}.alice.b1.alice.b2`);
 	});
 
 	it("renders half-bounded edges with one sentinel (leftmost / rightmost child)", () => {
-		expect(makeName("alice", null, "m")).toBe(`iddb~r.${BUCKET_HEX}.~min.alice.m`);
-		expect(makeName("alice", "m", null)).toBe(`iddb~r.${BUCKET_HEX}.alice.m.~max`);
+		expect(makeName("alice", null, "m")).toBe(`iddb~r.${ROUTING_HASH_HEX}.~min.alice.m`);
+		expect(makeName("alice", "m", null)).toBe(`iddb~r.${ROUTING_HASH_HEX}.alice.m.~max`);
 	});
 
 	it("escapes a real boundary that looks like a sentinel (collision-proofness)", () => {
 		// A literal "~min" value is escaped (~ → %7E), so it can never collide with the sentinel.
-		expect(makeName("~min", "~min", null)).toBe(`iddb~r.${BUCKET_HEX}.%7Emin.%7Emin.~max`);
+		expect(makeName("~min", "~min", null)).toBe(`iddb~r.${ROUTING_HASH_HEX}.%7Emin.%7Emin.~max`);
 	});
 
 	it("percent-encodes dots in the boundaries", () => {
-		expect(makeName("a.b", "c.d", "e.f")).toBe(`iddb~r.${BUCKET_HEX}.a%2Eb.c%2Ed.a%2Eb.e%2Ef`);
+		expect(makeName("a.b", "c.d", "e.f")).toBe(`iddb~r.${ROUTING_HASH_HEX}.a%2Eb.c%2Ed.a%2Eb.e%2Ef`);
 	});
 
 	it("leaves slashes literal (0x2F is a safe name byte, not reserved)", () => {
-		expect(makeName("a/b", "c/d", "e/f")).toBe(`iddb~r.${BUCKET_HEX}.a/b.c/d.a/b.e/f`);
+		expect(makeName("a/b", "c/d", "e/f")).toBe(`iddb~r.${ROUTING_HASH_HEX}.a/b.c/d.a/b.e/f`);
 	});
 
 	it("keeps range names disjoint from hash names (~r. vs ~h.)", () => {
@@ -643,9 +645,9 @@ describe("encodeRangeComponent", () => {
 describe("the shard group separator", () => {
 	it("gives different names to a hash partition and a range partition of two shard groups", () => {
 		const hash = PartitionIdHelper.fromHashIdxs("x.r.k", [0]).encode(true).doName;
-		const range = PartitionIdHelper.fromRangePartition("x", BUCKET, c("k", "h"), c("k", "0")).encode(true).doName;
+		const range = PartitionIdHelper.fromRangePartition("x", ROUTING_HASH, c("k", "h"), c("k", "0")).encode(true).doName;
 		expect(hash).toBe("x.r.k~h.0");
-		expect(range).toBe(`x~r.${BUCKET_HEX}.k.h.k.0`);
+		expect(range).toBe(`x~r.${ROUTING_HASH_HEX}.k.h.k.0`);
 	});
 
 	it("validateTopology rejects a shard group with ~ and accepts the internal prefixes", () => {
@@ -666,7 +668,7 @@ describe("the contexts derived from a route context", () => {
 		const built = [
 			...resolveHashChildPartitionContexts(root),
 			resolveDescendantHashPartitionContext(root, [1, 2]),
-			resolveRangePartitionContext(root, BUCKET, null, null),
+			resolveRangePartitionContext(root, ROUTING_HASH, null, null),
 		];
 
 		for (const ctx of built) {
@@ -682,7 +684,7 @@ describe("the contexts derived from a route context", () => {
 			Array.from({ length: HASH_SPLIT_N }, (_, i) => `${root.doName}.${i}`),
 		);
 		expect(built[HASH_SPLIT_N].doName).toBe(`${root.doName}.1.2`);
-		expect(built[HASH_SPLIT_N + 1].doName).toBe(`${base}~r.${BUCKET_HEX}.~min.~max`);
+		expect(built[HASH_SPLIT_N + 1].doName).toBe(`${base}~r.${ROUTING_HASH_HEX}.~min.~max`);
 	});
 });
 
@@ -705,7 +707,7 @@ describe("partitionIdentityFrom", () => {
 				end: Uint8Array.fromHex("b800000000000000"),
 			},
 			topology: root.topology,
-			hashPrefixBucketSeed: hashPrefixBucketSeedOf(base),
+			routingHashSeed: routingHashSeedOf(base),
 		});
 		expect(identityDepth(identity)).toBe(2);
 		expect(identityDepth(partitionIdentityFrom(root))).toBe(0);
@@ -720,14 +722,14 @@ describe("partitionIdentityFrom", () => {
 
 	it("decodes a range identity and takes the depth and ancestors from fokosInit", () => {
 		const root = makeRouter().allRoots()[0];
-		const range = resolveRangePartitionContext(root, BUCKET, c("alice", "b1"), null);
+		const range = resolveRangePartitionContext(root, ROUTING_HASH, c("alice", "b1"), null);
 		const ancestors = [{ depth: 0, startBoundary: c("alice", "a"), endBoundary: c("alice", "z") }];
 
 		const identity = partitionIdentityFrom(range, { depth: 1, ancestors });
 		expect(identity.kind).toBe("range");
 		expect(identity.hash).toBeUndefined();
-		expect(identity.range).toEqual({ hashPrefixBucket: BUCKET, start: c("alice", "b1"), end: null, depth: 1, ancestors });
-		expect(identity.hashPrefixBucketSeed).toBe(hashPrefixBucketSeedOf(base));
+		expect(identity.range).toEqual({ routingHash: ROUTING_HASH, start: c("alice", "b1"), end: null, depth: 1, ancestors });
+		expect(identity.routingHashSeed).toBe(routingHashSeedOf(base));
 		expect(identityDepth(identity)).toBe(1);
 		expect(() => partitionIdentityFrom(range)).toThrow(invariantFailure(/needs its depth and ancestors/));
 	});

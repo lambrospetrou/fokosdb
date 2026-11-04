@@ -15,17 +15,17 @@ import {
 	topologyGetPath,
 	type FokosTopologyCacheOptions,
 } from "./topology-cache.js";
-import { findLeaf, isPromotedHashPrefixBucket, parseHashBody } from "./topology-codec.js";
+import { findLeaf, isPromotedRoutingHash, parseHashBody } from "./topology-codec.js";
 import {
 	encodeHashBitmap,
 	encodeHashBody,
 	encodeRangeBody,
 	hashNodeKey,
-	mergePromotedBuckets,
+	mergePromotedRoutingHashes,
 	promotedKeysBloom,
 } from "./topology-encode.js";
 import { hashDigits } from "../../test/hash-digits.js";
-import { compareHashPrefixBuckets, hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
+import { compareRoutingHashes, routingHashOf, type RoutingHash } from "./hash-primitives.js";
 
 type Ops = { op: { req: { n: number }; res: string } };
 
@@ -36,7 +36,7 @@ function hashBody(opts: {
 	R?: number;
 	K?: number;
 	splits?: Uint8Array[];
-	promoted?: HashPrefixBucket[];
+	promoted?: RoutingHash[];
 	/** The section the promoted set goes into, as the keeper picks by its count. Default "list". */
 	promotedAs?: "list" | "bloom";
 }): Uint8Array {
@@ -52,7 +52,7 @@ function hashBody(opts: {
 		rootTreesN: R,
 		hashSplitN: K,
 		bitmap: encodeHashBitmap(R, K, nodes.length, () => nodes),
-		promoted: asList ? mergePromotedBuckets([], [...promoted].sort(compareHashPrefixBuckets)) : null,
+		promoted: asList ? mergePromotedRoutingHashes([], [...promoted].sort(compareRoutingHashes)) : null,
 		bloom: asList ? null : promotedKeysBloom(promoted.length, () => promoted),
 	});
 }
@@ -244,7 +244,7 @@ describe("topology cache — hash entries", () => {
 describe("topology cache — scope", () => {
 	it("keeps the hash and range entries of two scopes apart, also for one topology object", async () => {
 		const topology = { shardGroup: `tc_${crypto.randomUUID()}`, rootTreesN: 2, hashSplitN: 2 };
-		const hashKey = hashPrefixBucketOf(KeyCodec.encode("scoped"), topology.shardGroup);
+		const hashKey = routingHashOf(KeyCodec.encode("scoped"), topology.shardGroup);
 		const pending: Promise<unknown>[] = [];
 		const fetched: string[] = [];
 		const options = (scope: string | undefined, version: number): FokosTopologyCacheOptions => ({
@@ -320,7 +320,7 @@ describe("topology cache — bounded fallback", () => {
 		await t.settle();
 		const target = t.client.resolve(key);
 		const entry = cachedHashTopology(t.cache, target.topology)!;
-		const leaf = findLeaf(entry.view, 2, 2, hashPrefixBucketOf(key.hashKey, t.shardGroup), entry.cut);
+		const leaf = findLeaf(entry.view, 2, 2, routingHashOf(key.hashKey, t.shardGroup), entry.cut);
 		for (let pos = 2048; entry.cut.size < TOPOLOGY_CUT_MAX; pos++) {
 			if (pos !== leaf.pos) {
 				cutTopologyHint(entry, pos);
@@ -384,18 +384,18 @@ describe("topology cache — range entries", () => {
 			truncatedAtRank: null,
 		});
 	const emptyRange = () => encodeRangeBody({ epoch: 1, version: 1, boundaries: [], levels: [], depths: [], truncatedAtRank: null });
-	/** The bodies of a new shard group: the promoted set and the range path hold the hashPrefixBucket of `u42` in it. */
+	/** The bodies of a new shard group: the promoted set and the range path hold the routingHash of `u42` in it. */
 	const fixture = (range: (() => Uint8Array) | null) => {
 		const shardGroup = newShardGroup();
-		const bucket = hashPrefixBucketOf(hashKey, shardGroup);
-		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [bucket] })]]);
+		const routingHash = routingHashOf(hashKey, shardGroup);
+		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [routingHash] })]]);
 		if (range) {
-			bodies.set(topologyGetForRangePath("SG", bucket), range);
+			bodies.set(topologyGetForRangePath("SG", routingHash), range);
 		}
 		const name = (start: string | null, end: string | null) =>
 			resolveRangePartitionContext(
 				{ topology: { shardGroup } } as FokosRouteContext<null>,
-				bucket,
+				routingHash,
 				start === null ? null : b(start),
 				end === null ? null : b(end),
 			).doName;
@@ -448,12 +448,12 @@ describe("topology cache — range entries", () => {
 
 	it.each(["list", "bloom"] as const)("starts one range fetch on a positive %s answer, and none on a negative", async (promotedAs) => {
 		const shardGroup = newShardGroup();
-		const hit = hashPrefixBucketOf(hashKey, shardGroup);
+		const hit = routingHashOf(hashKey, shardGroup);
 		const body = hashBody({ version: 1, promoted: [hit], promotedAs });
 		// A Bloom filter can hold a key that is not promoted, so the miss comes from the built body.
 		const view = parseHashBody(body);
 		const missKey = Array.from({ length: 500 }, (_, i) => `miss-${i}`).find(
-			(candidate) => !isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode(candidate), shardGroup)),
+			(candidate) => !isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode(candidate), shardGroup)),
 		)!;
 		const miss = { hashKey: KeyCodec.encode(missKey), sortKey: k("h") };
 		const bodies = new Map([[GET, () => body]]);
@@ -480,7 +480,7 @@ describe("topology cache — range entries", () => {
 		["bloom", false],
 	] as const)("with speculative false, sends a %s hit with no range entry to the range root: %s", async (promotedAs, toRangeRoot) => {
 		const shardGroup = newShardGroup();
-		const hit = hashPrefixBucketOf(hashKey, shardGroup);
+		const hit = routingHashOf(hashKey, shardGroup);
 		// No range body: the range entry is not in the cache.
 		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [hit], promotedAs })]]);
 		const t = setup(bodies, undefined, { refreshMs: Number.MAX_SAFE_INTEGER }, shardGroup);
@@ -500,8 +500,8 @@ describe("topology cache — range entries", () => {
 		["bloom", false],
 	] as const)("sends a %s hit with a range entry that has no segment to the range root: %s", async (promotedAs, toRangeRoot) => {
 		const shardGroup = newShardGroup();
-		const hit = hashPrefixBucketOf(hashKey, shardGroup);
-		// The keeper serves a range body with no segment until it builds the range body of the bucket.
+		const hit = routingHashOf(hashKey, shardGroup);
+		// The keeper serves a range body with no segment until it builds the range body of the routingHash.
 		const bodies = new Map([[GET, () => hashBody({ version: 1, promoted: [hit], promotedAs })]]);
 		bodies.set(topologyGetForRangePath("SG", hit), emptyRange);
 		const t = setup(bodies, undefined, { refreshMs: Number.MAX_SAFE_INTEGER }, shardGroup);

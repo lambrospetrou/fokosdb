@@ -21,7 +21,7 @@ import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { unexpectedTransactionStateError } from "../errors-operations.js";
 import { KeyCodec, KeyPairMap, type KeyBytes } from "../../sharding/key-codec.js";
-import type { HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import type { RoutingHash } from "../../sharding/hash-primitives.js";
 import type { OpList, PartitionStore, PendingTxInfo, StalePendingTx, StoredItemData } from "./partition-store.js";
 import {
 	applyImageCap,
@@ -92,7 +92,7 @@ function isWrite(operation: string): boolean {
 /** The operations of one item in a request, in `opIndex` order, and the state of their evaluation. */
 type ItemSequence = {
 	/** The storage prefix of `hashKey`, computed once for the request. */
-	prefix: HashPrefixBucket;
+	prefix: RoutingHash;
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
 	ops: [TransactionItem, ...TransactionItem[]];
@@ -121,7 +121,7 @@ type SequencePlan = {
  * Sorts the operations by `opIndex` and groups them by item with `KeyPairMap`. It also runs the
  * version-reference check, before the first SQL statement, so a refusal writes nothing.
  */
-function sequencePlanOf(items: readonly TransactionItem[], storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket): SequencePlan {
+function sequencePlanOf(items: readonly TransactionItem[], storagePrefix: (hashKey: KeyBytes) => RoutingHash): SequencePlan {
 	const ops = [...items].sort((a, b) => a.opIndex - b.opIndex);
 	const sequences = new KeyPairMap<ItemSequence>();
 	const seqs = ops.map((op, i) => {
@@ -161,7 +161,7 @@ function lockOperationOf(ops: readonly [TransactionItem, ...TransactionItem[]]):
 type WriteSource = { from: "request"; item: TransactionItem } | { from: "lock"; row: PendingLock };
 
 type ApplyEntry = TransactionItemKey & {
-	prefix: HashPrefixBucket;
+	prefix: RoutingHash;
 	opIndex: number;
 	operation: TransactionOperationType;
 	source: WriteSource;
@@ -263,7 +263,7 @@ export type TransactionParticipantDeps = {
 	 */
 	ownerCheck: () => (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
 	/** The storage prefix of a hash key, which each store method takes with the key. */
-	storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket;
+	storagePrefix: (hashKey: KeyBytes) => RoutingHash;
 };
 
 /**
@@ -293,7 +293,7 @@ export class TransactionParticipant {
 	#staleTransactionMs: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
 	#ownerCheck: () => (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
-	#storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket;
+	#storagePrefix: (hashKey: KeyBytes) => RoutingHash;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
@@ -310,7 +310,7 @@ export class TransactionParticipant {
 	 * asked for none or the item does not exist. It runs in the same storage transaction as the
 	 * condition, with no `await` between them, so it returns the row the condition compared.
 	 */
-	#imageForFailedCondition(item: TransactionItem, prefix: HashPrefixBucket, itemPresent: boolean) {
+	#imageForFailedCondition(item: TransactionItem, prefix: RoutingHash, itemPresent: boolean) {
 		if (item.returnValuesOnConditionCheckFailure !== "all_old" || !itemPresent) {
 			return undefined;
 		}
@@ -337,7 +337,7 @@ export class TransactionParticipant {
 	 */
 	#precheckWrite(
 		item: TransactionItem,
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		readStamp: boolean,
 	): { reason: RejectionReasonEncoded | null; read: ItemRead | null } {
 		const { hashKey: hk, sortKey: sk } = item;
@@ -662,7 +662,7 @@ export class TransactionParticipant {
 	 * after a put or an update.
 	 */
 	#write(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		hk: KeyBytes,
 		sk: KeyBytes,
 		operation: TransactionOperationType,
@@ -712,7 +712,7 @@ export class TransactionParticipant {
 	}
 
 	/** One store write of one request operation at `ts`. */
-	#writeRequest(op: TransactionItem, prefix: HashPrefixBucket, ts: number): number | undefined {
+	#writeRequest(op: TransactionItem, prefix: RoutingHash, ts: number): number | undefined {
 		return this.#write(prefix, op.hashKey, op.sortKey, op.operation, { from: "request", item: op }, ts);
 	}
 

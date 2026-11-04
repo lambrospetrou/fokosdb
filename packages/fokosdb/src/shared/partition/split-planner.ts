@@ -1,4 +1,4 @@
-import { maxHashDepth, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { maxHashDepth, type RoutingHash } from "../../sharding/hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../sharding/key-codec.js";
 import type { FokosPartitionIdentity } from "../../sharding/route-context.js";
 import type { FokosShardingHooks } from "../../sharding/runtime-types.js";
@@ -7,7 +7,7 @@ import type { FokosDBPolicy } from "../partition-context.js";
 import type { KeySizeStats } from "./key-size-stats.js";
 
 /**
- * The most hashPrefixBuckets that one split decision asks to promote. When this many all have
+ * The most routingHashes that one split decision asks to promote. When this many all have
  * promotions that cannot finish, the next large one waits until one of them finishes.
  */
 const PROMOTION_CANDIDATES_MAX = 5;
@@ -15,17 +15,17 @@ const PROMOTION_CANDIDATES_MAX = 5;
 /** The data of the host that the split planner reads. */
 export type SplitSource = {
 	/**
-	 * A hash key of the first hashPrefixBucket of the partition, and whether another hashPrefixBucket
+	 * A hash key of the first routingHash of the partition, and whether another routingHash
 	 * follows it, or null when the partition has no key.
 	 */
-	probeHashPrefixBuckets(): { first: KeyBytes; more: boolean } | null;
+	probeRoutingHashes(): { first: KeyBytes; more: boolean } | null;
 	/**
-	 * The rows of `hashPrefixBucket` in the composite interval `[start, end)` in `(hk, sk)` order, each
+	 * The rows of `routingHash` in the composite interval `[start, end)` in `(hk, sk)` order, each
 	 * with its size. The size of each row is the size that the host gives to `KeySizeStats`. The planner
 	 * stops early, so the host must read the rows one by one, and not load them all.
 	 */
 	compositeKeySizes(
-		hashPrefixBucket: HashPrefixBucket,
+		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 	): Iterable<{ hk: KeyBytes; sk: KeyBytes; bytes: number }>;
@@ -44,7 +44,7 @@ export type SplitFloor = "no_hash_key" | "fewer_items" | "skewed_bytes" | "max_d
  */
 export type RangeSplitPlan = { boundaries: FokosCompositeKey[] } | { floor: "fewer_items" | "skewed_bytes" };
 
-/** A hash key that a write changed, with the estimate of its hashPrefixBucket after the write. */
+/** A hash key that a write changed, with the estimate of its routingHash after the write. */
 type PromotionCandidate = { hashKey: KeyBytes; keyEstBytes: number };
 
 type EvaluateSplitAnswer = ReturnType<FokosShardingHooks<FokosDBPolicy>["evaluateSplit"]>;
@@ -69,9 +69,9 @@ export function maxSplitBytes(identity: FokosPartitionIdentity, policy: FokosDBP
 }
 
 /**
- * The split decisions of a partition that uses hash splits, promotions of large hashPrefixBuckets,
- * and range splits of a promoted hashPrefixBucket. The host owns the rows. The planner reads the size
- * of each hashPrefixBucket from `KeySizeStats`, and the rows of one from `SplitSource`.
+ * The split decisions of a partition that uses hash splits, promotions of large routingHashes,
+ * and range splits of a promoted routingHash. The host owns the rows. The planner reads the size
+ * of each routingHash from `KeySizeStats`, and the rows of one from `SplitSource`.
  */
 export class SplitPlanner {
 	#opts: SplitPlannerOptions;
@@ -107,20 +107,20 @@ export class SplitPlanner {
 
 	/** The answer of the `computeRangeBoundaries` hook: the boundaries, or null. */
 	rangeBoundaries(
-		hashPrefixBucket: HashPrefixBucket,
+		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 		N: number,
 	): FokosCompositeKey[] | null {
-		const plan = this.#planRangeSplit(hashPrefixBucket, start, end, N);
+		const plan = this.#planRangeSplit(routingHash, start, end, N);
 		return "boundaries" in plan ? plan.boundaries : null;
 	}
 
 	/**
 	 * The keys of `candidates` that a hash partition must promote. The estimate of a candidate is the
-	 * total of its hashPrefixBucket, so colliding hash keys add up. It keeps the largest candidate of
+	 * total of its routingHash, so colliding hash keys add up. It keeps the largest candidate of
 	 * each key: one transaction can write many sort keys of one hash key, and each write reports the
-	 * estimate after its own row. The runtime promotes the hashPrefixBucket of a key one time.
+	 * estimate after its own row. The runtime promotes the routingHash of a key one time.
 	 */
 	promotionCandidates(
 		identity: FokosPartitionIdentity,
@@ -155,11 +155,11 @@ export class SplitPlanner {
 	 * The split answer, or the floor when this leaf is over its limit and no repartition can make it
 	 * smaller. Under the limit it reads the database size only.
 	 *
-	 * A hash leaf probes for two hashPrefixBuckets. A hash split cannot separate two hash keys of one
-	 * hashPrefixBucket, so they count as one. With two or more hashPrefixBuckets, the leaf promotes the
+	 * A hash leaf probes for two routingHashes. A hash split cannot separate two hash keys of one
+	 * routingHash, so they count as one. With two or more routingHashes, the leaf promotes the
 	 * ones at or above the promotion threshold, up to `PROMOTION_CANDIDATES_MAX` and largest first, and
 	 * splits when it has none. At the hash depth limit it cannot split, so with no large one it is at
-	 * the floor. One hashPrefixBucket is promoted whatever its estimate: the limit reads the physical
+	 * the floor. One routingHash is promoted whatever its estimate: the limit reads the physical
 	 * file, which can be much larger than the estimate. A range leaf splits when the planner finds its
 	 * boundaries, from the same arguments that the `computeRangeBoundaries` hook gets.
 	 */
@@ -173,20 +173,20 @@ export class SplitPlanner {
 		}
 		if (identity.kind === "range") {
 			invariant(identity.range, `fokos/split-planner: range identity must have a range`);
-			const { hashPrefixBucket, start, end } = identity.range;
-			const plan = this.#planRangeSplit(hashPrefixBucket, start, end, this.#opts.rangeSplitN());
+			const { routingHash, start, end } = identity.range;
+			const plan = this.#planRangeSplit(routingHash, start, end, this.#opts.rangeSplitN());
 			return "boundaries" in plan ? { answer: {} } : { floor: plan.floor, maxSizeBytes };
 		}
-		const keys = this.#opts.source.probeHashPrefixBuckets();
+		const keys = this.#opts.source.probeRoutingHashes();
 		if (!keys) {
 			return { floor: "no_hash_key", maxSizeBytes };
 		}
 		if (!keys.more) {
 			return { answer: { promote: [keys.first] } };
 		}
-		// A split copies a large hashPrefixBucket into a child, and the child promotes it with a second
+		// A split copies a large routingHash into a child, and the child promotes it with a second
 		// copy. A promotion that cannot finish blocks the split, and a refused write signals no promotion.
-		// So the large hashPrefixBuckets are promoted first, and each promotion answers independently.
+		// So the large routingHashes are promoted first, and each promotion answers independently.
 		const large = this.#opts.keySizes.largestAtLeast(maxSizeBytes * this.#opts.promotionFraction(), PROMOTION_CANDIDATES_MAX);
 		if (large.length > 0) {
 			return { answer: { promote: large } };
@@ -197,18 +197,13 @@ export class SplitPlanner {
 	}
 
 	/**
-	 * The range split plan of `[start, end)` of `hashPrefixBucket`. The caller gives the slice that
-	 * this partition owns, so the rows of the slice are all the rows of the hashPrefixBucket here, and
+	 * The range split plan of `[start, end)` of `routingHash`. The caller gives the slice that
+	 * this partition owns, so the rows of the slice are all the rows of the routingHash here, and
 	 * its estimate is the byte total of the slice.
 	 */
-	#planRangeSplit(
-		hashPrefixBucket: HashPrefixBucket,
-		start: FokosCompositeKey | null,
-		end: FokosCompositeKey | null,
-		N: number,
-	): RangeSplitPlan {
-		const bytes = this.#opts.keySizes.bytesOf(hashPrefixBucket);
-		return planRangeBoundaries(bytes, N, start, this.#opts.source.compositeKeySizes(hashPrefixBucket, start, end));
+	#planRangeSplit(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, N: number): RangeSplitPlan {
+		const bytes = this.#opts.keySizes.bytesOf(routingHash);
+		return planRangeBoundaries(bytes, N, start, this.#opts.source.compositeKeySizes(routingHash, start, end));
 	}
 }
 

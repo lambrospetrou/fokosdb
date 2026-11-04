@@ -1,13 +1,13 @@
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
-import type { HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import type { RoutingHash } from "../../sharding/hash-primitives.js";
 import { tryOne } from "../sql-cursor.js";
 
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 1,
-		description: "Create the size estimate of each hashPrefixBucket",
-		// One row for each storage prefix (hashPrefixBucket) that has items. `est_bytes` is the sum of the
+		description: "Create the size estimate of each routingHash",
+		// One row for each storage prefix (routingHash) that has items. `est_bytes` is the sum of the
 		// row sizes of all hash keys of the prefix, as the host measures them. The host gives the prefix
 		// as opaque bytes. The index finds the largest prefixes for the promotion decision.
 		//
@@ -19,7 +19,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//
 		sql: `
             CREATE TABLE IF NOT EXISTS key_size_estimates (
-                hash_prefix_bucket BLOB    NOT NULL PRIMARY KEY,
+                routing_hash BLOB    NOT NULL PRIMARY KEY,
                 hk                 BLOB    NOT NULL,
                 est_bytes          INTEGER NOT NULL DEFAULT 0
             ) WITHOUT ROWID, STRICT;
@@ -60,14 +60,14 @@ export class KeySizeStats {
 	 * above 0, so an equal size means that the estimate row exists. Then it reads the estimate and writes
 	 * nothing, because an update writes the row and its index entry also when the value does not change.
 	 */
-	change(prefix: HashPrefixBucket, hk: KeyBytes, oldBytes: number, newBytes: number): number {
+	change(prefix: RoutingHash, hk: KeyBytes, oldBytes: number, newBytes: number): number {
 		if (oldBytes === newBytes) {
 			return this.bytesOf(prefix);
 		}
 		const row = tryOne(
 			this.#storage.sql.exec<{ est_bytes: number }>(
-				`INSERT INTO key_size_estimates (hash_prefix_bucket, hk, est_bytes) VALUES (?4, ?1, ?2)
-				 ON CONFLICT(hash_prefix_bucket) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?3)
+				`INSERT INTO key_size_estimates (routing_hash, hk, est_bytes) VALUES (?4, ?1, ?2)
+				 ON CONFLICT(routing_hash) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?3)
 				 RETURNING est_bytes`,
 				hk,
 				newBytes,
@@ -83,13 +83,13 @@ export class KeySizeStats {
 	 * a page, with the sizes of the rows that it inserted. Zero bytes writes nothing, so a page of rows
 	 * that are already present costs no write.
 	 */
-	add(prefix: HashPrefixBucket, hk: KeyBytes, bytes: number): void {
+	add(prefix: RoutingHash, hk: KeyBytes, bytes: number): void {
 		if (bytes <= 0) {
 			return;
 		}
 		this.#storage.sql.exec(
-			`INSERT INTO key_size_estimates (hash_prefix_bucket, hk, est_bytes) VALUES (?3, ?1, ?2)
-			 ON CONFLICT(hash_prefix_bucket) DO UPDATE SET est_bytes = est_bytes + excluded.est_bytes`,
+			`INSERT INTO key_size_estimates (routing_hash, hk, est_bytes) VALUES (?3, ?1, ?2)
+			 ON CONFLICT(routing_hash) DO UPDATE SET est_bytes = est_bytes + excluded.est_bytes`,
 			hk,
 			bytes,
 			prefix,
@@ -101,8 +101,8 @@ export class KeySizeStats {
 	 * order, so the rows of one prefix are next to each other, and a run of rows of one prefix makes one
 	 * `add`.
 	 */
-	addRows(rows: Iterable<{ prefix: HashPrefixBucket; hk: KeyBytes; bytes: number }>): void {
-		let run: { prefix: HashPrefixBucket; hk: KeyBytes; bytes: number } | null = null;
+	addRows(rows: Iterable<{ prefix: RoutingHash; hk: KeyBytes; bytes: number }>): void {
+		let run: { prefix: RoutingHash; hk: KeyBytes; bytes: number } | null = null;
 		for (const { prefix, hk, bytes } of rows) {
 			if (run !== null && KeyCodec.compare(KeyCodec.asKeyBytes(run.prefix), KeyCodec.asKeyBytes(prefix)) === 0) {
 				run.bytes += bytes;
@@ -124,34 +124,25 @@ export class KeySizeStats {
 	 * partition keeps one row for each prefix that it ever stored. A prefix that gets a write again gets
 	 * a new row.
 	 */
-	subtract(prefix: HashPrefixBucket, bytes: number): void {
+	subtract(prefix: RoutingHash, bytes: number): void {
 		// `est_bytes <= bytes` is the same test as `est_bytes - bytes <= 0`. We use `<=` and not `=`, so
 		// that an estimate that is too low also goes, and does not stay as a row of 0 bytes.
-		const removed = this.#storage.sql.exec(
-			`DELETE FROM key_size_estimates WHERE hash_prefix_bucket = ?2 AND est_bytes <= ?1`,
-			bytes,
-			prefix,
-		);
+		const removed = this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE routing_hash = ?2 AND est_bytes <= ?1`, bytes, prefix);
 		if (removed.rowsWritten === 0) {
-			this.#storage.sql.exec(
-				`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?1) WHERE hash_prefix_bucket = ?2`,
-				bytes,
-				prefix,
-			);
+			this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?1) WHERE routing_hash = ?2`, bytes, prefix);
 		}
 	}
 
 	/** Deletes the estimate of `prefix`. A promotion calls it when the prefix moves out of the partition. */
-	remove(prefix: HashPrefixBucket): void {
-		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hash_prefix_bucket = ?1`, prefix);
+	remove(prefix: RoutingHash): void {
+		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE routing_hash = ?1`, prefix);
 	}
 
 	/** The estimate of `prefix`, or 0 when it has no items. One primary-key lookup. */
-	bytesOf(prefix: HashPrefixBucket): number {
+	bytesOf(prefix: RoutingHash): number {
 		return (
-			tryOne(
-				this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hash_prefix_bucket = ?1`, prefix),
-			)?.est_bytes ?? 0
+			tryOne(this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE routing_hash = ?1`, prefix))
+				?.est_bytes ?? 0
 		);
 	}
 

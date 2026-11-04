@@ -231,7 +231,7 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 			// A shared hash partition does not split. A large tenant leaves it by promotion.
 			evaluateSplit: ({ identity, policy }) => (identity.kind === "range" && this.docCount() >= policy.rangeSplitAtDocs ? {} : false),
 			// The boundaries divide the documents of this partition into equal parts in (tenant, sort key)
-			// order. A range partition holds the tenants of one hashPrefixBucket, normally one tenant.
+			// order. A range partition holds the tenants of one routingHash, normally one tenant.
 			computeRangeBoundaries: ({ childCount }) => {
 				const keys = sql
 					.exec<{ tenant_id: string; sort_key: string }>("SELECT tenant_id, sort_key FROM docs ORDER BY tenant_id, sort_key")
@@ -269,11 +269,11 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 				},
 			},
 			// Every target has acknowledged its import. A promotion moved the tenants of one
-			// hashPrefixBucket, and a range split moved all rows.
+			// routingHash, and a range split moved all rows.
 			cleanupSourceStep: (plan) => {
 				const slice = plan.targets[0]?.slice;
-				if (plan.kind === "key_promotion" && slice?.kind === "promoted_hash_prefix_bucket") {
-					const moved = slice.hashPrefixBucket;
+				if (plan.kind === "key_promotion" && slice?.kind === "promoted_routing_hash") {
+					const moved = slice.routingHash;
 					for (const { tenant_id } of sql.exec<{ tenant_id: string }>("SELECT DISTINCT tenant_id FROM docs").toArray()) {
 						const prefix = this.fokos.storagePrefix(KeyCodec.encode(tenant_id));
 						if (prefix.length === moved.length && prefix.every((b, i) => b === moved[i])) {

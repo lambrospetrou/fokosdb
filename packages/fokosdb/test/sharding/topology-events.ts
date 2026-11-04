@@ -1,5 +1,5 @@
 import { PartitionIdHelper, topologyEventToJson, type FokosTopologyEvent, type KeyBytes } from "../../src/sharding/index-server.js";
-import { hashPrefixBucketOf, type HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
+import { routingHashOf, type RoutingHash } from "../../src/sharding/hash-primitives.js";
 import type { FokosCompositeKey } from "../../src/sharding/key-codec.js";
 
 /**
@@ -49,35 +49,35 @@ export function hashSplitReport(
 	});
 }
 
-function rangeRef(shardGroup: string, hashPrefixBucket: HashPrefixBucket, start: FokosCompositeKey | null, end: FokosCompositeKey | null) {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(shardGroup, hashPrefixBucket, start, end).encode(true);
+function rangeRef(shardGroup: string, routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null) {
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(shardGroup, routingHash, start, end).encode(true);
 	return { partitionId: opaque, doName: doName! };
 }
 
-/** The report of the promotion of the hashPrefixBucket of `hashKey` from the hash root 0. */
+/** The report of the promotion of the routingHash of `hashKey` from the hash root 0. */
 export function promotionReport(shardGroup: string, hashKey: KeyBytes, completedAt = Date.now(), rootTreesN = 1, hashSplitN = 4): unknown {
-	return bucketPromotionReport(shardGroup, hashPrefixBucketOf(hashKey, shardGroup), completedAt, rootTreesN, hashSplitN);
+	return routingHashPromotionReport(shardGroup, routingHashOf(hashKey, shardGroup), completedAt, rootTreesN, hashSplitN);
 }
 
-/** The report of the promotion of `hashPrefixBucket` from the hash root 0. */
-export function bucketPromotionReport(
+/** The report of the promotion of `routingHash` from the hash root 0. */
+export function routingHashPromotionReport(
 	shardGroup: string,
-	hashPrefixBucket: HashPrefixBucket,
+	routingHash: RoutingHash,
 	completedAt = Date.now(),
 	rootTreesN = 1,
 	hashSplitN = 4,
 ): unknown {
 	const source = PartitionIdHelper.hashId(shardGroup, 0);
-	const target = rangeRef(shardGroup, hashPrefixBucket, null, null);
+	const target = rangeRef(shardGroup, routingHash, null, null);
 	return wire({
 		...common(shardGroup, source.doName, completedAt, rootTreesN, hashSplitN),
 		kind: "key_promotion",
 		source: { partitionId: source.opaque, doName: source.doName },
-		targets: [{ ref: target, slice: { kind: "promoted_hash_prefix_bucket", hashPrefixBucket }, actorId: `actor-of-${target.doName}` }],
+		targets: [{ ref: target, slice: { kind: "promoted_routing_hash", routingHash }, actorId: `actor-of-${target.doName}` }],
 	});
 }
 
-/** The report of the range split of `[start, end)` of the hashPrefixBucket of `hashKey` at the inner `boundaries`. */
+/** The report of the range split of `[start, end)` of the routingHash of `hashKey` at the inner `boundaries`. */
 export function rangeSplitReport(
 	shardGroup: string,
 	hashKey: KeyBytes,
@@ -86,16 +86,16 @@ export function rangeSplitReport(
 	boundaries: FokosCompositeKey[],
 	completedAt = Date.now(),
 ): unknown {
-	const hashPrefixBucket = hashPrefixBucketOf(hashKey, shardGroup);
-	const source = rangeRef(shardGroup, hashPrefixBucket, start, end);
+	const routingHash = routingHashOf(hashKey, shardGroup);
+	const source = rangeRef(shardGroup, routingHash, start, end);
 	const edges = [start, ...boundaries, end];
 	return wire({
 		...common(shardGroup, source.doName, completedAt, 1, 4),
 		kind: "range_split",
 		source,
 		targets: Array.from({ length: boundaries.length + 1 }, (_, i) => {
-			const ref = rangeRef(shardGroup, hashPrefixBucket, edges[i], edges[i + 1]);
-			return { ref, slice: { kind: "range", hashPrefixBucket, start: edges[i], end: edges[i + 1] }, actorId: `actor-of-${ref.doName}` };
+			const ref = rangeRef(shardGroup, routingHash, edges[i], edges[i + 1]);
+			return { ref, slice: { kind: "range", routingHash, start: edges[i], end: edges[i + 1] }, actorId: `actor-of-${ref.doName}` };
 		}),
 	});
 }

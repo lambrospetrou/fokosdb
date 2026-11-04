@@ -1,7 +1,7 @@
 /**
  * Measures the storage that a contiguous delete in the storage order of `items` gives back. Each case
  * fills a new partition to about 8 MiB with items in random key order, then deletes the rows of one
- * half, and then of three quarters, of the hashPrefixBucket space, as a hash child keeps 1/2 and then
+ * half, and then of three quarters, of the routingHash space, as a hash child keeps 1/2 and then
  * 1/4 of its parent. Each delete is one key range of the primary key.
  *
  * The ratio is the `databaseSize` after the delete against the `databaseSize` before it. A contiguous
@@ -23,7 +23,7 @@ const DATA_BYTES = [100, 200, 500, 1_000, 1_500, 2_000];
 const TOLERANCE = 0.1;
 const ROWS_PER_TRANSACTION = 500;
 
-/** The 8-byte hashPrefixBucket whose first byte is `first`, and the other bytes are 0. */
+/** The 8-byte routingHash whose first byte is `first`, and the other bytes are 0. */
 const bound = (first: number) => Uint8Array.from([first, 0, 0, 0, 0, 0, 0, 0]);
 
 it.each(DATA_BYTES)("a contiguous delete of %i-byte items frees a proportional part of the storage", async (dataBytes) => {
@@ -44,12 +44,12 @@ it.each(DATA_BYTES)("a contiguous delete of %i-byte items frees a proportional p
 		}
 		const full = store.databaseSize;
 		// Keep [0, 2^63): delete each row from the middle of the space to its end.
-		sql.exec(`DELETE FROM items WHERE hash_prefix_bucket >= ?`, bound(0x80));
-		sql.exec(`DELETE FROM key_size_estimates WHERE hash_prefix_bucket >= ?`, bound(0x80));
+		sql.exec(`DELETE FROM items WHERE routing_hash >= ?`, bound(0x80));
+		sql.exec(`DELETE FROM key_size_estimates WHERE routing_hash >= ?`, bound(0x80));
 		const half = store.databaseSize / full;
 		// Keep [0, 2^62).
-		sql.exec(`DELETE FROM items WHERE hash_prefix_bucket >= ?`, bound(0x40));
-		sql.exec(`DELETE FROM key_size_estimates WHERE hash_prefix_bucket >= ?`, bound(0x40));
+		sql.exec(`DELETE FROM items WHERE routing_hash >= ?`, bound(0x40));
+		sql.exec(`DELETE FROM key_size_estimates WHERE routing_hash >= ?`, bound(0x40));
 		const quarter = store.databaseSize / full;
 		console.log(
 			`| ${dataBytes} | ${rows} | ${(full / 1024 / 1024).toFixed(2)} MiB | ${(half * 100).toFixed(1)}% | ${(quarter * 100).toFixed(1)}% |`,

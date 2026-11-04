@@ -1,12 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
-import {
-	asHashPrefixBucket,
-	compareHashPrefixBuckets,
-	hashPrefixBucketInterval,
-	hashPrefixBucketOf,
-} from "../../src/sharding/hash-primitives.js";
+import { asRoutingHash, compareRoutingHashes, routingHashInterval, routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
 import { hashStorageInterval, rangeStorageInterval } from "../../src/sharding/repartition-slice.js";
@@ -46,12 +41,7 @@ async function intervalsOf(partition: TestPartition): Promise<Intervals> {
 
 /** The storage interval of the hash node at `idxs`: the root index, then one child index for each level. */
 function nodeInterval(partition: TestPartition, idxs: number[]): FokosStorageInterval {
-	const { start, end } = hashPrefixBucketInterval(
-		partition.ctx.topology.rootTreesN,
-		partition.ctx.topology.hashSplitN,
-		idxs[0],
-		idxs.slice(1),
-	);
+	const { start, end } = routingHashInterval(partition.ctx.topology.rootTreesN, partition.ctx.topology.hashSplitN, idxs[0], idxs.slice(1));
 	return hashStorageInterval(start, end);
 }
 
@@ -62,8 +52,8 @@ async function rowsOf(partition: TestPartition, interval: FokosStorageInterval):
 			state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items ${where}`, ...params).one().n;
 		const rows = count("");
 		const inside = interval.end
-			? count(`WHERE hash_prefix_bucket >= ? AND hash_prefix_bucket < ?`, interval.start.prefix, interval.end.prefix)
-			: count(`WHERE hash_prefix_bucket >= ?`, interval.start.prefix);
+			? count(`WHERE routing_hash >= ? AND routing_hash < ?`, interval.start.prefix, interval.end.prefix)
+			: count(`WHERE routing_hash >= ?`, interval.start.prefix);
 		return { rows, outside: rows - inside };
 	});
 }
@@ -77,8 +67,8 @@ async function localRows(partition: TestPartition, hashKey: KeyBytes): Promise<n
 				.exec<{
 					n: number;
 				}>(
-					`SELECT COUNT(*) AS n FROM items WHERE hash_prefix_bucket = ? AND hk = ?`,
-					hashPrefixBucketOf(hashKey, partition.ctx.topology.shardGroup),
+					`SELECT COUNT(*) AS n FROM items WHERE routing_hash = ? AND hk = ?`,
+					routingHashOf(hashKey, partition.ctx.topology.shardGroup),
 					hashKey,
 				)
 				.one().n,
@@ -128,23 +118,23 @@ describe("FokosDBPartitionDO — storage intervals", () => {
 		},
 	);
 
-	it("a range partition has the interval of the rows of its one hashPrefixBucket", async () => {
+	it("a range partition has the interval of the rows of its one routingHash", async () => {
 		const partition = makePartition();
 		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		const rangeRoot = await partition.awaitPromoted("alice");
-		const bucket = hashPrefixBucketOf(kb("alice"), partition.ctx.topology.shardGroup);
-		const interval = rangeStorageInterval(bucket, null, null);
+		const routingHash = routingHashOf(kb("alice"), partition.ctx.topology.shardGroup);
+		const interval = rangeStorageInterval(routingHash, null, null);
 		expect(await intervalsOf(rangeRoot)).toEqual({ scope: interval, owned: interval });
-		// The interval starts at the bucket and ends at the start of the next bucket.
-		expect(interval.start).toEqual({ prefix: bucket });
-		// The end bound is the start of the next bucket, which is a bucket value itself.
-		expect(interval.end === null || compareHashPrefixBuckets(asHashPrefixBucket(interval.end.prefix), bucket) > 0).toBe(true);
+		// The interval starts at the routingHash and ends at the start of the next routingHash.
+		expect(interval.start).toEqual({ prefix: routingHash });
+		// The end bound is the start of the next routingHash, which is a routingHash value itself.
+		expect(interval.end === null || compareRoutingHashes(asRoutingHash(interval.end.prefix), routingHash) > 0).toBe(true);
 	});
 
-	// Two hash keys can have one hashPrefixBucket. A promotion moves the whole bucket, so both keys
+	// Two hash keys can have one routingHash. A promotion moves the whole routingHash, so both keys
 	// move to the range tree. A range split can then put a boundary between the two keys.
 	it(
-		"promotes two hash keys of one hashPrefixBucket together, and a range split between them separates their rows",
+		"promotes two hash keys of one routingHash together, and a range split between them separates their rows",
 		{ timeout: 120_000 },
 		async () => {
 			const partition = makePartition({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 1 } });
@@ -152,15 +142,15 @@ describe("FokosDBPartitionDO — storage intervals", () => {
 			const [lower, upper] = collidingHashKeys(group)
 				.map((raw) => KeyCodec.encode(raw))
 				.sort(KeyCodec.compare);
-			const bucket = hashPrefixBucketOf(lower, group);
-			expect(hashPrefixBucketOf(upper, group)).toEqual(bucket);
+			const routingHash = routingHashOf(lower, group);
+			expect(routingHashOf(upper, group)).toEqual(routingHash);
 			for (const hashKey of [lower, upper]) {
 				for (const sk of ["s1", "s2", "s3"]) {
 					await partition.put({ hashKey, sortKey: kb(sk), data: "d", kind: "text" });
 				}
 			}
 			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: lower });
-			const rangeRoot = TestPartition.at(resolveRangePartitionContext(partition.ctx, bucket, null, null));
+			const rangeRoot = TestPartition.at(resolveRangePartitionContext(partition.ctx, routingHash, null, null));
 			await drainUntil(
 				[partition, rangeRoot],
 				async () =>

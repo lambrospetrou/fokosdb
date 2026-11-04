@@ -14,7 +14,7 @@ import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-c
 import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
-import type { HashPrefixBucket } from "../sharding/hash-primitives.js";
+import type { RoutingHash } from "../sharding/hash-primitives.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
@@ -133,13 +133,13 @@ export function topologyAdminName(shardGroup: string, fp: string): string {
 }
 
 /**
- * The name of the admin Durable Object that holds the range topology of one promoted hashPrefixBucket
+ * The name of the admin Durable Object that holds the range topology of one promoted routingHash
  * of `shardGroup`: `topologyAdminName(shardGroup, fp)` + `.rh.` + the 16 hex characters of the
- * hashPrefixBucket. A fingerprint has no ".", so the name has one form for each set of values, and no
- * name of a shard group is the same as the name of a hashPrefixBucket.
+ * routingHash. A fingerprint has no ".", so the name has one form for each set of values, and no
+ * name of a shard group is the same as the name of a routingHash.
  */
-export function hashPrefixBucketTopologyAdminName(shardGroup: string, fp: string, hashPrefixBucket: HashPrefixBucket): string {
-	return `${topologyAdminName(shardGroup, fp)}.rh.${hashPrefixBucket.toHex()}`;
+export function routingHashTopologyAdminName(shardGroup: string, fp: string, routingHash: RoutingHash): string {
+	return `${topologyAdminName(shardGroup, fp)}.rh.${routingHash.toHex()}`;
 }
 
 function checkedFingerprint(fp: string): string {

@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
-import { hashPrefixBucketSeedOf } from "../../src/sharding/hash-primitives.js";
+import { routingHashSeedOf } from "../../src/sharding/hash-primitives.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
@@ -56,10 +56,10 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 			schema: 1,
 			ref: { partitionId: partition.ctx.partitionId, doName: partition.ctx.doName },
 			kind: "hash",
-			// One root: its interval is the whole hashPrefixBucket space.
+			// One root: its interval is the whole routingHash space.
 			hash: { rootIndex: 0, path: [], depth: 0, start: new Uint8Array(8), end: null },
 			topology: partition.ctx.topology,
-			hashPrefixBucketSeed: hashPrefixBucketSeedOf(partition.ctx.topology.shardGroup),
+			routingHashSeed: routingHashSeedOf(partition.ctx.topology.shardGroup),
 		});
 
 		// Split so children are initialized through fokosInit. splitHash drains the whole tree, rather
@@ -76,7 +76,7 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 					rootIndex: 0,
 					path: [i],
 					depth: 1,
-					...PartitionIdHelper.hashPrefixBucketInterval(children[i].ctx.partitionId, partition.ctx.topology),
+					...PartitionIdHelper.routingHashInterval(children[i].ctx.partitionId, partition.ctx.topology),
 				},
 				ref: { doName: children[i].doName },
 			});

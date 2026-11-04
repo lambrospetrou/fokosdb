@@ -1,19 +1,19 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
-	asHashPrefixBucket,
+	asRoutingHash,
 	GOLDEN_RATIO_BIGINT,
-	HashPrefixBucketDigitCursor,
+	RoutingHashDigitCursor,
 	hash64,
-	hashPrefixBucket,
-	hashPrefixBucketDigits,
-	hashPrefixBucketInterval,
-	hashPrefixBucketOf,
-	hashPrefixBucketSeedOf,
-	inHashPrefixBucketInterval,
+	routingHash,
+	routingHashDigits,
+	routingHashInterval,
+	routingHashOf,
+	routingHashSeedOf,
+	inRoutingHashInterval,
 	MAX_HASH_DEPTH,
 	maxHashDepth,
-	type HashPrefixBucket,
+	type RoutingHash,
 } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 
@@ -23,11 +23,11 @@ const kb = (s: string) => KeyCodec.encode(s);
 const KEYS = Array.from({ length: 500 }, (_, i) => kb(`key-${i}-${i % 7 === 0 ? "😀" : "x"}-${"a".repeat(i % 11)}`));
 
 const TWO_64 = 1n << 64n;
-const toBigInt = (bucket: Uint8Array) => BigInt(`0x${bucket.toHex()}`);
-function bucketOf(value: bigint): HashPrefixBucket {
+const toBigInt = (rh: Uint8Array) => BigInt(`0x${rh.toHex()}`);
+function routingHashFromBigInt(value: bigint): RoutingHash {
 	const out = new Uint8Array(8);
 	new DataView(out.buffer).setBigUint64(0, value, false);
-	return asHashPrefixBucket(out);
+	return asRoutingHash(out);
 }
 
 /** The reference digits: each step is `floor(x * M / 2^64)`, and the rest is `x * M mod 2^64`. */
@@ -40,25 +40,25 @@ function referenceDigits(value: bigint, bases: number[]): number[] {
 	});
 }
 
-describe("the digits of a hashPrefixBucket", () => {
+describe("the digits of a routingHash", () => {
 	it("each limb step equals the bigint reference, for every base and the edge values", () => {
 		const values = [0n, 1n, TWO_64 - 1n, TWO_64 / 2n, TWO_64 / 2n - 1n, 0xc000000000000000n, 0x123456789abcdef0n];
 		for (let base = 1; base <= 65_000; base++) {
 			for (const value of values) {
-				const cursor = new HashPrefixBucketDigitCursor(bucketOf(value), base);
+				const cursor = new RoutingHashDigitCursor(routingHashFromBigInt(value), base);
 				const bases = [base, 255, 2, base];
 				expect([cursor.root, cursor.next(255), cursor.next(2), cursor.next(base)]).toEqual(referenceDigits(value, bases));
 			}
 		}
 	});
 
-	it("each limb step equals the bigint reference for random hashPrefixBuckets and bases", () => {
+	it("each limb step equals the bigint reference for random routingHashes and bases", () => {
 		fc.assert(
 			fc.property(
 				fc.bigInt({ min: 0n, max: TWO_64 - 1n }),
 				fc.array(fc.integer({ min: 1, max: 65_000 }), { minLength: 1, maxLength: 70 }),
 				(value, bases) => {
-					const cursor = new HashPrefixBucketDigitCursor(bucketOf(value), bases[0]);
+					const cursor = new RoutingHashDigitCursor(routingHashFromBigInt(value), bases[0]);
 					const digits = [cursor.root, ...bases.slice(1).map((base) => cursor.next(base))];
 					expect(digits).toEqual(referenceDigits(value, bases));
 				},
@@ -68,14 +68,14 @@ describe("the digits of a hashPrefixBucket", () => {
 	});
 
 	it("gives the digits of the worked example: R 3, K 2, and the fraction 0.75", () => {
-		expect(hashPrefixBucketDigits(bucketOf(0xc000000000000000n), 3, 2, 2)).toEqual({ root: 2, path: [0, 1] });
-		const { start, end } = hashPrefixBucketInterval(3, 2, 2, [0, 1]);
+		expect(routingHashDigits(routingHashFromBigInt(0xc000000000000000n), 3, 2, 2)).toEqual({ root: 2, path: [0, 1] });
+		const { start, end } = routingHashInterval(3, 2, 2, [0, 1]);
 		expect(toBigInt(start)).toBe(0xc000000000000000n);
 		// ceil(10 * 2^64 / 12)
 		expect(toBigInt(end!)).toBe((10n * TWO_64 + 11n) / 12n);
 	});
 
-	it("puts a hashPrefixBucket in the interval of a node exactly when its digits give the path of the node", () => {
+	it("puts a routingHash in the interval of a node exactly when its digits give the path of the node", () => {
 		fc.assert(
 			fc.property(
 				fc.integer({ min: 1, max: 65_000 }),
@@ -84,12 +84,12 @@ describe("the digits of a hashPrefixBucket", () => {
 				fc.nat(),
 				(R, K, value, depthPick) => {
 					const depth = depthPick % (maxHashDepth(R, K) + 1);
-					const bucket = bucketOf(value);
-					const { root, path } = hashPrefixBucketDigits(bucket, R, K, depth);
-					const { start, end } = hashPrefixBucketInterval(R, K, root, path);
-					expect(inHashPrefixBucketInterval(bucket, start, end)).toBe(true);
+					const rh = routingHashFromBigInt(value);
+					const { root, path } = routingHashDigits(rh, R, K, depth);
+					const { start, end } = routingHashInterval(R, K, root, path);
+					expect(inRoutingHashInterval(rh, start, end)).toBe(true);
 					// The edges of the interval have the same digits, and the values next to them do not.
-					const digitsOf = (v: bigint) => hashPrefixBucketDigits(bucketOf(v), R, K, depth);
+					const digitsOf = (v: bigint) => routingHashDigits(routingHashFromBigInt(v), R, K, depth);
 					expect(digitsOf(toBigInt(start))).toEqual({ root, path });
 					const last = end === null ? TWO_64 - 1n : toBigInt(end) - 1n;
 					expect(digitsOf(last)).toEqual({ root, path });
@@ -116,8 +116,8 @@ describe("the digits of a hashPrefixBucket", () => {
 					const depth = Math.min(picks.length, maxHashDepth(R, K) - 1);
 					const root = rootPick % R;
 					const path = picks.slice(0, depth).map((p) => p % K);
-					const parent = hashPrefixBucketInterval(R, K, root, path);
-					const children = Array.from({ length: K }, (_, c) => hashPrefixBucketInterval(R, K, root, [...path, c]));
+					const parent = routingHashInterval(R, K, root, path);
+					const children = Array.from({ length: K }, (_, c) => routingHashInterval(R, K, root, [...path, c]));
 					expect(children[0].start).toEqual(parent.start);
 					for (let c = 0; c + 1 < K; c++) {
 						expect(children[c].end).toEqual(children[c + 1].start);
@@ -133,7 +133,7 @@ describe("the digits of a hashPrefixBucket", () => {
 		const R = 8;
 		const counts = Array.from({ length: R }, () => 0);
 		for (const k of KEYS) {
-			counts[new HashPrefixBucketDigitCursor(hashPrefixBucketOf(k, "fokos.p.spread"), R).root]++;
+			counts[new RoutingHashDigitCursor(routingHashOf(k, "fokos.p.spread"), R).root]++;
 		}
 		const expected = KEYS.length / R;
 		// Loose chi-square-free bound: no root should be wildly off (within 2.5x of expected).
@@ -155,33 +155,33 @@ describe("maxHashDepth", () => {
 	});
 });
 
-describe("hashPrefixBucket", () => {
+describe("routingHash", () => {
 	const hex = (bytes: Uint8Array) => bytes.toHex();
 
-	it("hashPrefixBucketOf uses the seed of the shard group", () => {
-		const seed = BigInt(`0x${hashPrefixBucketSeedOf("fokos.p.orders")}`);
-		expect(hashPrefixBucketOf(kb("user#42"), "fokos.p.orders")).toEqual(hashPrefixBucket(kb("user#42"), seed));
+	it("routingHashOf uses the seed of the shard group", () => {
+		const seed = BigInt(`0x${routingHashSeedOf("fokos.p.orders")}`);
+		expect(routingHashOf(kb("user#42"), "fokos.p.orders")).toEqual(routingHash(kb("user#42"), seed));
 	});
 
 	it("gives 8 bytes, most significant byte first, equal to xxh64 of the key bytes", () => {
-		const seed = BigInt(`0x${hashPrefixBucketSeedOf("fokos.p.orders")}`);
+		const seed = BigInt(`0x${routingHashSeedOf("fokos.p.orders")}`);
 		for (const k of KEYS.slice(0, 50)) {
-			const bucket = hashPrefixBucket(k, seed);
-			expect(bucket).toHaveLength(8);
-			expect(BigInt(`0x${hex(bucket)}`)).toBe(hash64(k, seed));
+			const rh = routingHash(k, seed);
+			expect(rh).toHaveLength(8);
+			expect(BigInt(`0x${hex(rh)}`)).toBe(hash64(k, seed));
 		}
 	});
 
-	it("pins the seed of a shard group and the hashPrefixBucket of a key", () => {
-		const seed = hashPrefixBucketSeedOf("fokos.p.orders");
+	it("pins the seed of a shard group and the routingHash of a key", () => {
+		const seed = routingHashSeedOf("fokos.p.orders");
 		expect(seed).toMatch(/^[0-9a-f]{16}$/);
 		expect(seed).toBe("3291cf945f451beb");
-		expect(hex(hashPrefixBucket(kb("user#42"), BigInt(`0x${seed}`)))).toBe("79ea4b6db710a9a9");
+		expect(hex(routingHash(kb("user#42"), BigInt(`0x${seed}`)))).toBe("79ea4b6db710a9a9");
 	});
 
 	it("derives the seed of a shard group from a base seed, which defaults to GOLDEN_RATIO_BIGINT", () => {
-		expect(hashPrefixBucketSeedOf("fokos.p.orders", GOLDEN_RATIO_BIGINT)).toBe("3291cf945f451beb");
-		const custom = hashPrefixBucketSeedOf("fokos.p.orders", 42n);
+		expect(routingHashSeedOf("fokos.p.orders", GOLDEN_RATIO_BIGINT)).toBe("3291cf945f451beb");
+		const custom = routingHashSeedOf("fokos.p.orders", 42n);
 		expect(custom).toMatch(/^[0-9a-f]{16}$/);
 		expect(custom).not.toBe("3291cf945f451beb");
 		expect(BigInt(`0x${custom}`)).toBe(hash64("fokos.p.orders", 42n));

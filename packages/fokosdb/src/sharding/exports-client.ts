@@ -23,17 +23,17 @@ export { FokosRouter } from "./router.js";
 export { KeyCodec } from "./key-codec.js";
 export type { FokosCompositeKey, KeyBytes } from "./key-codec.js";
 export {
-	asHashPrefixBucket,
+	asRoutingHash,
 	GOLDEN_RATIO,
 	GOLDEN_RATIO_BIGINT,
-	HASH_PREFIX_BUCKET_BYTES,
+	ROUTING_HASH_BYTES,
 	hash32,
 	hash64,
-	hashPrefixBucket,
-	hashPrefixBucketDigits,
-	hashPrefixBucketSeedOf,
+	routingHash,
+	routingHashDigits,
+	routingHashSeedOf,
 } from "./hash-primitives.js";
-export type { HashPrefixBucket } from "./hash-primitives.js";
+export type { RoutingHash } from "./hash-primitives.js";
 
 // ─── Identity and context ─────────────────────────────────────────────────────
 

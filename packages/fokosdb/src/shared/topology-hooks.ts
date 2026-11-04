@@ -30,18 +30,18 @@ export function topologyCacheFor(
 		return undefined;
 	}
 	return {
-		fetch: async (path, signal, hashPrefixBucket) => {
+		fetch: async (path, signal, routingHash) => {
 			const entrypoint = (exports as unknown as Record<string, TopologyEntrypointFactory | undefined>)[topologyEntrypoint];
 			if (entrypoint === undefined) {
 				throw new Error(`the Worker does not export the topology entrypoint ${topologyEntrypoint}`);
 			}
-			// A range topology is in the admin of its hashPrefixBucket. `address` exists, so the table has `nsAdmin`.
-			const props = hashPrefixBucket === undefined ? address : topologyAdminAddress(env, ctx, binding, hashPrefixBucket)!;
+			// A range topology is in the admin of its routingHash. `address` exists, so the table has `nsAdmin`.
+			const props = routingHash === undefined ? address : topologyAdminAddress(env, ctx, binding, routingHash)!;
 			return await entrypoint({ props }).fetch(`http://fokos-topology${path}`, { signal });
 		},
 		waitUntil,
 		// The entrypoint answers by the admin address, so the isolate cache keys by it too. The key of a
-		// range entry also has its hashPrefixBucket, which gives the address of the admin of the bucket.
+		// range entry also has its routingHash, which gives the address of the admin of the routingHash.
 		scope: JSON.stringify([address.nsAdmin, address.jurisdiction ?? null, address.name]),
 		...(settings.refreshMs === undefined ? {} : { refreshMs: settings.refreshMs }),
 		...(settings.refreshTimeoutMs === undefined ? {} : { refreshTimeoutMs: settings.refreshTimeoutMs }),

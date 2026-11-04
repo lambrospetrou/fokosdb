@@ -14,10 +14,10 @@ import type { FokosDBPartitionDO } from "../server/do-partition.js";
 import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import invariant from "./invariant.js";
-import type { HashPrefixBucket } from "../sharding/hash-primitives.js";
+import type { RoutingHash } from "../sharding/hash-primitives.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import {
-	hashPrefixBucketTopologyAdminName,
+	routingHashTopologyAdminName,
 	NAMESPACE_FINGERPRINT_LENGTH,
 	topologyAdminName,
 	type AdminNamespaceKey,
@@ -168,14 +168,14 @@ export type TopologyAdminAddress = {
 /**
  * The admin address of the shard group of `ctx`, or undefined when the table has no `nsAdmin`. `binding`
  * is the namespace that holds the shard group: `ns` for a partition or a GSI group, `nsTx` for a
- * coordinator group, and `nsMat` for a materialization group. With `hashPrefixBucket`, it is the address
- * of the admin of that promoted hashPrefixBucket, which holds its range topology.
+ * coordinator group, and `nsMat` for a materialization group. With `routingHash`, it is the address
+ * of the admin of that promoted routingHash, which holds its range topology.
  */
 export function topologyAdminAddress(
 	env: Env,
 	ctx: FokosDBStubContext,
 	binding: DataNamespaceKey,
-	hashPrefixBucket?: HashPrefixBucket,
+	routingHash?: RoutingHash,
 ): TopologyAdminAddress | undefined {
 	const { nsAdmin } = ctx.policy;
 	if (nsAdmin === undefined) {
@@ -183,10 +183,7 @@ export function topologyAdminAddress(
 	}
 	const { jurisdiction, shardGroup } = ctx.topology;
 	const fp = namespaceFingerprint(env, binding, jurisdiction);
-	const name =
-		hashPrefixBucket === undefined
-			? topologyAdminName(shardGroup, fp)
-			: hashPrefixBucketTopologyAdminName(shardGroup, fp, hashPrefixBucket);
+	const name = routingHash === undefined ? topologyAdminName(shardGroup, fp) : routingHashTopologyAdminName(shardGroup, fp, routingHash);
 	return jurisdiction === undefined ? { nsAdmin, name } : { nsAdmin, jurisdiction, name };
 }
 

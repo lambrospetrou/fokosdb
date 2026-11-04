@@ -324,12 +324,12 @@ describe("MaterializationStore — plans of the storage order", () => {
 			plans();
 
 			store.storedImage(P(kb("x")), kb("x"), NO_SK);
-			expect(plans()).toEqual(["SEARCH latest_items USING PRIMARY KEY (hash_prefix_bucket=? AND base_hk=? AND base_sk=?)"]);
+			expect(plans()).toEqual(["SEARCH latest_items USING PRIMARY KEY (routing_hash=? AND base_hk=? AND base_sk=?)"]);
 
-			expect(store.transactionSync(() => store.deleteItemsOfHashPrefixBucket(P(kb("x")), 10))).toBe(true);
+			expect(store.transactionSync(() => store.deleteItemsOfRoutingHash(P(kb("x")), 10))).toBe(true);
 			expect(plans()).toEqual([
-				"SEARCH latest_items USING PRIMARY KEY (hash_prefix_bucket=?)",
-				"SEARCH latest_items USING PRIMARY KEY (hash_prefix_bucket=? AND (base_hk,base_sk)<(?,?))",
+				"SEARCH latest_items USING PRIMARY KEY (routing_hash=?)",
+				"SEARCH latest_items USING PRIMARY KEY (routing_hash=? AND (base_hk,base_sk)<(?,?))",
 			]);
 		});
 	});
@@ -375,8 +375,8 @@ describe("MaterializationStore — plans of the storage order", () => {
 	});
 });
 
-describe("MaterializationStore — the cleanup of a promoted hashPrefixBucket", () => {
-	it("deletes only the items of its hashPrefixBucket, in primary-key order, with their positions, retries, and GSI keys", async () => {
+describe("MaterializationStore — the cleanup of a promoted routingHash", () => {
+	it("deletes only the items of its routingHash, in primary-key order, with their positions, retries, and GSI keys", async () => {
 		await withStore((h) => {
 			const sql = h.state.storage.sql;
 			sql.exec(`INSERT INTO materialization_targets (target_id, kind) VALUES ('t1', 'gsi')`);
@@ -410,7 +410,7 @@ describe("MaterializationStore — the cleanup of a promoted hashPrefixBucket", 
 			const linked = (table: string) => sql.exec<{ item_id: number }>(`SELECT DISTINCT item_id FROM ${table} ORDER BY item_id`).toArray();
 
 			// The first step deletes the first two items in (base_hk, base_sk) order.
-			expect(h.store.transactionSync(() => h.store.deleteItemsOfHashPrefixBucket(P(promoted), 2))).toBe(false);
+			expect(h.store.transactionSync(() => h.store.deleteItemsOfRoutingHash(P(promoted), 2))).toBe(false);
 			expect([itemIdOf(promoted, "s1"), itemIdOf(promoted, "s2")]).toEqual([undefined, undefined]);
 			const s3 = itemIdOf(promoted, "s3");
 			expect(s3).toBeDefined();
@@ -418,7 +418,7 @@ describe("MaterializationStore — the cleanup of a promoted hashPrefixBucket", 
 				expect(linked(table)).toEqual([{ item_id: s3 }, { item_id: otherId }].sort((x, y) => x.item_id! - y.item_id!));
 			}
 
-			expect(h.store.transactionSync(() => h.store.deleteItemsOfHashPrefixBucket(P(promoted), 2))).toBe(true);
+			expect(h.store.transactionSync(() => h.store.deleteItemsOfRoutingHash(P(promoted), 2))).toBe(true);
 			expect(sql.exec(`SELECT item_id FROM latest_items`).toArray()).toEqual([{ item_id: otherId }]);
 			for (const table of ["change_positions", "target_retry", "target_index_keys"]) {
 				expect(linked(table)).toEqual([{ item_id: otherId }]);

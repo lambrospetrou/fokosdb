@@ -26,7 +26,7 @@ export const POOL_PARAM = 1;
 /** The storage prefix, hk, near bound, far bound, LIMIT: the widest scan tail after the pool of a query plan. */
 export const QUERY_MAX_TRAILING_BINDING_COUNT = 5;
 /** The scan terms of the widest query statement, used for the SQL size check. */
-export const QUERY_WIDEST_SCAN_CONDITIONS: readonly string[] = ["hash_prefix_bucket = ?", "hk = ?", "sk >= ?", "sk <= ?"];
+export const QUERY_WIDEST_SCAN_CONDITIONS: readonly string[] = ["routing_hash = ?", "hk = ?", "sk >= ?", "sk <= ?"];
 
 /**
  * Parameters every statement that runs an update plan binds BEFORE the plan's own, in this order:
@@ -55,7 +55,7 @@ SELECT i.hk IS NOT NULL AS item_present,
        i.last_write_ts
 FROM requested
 LEFT JOIN items AS i
-  ON i.hash_prefix_bucket = requested.requested_prefix AND i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
+  ON i.routing_hash = requested.requested_prefix AND i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
 }
 
 /**
@@ -80,7 +80,7 @@ SELECT i.hk IS NOT NULL AS item_present,
 FROM (SELECT i.*, (${plan.applicableSql}) AS applicable
       FROM requested
       LEFT JOIN items AS i
-        ON i.hash_prefix_bucket = requested.requested_prefix AND i.hk = requested.requested_hk AND i.sk = requested.requested_sk) AS i`;
+        ON i.routing_hash = requested.requested_prefix AND i.hk = requested.requested_hk AND i.sk = requested.requested_sk) AS i`;
 }
 
 /** The TTL of the stored row. The `ttlSql` of an update write that sets no TTL. */
@@ -108,13 +108,13 @@ export function composeUpdateWriteStatement(
 ): string {
 	const { txOrderTsParam, ttlSql, itemIdParam, limitParam } = tail;
 	const estRowBytes = estRowBytesExpr(plan.documentSql, "?1", "?2");
-	return `INSERT INTO items (hash_prefix_bucket, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+	return `INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
 SELECT ?3, ?1, ?2, ${itemIdParam}, ${JSON_KIND_CODE}, ${ttlSql}, d.max_deleted_v + 1,
        MAX(${txOrderTsParam}, d.max_delete_tx_order_ts), MAX(${txOrderTsParam}, d.max_delete_tx_order_ts),
        ${estRowBytes}, ${plan.documentSql}
-  FROM deletion_metadata AS d LEFT JOIN items AS i ON i.hash_prefix_bucket = ?3 AND i.hk = ?1 AND i.sk = ?2
+  FROM deletion_metadata AS d LEFT JOIN items AS i ON i.routing_hash = ?3 AND i.hk = ?1 AND i.sk = ?2
  WHERE d.id = 1 AND ${estRowBytes} <= ${limitParam}
-ON CONFLICT(hash_prefix_bucket, hk, sk) DO UPDATE SET
+ON CONFLICT(routing_hash, hk, sk) DO UPDATE SET
   data = excluded.data,
   data_kind = excluded.data_kind,
   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
@@ -129,7 +129,7 @@ export function composeProjectionStatement(plan: Pick<CompiledProjectionPlan, "v
 	const columns = plan.valueSql.flatMap((valueSql, index) => [`${valueSql} AS p${index}`, `${plan.typeSql[index]} AS t${index}`]);
 	return `SELECT i.v, i.ttl_epoch_utc_seconds, ${columns.join(", ")}
 FROM items AS i
-WHERE i.hash_prefix_bucket = ?4 AND i.hk = ?2 AND i.sk = ?3
+WHERE i.routing_hash = ?4 AND i.hk = ?2 AND i.sk = ?3
 LIMIT 1`;
 }
 

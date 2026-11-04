@@ -1,7 +1,7 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../sharding/key-codec.js";
-import { asHashPrefixBucket, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { asRoutingHash, type RoutingHash } from "../../sharding/hash-primitives.js";
 import invariant from "../invariant.js";
 import { exists, one, tryOne } from "../sql-cursor.js";
 import {
@@ -75,7 +75,7 @@ class StatementTail {
 	}
 
 	/** The complete bound list: the keys and the storage prefix, then the plan's parameters, then this statement's own. */
-	bindings(hk: KeyBytes, sk: KeyBytes, prefix: HashPrefixBucket): unknown[] {
+	bindings(hk: KeyBytes, sk: KeyBytes, prefix: RoutingHash): unknown[] {
 		// A statement that embeds only documentSql still binds every plan parameter, so a parameter that
 		// only applicableSql uses is a gap in the numbering. SQLite counts the parameters of a statement
 		// by the HIGHEST index it references, so the count matches this list only while the tail reaches
@@ -173,7 +173,7 @@ export type ItemLinkId = number & { readonly [ITEM_LINK_ID_BRAND]: true };
  * A stored item as migration copies it: the item, its storage prefix, and its link id. Query results
  * never carry the id.
  */
-export type MigratedItem = StoredItem & { prefix: HashPrefixBucket; item_id: ItemLinkId };
+export type MigratedItem = StoredItem & { prefix: RoutingHash; item_id: ItemLinkId };
 
 /** The facts of one transaction that are the same for each of its locks: one `pending_tx_info` row. */
 export type PendingTxInfo = {
@@ -214,7 +214,7 @@ function parseOpList(json: string): OpList {
 /** One lock and the facts of its transaction, as prepare writes them and as migration copies them. */
 export type PendingTxItem = PendingTxInfo & {
 	/** The storage prefix of `hk`. */
-	prefix: HashPrefixBucket;
+	prefix: RoutingHash;
 	hk: KeyBytes;
 	sk: KeyBytes;
 	/**
@@ -237,12 +237,12 @@ export type StoredItemData = { data: string | Uint8Array; kind: DataKind; ttl_ep
 export type StalePendingTx = Pick<PendingTxInfo, "transaction_id" | "coordinator_json" | "created_at">;
 
 /** A position of a migration read in the storage order `(prefix, hk, sk)`. */
-export type StorageCursor = { prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes };
+export type StorageCursor = { prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes };
 
 export type PendingTransactionCursor = StorageCursor & { transaction_id: string };
 
 /** The last row that a TTL sweep chunk read, in the order of `idx_items_ttl`. */
-export type TtlScanPosition = { ttlAt: number; prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes };
+export type TtlScanPosition = { ttlAt: number; prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes };
 
 /**
  * One sweep chunk reads at most this many candidates for each row that it can delete. The bound keeps a
@@ -251,7 +251,7 @@ export type TtlScanPosition = { ttlAt: number; prefix: HashPrefixBucket; hk: Key
 const TTL_SCAN_ROWS_PER_DELETED_ROW = 10;
 
 /** One key of a lock row, as the transaction paths hold it, with the storage prefix of its hash key. */
-export type PendingTxKey = { prefix: HashPrefixBucket; hashKey: KeyBytes; sortKey: KeyBytes };
+export type PendingTxKey = { prefix: RoutingHash; hashKey: KeyBytes; sortKey: KeyBytes };
 
 /** A position of a query scan inside one hash key. */
 export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
@@ -260,11 +260,11 @@ export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 export type KeyRange = FokosStorageInterval;
 
 /** One `materialization_outbox` row as a migration page carries it. The target gives it a new `outbox_id`. */
-export type MigratedOutboxRow = { prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes; revision: number; is_deleted: 0 | 1 };
+export type MigratedOutboxRow = { prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes; revision: number; is_deleted: 0 | 1 };
 
 /** One due `materialization_outbox` row, as the export claim reads it. */
 export type DueOutboxRow = {
-	prefix: HashPrefixBucket;
+	prefix: RoutingHash;
 	hk: KeyBytes;
 	sk: KeyBytes;
 	revision: number;
@@ -284,7 +284,7 @@ export type ExportItemImage = { v: number; data: string | Uint8Array; kind: Data
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
 	/** The storage prefix of `hk`. */
-	prefix: HashPrefixBucket;
+	prefix: RoutingHash;
 	hk: KeyBytes;
 	lower: KeyBytes;
 	lowerInclusive: boolean;
@@ -430,7 +430,7 @@ export function fromSqlData(value: string | ArrayBuffer | null): string | Uint8A
 
 /** The `WHERE` conditions and their bound values of one sort-key range scan, in the order the SQL text names them. */
 function rangeScanConditions(opts: RangeScanBounds): { conds: string[]; params: unknown[] } {
-	const conds: string[] = ["hash_prefix_bucket = ?", "hk = ?"];
+	const conds: string[] = ["routing_hash = ?", "hk = ?"];
 	const params: unknown[] = [opts.prefix, opts.hk];
 
 	if (opts.direction === "asc") {
@@ -536,7 +536,7 @@ export function intervalTerms(
 	return { conds, params };
 }
 
-const ITEM_KEY_COLUMNS = ["hash_prefix_bucket", "hk", "sk"] as const;
+const ITEM_KEY_COLUMNS = ["routing_hash", "hk", "sk"] as const;
 
 /**
  * The SQL of one migration page of `items` over `interval`, in storage order, strictly after
@@ -546,8 +546,8 @@ const ITEM_KEY_COLUMNS = ["hash_prefix_bucket", "hk", "sk"] as const;
 export function itemsPageStatement(cursor: StorageCursor | null, limit: number, interval: KeyRange): { sql: string; params: unknown[] } {
 	const { conds, params } = intervalTerms(ITEM_KEY_COLUMNS, interval, cursor && [cursor.prefix, cursor.hk, cursor.sk]);
 	return {
-		sql: `SELECT hash_prefix_bucket, item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items
-		       WHERE ${conds.join(" AND ")} ORDER BY hash_prefix_bucket, hk, sk LIMIT ?`,
+		sql: `SELECT routing_hash, item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items
+		       WHERE ${conds.join(" AND ")} ORDER BY routing_hash, hk, sk LIMIT ?`,
 		params: [...params, limit],
 	};
 }
@@ -559,15 +559,15 @@ export function itemsPageStatement(cursor: StorageCursor | null, limit: number, 
 export function outboxPageStatement(cursor: StorageCursor | null, limit: number, interval: KeyRange): { sql: string; params: unknown[] } {
 	const { conds, params } = intervalTerms(ITEM_KEY_COLUMNS, interval, cursor && [cursor.prefix, cursor.hk, cursor.sk]);
 	return {
-		sql: `SELECT hash_prefix_bucket, hk, sk, revision, is_deleted FROM materialization_outbox
-		       WHERE ${conds.join(" AND ")} ORDER BY hash_prefix_bucket, hk, sk LIMIT ?`,
+		sql: `SELECT routing_hash, hk, sk, revision, is_deleted FROM materialization_outbox
+		       WHERE ${conds.join(" AND ")} ORDER BY routing_hash, hk, sk LIMIT ?`,
 		params: [...params, limit],
 	};
 }
 
 /**
  * The SQL of one migration page of `pending_transactions` over `interval`, in
- * `(hash_prefix_bucket, hk, sk, transaction_id)` order, strictly after `cursor`. The cursor keeps all
+ * `(routing_hash, hk, sk, transaction_id)` order, strictly after `cursor`. The cursor keeps all
  * four columns: two locks on one key can be on the two sides of a page boundary. The rules of
  * `intervalTerms` apply.
  *
@@ -580,15 +580,15 @@ export function pendingTxPageStatement(
 	interval: KeyRange,
 ): { sql: string; params: unknown[] } {
 	const { conds, params } = intervalTerms(
-		["p.hash_prefix_bucket", "p.hk", "p.sk", "p.transaction_id"],
+		["p.routing_hash", "p.hk", "p.sk", "p.transaction_id"],
 		interval,
 		cursor && [cursor.prefix, cursor.hk, cursor.sk, cursor.transaction_id],
 	);
 	return {
-		sql: `SELECT p.hash_prefix_bucket, p.hk, p.sk, p.transaction_id, p.operation, p.op_list, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
+		sql: `SELECT p.routing_hash, p.hk, p.sk, p.transaction_id, p.operation, p.op_list, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
 		             t.transaction_ts, t.coordinator_json, t.created_at, t.guarded_at, t.next_recovery_at
 		        FROM pending_transactions p JOIN pending_tx_info t ON t.transaction_id = p.transaction_id
-		       WHERE ${conds.join(" AND ")} ORDER BY p.hash_prefix_bucket, p.hk, p.sk, p.transaction_id LIMIT ?`,
+		       WHERE ${conds.join(" AND ")} ORDER BY p.routing_hash, p.hk, p.sk, p.transaction_id LIMIT ?`,
 		params: [...params, limit],
 	};
 }
@@ -610,9 +610,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   overflow pages of a large `data` value.
 		//
 		// Table type:
-		// - This is a WITHOUT ROWID table on `(hash_prefix_bucket, hk, sk)`. The rows are in the primary-key
+		// - This is a WITHOUT ROWID table on `(routing_hash, hk, sk)`. The rows are in the primary-key
 		//   B-tree, so the table pages are in storage order. The rows of one hash child, and the rows of
-		//   one promoted hashPrefixBucket, are then one key range, and a delete of that range frees whole
+		//   one promoted routingHash, are then one key range, and a delete of that range frees whole
 		//   pages. A rowid table keeps its pages in insert order, and no delete of a key range frees them.
 		// - The cost: a WITHOUT ROWID table keeps its rows in an index B-tree. On a 4 KiB page, the inline
 		//   payload limit of an index B-tree is approximately 1002 bytes. Each row above that limit gets
@@ -624,7 +624,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   `data` stays last (see above).
 		//
 		// Item key:
-		// - `hash_prefix_bucket` is the storage prefix of `hk`, which the runtime gives
+		// - `routing_hash` is the storage prefix of `hk`, which the runtime gives
 		//   (`storagePrefix`). The store treats it as opaque bytes. It is not an item identity: two hash
 		//   keys can have one prefix, and `hk` and `sk` keep the items apart.
 		// - The key columns have an explicit NOT NULL, because the row-value reads need it.
@@ -652,7 +652,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - K is an approximate value for size accounting (promotion and split). It is not an exact value.
 		//
 		// Index `idx_items_scan`:
-		// - The index contains (hash_prefix_bucket, hk, sk, est_row_bytes). Thus, the est_row_bytes scans
+		// - The index contains (routing_hash, hk, sk, est_row_bytes). Thus, the est_row_bytes scans
 		//   (computeRangeSplitBoundaries) and the count queries read only the index, and never read the
 		//   item rows.
 		//
@@ -664,7 +664,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// Table `item_id_counter`: one row (id = 1). Every `item_id` below `hwm` is reserved.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
-                hash_prefix_bucket    BLOB    NOT NULL,
+                routing_hash    BLOB    NOT NULL,
                 hk                    BLOB    NOT NULL,
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 item_id               INTEGER NOT NULL,
@@ -676,12 +676,12 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 est_row_bytes         INTEGER NOT NULL,
                 data                  ANY     NOT NULL,
 
-                PRIMARY KEY (hash_prefix_bucket, hk, sk)
+                PRIMARY KEY (routing_hash, hk, sk)
             ) WITHOUT ROWID, STRICT;
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_items_item_id ON items (item_id);
-            CREATE INDEX IF NOT EXISTS idx_items_scan ON items (hash_prefix_bucket, hk, sk, est_row_bytes);
-            CREATE INDEX IF NOT EXISTS idx_items_ttl ON items (ttl_epoch_utc_seconds, hash_prefix_bucket, hk, sk)
+            CREATE INDEX IF NOT EXISTS idx_items_scan ON items (routing_hash, hk, sk, est_row_bytes);
+            CREATE INDEX IF NOT EXISTS idx_items_ttl ON items (ttl_epoch_utc_seconds, routing_hash, hk, sk)
                 WHERE ttl_epoch_utc_seconds IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS item_id_counter (
@@ -708,7 +708,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// page, so every row whose `data` exceeds that takes a private overflow page it cannot share.
 		// Measured on Durable Object storage, 2000 rows of 1500-byte data against 3.00 MB logical:
 		// 9.41 MB WITHOUT ROWID (3.1x) against 4.20 MB as a rowid table (1.4x). `PRIMARY KEY
-		// (hash_prefix_bucket, hk, sk, transaction_id)` still enforces uniqueness through
+		// (routing_hash, hk, sk, transaction_id)` still enforces uniqueness through
 		// sqlite_autoindex_pending_transactions_1, and the key columns keep their explicit NOT NULL
 		// because a rowid table does NOT imply it from the primary key.
 		//
@@ -718,7 +718,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// commit, so without this index the cost of committing ONE transaction is O(all pending rows in
 		// the partition). A per-key statement, deletePendingTxKeys, seeks the primary key instead.
 		//
-		// Its key carries (hash_prefix_bucket, hk, sk) EXPLICITLY. A rowid table appends only the rowid to
+		// Its key carries (routing_hash, hk, sk) EXPLICITLY. A rowid table appends only the rowid to
 		// an index entry, so a key of `transaction_id` alone would make the existence test of the last lock
 		// row and the key list of a commit read the table.
 		sql: `
@@ -734,7 +734,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE INDEX IF NOT EXISTS pending_tx_info_due ON pending_tx_info (next_recovery_at) WHERE guarded_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS pending_transactions (
-                hash_prefix_bucket    BLOB    NOT NULL,
+                routing_hash    BLOB    NOT NULL,
                 hk                    BLOB    NOT NULL,
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 transaction_id        TEXT    NOT NULL,
@@ -745,11 +745,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 ttl_epoch_utc_seconds INTEGER,
                 data                  ANY,
 
-                PRIMARY KEY (hash_prefix_bucket, hk, sk, transaction_id)
+                PRIMARY KEY (routing_hash, hk, sk, transaction_id)
             ) STRICT;
 
             CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id
-                ON pending_transactions (transaction_id, hash_prefix_bucket, hk, sk);
+                ON pending_transactions (transaction_id, routing_hash, hk, sk);
 
             -- deletion_metadata: one row (id = 1) with the delete values of the whole partition. The values stay after the
             -- delete of an item row, so they describe keys that have no row.
@@ -782,20 +782,20 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - `revision` is the `v` of the item, or the delete revision `v + 1` when `is_deleted = 1`.
 		// - `is_local_only = 1` means that no receiver can hold a revision of the key. A delete of such a
 		//   row removes it, and nothing is sent. The value changes only from 1 to 0.
-		// - A writer must keep `outbox_id`: use `INSERT ... ON CONFLICT (hash_prefix_bucket, hk, sk) DO UPDATE`,
+		// - A writer must keep `outbox_id`: use `INSERT ... ON CONFLICT (routing_hash, hk, sk) DO UPDATE`,
 		//   never `INSERT OR REPLACE`.
 		// - A rowid table, because the keys can be some kilobytes (see the items table).
 		sql: `
             CREATE TABLE IF NOT EXISTS materialization_outbox (
                 outbox_id          INTEGER PRIMARY KEY,
-                hash_prefix_bucket BLOB    NOT NULL,
+                routing_hash BLOB    NOT NULL,
                 hk                 BLOB    NOT NULL,
                 sk                 BLOB    NOT NULL DEFAULT x'',
                 revision           INTEGER NOT NULL,
                 is_deleted         INTEGER NOT NULL,
                 is_local_only      INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at    INTEGER NOT NULL DEFAULT 0,
-                UNIQUE (hash_prefix_bucket, hk, sk)
+                UNIQUE (routing_hash, hk, sk)
             ) STRICT;
 
             CREATE INDEX IF NOT EXISTS idx_materialization_outbox_due ON materialization_outbox (next_attempt_at, outbox_id);
@@ -948,7 +948,7 @@ export class PartitionStore {
 
 	/** Metrics cover the single SELECT (what the DO surfaced in read meta). */
 	getItem(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		hk: KeyBytes,
 		sk: KeyBytes,
 	): {
@@ -971,7 +971,7 @@ export class PartitionStore {
 			last_read_ts: number;
 			last_write_ts: number;
 		}>(
-			`SELECT ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
+			`SELECT ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
 			prefix,
 			hk,
 			sk,
@@ -992,7 +992,7 @@ export class PartitionStore {
 	 * Secondary read run only after a failed condition on an existing row when the caller
 	 * asked for an image.
 	 */
-	getItemImage(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): ItemImageRead {
+	getItemImage(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): ItemImageRead {
 		const res = this.#storage.sql.exec<{
 			data: string | ArrayBuffer;
 			data_kind: number;
@@ -1000,7 +1000,7 @@ export class PartitionStore {
 			ttl_epoch_utc_seconds: number | null;
 			image_bytes: number;
 		}>(
-			`SELECT ${DATA_SELECT_DECODED}, data_kind, v, ttl_epoch_utc_seconds, octet_length(CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END) AS image_bytes FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
+			`SELECT ${DATA_SELECT_DECODED}, data_kind, v, ttl_epoch_utc_seconds, octet_length(CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END) AS image_bytes FROM items WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
 			prefix,
 			hk,
 			sk,
@@ -1024,7 +1024,7 @@ export class PartitionStore {
 
 	/** Lightweight existence and timestamp read for an unconditional transaction prepare. */
 	getItemStamp(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		hk: KeyBytes,
 		sk: KeyBytes,
 	): {
@@ -1033,7 +1033,7 @@ export class PartitionStore {
 		rowsWritten: number;
 	} {
 		const res = this.#storage.sql.exec<{ last_read_ts: number; last_write_ts: number }>(
-			`SELECT last_read_ts, last_write_ts FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
+			`SELECT last_read_ts, last_write_ts FROM items WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
 			prefix,
 			hk,
 			sk,
@@ -1045,15 +1045,15 @@ export class PartitionStore {
 	// Each method below that takes an expression compiles a tree before its statement runs. A tree that
 	// does not compile throws before the method reads or writes a row.
 
-	evaluateCondition(condition: ConditionExpression, prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
+	evaluateCondition(condition: ConditionExpression, prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
 		return withExpressionErrors(() => evaluateConditionPlan(this.#storage, conditionPlanOf(condition), hk, sk, prefix));
 	}
 
-	getItemProjected(projection: readonly ProjectionExpression[], prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): ProjectedReadResult {
+	getItemProjected(projection: readonly ProjectionExpression[], prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): ProjectedReadResult {
 		return withExpressionErrors(() => readProjectedItem(this.#storage, projectionPlanOf(projection), hk, sk, prefix));
 	}
 
-	probeUpdate(update: UpdateExpression, prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
+	probeUpdate(update: UpdateExpression, prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
 		return withExpressionErrors(() => probeUpdatePlan(this.#storage, updatePlanOf(update), hk, sk, prefix));
 	}
 
@@ -1068,11 +1068,11 @@ export class PartitionStore {
 	 * size together with the `v` and the `last_read_ts` of the row, so it does not use this read.
 	 *
 	 * `INDEXED BY idx_items_scan` is a deliberate plan pin, not decoration. `idx_items_scan
-	 * (hash_prefix_bucket, hk, sk, est_row_bytes)` covers this query exactly, but SQLite prefers the
+	 * (routing_hash, hk, sk, est_row_bytes)` covers this query exactly, but SQLite prefers the
 	 * primary key, whose rows also hold the item data:
 	 *
-	 *   without the hint: SEARCH items USING PRIMARY KEY (hash_prefix_bucket=? AND hk=? AND sk=?)
-	 *   with the hint:    SEARCH items USING COVERING INDEX idx_items_scan (hash_prefix_bucket=? AND hk=? AND sk=?)
+	 *   without the hint: SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=? AND sk=?)
+	 *   with the hint:    SEARCH items USING COVERING INDEX idx_items_scan (routing_hash=? AND hk=? AND sk=?)
 	 *
 	 * The hint reads the narrow index entry in place of the wide row on every put. It saves page
 	 * reads, not billed rows — SQLite reports one row read either way. `INDEXED BY` makes the dependency on
@@ -1086,13 +1086,13 @@ export class PartitionStore {
 	 * Do NOT replace this read with `AFTER INSERT/UPDATE/DELETE` triggers on items that maintain
 	 * key_size_estimates. A trigger fires for EVERY writer of items, including the two that do their
 	 * size accounting in bulk: insertItemIfAbsent (migration ingest, one `keySizes.add` per key per
-	 * page) and deleteItemsBatchForHashPrefixBucket (cleanup, 1000 rows per call, followed by one
+	 * page) and deleteItemsBatchForRoutingHash (cleanup, 1000 rows per call, followed by one
 	 * `keySizes.remove`). It would add one row WRITE per row on those paths to save one row READ here.
 	 */
-	#storedEstRowBytes(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): number {
+	#storedEstRowBytes(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): number {
 		const row = tryOne(
 			this.#storage.sql.exec<{ est_row_bytes: number }>(
-				`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
+				`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
 				prefix,
 				hk,
 				sk,
@@ -1128,7 +1128,7 @@ export class PartitionStore {
 	 * clause names the primary key, so at most one row matches, and `MAX` returns its value. For an
 	 * absent item, `present` is 0 and both stamps are NULL.
 	 */
-	measureItemBytesWithStamp(opts: { prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes; data: string | Uint8Array; kind: DataKind }): {
+	measureItemBytesWithStamp(opts: { prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes; data: string | Uint8Array; kind: DataKind }): {
 		estRowBytes: number;
 		itemPresent: boolean;
 		lastReadTs: number | null;
@@ -1144,7 +1144,7 @@ export class PartitionStore {
 		}>(
 			`SELECT ${estRowBytesExpr(dataExpr, "?1", "?2")} AS est_row_bytes, COUNT(*) AS present,
 			        MAX(last_read_ts) AS last_read_ts, MAX(last_write_ts) AS last_write_ts
-			   FROM items WHERE hash_prefix_bucket = ?4 AND hk = ?1 AND sk = ?2`,
+			   FROM items WHERE routing_hash = ?4 AND hk = ?1 AND sk = ?2`,
 			opts.hk,
 			opts.sk,
 			opts.data,
@@ -1170,7 +1170,7 @@ export class PartitionStore {
 	 */
 	upsertItem(opts: {
 		/** The storage prefix of `hk`. */
-		prefix: HashPrefixBucket;
+		prefix: RoutingHash;
 		hk: KeyBytes;
 		sk: KeyBytes;
 		/** json ⇒ JSON text from a client put, or a raw JSONB blob from a commit apply. */
@@ -1215,12 +1215,12 @@ export class PartitionStore {
 		// conflict branch uses ?5 and not `excluded`, because `excluded` holds the stamps of the insert
 		// branch, which include the partition delete timestamp.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`INSERT INTO items (hash_prefix_bucket, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+			`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
 			 SELECT ?8, ?1, ?2, ?9, ?3, ?4, d.max_deleted_v + 1, MAX(?5, d.max_delete_tx_order_ts), MAX(?5, d.max_delete_tx_order_ts),
 			        ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
 			   FROM deletion_metadata AS d
 			  WHERE d.id = 1 AND ${estRowBytesExpr(dataExpr, "?1", "?2")} <= ?7
-			 ON CONFLICT(hash_prefix_bucket, hk, sk) DO UPDATE SET
+			 ON CONFLICT(routing_hash, hk, sk) DO UPDATE SET
 			   data = excluded.data,
 			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
@@ -1268,7 +1268,7 @@ export class PartitionStore {
 	 * revision of a key is above all earlier revisions. `deleteVersion` is absent when no row was
 	 * removed.
 	 */
-	deleteItem(opts: { prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes; txOrderTs: number; bumpTxOrderTsAlways?: boolean }): {
+	deleteItem(opts: { prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes; txOrderTs: number; bumpTxOrderTsAlways?: boolean }): {
 		deleted: boolean;
 		deleteVersion?: number;
 		rowsRead: number;
@@ -1279,7 +1279,7 @@ export class PartitionStore {
 		// clause of the DELETE: RETURNING adds one row read to each delete, also when no row exists.
 		const before = tryOne(
 			this.#storage.sql.exec<{ est_row_bytes: number; v: number; last_read_ts: number }>(
-				`SELECT est_row_bytes, v, last_read_ts FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`,
+				`SELECT est_row_bytes, v, last_read_ts FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 				opts.prefix,
 				opts.hk,
 				opts.sk,
@@ -1288,7 +1288,7 @@ export class PartitionStore {
 		const delEst = before?.est_row_bytes ?? 0;
 
 		const writeRes = this.#storage.sql.exec(
-			`DELETE FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`,
+			`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 			opts.prefix,
 			opts.hk,
 			opts.sk,
@@ -1315,7 +1315,7 @@ export class PartitionStore {
 	 * only. An existing outbox row keeps its `outbox_id` and its `is_local_only`: a row that is not
 	 * local only holds a delete or a revision that a receiver can have.
 	 */
-	#captureWrite(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes, revision: number, created: boolean): void {
+	#captureWrite(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes, revision: number, created: boolean): void {
 		if (!this.#captureChanges()) {
 			return;
 		}
@@ -1328,7 +1328,7 @@ export class PartitionStore {
 	 * receiver can hold a revision of the key, the delete removes the outbox row and nothing is sent.
 	 * Otherwise the row becomes a tombstone and keeps its `outbox_id`.
 	 */
-	#captureDelete(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes, deleteVersion: number): void {
+	#captureDelete(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes, deleteVersion: number): void {
 		if (!this.#captureChanges()) {
 			return;
 		}
@@ -1336,7 +1336,7 @@ export class PartitionStore {
 		if (
 			exists(
 				sql.exec(
-					`DELETE FROM materialization_outbox WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? AND is_local_only = 1 RETURNING 1`,
+					`DELETE FROM materialization_outbox WHERE routing_hash = ? AND hk = ? AND sk = ? AND is_local_only = 1 RETURNING 1`,
 					prefix,
 					hk,
 					sk,
@@ -1360,7 +1360,7 @@ export class PartitionStore {
 	 * write. The row is due already in normal operation, so only a deferred row gets a second statement.
 	 */
 	#upsertOutboxRow(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		hk: KeyBytes,
 		sk: KeyBytes,
 		revision: number,
@@ -1369,9 +1369,9 @@ export class PartitionStore {
 		const sql = this.#storage.sql;
 		const { next_attempt_at } = one(
 			sql.exec<{ next_attempt_at: number }>(
-				`INSERT INTO materialization_outbox (hash_prefix_bucket, hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
+				`INSERT INTO materialization_outbox (routing_hash, hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
 				 VALUES (?6, ?1, ?2, ?3, ?4, ?5, 0)
-				 ON CONFLICT (hash_prefix_bucket, hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = excluded.is_deleted${opts.deleted ? ", is_local_only = 0" : ""}
+				 ON CONFLICT (routing_hash, hk, sk) DO UPDATE SET revision = excluded.revision, is_deleted = excluded.is_deleted${opts.deleted ? ", is_local_only = 0" : ""}
 				 RETURNING next_attempt_at`,
 				hk,
 				sk,
@@ -1382,7 +1382,7 @@ export class PartitionStore {
 			),
 		);
 		if (next_attempt_at !== 0) {
-			sql.exec(`UPDATE materialization_outbox SET next_attempt_at = 0 WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`, prefix, hk, sk);
+			sql.exec(`UPDATE materialization_outbox SET next_attempt_at = 0 WHERE routing_hash = ? AND hk = ? AND sk = ?`, prefix, hk, sk);
 		}
 	}
 
@@ -1390,7 +1390,7 @@ export class PartitionStore {
 	 * Deletes one bounded chunk of expired, unlocked items and updates all deletion bookkeeping in the
 	 * same storage transaction. The victim scan uses only metadata columns and never reads item data.
 	 *
-	 * The scan reads the candidates in `(ttl_epoch_utc_seconds, hash_prefix_bucket, hk, sk)` order after
+	 * The scan reads the candidates in `(ttl_epoch_utc_seconds, routing_hash, hk, sk)` order after
 	 * `after`, and deletes only the candidates that `owns` accepts. It stops at `limit` owned rows or at
 	 * `limit * TTL_SCAN_ROWS_PER_DELETED_ROW` candidates. A copy of a moved key stays until the cleanup of
 	 * the source deletes it, because the new owner must pull the row and write its delete itself. The
@@ -1413,14 +1413,14 @@ export class PartitionStore {
 			const owned: TtlScanPosition[] = [];
 			let scanned = 0;
 			let last: TtlScanPosition | null = null;
-			for (const candidate of sql.exec<{ ttl: number; hash_prefix_bucket: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer }>(
-				`SELECT i.ttl_epoch_utc_seconds AS ttl, i.hash_prefix_bucket, i.hk, i.sk FROM items i INDEXED BY idx_items_ttl
+			for (const candidate of sql.exec<{ ttl: number; routing_hash: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer }>(
+				`SELECT i.ttl_epoch_utc_seconds AS ttl, i.routing_hash, i.hk, i.sk FROM items i INDEXED BY idx_items_ttl
 				  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 				    AND i.ttl_epoch_utc_seconds <= ?1
-				    ${after ? "AND (i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk) > (?3, ?4, ?5, ?6)" : ""}
+				    ${after ? "AND (i.ttl_epoch_utc_seconds, i.routing_hash, i.hk, i.sk) > (?3, ?4, ?5, ?6)" : ""}
 				    AND NOT EXISTS (SELECT 1 FROM pending_transactions p
-				                     WHERE p.hash_prefix_bucket = i.hash_prefix_bucket AND p.hk = i.hk AND p.sk = i.sk)
-				  ORDER BY i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk
+				                     WHERE p.routing_hash = i.routing_hash AND p.hk = i.hk AND p.sk = i.sk)
+				  ORDER BY i.ttl_epoch_utc_seconds, i.routing_hash, i.hk, i.sk
 				  LIMIT ?2`,
 				nowSeconds,
 				scanLimit,
@@ -1429,7 +1429,7 @@ export class PartitionStore {
 				scanned++;
 				last = {
 					ttlAt: candidate.ttl,
-					prefix: asHashPrefixBucket(new Uint8Array(candidate.hash_prefix_bucket)),
+					prefix: asRoutingHash(new Uint8Array(candidate.routing_hash)),
 					hk: fromSqlKey(candidate.hk),
 					sk: fromSqlKey(candidate.sk),
 				};
@@ -1450,7 +1450,7 @@ export class PartitionStore {
 			for (const key of owned) {
 				const row = tryOne(
 					sql.exec<{ est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
-						`DELETE FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?
+						`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?
 						 RETURNING est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 						key.prefix,
 						key.hk,
@@ -1483,9 +1483,9 @@ export class PartitionStore {
 	 * The transactional "check" operation: advances only the item's read watermark. An absent item has
 	 * no row to hold it, and `itemPresent` is then false.
 	 */
-	bumpItemReadTs(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes, ts: number): { itemPresent: boolean } {
+	bumpItemReadTs(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes, ts: number): { itemPresent: boolean } {
 		const res = this.#storage.sql.exec(
-			`UPDATE items SET last_read_ts = MAX(last_read_ts, ?) WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`,
+			`UPDATE items SET last_read_ts = MAX(last_read_ts, ?) WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 			ts,
 			prefix,
 			hk,
@@ -1500,7 +1500,7 @@ export class PartitionStore {
 	 * Keeping the row is the safer form on a retry: when a crash followed a written batch, the retry
 	 * keeps those rows instead of writing them again.
 	 *
-	 * The conflict target MUST stay `(hash_prefix_bucket, hk, sk)`. Do NOT use `INSERT OR IGNORE`: it
+	 * The conflict target MUST stay `(routing_hash, hk, sk)`. Do NOT use `INSERT OR IGNORE`: it
 	 * also ignores a conflict on `item_id`, which would drop a copied item without an error. With the
 	 * explicit target, a retried row is skipped, and an `item_id` that another item already holds fails
 	 * the statement. The caller raises the item-id mark after the page (`raiseItemIdMark`).
@@ -1516,9 +1516,9 @@ export class PartitionStore {
 		// measure the same parameter.
 		const row = tryOne(
 			this.#storage.sql.exec<{ est_row_bytes: number }>(
-				`INSERT INTO items (hash_prefix_bucket, item_id, hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+				`INSERT INTO items (routing_hash, item_id, hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
 			 VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${estRowBytesExpr("?9", "?2", "?3")}, ?9)
-			 ON CONFLICT (hash_prefix_bucket, hk, sk) DO NOTHING
+			 ON CONFLICT (routing_hash, hk, sk) DO NOTHING
 			 RETURNING est_row_bytes`,
 				item.item_id,
 				item.hk,
@@ -1535,29 +1535,27 @@ export class PartitionStore {
 		return row ? { inserted: true, estRowBytes: row.est_row_bytes } : { inserted: false, estRowBytes: 0 };
 	}
 
-	hasItemsForHashPrefixBucket(prefix: HashPrefixBucket): boolean {
-		return exists(this.#storage.sql.exec(`SELECT 1 FROM items WHERE hash_prefix_bucket = ? LIMIT 1`, prefix));
+	hasItemsForRoutingHash(prefix: RoutingHash): boolean {
+		return exists(this.#storage.sql.exec(`SELECT 1 FROM items WHERE routing_hash = ? LIMIT 1`, prefix));
 	}
 
 	/**
 	 * One hash key of the first storage prefix of `table`, and whether another prefix follows it. Two
-	 * seeks of the index that leads with `hash_prefix_bucket`: `idx_items_scan`, or the primary key of
+	 * seeks of the index that leads with `routing_hash`: `idx_items_scan`, or the primary key of
 	 * `pending_transactions`. The second seek starts past every row of the first prefix, so the cost
 	 * does not depend on the row count.
 	 */
-	probeHashPrefixBuckets(table: "items" | "pending_transactions"): { first: KeyBytes; more: boolean } | null {
+	probeRoutingHashes(table: "items" | "pending_transactions"): { first: KeyBytes; more: boolean } | null {
 		const sql = this.#storage.sql;
 		const first = tryOne(
-			sql.exec<{ hash_prefix_bucket: ArrayBuffer; hk: ArrayBuffer }>(
-				`SELECT hash_prefix_bucket, hk FROM ${table} ORDER BY hash_prefix_bucket, hk LIMIT 1`,
-			),
+			sql.exec<{ routing_hash: ArrayBuffer; hk: ArrayBuffer }>(`SELECT routing_hash, hk FROM ${table} ORDER BY routing_hash, hk LIMIT 1`),
 		);
 		if (!first) {
 			return null;
 		}
 		return {
 			first: fromSqlKey(first.hk),
-			more: exists(sql.exec(`SELECT 1 FROM ${table} WHERE hash_prefix_bucket > ? LIMIT 1`, first.hash_prefix_bucket)),
+			more: exists(sql.exec(`SELECT 1 FROM ${table} WHERE routing_hash > ? LIMIT 1`, first.routing_hash)),
 		};
 	}
 
@@ -1567,11 +1565,11 @@ export class PartitionStore {
 	 * caller asks for the next row. `idx_items_scan` covers the scan, so it does not read the item data.
 	 */
 	*compositeKeySizes(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 	): Generator<{ hk: KeyBytes; sk: KeyBytes; bytes: number }> {
-		const conds = ["hash_prefix_bucket = ?"];
+		const conds = ["routing_hash = ?"];
 		const params: unknown[] = [prefix];
 		if (start !== null) {
 			conds.push("(hk, sk) >= (?, ?)");
@@ -1593,10 +1591,10 @@ export class PartitionStore {
 	 * Promotion GC: deletes up to `limit` rows of a promoted prefix per call (bounded work per cycle).
 	 * The rows of one prefix are one key range of the primary key, so the delete is contiguous.
 	 */
-	deleteItemsBatchForHashPrefixBucket(prefix: HashPrefixBucket, limit: number): void {
+	deleteItemsBatchForRoutingHash(prefix: RoutingHash, limit: number): void {
 		this.#storage.sql.exec(
-			`DELETE FROM items WHERE (hash_prefix_bucket, hk, sk) IN
-			    (SELECT hash_prefix_bucket, hk, sk FROM items WHERE hash_prefix_bucket = ?1 ORDER BY hk, sk LIMIT ?2)`,
+			`DELETE FROM items WHERE (routing_hash, hk, sk) IN
+			    (SELECT routing_hash, hk, sk FROM items WHERE routing_hash = ?1 ORDER BY hk, sk LIMIT ?2)`,
 			prefix,
 			limit,
 		);
@@ -1609,7 +1607,7 @@ export class PartitionStore {
 	 */
 	*queryItemsPage(cursor: StorageCursor | null, limit: number, interval: KeyRange): Generator<MigratedItem> {
 		type Row = {
-			hash_prefix_bucket: ArrayBuffer;
+			routing_hash: ArrayBuffer;
 			item_id: ItemLinkId;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
@@ -1621,10 +1619,10 @@ export class PartitionStore {
 			last_write_ts: number;
 		};
 		const { sql, params } = itemsPageStatement(cursor, limit, interval);
-		for (const { data_kind, hash_prefix_bucket, ...row } of this.#storage.sql.exec<Row>(sql, ...params)) {
+		for (const { data_kind, routing_hash, ...row } of this.#storage.sql.exec<Row>(sql, ...params)) {
 			yield {
 				...row,
-				prefix: asHashPrefixBucket(new Uint8Array(hash_prefix_bucket)),
+				prefix: asRoutingHash(new Uint8Array(routing_hash)),
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				data: fromSqlData(row.data),
@@ -1689,17 +1687,12 @@ export class PartitionStore {
 
 	// ─── pending_transactions ───────────────────────────────────────────────
 
-	pendingLockFor(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): { transaction_id: string; operation: string } | undefined {
+	pendingLockFor(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): { transaction_id: string; operation: string } | undefined {
 		return tryOne(
 			this.#storage.sql.exec<{
 				transaction_id: string;
 				operation: string;
-			}>(
-				`SELECT transaction_id, operation FROM pending_transactions WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
-				prefix,
-				hk,
-				sk,
-			),
+			}>(`SELECT transaction_id, operation FROM pending_transactions WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`, prefix, hk, sk),
 		);
 	}
 
@@ -1735,7 +1728,7 @@ export class PartitionStore {
 			// pending_transactions is never queried by JSON path, so a put's json data is stored raw, as
 			// the client's JSON text; the data_kind tag lets commit reconstruct the kind for upsertItem.
 			// An update's row instead holds JSONB, which insertPendingUpdateLock explains.
-			`INSERT OR IGNORE INTO pending_transactions (hash_prefix_bucket, hk, sk, transaction_id, operation, op_list, data, data_kind, ttl_epoch_utc_seconds)
+			`INSERT OR IGNORE INTO pending_transactions (routing_hash, hk, sk, transaction_id, operation, op_list, data, data_kind, ttl_epoch_utc_seconds)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.prefix,
 			row.hk,
@@ -1756,10 +1749,10 @@ export class PartitionStore {
 	 * returned value stores the same bytes. `getItemImage` decodes JSONB to text, and a JSONB to text to
 	 * JSONB round trip is not size-stable (see `insertPendingUpdateLock`).
 	 */
-	readItemData(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): StoredItemData | undefined {
+	readItemData(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): StoredItemData | undefined {
 		const row = tryOne(
 			this.#storage.sql.exec<{ data: string | ArrayBuffer; data_kind: number; ttl_epoch_utc_seconds: number | null }>(
-				`SELECT data, data_kind, ttl_epoch_utc_seconds FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
+				`SELECT data, data_kind, ttl_epoch_utc_seconds FROM items WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
 				prefix,
 				hk,
 				sk,
@@ -1783,7 +1776,7 @@ export class PartitionStore {
 	 * blob makes the bytes that `probeUpdate` measured at prepare the exact bytes commit writes.
 	 */
 	insertPendingUpdateLock(opts: {
-		prefix: HashPrefixBucket;
+		prefix: RoutingHash;
 		hk: KeyBytes;
 		sk: KeyBytes;
 		tx: PendingTxInfo;
@@ -1805,9 +1798,9 @@ export class PartitionStore {
 		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
 
 		const res = this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO pending_transactions (hash_prefix_bucket, hk, sk, transaction_id, operation, op_list, data_kind, ttl_epoch_utc_seconds, data)
+			`INSERT OR IGNORE INTO pending_transactions (routing_hash, hk, sk, transaction_id, operation, op_list, data_kind, ttl_epoch_utc_seconds, data)
 			SELECT ?3, ?1, ?2, ${transactionIdParam}, 'update', ${opListParam}, ${JSON_KIND_CODE}, ${ttlExpr}, ${plan.documentSql}
-			FROM (VALUES (1)) LEFT JOIN items AS i ON i.hash_prefix_bucket = ?3 AND i.hk = ?1 AND i.sk = ?2`,
+			FROM (VALUES (1)) LEFT JOIN items AS i ON i.routing_hash = ?3 AND i.hk = ?1 AND i.sk = ?2`,
 			...tail.bindings(opts.hk, opts.sk, opts.prefix),
 		);
 		return { rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
@@ -1821,7 +1814,7 @@ export class PartitionStore {
 	 * Throws when the new document would exceed MAX_ITEM_BYTES — see throwItemTooLarge.
 	 */
 	updateItemSingleShot(opts: {
-		prefix: HashPrefixBucket;
+		prefix: RoutingHash;
 		hk: KeyBytes;
 		sk: KeyBytes;
 		plan: UpdateExpression;
@@ -1897,14 +1890,14 @@ export class PartitionStore {
 	}
 
 	/** The keys that one transaction locks here. It reads only `pending_transactions_transaction_id`. */
-	listPendingTxKeys(transactionId: string): { prefix: HashPrefixBucket; hk: KeyBytes; sk: KeyBytes }[] {
+	listPendingTxKeys(transactionId: string): { prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes }[] {
 		return this.#storage.sql
-			.exec<{ hash_prefix_bucket: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer }>(
-				`SELECT hash_prefix_bucket, hk, sk FROM pending_transactions WHERE transaction_id = ?`,
+			.exec<{ routing_hash: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer }>(
+				`SELECT routing_hash, hk, sk FROM pending_transactions WHERE transaction_id = ?`,
 				transactionId,
 			)
 			.toArray()
-			.map((r) => ({ prefix: asHashPrefixBucket(new Uint8Array(r.hash_prefix_bucket)), hk: fromSqlKey(r.hk), sk: fromSqlKey(r.sk) }));
+			.map((r) => ({ prefix: asRoutingHash(new Uint8Array(r.routing_hash)), hk: fromSqlKey(r.hk), sk: fromSqlKey(r.sk) }));
 	}
 
 	/**
@@ -1923,7 +1916,7 @@ export class PartitionStore {
 			return [];
 		}
 		const cursor = this.#storage.sql.exec<{
-			hash_prefix_bucket: ArrayBuffer;
+			routing_hash: ArrayBuffer;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			operation: string;
@@ -1932,7 +1925,7 @@ export class PartitionStore {
 			data_kind: number | null;
 			ttl_epoch_utc_seconds: number | null;
 		}>(
-			`SELECT hash_prefix_bucket, hk, sk, operation, op_list, data, data_kind, ttl_epoch_utc_seconds
+			`SELECT routing_hash, hk, sk, operation, op_list, data, data_kind, ttl_epoch_utc_seconds
 			   FROM pending_transactions WHERE transaction_id = ?`,
 			transactionId,
 		);
@@ -1943,7 +1936,7 @@ export class PartitionStore {
 				created_at: tx.created_at,
 				guarded_at: tx.guarded_at,
 				next_recovery_at: tx.next_recovery_at,
-				prefix: asHashPrefixBucket(new Uint8Array(row.hash_prefix_bucket)),
+				prefix: asRoutingHash(new Uint8Array(row.routing_hash)),
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				operation: row.operation,
@@ -2012,7 +2005,7 @@ export class PartitionStore {
 	deletePendingTxKeys(transactionId: string, keys: readonly PendingTxKey[]): void {
 		for (const key of keys) {
 			this.#storage.sql.exec(
-				`DELETE FROM pending_transactions WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? AND transaction_id = ?`,
+				`DELETE FROM pending_transactions WHERE routing_hash = ? AND hk = ? AND sk = ? AND transaction_id = ?`,
 				key.prefix,
 				key.hashKey,
 				key.sortKey,
@@ -2031,17 +2024,14 @@ export class PartitionStore {
 	 * its copies. A transaction has at most MAX_ITEMS_PER_TX (100) rows, thus one call can delete up
 	 * to 99 rows more than `maxRows`.
 	 */
-	deletePendingTxCopiesBatch(prefix: HashPrefixBucket | null, maxRows: number): boolean {
+	deletePendingTxCopiesBatch(prefix: RoutingHash | null, maxRows: number): boolean {
 		const sql = this.#storage.sql;
 		let deleted = 0;
 		while (deleted < maxRows) {
 			const next = tryOne(
 				prefix === null
 					? sql.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions LIMIT 1`)
-					: sql.exec<{ transaction_id: string }>(
-							`SELECT transaction_id FROM pending_transactions WHERE hash_prefix_bucket = ? LIMIT 1`,
-							prefix,
-						),
+					: sql.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions WHERE routing_hash = ? LIMIT 1`, prefix),
 			);
 			if (!next) {
 				return true;
@@ -2050,7 +2040,7 @@ export class PartitionStore {
 				prefix === null
 					? sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ? RETURNING 1`, next.transaction_id)
 					: sql.exec(
-							`DELETE FROM pending_transactions WHERE transaction_id = ? AND hash_prefix_bucket = ? RETURNING 1`,
+							`DELETE FROM pending_transactions WHERE transaction_id = ? AND routing_hash = ? RETURNING 1`,
 							next.transaction_id,
 							prefix,
 						);
@@ -2067,7 +2057,7 @@ export class PartitionStore {
 	 */
 	*queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number, interval: KeyRange): Generator<PendingTxItem> {
 		type Row = Omit<PendingTxItem, "prefix" | "hk" | "sk" | "data" | "kind" | "op_list"> & {
-			hash_prefix_bucket: ArrayBuffer;
+			routing_hash: ArrayBuffer;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			op_list: string;
@@ -2075,10 +2065,10 @@ export class PartitionStore {
 			data_kind: number | null;
 		};
 		const { sql, params } = pendingTxPageStatement(cursor, limit, interval);
-		for (const { data_kind, hash_prefix_bucket, ...row } of this.#storage.sql.exec<Row>(sql, ...params)) {
+		for (const { data_kind, routing_hash, ...row } of this.#storage.sql.exec<Row>(sql, ...params)) {
 			yield {
 				...row,
-				prefix: asHashPrefixBucket(new Uint8Array(hash_prefix_bucket)),
+				prefix: asRoutingHash(new Uint8Array(routing_hash)),
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				op_list: parseOpList(row.op_list),
@@ -2094,14 +2084,14 @@ export class PartitionStore {
 	*queryOutboxPage(cursor: StorageCursor | null, limit: number, interval: KeyRange): Generator<MigratedOutboxRow> {
 		const { sql, params } = outboxPageStatement(cursor, limit, interval);
 		for (const row of this.#storage.sql.exec<{
-			hash_prefix_bucket: ArrayBuffer;
+			routing_hash: ArrayBuffer;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			revision: number;
 			is_deleted: 0 | 1;
 		}>(sql, ...params)) {
 			yield {
-				prefix: asHashPrefixBucket(new Uint8Array(row.hash_prefix_bucket)),
+				prefix: asRoutingHash(new Uint8Array(row.routing_hash)),
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				revision: row.revision,
@@ -2117,9 +2107,9 @@ export class PartitionStore {
 	 */
 	insertMigratedOutboxRow(row: MigratedOutboxRow): void {
 		this.#storage.sql.exec(
-			`INSERT INTO materialization_outbox (hash_prefix_bucket, hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
+			`INSERT INTO materialization_outbox (routing_hash, hk, sk, revision, is_deleted, is_local_only, next_attempt_at)
 			 VALUES (?, ?, ?, ?, ?, 0, 0)
-			 ON CONFLICT (hash_prefix_bucket, hk, sk) DO NOTHING`,
+			 ON CONFLICT (routing_hash, hk, sk) DO NOTHING`,
 			row.prefix,
 			row.hk,
 			row.sk,
@@ -2132,7 +2122,7 @@ export class PartitionStore {
 	 * Deletes up to `maxRows` outbox copies after a repartition: the rows of `prefix`, or all rows when
 	 * `prefix` is null. Returns true when no copy is left.
 	 */
-	deleteOutboxCopiesBatch(prefix: HashPrefixBucket | null, maxRows: number): boolean {
+	deleteOutboxCopiesBatch(prefix: RoutingHash | null, maxRows: number): boolean {
 		const sql = this.#storage.sql;
 		if (prefix === null) {
 			sql.exec(`DELETE FROM materialization_outbox WHERE outbox_id IN (SELECT outbox_id FROM materialization_outbox LIMIT ?)`, maxRows);
@@ -2141,12 +2131,12 @@ export class PartitionStore {
 		}
 		sql.exec(
 			`DELETE FROM materialization_outbox WHERE outbox_id IN
-			   (SELECT outbox_id FROM materialization_outbox WHERE hash_prefix_bucket = ? LIMIT ?)`,
+			   (SELECT outbox_id FROM materialization_outbox WHERE routing_hash = ? LIMIT ?)`,
 			prefix,
 			maxRows,
 		);
 		this.#dropDoneExportFences();
-		return !exists(sql.exec(`SELECT 1 FROM materialization_outbox WHERE hash_prefix_bucket = ? LIMIT 1`, prefix));
+		return !exists(sql.exec(`SELECT 1 FROM materialization_outbox WHERE routing_hash = ? LIMIT 1`, prefix));
 	}
 
 	// ─── materialization export ─────────────────────────────────────────────
@@ -2159,20 +2149,20 @@ export class PartitionStore {
 	dueOutboxRows(now: number, limit: number): DueOutboxRow[] {
 		const rows: DueOutboxRow[] = [];
 		for (const row of this.#storage.sql.exec<{
-			hash_prefix_bucket: ArrayBuffer;
+			routing_hash: ArrayBuffer;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			revision: number;
 			is_deleted: number;
 			is_local_only: number;
 		}>(
-			`SELECT hash_prefix_bucket, hk, sk, revision, is_deleted, is_local_only FROM materialization_outbox INDEXED BY idx_materialization_outbox_due
+			`SELECT routing_hash, hk, sk, revision, is_deleted, is_local_only FROM materialization_outbox INDEXED BY idx_materialization_outbox_due
 			  WHERE next_attempt_at <= ? ORDER BY next_attempt_at, outbox_id LIMIT ?`,
 			now,
 			limit,
 		)) {
 			rows.push({
-				prefix: asHashPrefixBucket(new Uint8Array(row.hash_prefix_bucket)),
+				prefix: asRoutingHash(new Uint8Array(row.routing_hash)),
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				revision: row.revision,
@@ -2195,9 +2185,9 @@ export class PartitionStore {
 	}
 
 	/** A claimed row is no longer local only: a receiver can hold its revision from now on. */
-	markOutboxRowExported(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): void {
+	markOutboxRowExported(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): void {
 		this.#storage.sql.exec(
-			`UPDATE materialization_outbox SET is_local_only = 0 WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? AND is_local_only = 1`,
+			`UPDATE materialization_outbox SET is_local_only = 0 WHERE routing_hash = ? AND hk = ? AND sk = ? AND is_local_only = 1`,
 			prefix,
 			hk,
 			sk,
@@ -2208,9 +2198,9 @@ export class PartitionStore {
 	 * Moves the next attempt of an outbox row to `at`, when the row still holds `revision`. A newer write
 	 * made the row due again, and a delay must not push it back.
 	 */
-	deferOutboxRow(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes, revision: number, at: number): void {
+	deferOutboxRow(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes, revision: number, at: number): void {
 		this.#storage.sql.exec(
-			`UPDATE materialization_outbox SET next_attempt_at = ? WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? AND revision = ?`,
+			`UPDATE materialization_outbox SET next_attempt_at = ? WHERE routing_hash = ? AND hk = ? AND sk = ? AND revision = ?`,
 			at,
 			prefix,
 			hk,
@@ -2223,11 +2213,11 @@ export class PartitionStore {
 	 * Deletes an outbox row when it still holds `revision`: the receiver acknowledged that revision. A
 	 * newer write changed the revision, so its row stays and the export sends it.
 	 */
-	deleteOutboxRow(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes, revision: number): void {
+	deleteOutboxRow(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes, revision: number): void {
 		if (
 			exists(
 				this.#storage.sql.exec(
-					`DELETE FROM materialization_outbox WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? AND revision = ? RETURNING 1`,
+					`DELETE FROM materialization_outbox WHERE routing_hash = ? AND hk = ? AND sk = ? AND revision = ? RETURNING 1`,
 					prefix,
 					hk,
 					sk,
@@ -2240,13 +2230,13 @@ export class PartitionStore {
 	}
 
 	/** Deletes an outbox row with any revision, after the export found that it does not match its item. */
-	discardOutboxRow(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): void {
-		this.#storage.sql.exec(`DELETE FROM materialization_outbox WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`, prefix, hk, sk);
+	discardOutboxRow(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): void {
+		this.#storage.sql.exec(`DELETE FROM materialization_outbox WHERE routing_hash = ? AND hk = ? AND sk = ?`, prefix, hk, sk);
 		this.#dropDoneExportFences();
 	}
 
 	/** The stored representation of a live item for its export, or undefined when the item is absent. */
-	exportItemImage(prefix: HashPrefixBucket, hk: KeyBytes, sk: KeyBytes): ExportItemImage | undefined {
+	exportItemImage(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): ExportItemImage | undefined {
 		const row = tryOne(
 			this.#storage.sql.exec<{
 				v: number;
@@ -2255,7 +2245,7 @@ export class PartitionStore {
 				ttl_epoch_utc_seconds: number | null;
 				est_row_bytes: number;
 			}>(
-				`SELECT v, data_kind, ttl_epoch_utc_seconds, est_row_bytes, data FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`,
+				`SELECT v, data_kind, ttl_epoch_utc_seconds, est_row_bytes, data FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 				prefix,
 				hk,
 				sk,

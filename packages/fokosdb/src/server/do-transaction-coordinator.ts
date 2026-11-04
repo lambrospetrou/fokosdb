@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
-import { asHashPrefixBucket, maxHashDepth, type HashPrefixBucket } from "../sharding/hash-primitives.js";
+import { asRoutingHash, maxHashDepth, type RoutingHash } from "../sharding/hash-primitives.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import { INIT_RETRY_ALARM_MS } from "../sharding/scheduler.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
@@ -267,9 +267,9 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 	return KeyCodec.asKeyBytes(new Uint8Array(value));
 }
 
-/** A read `hash_prefix_bucket` column as a hashPrefixBucket. */
-function prefixFromBlob(value: ArrayBuffer): HashPrefixBucket {
-	return asHashPrefixBucket(new Uint8Array(value));
+/** A read `routing_hash` column as a routingHash. */
+function prefixFromBlob(value: ArrayBuffer): RoutingHash {
+	return asRoutingHash(new Uint8Array(value));
 }
 
 /** The host job that drives the non-terminal transactions that no request drives. */
@@ -306,13 +306,13 @@ type CoordinatorRpc = FokosShardingRpc & {
 
 /**
  * The position of a migration page: the primary key of the last `tc_state` row that the page read. The
- * runtime stores it with structured clone, so the hashPrefixBucket stays bytes.
+ * runtime stores it with structured clone, so the routingHash stays bytes.
  */
-type MigrationCursor = { prefix: HashPrefixBucket; transactionId: string };
+type MigrationCursor = { prefix: RoutingHash; transactionId: string };
 
 /**
  * One transaction and its rows in the four tables, as a migration page carries it. The page carries
- * no hashPrefixBucket: the target computes it again from the idempotency token.
+ * no routingHash: the target computes it again from the idempotency token.
  */
 type MigratedTransaction = {
 	state: TcStateRow;
@@ -326,10 +326,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		idMonotonicInc: 1,
 		description: "Create TC state machine tables",
 		sql: `
-            -- Each tc_* row leads with the hashPrefixBucket of the idempotency token of its transaction, so
+            -- Each tc_* row leads with the routingHash of the idempotency token of its transaction, so
             -- the rows of a split target are one key range of each table.
             CREATE TABLE IF NOT EXISTS tc_state (
-                hash_prefix_bucket      BLOB    NOT NULL,
+                routing_hash      BLOB    NOT NULL,
                 transaction_id          TEXT    NOT NULL,
                 idempotency_token       TEXT    NOT NULL,
                 state                   TEXT    NOT NULL,
@@ -348,16 +348,16 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 -- rejected instead of being answered with this transaction's outcome.
                 -- TEXT because DO SQL cannot bind a JS bigint.
                 operations_hash         TEXT    NOT NULL,
-                PRIMARY KEY (hash_prefix_bucket, transaction_id)
+                PRIMARY KEY (routing_hash, transaction_id)
 			) WITHOUT ROWID, STRICT;
 
-			-- The hashPrefixBucket is a function of the token, so this is the same rule as a unique token.
-			CREATE UNIQUE INDEX IF NOT EXISTS tc_state_idempotency_token ON tc_state (hash_prefix_bucket, idempotency_token);
+			-- The routingHash is a function of the token, so this is the same rule as a unique token.
+			CREATE UNIQUE INDEX IF NOT EXISTS tc_state_idempotency_token ON tc_state (routing_hash, idempotency_token);
 			CREATE INDEX IF NOT EXISTS idx_tc_state_completed_at ON tc_state (completed_at) WHERE completed_at IS NOT NULL;
 			CREATE INDEX IF NOT EXISTS idx_tc_state_recovery ON tc_state (next_recovery_at) WHERE completed_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS tc_participants (
-                hash_prefix_bucket      BLOB    NOT NULL,
+                routing_hash      BLOB    NOT NULL,
                 transaction_id          TEXT    NOT NULL,
                 partition_do_name       TEXT    NOT NULL,
                 partition_context_json  TEXT    NOT NULL DEFAULT '',
@@ -371,11 +371,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 -- FokosValidationError or a FokosExpressionError) stays: no later error replaces it, and no
                 -- later answer is stored.
                 error_json              TEXT,
-                PRIMARY KEY (hash_prefix_bucket, transaction_id, partition_do_name)
+                PRIMARY KEY (routing_hash, transaction_id, partition_do_name)
             ) WITHOUT ROWID, STRICT;
 
             CREATE TABLE IF NOT EXISTS tc_items (
-                hash_prefix_bucket  BLOB    NOT NULL,
+                routing_hash  BLOB    NOT NULL,
                 transaction_id      TEXT    NOT NULL,
                 hk                  BLOB    NOT NULL,
                 sk                  BLOB    NOT NULL DEFAULT x'',
@@ -391,20 +391,20 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 -- 1 for "all_old", 0 for "none". Reconstructs TransactionItem during prepare recovery.
                 return_values_on_condition_check_failure INTEGER NOT NULL DEFAULT 0,
                 -- One row for each operation. More than one operation can have the same (hk, sk).
-                PRIMARY KEY (hash_prefix_bucket, transaction_id, op_index)
+                PRIMARY KEY (routing_hash, transaction_id, op_index)
             ) WITHOUT ROWID, STRICT;
 
             -- Stores raw item images for rejected operations requesting all_old.
             -- Stored as separate rows to avoid JSON encoding expansion and prevent tc_state row size blowup.
             CREATE TABLE IF NOT EXISTS tc_results (
-                hash_prefix_bucket BLOB NOT NULL,
+                routing_hash BLOB NOT NULL,
                 transaction_id  TEXT    NOT NULL,
                 op_index        INTEGER NOT NULL,
                 image_kind      INTEGER NOT NULL,
                 image_version   INTEGER NOT NULL,
                 image_ttl_epoch_utc_seconds INTEGER,
                 image_data      ANY     NOT NULL,
-                PRIMARY KEY (hash_prefix_bucket, transaction_id, op_index)
+                PRIMARY KEY (routing_hash, transaction_id, op_index)
             ) WITHOUT ROWID, STRICT;
         `,
 	},
@@ -584,8 +584,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			Math.min((policy.hashSplitConditions.maxSizeMb || Infinity) * 1024 * 1024, this.config().maxDatabaseBytes / ADMISSION_MARGIN);
 		return {
 			// The coordinator splits above the hash split threshold of its table. It also splits above
-			// its own size limit, when that limit is smaller. A hash split moves whole hashPrefixBuckets of
-			// tokens, so it cannot make a coordinator with one hashPrefixBucket or none smaller: that is the
+			// its own size limit, when that limit is smaller. A hash split moves whole routingHashes of
+			// tokens, so it cannot make a coordinator with one routingHash or none smaller: that is the
 			// floor. A coordinator at the hash depth limit of its topology cannot split either.
 			evaluateSplit: ({ identity, policy }) => {
 				const databaseSize = sql.databaseSize;
@@ -596,7 +596,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				}
 				const { rootTreesN, hashSplitN } = identity.topology;
 				const atDepthLimit = (identity.hash?.depth ?? 0) >= maxHashDepth(rootTreesN, hashSplitN);
-				if (!atDepthLimit && this.hasAtLeastTwoHashPrefixBuckets()) {
+				if (!atDepthLimit && this.hasAtLeastTwoRoutingHashes()) {
 					this.#splitFloorLogged = false;
 					return {};
 				}
@@ -605,7 +605,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					console.error({
 						message: "fokos/tc: over the split threshold, but a split cannot make this coordinator smaller",
 						...identity.ref,
-						reason: atDepthLimit ? "the hash depth limit" : "fewer than two hashPrefixBuckets",
+						reason: atDepthLimit ? "the hash depth limit" : "fewer than two routingHashes",
 						databaseSize,
 						maxSizeBytes,
 					});
@@ -687,10 +687,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/**
-	 * The storage prefix of the rows of a transaction: the hashPrefixBucket of its idempotency token. A
+	 * The storage prefix of the rows of a transaction: the routingHash of its idempotency token. A
 	 * request computes it one time and passes it to each statement.
 	 */
-	private prefixOf(idempotencyToken: string): HashPrefixBucket {
+	private prefixOf(idempotencyToken: string): RoutingHash {
 		return this.fokos.storagePrefix(tokenKey(idempotencyToken).hashKey);
 	}
 
@@ -825,7 +825,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const createdAt = this.fokosNow();
 		this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
-				`INSERT INTO tc_state (hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash)
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash)
                  VALUES (?, ?, ?, 'CREATED', ?, ?, ?, ?)`,
 				prefix,
 				transactionId,
@@ -837,7 +837,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			);
 			for (const op of request.items) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
+					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					prefix,
 					transactionId,
@@ -857,7 +857,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			for (const p of participants) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_participants (hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?, ?)`,
+					`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?, ?)`,
 					prefix,
 					transactionId,
 					p.doName,
@@ -880,7 +880,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	private async resumeTransaction(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		existingRow: TcStateRow,
 		idempotencyToken: string,
 	): Promise<InitiateWriteResponseEncoded> {
@@ -929,7 +929,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * the pending errors.
 	 */
 	private loadFinalResponse(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		seen = new RequestPartitions(),
@@ -1012,10 +1012,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * that does not complete keeps its payload only until its first claim. It writes no row when the
 	 * payload is already removed.
 	 */
-	private stripPayload(prefix: HashPrefixBucket, transactionId: string): void {
+	private stripPayload(prefix: RoutingHash, transactionId: string): void {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL, update_json = NULL
-			  WHERE hash_prefix_bucket = ? AND transaction_id = ?
+			  WHERE routing_hash = ? AND transaction_id = ?
 			    AND (data IS NOT NULL OR data_kind IS NOT NULL OR conditions_json IS NOT NULL OR update_json IS NOT NULL)`,
 			prefix,
 			transactionId,
@@ -1028,7 +1028,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * COMMITTING or CANCELLING state.
 	 */
 	private async completeTransaction(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
@@ -1038,7 +1038,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		let transitioned = false;
 		this.transition(idempotencyToken, () => {
 			const transition = this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = ?, completed_at = ?, next_recovery_at = NULL WHERE hash_prefix_bucket = ? AND transaction_id = ? AND state = ?`,
+				`UPDATE tc_state SET state = ?, completed_at = ?, next_recovery_at = NULL WHERE routing_hash = ? AND transaction_id = ? AND state = ?`,
 				terminalState,
 				completedAt,
 				prefix,
@@ -1048,8 +1048,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			if (transition.rowsWritten === 0) {
 				return;
 			}
-			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE hash_prefix_bucket = ? AND transaction_id = ?`, prefix, transactionId);
-			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ?`, prefix, transactionId);
+			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, prefix, transactionId);
+			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE routing_hash = ? AND transaction_id = ?`, prefix, transactionId);
 			transitioned = true;
 		});
 		if (transitioned) {
@@ -1081,7 +1081,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 *
 	 * Returns true when it stored the answer.
 	 */
-	private storePrepareAnswer(prefix: HashPrefixBucket, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
+	private storePrepareAnswer(prefix: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
 		return this.ctx.storage.transactionSync(() => {
 			if (this.loadStateRow(prefix, transactionId)?.state !== "PREPARING") {
 				return false;
@@ -1090,7 +1090,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			// must not hide that error, or let markCommitting record a commit decision.
 			const stored = tryOne(
 				this.ctx.storage.sql.exec<{ error_json: string | null }>(
-					`SELECT error_json FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? AND partition_do_name = ?`,
+					`SELECT error_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
 					prefix,
 					transactionId,
 					partitionDoName,
@@ -1101,7 +1101,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			const written = this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
-				  WHERE hash_prefix_bucket = ? AND transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
+				  WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
 				answer.outcome,
 				answer.outcome === "rejected" ? stringifyTagged(stripImagesFromPrepareResponse(answer)) : null,
 				prefix,
@@ -1118,7 +1118,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const aboveCap = this.imagesAboveCap(prefix, transactionId);
 			for (const opIndex of aboveCap) {
 				this.ctx.storage.sql.exec(
-					`DELETE FROM tc_results WHERE hash_prefix_bucket = ? AND transaction_id = ? AND op_index = ?`,
+					`DELETE FROM tc_results WHERE routing_hash = ? AND transaction_id = ? AND op_index = ?`,
 					prefix,
 					transactionId,
 					opIndex,
@@ -1132,7 +1132,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				// image_data is an ANY column: text and JSON text bind as TEXT, bytes bind as a BLOB, exactly
 				// as the partition returned them. Nothing JSON-encodes an image anywhere on this path.
 				this.ctx.storage.sql.exec(
-					`INSERT OR REPLACE INTO tc_results (hash_prefix_bucket, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+					`INSERT OR REPLACE INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
 					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 					prefix,
 					transactionId,
@@ -1148,10 +1148,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** The operations whose image the combined cap drops, from the prepare answers that are stored now. */
-	private imagesAboveCap(prefix: HashPrefixBucket, transactionId: string): Set<number> {
+	private imagesAboveCap(prefix: RoutingHash, transactionId: string): Set<number> {
 		const results: ParticipantOperationResultEncoded[] = [];
 		for (const { answer_json } of this.ctx.storage.sql.exec<{ answer_json: string }>(
-			`SELECT answer_json FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
+			`SELECT answer_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
 			prefix,
 			transactionId,
 		)) {
@@ -1174,14 +1174,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * for example a transport failure, must not replace it, because recovery cancels on it. A new error
 	 * can replace a transient one. The read and the write run in one storage transaction.
 	 */
-	private storePrepareError(prefix: HashPrefixBucket, transactionId: string, partitionDoName: string, err: unknown): void {
+	private storePrepareError(prefix: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void {
 		dropCallCost(err);
 		this.ctx.storage.transactionSync(() => {
 			const row = tryOne(
 				this.ctx.storage.sql.exec<{ error_json: string | null }>(
 					`SELECT p.error_json FROM tc_participants p
-					   JOIN tc_state s ON s.hash_prefix_bucket = p.hash_prefix_bucket AND s.transaction_id = p.transaction_id
-					  WHERE p.hash_prefix_bucket = ? AND p.transaction_id = ? AND p.partition_do_name = ? AND p.prepare_outcome IS NULL
+					   JOIN tc_state s ON s.routing_hash = p.routing_hash AND s.transaction_id = p.transaction_id
+					  WHERE p.routing_hash = ? AND p.transaction_id = ? AND p.partition_do_name = ? AND p.prepare_outcome IS NULL
 					    AND s.state = 'PREPARING'`,
 					prefix,
 					transactionId,
@@ -1195,7 +1195,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const wire = FokosError.toWire(err);
 			delete wire.fields?.routing;
 			this.ctx.storage.sql.exec(
-				`UPDATE tc_participants SET error_json = ? WHERE hash_prefix_bucket = ? AND transaction_id = ? AND partition_do_name = ?`,
+				`UPDATE tc_participants SET error_json = ? WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
 				JSON.stringify(wire),
 				prefix,
 				transactionId,
@@ -1211,7 +1211,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * Both drivePrepare and runPrepareRecovery call it, so the two writers of CANCELLING cannot merge
 	 * differently: the answers come from storage, never from what the caller still holds in memory.
 	 */
-	private cancelTransactionInStore(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): void {
+	private cancelTransactionInStore(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () => {
 			const items = this.loadItems(prefix, transactionId);
 			const itemsByPartition = groupByPartition(items);
@@ -1272,7 +1272,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			);
 
 			const transition = this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'CANCELLING', results_json = ? WHERE hash_prefix_bucket = ? AND transaction_id = ? AND state = 'PREPARING'`,
+				`UPDATE tc_state SET state = 'CANCELLING', results_json = ? WHERE routing_hash = ? AND transaction_id = ? AND state = 'PREPARING'`,
 				stringifyTagged(finalResults),
 				prefix,
 				transactionId,
@@ -1285,7 +1285,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 			for (const opIndex of cappedOutOpIndexes) {
 				this.ctx.storage.sql.exec(
-					`DELETE FROM tc_results WHERE hash_prefix_bucket = ? AND transaction_id = ? AND op_index = ?`,
+					`DELETE FROM tc_results WHERE routing_hash = ? AND transaction_id = ? AND op_index = ?`,
 					prefix,
 					transactionId,
 					opIndex,
@@ -1361,11 +1361,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * The statement writes nothing when the state is not PREPARING. In that case, another drive has
 	 * already written a decision, and the caller follows the stored state.
 	 */
-	private markCommitting(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): void {
+	private markCommitting(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () =>
 			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'COMMITTING' WHERE hash_prefix_bucket = ?1 AND transaction_id = ?2 AND state = 'PREPARING'
-				   AND NOT EXISTS (SELECT 1 FROM tc_participants WHERE hash_prefix_bucket = ?1 AND transaction_id = ?2 AND prepare_outcome IS NOT 'accepted')`,
+				`UPDATE tc_state SET state = 'COMMITTING' WHERE routing_hash = ?1 AND transaction_id = ?2 AND state = 'PREPARING'
+				   AND NOT EXISTS (SELECT 1 FROM tc_participants WHERE routing_hash = ?1 AND transaction_id = ?2 AND prepare_outcome IS NOT 'accepted')`,
 				prefix,
 				transactionId,
 			),
@@ -1379,7 +1379,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * transaction, the `tx_recovery` job, recovery) has no in-memory copy and loads the fan-out from SQLite.
 	 */
 	private async drivePrepare(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1388,7 +1388,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	): Promise<InitiateWriteResponseEncoded> {
 		const row = this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'PREPARING' WHERE hash_prefix_bucket = ? AND transaction_id = ? AND state = 'CREATED'`,
+				`UPDATE tc_state SET state = 'PREPARING' WHERE routing_hash = ? AND transaction_id = ? AND state = 'CREATED'`,
 				prefix,
 				transactionId,
 			);
@@ -1484,7 +1484,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * stays unconfirmed, and the transaction stays non-terminal for the `tx_recovery` job.
 	 */
 	private async runCommit(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1500,7 +1500,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// FIXME: Remove the fallback after all older code that writes PREPARED rows is gone.
 		const stateRow = this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'COMMITTING' WHERE hash_prefix_bucket = ? AND transaction_id = ? AND state = 'PREPARED'`,
+				`UPDATE tc_state SET state = 'COMMITTING' WHERE routing_hash = ? AND transaction_id = ? AND state = 'PREPARED'`,
 				prefix,
 				transactionId,
 			);
@@ -1522,7 +1522,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
-                 FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? AND commit_outcome IS NULL`,
+                 FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL`,
 				prefix,
 				transactionId,
 			)
@@ -1581,8 +1581,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				for (const partitionDoName of confirmed) {
 					this.ctx.storage.sql.exec(
 						`UPDATE tc_participants SET commit_outcome = 'committed'
-						  WHERE hash_prefix_bucket = ?1 AND transaction_id = ?2 AND partition_do_name = ?3 AND commit_outcome IS NULL
-						    AND EXISTS (SELECT 1 FROM tc_state WHERE hash_prefix_bucket = ?1 AND transaction_id = ?2 AND state = 'COMMITTING')`,
+						  WHERE routing_hash = ?1 AND transaction_id = ?2 AND partition_do_name = ?3 AND commit_outcome IS NULL
+						    AND EXISTS (SELECT 1 FROM tc_state WHERE routing_hash = ?1 AND transaction_id = ?2 AND state = 'COMMITTING')`,
 						prefix,
 						transactionId,
 						partitionDoName,
@@ -1590,7 +1590,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				}
 				return one(
 					this.ctx.storage.sql.exec<{ n: number }>(
-						`SELECT COUNT(*) as n FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? AND commit_outcome IS NULL`,
+						`SELECT COUNT(*) as n FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL`,
 						prefix,
 						transactionId,
 					),
@@ -1605,7 +1605,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
 	private async runCancel(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1630,7 +1630,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
-                 FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? AND cancel_outcome IS NULL`,
+                 FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND cancel_outcome IS NULL`,
 				prefix,
 				transactionId,
 			)
@@ -1660,7 +1660,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					}),
 				);
 				this.ctx.storage.sql.exec(
-					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE hash_prefix_bucket = ? AND transaction_id = ? AND partition_do_name = ?`,
+					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
 					prefix,
 					transactionId,
 					p.partition_do_name,
@@ -1672,7 +1672,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// in CANCELLING so the `tx_recovery` job retries the remaining ones.
 		const stillPending = one(
 			this.ctx.storage.sql.exec<{ n: number }>(
-				`SELECT COUNT(*) as n FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
+				`SELECT COUNT(*) as n FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
 				prefix,
 				transactionId,
 			),
@@ -1683,7 +1683,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	private async runPrepareRecovery(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1805,7 +1805,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	/**
 	 * The transactions whose `next_recovery_at` is at or before `dueAt`, earliest first, at most `limit`
 	 * of them, each with its `next_recovery_at` moved forward in the same storage transaction. The scan
-	 * keeps its time order over all hashPrefixBuckets, and each row keeps its own hashPrefixBucket. The same
+	 * keeps its time order over all routingHashes, and each row keeps its own routingHash. The same
 	 * storage transaction removes the payload of a claimed transaction that is past its prepare. The step
 	 * passes its start time as `dueAt`, and a claim moves the time past it, so one step claims a
 	 * transaction at most one time.
@@ -1814,21 +1814,21 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		dueAt: number,
 		limit: number,
 		staleTransactionMs: number,
-	): { prefix: HashPrefixBucket; transaction_id: string; idempotency_token: string; state: TCState }[] {
+	): { prefix: RoutingHash; transaction_id: string; idempotency_token: string; state: TCState }[] {
 		const now = this.fokosNow();
 		return this.ctx.storage.transactionSync(() => {
 			const rows = this.ctx.storage.sql
-				.exec<{ hash_prefix_bucket: ArrayBuffer; transaction_id: string; idempotency_token: string; state: TCState; created_at: number }>(
-					`SELECT hash_prefix_bucket, transaction_id, idempotency_token, state, created_at FROM tc_state
+				.exec<{ routing_hash: ArrayBuffer; transaction_id: string; idempotency_token: string; state: TCState; created_at: number }>(
+					`SELECT routing_hash, transaction_id, idempotency_token, state, created_at FROM tc_state
 					  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
 					dueAt,
 					limit,
 				)
 				.toArray()
-				.map(({ hash_prefix_bucket, ...row }) => ({ ...row, prefix: prefixFromBlob(hash_prefix_bucket) }));
+				.map(({ routing_hash, ...row }) => ({ ...row, prefix: prefixFromBlob(routing_hash) }));
 			for (const row of rows) {
 				this.ctx.storage.sql.exec(
-					`UPDATE tc_state SET next_recovery_at = ? WHERE hash_prefix_bucket = ? AND transaction_id = ?`,
+					`UPDATE tc_state SET next_recovery_at = ? WHERE routing_hash = ? AND transaction_id = ?`,
 					nextRecoveryAt(now, row.created_at, staleTransactionMs),
 					row.prefix,
 					row.transaction_id,
@@ -1854,7 +1854,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/** Drives one non-terminal transaction from its stored state. `budgetMs` bounds the participant retries. */
 	private async driveTransaction(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		state: TCState,
@@ -1886,11 +1886,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const cutoff = this.fokosNow() - IDEMPOTENCY_WINDOW_MS;
 		const { sweepBatchRows, sweepDeleteChunkRows } = this.config();
 		// The order is the order of `idx_tc_state_completed_at`, whose entries end with the primary key, so
-		// the read needs no sort. Each row keeps its own hashPrefixBucket for the deletes.
+		// the read needs no sort. Each row keeps its own routingHash for the deletes.
 		const expiredBatch = this.ctx.storage.sql
-			.exec<{ hash_prefix_bucket: ArrayBuffer; transaction_id: string }>(
-				`SELECT hash_prefix_bucket, transaction_id FROM tc_state WHERE completed_at < ?
-				  ORDER BY completed_at, hash_prefix_bucket, transaction_id LIMIT ?`,
+			.exec<{ routing_hash: ArrayBuffer; transaction_id: string }>(
+				`SELECT routing_hash, transaction_id FROM tc_state WHERE completed_at < ?
+				  ORDER BY completed_at, routing_hash, transaction_id LIMIT ?`,
 				cutoff,
 				sweepBatchRows,
 			)
@@ -1900,9 +1900,9 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				for (let i = 0; i < expiredBatch.length; i += sweepDeleteChunkRows) {
 					const chunk = expiredBatch.slice(i, i + sweepDeleteChunkRows);
 					const keys = chunk.map(() => "(?, ?)").join(", ");
-					const params = chunk.flatMap((r) => [r.hash_prefix_bucket, r.transaction_id]);
-					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE (hash_prefix_bucket, transaction_id) IN (VALUES ${keys})`, ...params);
-					this.ctx.storage.sql.exec(`DELETE FROM tc_state WHERE (hash_prefix_bucket, transaction_id) IN (VALUES ${keys})`, ...params);
+					const params = chunk.flatMap((r) => [r.routing_hash, r.transaction_id]);
+					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE (routing_hash, transaction_id) IN (VALUES ${keys})`, ...params);
+					this.ctx.storage.sql.exec(`DELETE FROM tc_state WHERE (routing_hash, transaction_id) IN (VALUES ${keys})`, ...params);
 				}
 			});
 		}
@@ -1928,10 +1928,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * A drive here would run beside the other drives of the transaction, one for each call. The job
 	 * runs in the passes of the scheduler, one at a time, so calls from many participants give one drive.
 	 */
-	private async recoverTransactionLocal(prefix: HashPrefixBucket, transactionId: string): Promise<RecoverTransactionResult> {
+	private async recoverTransactionLocal(prefix: RoutingHash, transactionId: string): Promise<RecoverTransactionResult> {
 		const state = tryOne(
 			this.ctx.storage.sql.exec<{ state: TCState }>(
-				`SELECT state FROM tc_state WHERE hash_prefix_bucket = ? AND transaction_id = ?`,
+				`SELECT state FROM tc_state WHERE routing_hash = ? AND transaction_id = ?`,
 				prefix,
 				transactionId,
 			),
@@ -1944,7 +1944,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		}
 		const now = this.fokosNow();
 		this.ctx.storage.sql.exec(
-			`UPDATE tc_state SET next_recovery_at = MIN(next_recovery_at, ?) WHERE hash_prefix_bucket = ? AND transaction_id = ? AND completed_at IS NULL`,
+			`UPDATE tc_state SET next_recovery_at = MIN(next_recovery_at, ?) WHERE routing_hash = ? AND transaction_id = ? AND completed_at IS NULL`,
 			now,
 			prefix,
 			transactionId,
@@ -1957,7 +1957,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/**
 	 * One page of the transactions that a split target owns, with their rows in all four tables. The page
-	 * reads `interval`, the hashPrefixBucket interval of the target, in primary-key order, and filters each
+	 * reads `interval`, the routingHash interval of the target, in primary-key order, and filters each
 	 * row with `belongsToTarget`. The cursor is the primary key of the last `tc_state` row read, and it
 	 * replaces the lower bound of the interval. A page reads at most `budget.scanRows` ledger rows, holds
 	 * at most `budget.pageRows` transactions, and keeps its payload near `budget.pageBytes`: it stops
@@ -1969,21 +1969,21 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		budget: FokosMigrationPageBudget,
 		interval: FokosStorageInterval,
 	): { page: MigratedTransaction[]; nextCursor: MigrationCursor | null } {
-		// A coordinator splits only by hash, so each bound of its interval is a hashPrefixBucket.
+		// A coordinator splits only by hash, so each bound of its interval is a routingHash.
 		invariant(
 			interval.start.hk === undefined && interval.end?.hk === undefined,
-			"fokos/tc: a migration interval of a coordinator is a hashPrefixBucket interval",
+			"fokos/tc: a migration interval of a coordinator is a routingHash interval",
 		);
 		// Each bound stays a row-value comparison, so SQLite seeks on the primary key.
-		const conds = [cursor === null ? `hash_prefix_bucket >= ?` : `(hash_prefix_bucket, transaction_id) > (?, ?)`];
+		const conds = [cursor === null ? `routing_hash >= ?` : `(routing_hash, transaction_id) > (?, ?)`];
 		const params: unknown[] = cursor === null ? [interval.start.prefix] : [cursor.prefix, cursor.transactionId];
 		if (interval.end !== null) {
-			conds.push(`hash_prefix_bucket < ?`);
+			conds.push(`routing_hash < ?`);
 			params.push(interval.end.prefix);
 		}
-		const rows = this.ctx.storage.sql.exec<TcStateRow & { hash_prefix_bucket: ArrayBuffer }>(
-			`SELECT hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
-             FROM tc_state WHERE ${conds.join(" AND ")} ORDER BY hash_prefix_bucket, transaction_id LIMIT ?`,
+		const rows = this.ctx.storage.sql.exec<TcStateRow & { routing_hash: ArrayBuffer }>(
+			`SELECT routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
+             FROM tc_state WHERE ${conds.join(" AND ")} ORDER BY routing_hash, transaction_id LIMIT ?`,
 			...params,
 			budget.scanRows + 1,
 		);
@@ -1991,12 +1991,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		let bytes = 0;
 		let scanned = 0;
 		let last: MigrationCursor | null = null;
-		for (const { hash_prefix_bucket, ...row } of rows) {
+		for (const { routing_hash, ...row } of rows) {
 			// The extra row only shows that the ledger continues after this page.
 			if (scanned === budget.scanRows || page.length === budget.pageRows) {
 				return { page, nextCursor: last };
 			}
-			const prefix = prefixFromBlob(hash_prefix_bucket);
+			const prefix = prefixFromBlob(routing_hash);
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {
 				const tx: MigratedTransaction = {
 					state: row,
@@ -2029,7 +2029,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		for (const { state, items, participants, results } of page) {
 			const prefix = this.prefixOf(state.idempotency_token);
 			sql.exec(
-				`INSERT OR REPLACE INTO tc_state (hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
+				`INSERT OR REPLACE INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				prefix,
 				state.transaction_id,
@@ -2044,7 +2044,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			);
 			for (const r of items) {
 				sql.exec(
-					`INSERT OR REPLACE INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
+					`INSERT OR REPLACE INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					prefix,
 					r.transaction_id,
@@ -2063,7 +2063,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			for (const r of participants) {
 				sql.exec(
-					`INSERT OR REPLACE INTO tc_participants (hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
+					`INSERT OR REPLACE INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					prefix,
 					r.transaction_id,
@@ -2078,7 +2078,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			for (const r of results) {
 				sql.exec(
-					`INSERT OR REPLACE INTO tc_results (hash_prefix_bucket, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+					`INSERT OR REPLACE INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
 					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 					prefix,
 					r.transaction_id,
@@ -2095,13 +2095,13 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	/**
 	 * One bounded step of the cleanup of a split source. Returns true when no ledger row is left. Each step
 	 * deletes the first `sweepBatchRows` transactions in primary-key order. All four tables lead with
-	 * `(hash_prefix_bucket, transaction_id)`, so each delete is one key range of its table.
+	 * `(routing_hash, transaction_id)`, so each delete is one key range of its table.
 	 */
 	private deleteMigratedRowsStep(): boolean {
 		const sql = this.ctx.storage.sql;
 		const last = tryOne(
-			sql.exec<{ hash_prefix_bucket: ArrayBuffer; transaction_id: string }>(
-				`SELECT hash_prefix_bucket, transaction_id FROM tc_state ORDER BY hash_prefix_bucket, transaction_id LIMIT 1 OFFSET ?`,
+			sql.exec<{ routing_hash: ArrayBuffer; transaction_id: string }>(
+				`SELECT routing_hash, transaction_id FROM tc_state ORDER BY routing_hash, transaction_id LIMIT 1 OFFSET ?`,
 				this.config().sweepBatchRows - 1,
 			),
 		);
@@ -2109,17 +2109,17 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			if (last === undefined) {
 				sql.exec(`DELETE FROM ${table}`);
 			} else {
-				sql.exec(`DELETE FROM ${table} WHERE (hash_prefix_bucket, transaction_id) <= (?, ?)`, last.hash_prefix_bucket, last.transaction_id);
+				sql.exec(`DELETE FROM ${table} WHERE (routing_hash, transaction_id) <= (?, ?)`, last.routing_hash, last.transaction_id);
 			}
 		}
 		return !exists(sql.exec(`SELECT 1 FROM tc_state LIMIT 1`));
 	}
 
-	private loadStateRow(prefix: HashPrefixBucket, transactionId: string): TcStateRow | undefined {
+	private loadStateRow(prefix: RoutingHash, transactionId: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
 				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
-                 FROM tc_state WHERE hash_prefix_bucket = ? AND transaction_id = ?`,
+                 FROM tc_state WHERE routing_hash = ? AND transaction_id = ?`,
 				prefix,
 				transactionId,
 			),
@@ -2127,30 +2127,28 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** One seek of the unique token index, and no row read: the admission hook needs only to know that a row exists. */
-	private hasStateRowForToken(prefix: HashPrefixBucket, idempotencyToken: string): boolean {
+	private hasStateRowForToken(prefix: RoutingHash, idempotencyToken: string): boolean {
 		return exists(
 			this.ctx.storage.sql.exec(
-				`SELECT 1 FROM tc_state WHERE hash_prefix_bucket = ? AND idempotency_token = ? LIMIT 1`,
+				`SELECT 1 FROM tc_state WHERE routing_hash = ? AND idempotency_token = ? LIMIT 1`,
 				prefix,
 				idempotencyToken,
 			),
 		);
 	}
 
-	/** Two seeks of the primary key. The second seeks past the first hashPrefixBucket. */
-	private hasAtLeastTwoHashPrefixBuckets(): boolean {
+	/** Two seeks of the primary key. The second seeks past the first routingHash. */
+	private hasAtLeastTwoRoutingHashes(): boolean {
 		const sql = this.ctx.storage.sql;
-		const first = tryOne(
-			sql.exec<{ hash_prefix_bucket: ArrayBuffer }>(`SELECT hash_prefix_bucket FROM tc_state ORDER BY hash_prefix_bucket LIMIT 1`),
-		);
-		return first !== undefined && exists(sql.exec(`SELECT 1 FROM tc_state WHERE hash_prefix_bucket > ? LIMIT 1`, first.hash_prefix_bucket));
+		const first = tryOne(sql.exec<{ routing_hash: ArrayBuffer }>(`SELECT routing_hash FROM tc_state ORDER BY routing_hash LIMIT 1`));
+		return first !== undefined && exists(sql.exec(`SELECT 1 FROM tc_state WHERE routing_hash > ? LIMIT 1`, first.routing_hash));
 	}
 
-	private loadStateRowByToken(prefix: HashPrefixBucket, idempotencyToken: string): TcStateRow | undefined {
+	private loadStateRowByToken(prefix: RoutingHash, idempotencyToken: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
 				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
-                 FROM tc_state WHERE hash_prefix_bucket = ? AND idempotency_token = ?`,
+                 FROM tc_state WHERE routing_hash = ? AND idempotency_token = ?`,
 				prefix,
 				idempotencyToken,
 			),
@@ -2158,7 +2156,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** The prepare fan-out of a stored transaction: the state, the participants, and their items. */
-	private loadPrepareFanout(prefix: HashPrefixBucket, transactionId: string): PrepareFanout {
+	private loadPrepareFanout(prefix: RoutingHash, transactionId: string): PrepareFanout {
 		const stateRow = this.loadStateRow(prefix, transactionId);
 		invariant(stateRow, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
 		const itemsByPartition = groupByPartition(this.loadItems(prefix, transactionId));
@@ -2173,14 +2171,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** With `withPayload` false, the payload columns are NULL, so the rows do not hold the payload in memory. */
-	private loadItems(prefix: HashPrefixBucket, transactionId: string, withPayload = true): TcItemRow[] {
+	private loadItems(prefix: RoutingHash, transactionId: string, withPayload = true): TcItemRow[] {
 		const payload = withPayload
 			? "data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json"
 			: "NULL AS data, NULL AS data_kind, ttl_epoch_utc_seconds, NULL AS conditions_json, NULL AS update_json";
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
 				`SELECT transaction_id, hk, sk, op_index, operation, ${payload}, partition_do_name, return_values_on_condition_check_failure
-                 FROM tc_items WHERE hash_prefix_bucket = ? AND transaction_id = ? ORDER BY op_index`,
+                 FROM tc_items WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index`,
 				prefix,
 				transactionId,
 			)
@@ -2191,30 +2189,30 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * The routing half of loadItems: no data, no conditions — see runCancel. Each key comes one time,
 	 * because commit and cancel send each key one time. SQLite compares the BLOB keys by bytes.
 	 */
-	private loadItemKeys(prefix: HashPrefixBucket, transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
+	private loadItemKeys(prefix: RoutingHash, transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
 		return this.ctx.storage.sql
 			.exec<
 				Pick<TcItemRow, "hk" | "sk" | "partition_do_name">
-			>(`SELECT DISTINCT hk, sk, partition_do_name FROM tc_items WHERE hash_prefix_bucket = ? AND transaction_id = ?`, prefix, transactionId)
+			>(`SELECT DISTINCT hk, sk, partition_do_name FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, prefix, transactionId)
 			.toArray();
 	}
 
-	private loadResultImages(prefix: HashPrefixBucket, transactionId: string): TcResultRow[] {
+	private loadResultImages(prefix: RoutingHash, transactionId: string): TcResultRow[] {
 		return this.ctx.storage.sql
 			.exec<TcResultRow>(
 				`SELECT transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data
-                 FROM tc_results WHERE hash_prefix_bucket = ? AND transaction_id = ? ORDER BY op_index`,
+                 FROM tc_results WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index`,
 				prefix,
 				transactionId,
 			)
 			.toArray();
 	}
 
-	private loadParticipants(prefix: HashPrefixBucket, transactionId: string): TcParticipantRow[] {
+	private loadParticipants(prefix: RoutingHash, transactionId: string): TcParticipantRow[] {
 		return this.ctx.storage.sql
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json
-                 FROM tc_participants WHERE hash_prefix_bucket = ? AND transaction_id = ? ORDER BY partition_do_name`,
+                 FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name`,
 				prefix,
 				transactionId,
 			)

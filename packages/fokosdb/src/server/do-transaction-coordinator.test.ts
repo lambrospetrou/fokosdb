@@ -33,7 +33,7 @@ import type {
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 import type { FokosMigrationPageBudget } from "../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosShardingHooks, FokosStorageInterval } from "../sharding/runtime-types.js";
-import { asHashPrefixBucket, compareHashPrefixBuckets, type HashPrefixBucket } from "../sharding/hash-primitives.js";
+import { asRoutingHash, compareRoutingHashes, type RoutingHash } from "../sharding/hash-primitives.js";
 import { hashStorageInterval } from "../sharding/repartition-slice.js";
 import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
 
@@ -69,10 +69,10 @@ const TOKEN = "tok-1";
 const BASE_TIME = 2_000_000_000_000;
 
 /** The position of a migration page of the coordinator. */
-type MigrationCursor = { prefix: HashPrefixBucket; transactionId: string };
+type MigrationCursor = { prefix: RoutingHash; transactionId: string };
 
 /** The storage prefix of the rows of a token in `tc`. */
-function P(tc: CoordinatorInternals, token = TOKEN): HashPrefixBucket {
+function P(tc: CoordinatorInternals, token = TOKEN): RoutingHash {
 	return tc.fokos.storagePrefix(KeyCodec.encode(token));
 }
 
@@ -90,16 +90,10 @@ type CoordinatorInternals = {
 	fokosNow(): number;
 	hooks(): FokosShardingHooks<FokosDBPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
-	recoverTransactionLocal(prefix: HashPrefixBucket, transactionId: string): Promise<unknown>;
+	recoverTransactionLocal(prefix: RoutingHash, transactionId: string): Promise<unknown>;
 	/** The step of the `tx_recovery` job. */
 	recoverStaleTransactions(): Promise<void>;
-	driveTransaction(
-		prefix: HashPrefixBucket,
-		transactionId: string,
-		idempotencyToken: string,
-		state: TCState,
-		budgetMs: number,
-	): Promise<void>;
+	driveTransaction(prefix: RoutingHash, transactionId: string, idempotencyToken: string, state: TCState, budgetMs: number): Promise<void>;
 	earliestRecoveryAt(): number | null;
 	/** The step of the `idempotency_sweep` job. */
 	sweepExpiredTransactions(): number | null;
@@ -117,23 +111,23 @@ type CoordinatorInternals = {
 		nextCursor: MigrationCursor | null;
 	};
 	applyMigrationPage(page: unknown[]): void;
-	loadFinalResponse(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
-	cancelTransactionInStore(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): void;
-	storePrepareAnswer(prefix: HashPrefixBucket, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
-	storePrepareError(prefix: HashPrefixBucket, transactionId: string, partitionDoName: string, err: unknown): void;
-	markCommitting(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string): void;
+	loadFinalResponse(prefix: RoutingHash, transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
+	cancelTransactionInStore(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void;
+	storePrepareAnswer(prefix: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
+	storePrepareError(prefix: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void;
+	markCommitting(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void;
 	drivePrepare(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
 	): Promise<InitiateWriteResponseEncoded>;
-	runPrepareRecovery(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	runCommit(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	runCancel(prefix: HashPrefixBucket, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	stripPayload(prefix: HashPrefixBucket, transactionId: string): void;
+	runPrepareRecovery(prefix: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCommit(prefix: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCancel(prefix: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	stripPayload(prefix: RoutingHash, transactionId: string): void;
 	completeTransaction(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		terminalState: "COMMITTED" | "CANCELLED",
@@ -152,7 +146,7 @@ function seed(
 	state.storage.sql.exec(`DELETE FROM tc_items`);
 	const now = createdAt ?? Date.now() - 10_000;
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (hash_prefix_bucket, idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
+		`INSERT INTO tc_state (routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		P(tc),
 		TOKEN,
@@ -168,7 +162,7 @@ function seed(
 	// A realistic item set, one row with a sort key and one without. The response must not depend on
 	// it: a committed transaction reports no items.
 	state.storage.sql.exec(
-		`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
+		`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
 		 VALUES (?, ?, ?, ?, 0, 'put', 'v', 1, NULL, 'p1')`,
 		P(tc),
 		TX_ID,
@@ -176,7 +170,7 @@ function seed(
 		kb("sk1"),
 	);
 	state.storage.sql.exec(
-		`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
+		`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
 		 VALUES (?, ?, ?, ?, 1, 'delete', NULL, NULL, NULL, 'p1')`,
 		P(tc),
 		TX_ID,
@@ -200,15 +194,15 @@ function insertState(
 		completedAt?: number | null;
 		results?: TransactWriteOperationResultEncoded[];
 		operationsHash?: string;
-		/** A bucket other than the token's, to seed two transactions into one hashPrefixBucket. */
-		hashPrefixBucket?: HashPrefixBucket;
+		/** A routingHash other than the token's, to seed two transactions into one routingHash. */
+		routingHash?: RoutingHash;
 	},
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_state
-			(hash_prefix_bucket, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
+			(routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		options.hashPrefixBucket ?? P(tc, options.token),
+		options.routingHash ?? P(tc, options.token),
 		options.token,
 		options.transactionId,
 		options.state,
@@ -228,7 +222,7 @@ function insertParticipant(
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_participants
-			(hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
+			(routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		P(tc),
 		TX_ID,
@@ -252,7 +246,7 @@ function insertImage(
 	token = TOKEN,
 ): void {
 	state.storage.sql.exec(
-		`INSERT INTO tc_results (hash_prefix_bucket, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+		`INSERT INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
 		 VALUES (?, ?, ?, 1, 1, NULL, ?)`,
 		P(tc, token),
 		transactionId,
@@ -477,7 +471,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		async (hashSplitConditions) => {
 			await withCoordinator(async (tc, state, ctx) => {
 				const policy = { ...ctx.policy, hashSplitConditions };
-				// A split needs two hashPrefixBuckets.
+				// A split needs two routingHashes.
 				for (const token of ["tok-a", "tok-b"]) {
 					insertState(tc, state, {
 						token,
@@ -499,7 +493,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		},
 	);
 
-	it("does not split above the limit with fewer than two hashPrefixBuckets, because a split moves whole hashPrefixBuckets", async () => {
+	it("does not split above the limit with fewer than two routingHashes, because a split moves whole routingHashes", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(console, "error").mockImplementation(() => {});
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
@@ -507,10 +501,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(evaluate()).toBe(false);
 			insertState(tc, state, { token: "tok-a", transactionId: "tx-a", state: "COMMITTED", createdAt: Date.now(), completedAt: Date.now() });
 			expect(evaluate()).toBe(false);
-			// A second transaction in the same hashPrefixBucket can still not leave for another child.
+			// A second transaction in the same routingHash can still not leave for another child.
 			insertState(tc, state, {
 				token: "tok-c",
-				hashPrefixBucket: P(tc, "tok-a"),
+				routingHash: P(tc, "tok-a"),
 				transactionId: "tx-c",
 				state: "COMMITTED",
 				createdAt: Date.now(),
@@ -571,8 +565,8 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			const drives: { transactionId: string; budgetMs: number }[] = [];
 			const prefixMatches: boolean[] = [];
 			vi.spyOn(tc, "driveTransaction").mockImplementation(async (prefix, transactionId, token, _state, budgetMs) => {
-				// Each claimed row keeps the hashPrefixBucket of its own token.
-				prefixMatches.push(compareHashPrefixBuckets(prefix, P(tc, token)) === 0);
+				// Each claimed row keeps the routingHash of its own token.
+				prefixMatches.push(compareRoutingHashes(prefix, P(tc, token)) === 0);
 				drives.push({ transactionId, budgetMs });
 			});
 
@@ -688,7 +682,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(deadline).toContain("USING INDEX idx_tc_state_recovery");
 			expect(deadline).not.toContain("TEMP B-TREE");
 			const due = plan(
-				`SELECT hash_prefix_bucket, transaction_id, idempotency_token, state, created_at FROM tc_state
+				`SELECT routing_hash, transaction_id, idempotency_token, state, created_at FROM tc_state
 				  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
 				1,
 				10,
@@ -710,8 +704,8 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 					.join(" | ");
 
 			const expired = plan(
-				`SELECT hash_prefix_bucket, transaction_id FROM tc_state WHERE completed_at < ?
-				  ORDER BY completed_at, hash_prefix_bucket, transaction_id LIMIT ?`,
+				`SELECT routing_hash, transaction_id FROM tc_state WHERE completed_at < ?
+				  ORDER BY completed_at, routing_hash, transaction_id LIMIT ?`,
 				1,
 				10,
 			);
@@ -719,18 +713,18 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			expect(expired).not.toContain("TEMP B-TREE");
 			for (const table of ["tc_state", "tc_results"]) {
 				const remove = plan(
-					`DELETE FROM ${table} WHERE (hash_prefix_bucket, transaction_id) IN (VALUES (?, ?), (?, ?))`,
+					`DELETE FROM ${table} WHERE (routing_hash, transaction_id) IN (VALUES (?, ?), (?, ?))`,
 					P(tc, "a"),
 					"tx-a",
 					P(tc, "b"),
 					"tx-b",
 				);
-				expect(remove).toContain("USING PRIMARY KEY (hash_prefix_bucket=? AND transaction_id=?)");
+				expect(remove).toContain("USING PRIMARY KEY (routing_hash=? AND transaction_id=?)");
 			}
 		});
 	});
 
-	it("keys each tc_* table by the hashPrefixBucket and the transaction, and enforces a unique idempotency_token", async () => {
+	it("keys each tc_* table by the routingHash and the transaction, and enforces a unique idempotency_token", async () => {
 		await withCoordinator((tc, state) => {
 			const primaryKey = (table: string) =>
 				state.storage.sql
@@ -739,10 +733,10 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 					.filter((c) => c.pk > 0)
 					.sort((a, b) => a.pk - b.pk)
 					.map((c) => c.name);
-			expect(primaryKey("tc_state")).toEqual(["hash_prefix_bucket", "transaction_id"]);
-			expect(primaryKey("tc_participants")).toEqual(["hash_prefix_bucket", "transaction_id", "partition_do_name"]);
-			expect(primaryKey("tc_items")).toEqual(["hash_prefix_bucket", "transaction_id", "op_index"]);
-			expect(primaryKey("tc_results")).toEqual(["hash_prefix_bucket", "transaction_id", "op_index"]);
+			expect(primaryKey("tc_state")).toEqual(["routing_hash", "transaction_id"]);
+			expect(primaryKey("tc_participants")).toEqual(["routing_hash", "transaction_id", "partition_do_name"]);
+			expect(primaryKey("tc_items")).toEqual(["routing_hash", "transaction_id", "op_index"]);
+			expect(primaryKey("tc_results")).toEqual(["routing_hash", "transaction_id", "op_index"]);
 
 			const indexes = state.storage.sql.exec<{ name: string; unique: number }>(`PRAGMA index_list(tc_state)`).toArray();
 			const tokenIndex = indexes.find((idx) => idx.name === "tc_state_idempotency_token");
@@ -955,7 +949,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				insertParticipant(tc, state, { name: `p${p}` });
 				for (let i = p * 10; i < p * 10 + 10; i++) {
 					state.storage.sql.exec(
-						`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, ?, 'check', ?)`,
+						`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, ?, 'check', ?)`,
 						P(tc),
 						TX_ID,
 						kb(`hk${i}`),
@@ -1308,7 +1302,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			seed(tc, state, "PREPARING");
 			const largeData = "A".repeat(50_000);
 			state.storage.sql.exec(
-				`INSERT INTO tc_participants (hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
 				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
 				P(tc),
 				TX_ID,
@@ -1328,7 +1322,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				}),
 			);
 			state.storage.sql.exec(
-				`INSERT INTO tc_results (hash_prefix_bucket, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+				`INSERT INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
 				 VALUES (?, ?, 0, 1, 1, NULL, ?)`,
 				P(tc),
 				TX_ID,
@@ -1363,7 +1357,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		await withCoordinator(async (tc, state) => {
 			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(
-				`INSERT INTO tc_participants (hash_prefix_bucket, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
 				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
 				P(tc),
 				TX_ID,
@@ -1411,7 +1405,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		function seedRepeatedItem(tc: CoordinatorInternals, state: DurableObjectState, tcState: TCState) {
 			seed(tc, state, tcState);
 			state.storage.sql.exec(
-				`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 2, 'check', 'p1')`,
+				`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 2, 'check', 'p1')`,
 				P(tc),
 				TX_ID,
 				kb("hk1"),
@@ -1587,7 +1581,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
-	// tc_results is keyed by (hash_prefix_bucket, transaction_id), and the sweep selects one batch of keys
+	// tc_results is keyed by (routing_hash, transaction_id), and the sweep selects one batch of keys
 	// and deletes both tables by it. A tc_results row that outlived its tc_state row would be unreachable
 	// and unswept.
 	it("deletes the images of every transaction it sweeps, and leaves the rest alone", async () => {
@@ -1622,7 +1616,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
-	// The primary key is (hash_prefix_bucket, transaction_id). Two tokens in two hashPrefixBuckets with
+	// The primary key is (routing_hash, transaction_id). Two tokens in two routingHashes with
 	// one transaction ID show that each scan changes only the row it selected.
 	it("uses the full transaction key of each row that the recovery and the sweep scans select", async () => {
 		await withCoordinator(async (tc, state) => {
@@ -2023,15 +2017,15 @@ describe("FokosDBTransactionCoordinatorDO - bounded preparing hold", () => {
 });
 
 describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
-	/** The hashPrefixBucket at a byte position: `first` and then zeros. */
-	const bucketAt = (first: number) => asHashPrefixBucket(Uint8Array.of(first, 0, 0, 0, 0, 0, 0, 0));
-	/** The whole hashPrefixBucket space: the interval of a root coordinator. */
-	const WHOLE = hashStorageInterval(bucketAt(0), null);
+	/** The routingHash at a byte position: `first` and then zeros. */
+	const routingHashAt = (first: number) => asRoutingHash(Uint8Array.of(first, 0, 0, 0, 0, 0, 0, 0));
+	/** The whole routingHash space: the interval of a root coordinator. */
+	const WHOLE = hashStorageInterval(routingHashAt(0), null);
 	/** The token of each transaction that these tests insert. */
 	const tokenOf = (id: string) => `token-${id}`;
-	/** The transactions in storage order: by the hashPrefixBucket of the token, then by the ID. */
+	/** The transactions in storage order: by the routingHash of the token, then by the ID. */
 	const inStorageOrder = (tc: CoordinatorInternals, ids: string[]) =>
-		[...ids].sort((a, b) => compareHashPrefixBuckets(P(tc, tokenOf(a)), P(tc, tokenOf(b))) || (a < b ? -1 : 1));
+		[...ids].sort((a, b) => compareRoutingHashes(P(tc, tokenOf(a)), P(tc, tokenOf(b))) || (a < b ? -1 : 1));
 	const cursorAt = (tc: CoordinatorInternals, id: string): MigrationCursor => ({ prefix: P(tc, tokenOf(id)), transactionId: id });
 	const insertCommitted = (tc: CoordinatorInternals, state: DurableObjectState, ids: string[]) => {
 		for (const id of ids) {
@@ -2083,16 +2077,16 @@ describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
 		});
 	});
 
-	// A split target owns one hashPrefixBucket interval. The pages read that interval in primary-key
+	// A split target owns one routingHash interval. The pages read that interval in primary-key
 	// order, and the cursor continues inside it, so no page reads a row of another target.
 	it.each([
-		["the lower half", bucketAt(0), bucketAt(0x80)],
-		["the upper half", bucketAt(0x80), null],
-	] as const)("reads only %s of the hashPrefixBucket space when the target owns it", async (_name, start, end) => {
+		["the lower half", routingHashAt(0), routingHashAt(0x80)],
+		["the upper half", routingHashAt(0x80), null],
+	] as const)("reads only %s of the routingHash space when the target owns it", async (_name, start, end) => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 3, scanRows: 4 };
 		const interval = hashStorageInterval(start, end);
-		const inside = (prefix: HashPrefixBucket) =>
-			compareHashPrefixBuckets(prefix, start) >= 0 && (end === null || compareHashPrefixBuckets(prefix, end) < 0);
+		const inside = (prefix: RoutingHash) =>
+			compareRoutingHashes(prefix, start) >= 0 && (end === null || compareRoutingHashes(prefix, end) < 0);
 		await withCoordinator((tc, state) => {
 			const inserted = Array.from({ length: 30 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
 			insertCommitted(tc, state, inserted);
@@ -2154,13 +2148,13 @@ describe("FokosDBTransactionCoordinatorDO - migration of an item with more than 
 		await withCoordinator((tc, state) => {
 			seed(tc, state, "PREPARING");
 			state.storage.sql.exec(
-				`INSERT INTO tc_items (hash_prefix_bucket, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 2, 'check', 'p1')`,
+				`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 2, 'check', 'p1')`,
 				P(tc),
 				TX_ID,
 				kb("hk1"),
 				kb("sk1"),
 			);
-			const { page } = tc.buildMigrationPage(null, () => true, budget, hashStorageInterval(asHashPrefixBucket(new Uint8Array(8)), null));
+			const { page } = tc.buildMigrationPage(null, () => true, budget, hashStorageInterval(asRoutingHash(new Uint8Array(8)), null));
 			expect(page[0].items.map((item) => item.op_index)).toEqual([0, 1, 2]);
 
 			// The target starts empty. A page that comes again is idempotent.

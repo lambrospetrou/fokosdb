@@ -18,7 +18,7 @@ import { runInDurableObject } from "cloudflare:test";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../src/sharding/key-codec.js";
-import type { HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
+import type { RoutingHash } from "../../src/sharding/hash-primitives.js";
 import { ALL_ROWS, prefixOf } from "../storage-prefix.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import {
@@ -46,8 +46,8 @@ import type {
 	FokosPartitionRef,
 	FokosRepartitionPeer,
 } from "../../src/sharding/repartition-types.js";
-import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
-import { promotedHashPrefixBucketOf } from "../../src/sharding/repartition-slice.js";
+import { routingHashOf } from "../../src/sharding/hash-primitives.js";
+import { promotedRoutingHashOf } from "../../src/sharding/repartition-slice.js";
 
 export const kb = (s: string) => KeyCodec.encode(s);
 
@@ -89,7 +89,7 @@ export type Cluster = {
 	/** The node for a context, created on first use so a target exists before it is initialized. */
 	node(ctx: FokosDBRouteContext): Node;
 	hashNode(idxs: number[]): Node;
-	/** The range node of the hashPrefixBucket of `hashKey`, with the composite interval `[start, end)`. */
+	/** The range node of the routingHash of `hashKey`, with the composite interval `[start, end)`. */
 	rangeNode(from: FokosDBRouteContext, hashKey: KeyBytes, start: FokosCompositeKey | null, end: FokosCompositeKey | null): Node;
 	/** Per-node counts of the side effects the flow asks its DO for. */
 	scheduled(doName: string): number;
@@ -109,7 +109,7 @@ export type Cluster = {
 const CLUSTER_TABLE = "repartition";
 
 /** The storage prefix of a hash key in the shard group of every cluster, as a node of the cluster stores it. */
-export const P = (hk: KeyBytes): HashPrefixBucket => prefixOf(hk, `fokos.p.${CLUSTER_TABLE}`);
+export const P = (hk: KeyBytes): RoutingHash => prefixOf(hk, `fokos.p.${CLUSTER_TABLE}`);
 
 export type ClusterOptions = {
 	hashSplitN?: number;
@@ -158,7 +158,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			return cluster.node({ ...base, doName: doName!, partitionId: opaque });
 		},
 		rangeNode(from, hashKey, start, end) {
-			return cluster.node(resolveRangePartitionContext(from, hashPrefixBucketOf(hashKey, from.topology.shardGroup), start, end));
+			return cluster.node(resolveRangePartitionContext(from, routingHashOf(hashKey, from.topology.shardGroup), start, end));
 		},
 		scheduled: (doName) => scheduled.get(doName) ?? 0,
 		alarms: (doName) => alarms.get(doName) ?? [],
@@ -243,14 +243,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					logParams: () => ({ doName, partitionId: ctx.partitionId }),
 					captureChanges: () => false,
 					selfId: () => doName,
-					storagePrefix: (hashKey) => hashPrefixBucketOf(hashKey, ctx.topology.shardGroup),
+					storagePrefix: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
 				}),
-				computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) => {
+				computeRangeBoundaries: ({ routingHash, start, end, childCount }) => {
 					const plan = planRangeBoundaries(
-						store.keySizes.bytesOf(hashPrefixBucket),
+						store.keySizes.bytesOf(routingHash),
 						childCount,
 						start,
-						store.compositeKeySizes(hashPrefixBucket, start, end),
+						store.compositeKeySizes(routingHash, start, end),
 					);
 					return "boundaries" in plan ? plan.boundaries : null;
 				},
@@ -263,15 +263,15 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					if (plan.kind !== "key_promotion") {
 						return store.deletePendingTxCopiesBatch(null, CLEANUP_BATCH);
 					}
-					const bucket = promotedHashPrefixBucketOf(plan);
-					if (!store.deletePendingTxCopiesBatch(bucket, CLEANUP_BATCH)) {
+					const routingHash = promotedRoutingHashOf(plan);
+					if (!store.deletePendingTxCopiesBatch(routingHash, CLEANUP_BATCH)) {
 						return false;
 					}
-					store.deleteItemsBatchForHashPrefixBucket(bucket, CLEANUP_BATCH);
-					if (store.hasItemsForHashPrefixBucket(bucket)) {
+					store.deleteItemsBatchForRoutingHash(routingHash, CLEANUP_BATCH);
+					if (store.hasItemsForRoutingHash(routingHash)) {
 						return false;
 					}
-					store.keySizes.remove(bucket);
+					store.keySizes.remove(routingHash);
 					return true;
 				},
 			},

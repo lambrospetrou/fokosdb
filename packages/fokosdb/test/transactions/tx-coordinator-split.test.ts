@@ -11,7 +11,7 @@ import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transa
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { DEFAULT_LIMITS, encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
-import { asHashPrefixBucket, compareHashPrefixBuckets, type HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
+import { asRoutingHash, compareRoutingHashes, type RoutingHash } from "../../src/sharding/hash-primitives.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
@@ -44,7 +44,7 @@ function tokenKey(token: string) {
 /** Writes a committed ledger row under a new token, as a transaction that completed now writes it. */
 function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState, token: string): void {
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
+		`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
 		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000')`,
 		instance.fokos.storagePrefix(tokenKey(token).hashKey),
 		`tx-${crypto.randomUUID()}`,
@@ -56,7 +56,7 @@ function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: 
 
 /**
  * Queues a hash split of the coordinator. The coordinator must already hold its identity. A split
- * needs two hashPrefixBuckets, so the helper adds a committed token of its own.
+ * needs two routingHashes, so the helper adds a committed token of its own.
  */
 async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<void> {
 	await runInDurableObject(
@@ -74,12 +74,12 @@ async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<
 	);
 }
 
-/** True when `prefix` is inside the hashPrefixBucket interval `[start, end)`. */
-function inInterval(prefix: HashPrefixBucket, interval: FokosStorageInterval): boolean {
-	const bound = (key: { prefix: Uint8Array }) => asHashPrefixBucket(key.prefix);
+/** True when `prefix` is inside the routingHash interval `[start, end)`. */
+function inInterval(prefix: RoutingHash, interval: FokosStorageInterval): boolean {
+	const bound = (key: { prefix: Uint8Array }) => asRoutingHash(key.prefix);
 	return (
-		compareHashPrefixBuckets(prefix, bound(interval.start)) >= 0 &&
-		(interval.end === null || compareHashPrefixBuckets(prefix, bound(interval.end)) < 0)
+		compareRoutingHashes(prefix, bound(interval.start)) >= 0 &&
+		(interval.end === null || compareRoutingHashes(prefix, bound(interval.end)) < 0)
 	);
 }
 
@@ -148,14 +148,14 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		expect(await coordinatorStub(owner.doName).testInitiateWriteCalls()).toBe(1);
 	});
 
-	it("moves each transaction to the child whose interval holds its hashPrefixBucket, and reads no row outside that interval", async () => {
+	it("moves each transaction to the child whose interval holds its routingHash, and reads no row outside that interval", async () => {
 		const db = makeDB({ controlled: true });
 		const items = keysAcrossPartitions(db, 2, "tc-split-interval").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `tc-split-interval-${crypto.randomUUID()}`;
 		expect(await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }))).toMatchObject({ outcome: "committed" });
 		const tokens = [token, ...Array.from({ length: 20 }, (_, i) => `${token}-${i}`)];
 
-		// Each ledger row that a page read gives to the filter, and whether its hashPrefixBucket is inside
+		// Each ledger row that a page read gives to the filter, and whether its routingHash is inside
 		// the interval of the page.
 		const reads: boolean[] = [];
 		type PageRead = (
@@ -266,7 +266,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const transactionId = `tx-${crypto.randomUUID()}`;
 		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (hash_prefix_bucket, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
 				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
 				instance.fokos.storagePrefix(tokenKey(token).hashKey),
 				transactionId,

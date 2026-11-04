@@ -125,7 +125,7 @@ describe("FokosDBPartitionDO — a migration page that outlives its import recor
 				 VALUES ('tx-stale', 1, 1000, '{"v":1,"route":{"doName":"tc-1"},"idempotencyToken":"tok-1"}', 6000)`,
 			);
 			state.storage.sql.exec(
-				`INSERT INTO pending_transactions (hash_prefix_bucket, hk, sk, transaction_id, operation, op_list)
+				`INSERT INTO pending_transactions (routing_hash, hk, sk, transaction_id, operation, op_list)
 				 VALUES (?, ?, ?, 'tx-stale', 'put', '[[0,"put"]]')`,
 				partitionPrefixOf(state)(kb(HELD_KEY)),
 				kb(HELD_KEY),

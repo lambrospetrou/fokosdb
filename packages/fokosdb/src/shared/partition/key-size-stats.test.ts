@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
-import { asHashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { asRoutingHash } from "../../sharding/hash-primitives.js";
 import { KeySizeStats } from "./key-size-stats.js";
 import { prefixOf } from "../../../test/storage-prefix.js";
 
@@ -22,7 +22,7 @@ async function withStats(fn: (stats: KeySizeStats, state: DurableObjectState) =>
 }
 
 describe("KeySizeStats", () => {
-	it("adds, changes, and subtracts row sizes, and keeps no row for a hashPrefixBucket with no bytes", async () => {
+	it("adds, changes, and subtracts row sizes, and keeps no row for a routingHash with no bytes", async () => {
 		await withStats((stats, state) => {
 			const rows = () => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM key_size_estimates`).one().n;
 
@@ -83,10 +83,10 @@ describe("KeySizeStats", () => {
 		});
 	});
 
-	it("keeps one total for the hash keys of one hashPrefixBucket, and a rollback restores it", async () => {
+	it("keeps one total for the hash keys of one routingHash, and a rollback restores it", async () => {
 		await withStats((stats, state) => {
 			// Two hash keys with one prefix: the test gives the prefix, as a host does.
-			const prefix = asHashPrefixBucket(Uint8Array.fromHex("0102030405060708"));
+			const prefix = asRoutingHash(Uint8Array.fromHex("0102030405060708"));
 			expect(stats.change(prefix, kb("a"), 0, 100)).toBe(100);
 			expect(stats.change(prefix, kb("b"), 0, 50)).toBe(150);
 			expect(stats.bytesOf(prefix)).toBe(150);
@@ -105,8 +105,8 @@ describe("KeySizeStats", () => {
 
 	it("adds the rows of a page once for each run of one prefix", async () => {
 		await withStats((stats) => {
-			const p1 = asHashPrefixBucket(Uint8Array.fromHex("0000000000000001"));
-			const p2 = asHashPrefixBucket(Uint8Array.fromHex("0000000000000002"));
+			const p1 = asRoutingHash(Uint8Array.fromHex("0000000000000001"));
+			const p2 = asRoutingHash(Uint8Array.fromHex("0000000000000002"));
 			stats.addRows([
 				{ prefix: p1, hk: kb("a"), bytes: 10 },
 				{ prefix: p1, hk: kb("b"), bytes: 20 },

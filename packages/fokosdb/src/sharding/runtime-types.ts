@@ -7,7 +7,7 @@
  * of another does not compile.
  */
 import type { FokosCompositeKey, KeyBytes } from "./key-codec.js";
-import type { HashPrefixBucket } from "./hash-primitives.js";
+import type { RoutingHash } from "./hash-primitives.js";
 import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosImportState, MigrationHost, RouteKey } from "./repartition-types.js";
@@ -93,7 +93,7 @@ export type FokosChild = { ref: FokosPartitionRef; start: FokosCompositeKey | nu
 
 /**
  * A position in the storage order `(prefix, hk, sk)`. An absent `hk` or `sk` is the empty key, the
- * minimum. `prefix` is a `HashPrefixBucket` for a bound at a bucket edge, but a bound can also be the
+ * minimum. `prefix` is a `RoutingHash` for a bound at a routingHash edge, but a bound can also be the
  * empty byte string, so the field stays unbranded. The host treats it as opaque bytes: the first
  * primary-key column of its rows.
  */
@@ -383,10 +383,10 @@ export interface FokosShardingHooks<TPolicy> {
 	}): false | { data?: unknown } | { promote: KeyBytes[]; data?: unknown };
 	/**
 	 * Range partitions only. Returns `childCount - 1` strictly increasing composite boundaries inside
-	 * (start, end) of the hashPrefixBucket, or null when the host cannot produce valid boundaries yet.
+	 * (start, end) of the routingHash, or null when the host cannot produce valid boundaries yet.
 	 */
 	computeRangeBoundaries?(input: {
-		hashPrefixBucket: HashPrefixBucket;
+		routingHash: RoutingHash;
 		start: FokosCompositeKey | null;
 		end: FokosCompositeKey | null;
 		childCount: number;

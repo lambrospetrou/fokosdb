@@ -1,5 +1,5 @@
 import { type KeyBytes } from "../../sharding/key-codec.js";
-import type { HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import type { RoutingHash } from "../../sharding/hash-primitives.js";
 import { materializedPlanBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "./projection.js";
@@ -44,7 +44,7 @@ export function evaluateConditionPlan(
 	plan: CompiledConditionPlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
-	prefix: HashPrefixBucket,
+	prefix: RoutingHash,
 ): ConditionEvaluationResult {
 	const statement = composeConditionStatement(plan.sql);
 	try {
@@ -81,7 +81,7 @@ export function readProjectedItem(
 	plan: CompiledProjectionPlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
-	prefix: HashPrefixBucket,
+	prefix: RoutingHash,
 ): ProjectedReadResult {
 	const statement = composeProjectionStatement(plan);
 	try {
@@ -118,7 +118,7 @@ export function probeUpdatePlan(
 	plan: CompiledUpdatePlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
-	prefix: HashPrefixBucket,
+	prefix: RoutingHash,
 ): UpdateProbeResult {
 	try {
 		const cursor = storage.sql.exec<{

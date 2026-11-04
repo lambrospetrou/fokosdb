@@ -2,12 +2,12 @@ import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext, FokosTopology } from "./route-context.js";
 import {
-	asHashPrefixBucket,
-	HASH_PREFIX_BUCKET_BYTES,
-	hashPrefixBucketInterval,
-	hashPrefixBucketSeedOf,
+	asRoutingHash,
+	ROUTING_HASH_BYTES,
+	routingHashInterval,
+	routingHashSeedOf,
 	maxHashDepth,
-	type HashPrefixBucket,
+	type RoutingHash,
 } from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
@@ -189,7 +189,7 @@ function rangeBoundaryName(boundary: FokosCompositeKey | null, unbounded: string
 }
 
 /**
- * The DO name of a range partition: `<shardGroup>~r.<hashPrefixBucket hex>.<start>.<end>`. A bounded
+ * The DO name of a range partition: `<shardGroup>~r.<routingHash hex>.<start>.<end>`. A bounded
  * edge has two components, the hash key and the sort key, and an unbounded edge is `~min` or `~max`.
  * No component contains "." and no component starts with "~m", so a reader knows the count of
  * components of each edge, and the name is injective. A range root is `<shardGroup>~r.<hex>.~min.~max`.
@@ -197,26 +197,26 @@ function rangeBoundaryName(boundary: FokosCompositeKey | null, unbounded: string
  */
 function rangePartitionDoName(
 	shardGroup: string,
-	hashPrefixBucket: HashPrefixBucket,
+	routingHash: RoutingHash,
 	startBoundary: FokosCompositeKey | null,
 	endBoundary: FokosCompositeKey | null,
 ): string {
 	// FIXME: when the two boundaries share leading bytes, the DO name stores those bytes two times.
 	const start = rangeBoundaryName(startBoundary, RANGE_MIN);
 	const end = rangeBoundaryName(endBoundary, RANGE_MAX);
-	return `${shardGroup}${SHARD_GROUP_SEPARATOR}r.${hashPrefixBucket.toHex()}.${start}.${end}`;
+	return `${shardGroup}${SHARD_GROUP_SEPARATOR}r.${routingHash.toHex()}.${start}.${end}`;
 }
 
 /** The route context of a range partition (root or child) of the same shard group as `base`. */
 export function resolveRangePartitionContext<P>(
 	base: FokosRouteContext<P>,
-	hashPrefixBucket: HashPrefixBucket,
+	routingHash: RoutingHash,
 	startBoundary: FokosCompositeKey | null,
 	endBoundary: FokosCompositeKey | null,
 ): FokosRouteContext<P> {
 	// The ID and the DO name come from the same keys, so no ID decode is necessary.
-	const partitionId = rangeBytesToPartitionId(encodeRangeBytes(hashPrefixBucket, startBoundary, endBoundary));
-	const doName = rangePartitionDoName(base.topology.shardGroup, hashPrefixBucket, startBoundary, endBoundary);
+	const partitionId = rangeBytesToPartitionId(encodeRangeBytes(routingHash, startBoundary, endBoundary));
+	const doName = rangePartitionDoName(base.topology.shardGroup, routingHash, startBoundary, endBoundary);
 	return { ...base, doName, partitionId };
 }
 
@@ -255,14 +255,14 @@ export function partitionIdentityFrom(
 		checkHashDepth(decoded.depth, ctx.topology);
 		const path = Array.from(bytes.subarray(4, 4 + decoded.depth));
 		const { rootTreesN, hashSplitN } = ctx.topology;
-		const interval = hashPrefixBucketInterval(rootTreesN, hashSplitN, decoded.rootIdx, path);
+		const interval = routingHashInterval(rootTreesN, hashSplitN, decoded.rootIdx, path);
 		return {
 			schema: 1,
 			ref,
 			kind: "hash",
 			hash: { rootIndex: decoded.rootIdx, path, depth: decoded.depth, ...interval },
 			topology: ctx.topology,
-			hashPrefixBucketSeed: hashPrefixBucketSeedOf(ctx.topology.shardGroup),
+			routingHashSeed: routingHashSeedOf(ctx.topology.shardGroup),
 		};
 	}
 	invariant(range, "fokos/topology.partitionIdentityFrom: a range partition needs its depth and ancestors");
@@ -270,9 +270,9 @@ export function partitionIdentityFrom(
 		schema: 1,
 		ref,
 		kind: "range",
-		range: { hashPrefixBucket: decoded.hashPrefixBucket, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
+		range: { routingHash: decoded.routingHash, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
 		topology: ctx.topology,
-		hashPrefixBucketSeed: hashPrefixBucketSeedOf(ctx.topology.shardGroup),
+		routingHashSeed: routingHashSeedOf(ctx.topology.shardGroup),
 	};
 }
 
@@ -283,11 +283,11 @@ export function identityDepth(identity: FokosPartitionIdentity): number {
 
 // The range ID is "01" + base64url(first) + "." + base64url(second), both parts unpadded. The dot is
 // a separator, not base64url data. The flat bytes are 0x01 + first + second:
-//   first:  flags u8 (bit0 = has start, bit1 = has end), then the 8 bytes of the hashPrefixBucket
+//   first:  flags u8 (bit0 = has start, bit1 = has end), then the 8 bytes of the routingHash
 //   second: each present boundary, the start first: hkLen u32 LE, skLen u32 LE, the hash-key bytes,
 //           then the sort-key bytes
 // A range root has an empty second part, so its ID ends with the dot. The first part holds the
-// hashPrefixBucket, so a reader can get it without the boundary bytes.
+// routingHash, so a reader can get it without the boundary bytes.
 const RANGE_FIRST_LEN = 9;
 const RANGE_FLAG_START = 0x01;
 const RANGE_FLAG_END = 0x02;
@@ -366,26 +366,26 @@ function readBoundary(second: Uint8Array, offset: number): { boundary: FokosComp
 
 /** The flat bytes of a range ID. null is an unbounded edge. */
 function encodeRangeBytes(
-	hashPrefixBucket: HashPrefixBucket,
+	routingHash: RoutingHash,
 	startBoundary: FokosCompositeKey | null,
 	endBoundary: FokosCompositeKey | null,
 ): Uint8Array {
-	invariant(hashPrefixBucket.length === HASH_PREFIX_BUCKET_BYTES, "fokos/topology: a hashPrefixBucket must be 8 bytes");
+	invariant(routingHash.length === ROUTING_HASH_BYTES, "fokos/topology: a routingHash must be 8 bytes");
 	const split = 1 + RANGE_FIRST_LEN;
 	const bytes = new Uint8Array(split + boundaryByteLength(startBoundary) + boundaryByteLength(endBoundary));
 	bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
 	bytes[1] = (startBoundary ? RANGE_FLAG_START : 0) | (endBoundary ? RANGE_FLAG_END : 0);
-	bytes.set(hashPrefixBucket, 2);
+	bytes.set(routingHash, 2);
 	writeBoundary(bytes, writeBoundary(bytes, split, startBoundary), endBoundary);
 	return bytes;
 }
 
-/** Checks a first part and returns its flags and its hashPrefixBucket. */
-function readRangeFirst(first: Uint8Array): { flags: number; hashPrefixBucket: HashPrefixBucket } {
+/** Checks a first part and returns its flags and its routingHash. */
+function readRangeFirst(first: Uint8Array): { flags: number; routingHash: RoutingHash } {
 	invariant(first.length === RANGE_FIRST_LEN, "fokos/topology: a range partition ID first part has the wrong length");
 	const flags = first[0];
 	invariant((flags & ~(RANGE_FLAG_START | RANGE_FLAG_END)) === 0, `fokos/topology: invalid range partition ID flags: ${flags}`);
-	return { flags, hashPrefixBucket: asHashPrefixBucket(first.subarray(1)) };
+	return { flags, routingHash: asRoutingHash(first.subarray(1)) };
 }
 
 /**
@@ -404,7 +404,7 @@ function rangeBytesToPartitionId(bytes: Uint8Array): string {
 	return PartitionIdHelper.SCHEMA_RANGE_V1_STR + toBase64Url(bytes.subarray(1, split)) + "." + toBase64Url(bytes.subarray(split));
 }
 
-/** Refuses a hash partition below the depth limit of its topology, where the digits of a hashPrefixBucket are not exact. */
+/** Refuses a hash partition below the depth limit of its topology, where the digits of a routingHash are not exact. */
 function checkHashDepth(depth: number, topology: Pick<FokosTopology, "rootTreesN" | "hashSplitN">): void {
 	const limit = maxHashDepth(topology.rootTreesN, topology.hashSplitN);
 	if (depth > limit) {
@@ -456,14 +456,14 @@ export class PartitionIdHelper {
 	}
 
 	/**
-	 * The hashPrefixBucket of a range ID, from its first part only. The boundary part is not read, so
+	 * The routingHash of a range ID, from its first part only. The boundary part is not read, so
 	 * the cost does not grow with the boundaries.
 	 */
-	static rangeHashPrefixBucket(partitionId: PartitionNodeId): HashPrefixBucket {
+	static rangeRoutingHash(partitionId: PartitionNodeId): RoutingHash {
 		const [firstText] = splitRangePartitionId(partitionId);
 		const first = new Uint8Array(base64UrlByteLength(firstText.length));
 		decodeBase64UrlInto(firstText, first);
-		return readRangeFirst(first).hashPrefixBucket;
+		return readRangeFirst(first).routingHash;
 	}
 
 	static doName(shardGroup: string, bytes: Uint8Array): string {
@@ -476,7 +476,7 @@ export class PartitionIdHelper {
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		const decoded = PartitionIdHelper.decode(bytes);
 		invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology.doName: unreachable");
-		return rangePartitionDoName(shardGroup, decoded.hashPrefixBucket, decoded.startBoundary, decoded.endBoundary);
+		return rangePartitionDoName(shardGroup, decoded.routingHash, decoded.startBoundary, decoded.endBoundary);
 	}
 
 	// Decode a partition ID bytes to a schema-specific representation.
@@ -484,7 +484,7 @@ export class PartitionIdHelper {
 		bytes: Uint8Array,
 	):
 		| { schema: 0; rootIdx: number; depth: number }
-		| { schema: 1; hashPrefixBucket: HashPrefixBucket; startBoundary: FokosCompositeKey | null; endBoundary: FokosCompositeKey | null } {
+		| { schema: 1; routingHash: RoutingHash; startBoundary: FokosCompositeKey | null; endBoundary: FokosCompositeKey | null } {
 		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
 			return { schema: 0, rootIdx: (bytes[1] << 8) | bytes[2], depth: bytes[3] };
 		}
@@ -493,7 +493,7 @@ export class PartitionIdHelper {
 		// `encodeRangeBytes`. The keys of the boundaries are raw canonical KeyBytes.
 		invariant(bytes.length >= 1 + RANGE_FIRST_LEN, "fokos/topology.decode: a range partition ID is too short");
 		const split = 1 + RANGE_FIRST_LEN;
-		const { flags, hashPrefixBucket } = readRangeFirst(bytes.subarray(1, split));
+		const { flags, routingHash } = readRangeFirst(bytes.subarray(1, split));
 		const second = bytes.subarray(split);
 		let offset = 0;
 		let startBoundary: FokosCompositeKey | null = null;
@@ -505,18 +505,18 @@ export class PartitionIdHelper {
 			({ boundary: endBoundary, next: offset } = readBoundary(second, offset));
 		}
 		invariant(offset === second.length, "fokos/topology.decode: a range partition ID has bytes after its boundaries");
-		return { schema: 1, hashPrefixBucket, startBoundary, endBoundary };
+		return { schema: 1, routingHash, startBoundary, endBoundary };
 	}
 
 	// Creates a PartitionIdHelper for a range-structure DO. null start/end = unbounded edge.
 	static fromRangePartition(
 		shardGroup: string,
-		hashPrefixBucket: HashPrefixBucket,
+		routingHash: RoutingHash,
 		startBoundary: FokosCompositeKey | null,
 		endBoundary: FokosCompositeKey | null,
 	): PartitionIdHelper {
 		// Boundaries are already canonical KeyBytes — store them raw (no TextEncoder).
-		return new PartitionIdHelper(shardGroup, encodeRangeBytes(hashPrefixBucket, startBoundary, endBoundary));
+		return new PartitionIdHelper(shardGroup, encodeRangeBytes(routingHash, startBoundary, endBoundary));
 	}
 
 	/**
@@ -608,19 +608,14 @@ export class PartitionIdHelper {
 		invariant(id[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${id[0]}`);
 		return id[3];
 	}
-	/** The hashPrefixBucket interval `[start, end)` of a hash partition. A null `end` has no upper bound. */
-	static hashPrefixBucketInterval(
+	/** The routingHash interval `[start, end)` of a hash partition. A null `end` has no upper bound. */
+	static routingHashInterval(
 		partitionId: PartitionNodeId,
 		topology: Pick<FokosTopology, "rootTreesN" | "hashSplitN">,
-	): { start: HashPrefixBucket; end: HashPrefixBucket | null } {
+	): { start: RoutingHash; end: RoutingHash | null } {
 		const bytes = PartitionIdHelper.partitionIdToBytes(partitionId);
 		const depth = PartitionIdHelper.depth(bytes);
-		return hashPrefixBucketInterval(
-			topology.rootTreesN,
-			topology.hashSplitN,
-			PartitionIdHelper.rootIdx(bytes),
-			bytes.subarray(4, 4 + depth),
-		);
+		return routingHashInterval(topology.rootTreesN, topology.hashSplitN, PartitionIdHelper.rootIdx(bytes), bytes.subarray(4, 4 + depth));
 	}
 
 	// The last child index is this partition's slot among its siblings (only valid when depth >= 1).

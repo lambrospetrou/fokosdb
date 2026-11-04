@@ -29,7 +29,7 @@ import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/rout
 import { isGsiShardGroup, materializationTableConfig, type FokosDBPolicy, type FokosDBRouteContext } from "../shared/partition-context.js";
 import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
-import type { HashPrefixBucket } from "../sharding/hash-primitives.js";
+import type { RoutingHash } from "../sharding/hash-primitives.js";
 import type { SplitType } from "../sharding/types.js";
 import invariant from "../shared/invariant.js";
 import {
@@ -50,7 +50,7 @@ import {
 } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry } from "../shared/partition/ttl-expiry.js";
 import { SplitPlanner } from "../shared/partition/split-planner.js";
-import { promotedHashPrefixBucketOf } from "../sharding/repartition-slice.js";
+import { promotedRoutingHashOf } from "../sharding/repartition-slice.js";
 import { resolvePartitionConfig, type PartitionDOConfig, type PartitionDOConfigOverrides } from "./host-config.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
@@ -426,9 +426,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		this.#splitPlanner = new SplitPlanner({
 			keySizes: this.#store.keySizes,
 			source: {
-				probeHashPrefixBuckets: () =>
-					this.#store.probeHashPrefixBuckets("items") ?? this.#store.probeHashPrefixBuckets("pending_transactions"),
-				compositeKeySizes: (hashPrefixBucket, start, end) => this.#store.compositeKeySizes(hashPrefixBucket, start, end),
+				probeRoutingHashes: () => this.#store.probeRoutingHashes("items") ?? this.#store.probeRoutingHashes("pending_transactions"),
+				compositeKeySizes: (routingHash, start, end) => this.#store.compositeKeySizes(routingHash, start, end),
 			},
 			databaseSize: () => this.#store.databaseSize,
 			promotionFraction: () => this.config().promotionFraction,
@@ -1146,8 +1145,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		return {
 			evaluateSplit: (input) => this.#splitPlanner.evaluateSplit(input),
-			computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) =>
-				this.#splitPlanner.rangeBoundaries(hashPrefixBucket, start, end, childCount),
+			computeRangeBoundaries: ({ routingHash, start, end, childCount }) =>
+				this.#splitPlanner.rangeBoundaries(routingHash, start, end, childCount),
 			migration: new FokosMigrationHost({
 				store: this.#store,
 				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
@@ -1163,24 +1162,24 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					this.#store.raiseExportEpoch();
 				}
 			},
-			// A promotion deletes the size estimate of its hashPrefixBucket. Every new write of it goes to
+			// A promotion deletes the size estimate of its routingHash. Every new write of it goes to
 			// the range tree, so nothing here reads the estimate again. Without the delete, it stays in the
 			// promotion list of the split decision until the cleanup deletes its last row, and the split
 			// behind it waits. The cleanup keeps its own delete of the estimate as a guard.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
-					this.#store.keySizes.remove(promotedHashPrefixBucketOf(plan));
+					this.#store.keySizes.remove(promotedRoutingHashOf(plan));
 				}
 			},
 			// Each target now holds its own locks, so the lock copies here are not necessary. The
 			// cleanup deletes them in steps of a limited size, because one large delete holds every
 			// request of this partition until its write is durable. Each step deletes complete
 			// transactions, so no call can send on only a part of one transaction. A promotion deletes
-			// the copies of its hashPrefixBucket only, because the other keys stay here. A split deletes
+			// the copies of its routingHash only, because the other keys stay here. A split deletes
 			// all copies.
 			//
 			// A split keeps its item rows. Only a promotion has item rows to give back: its
-			// hashPrefixBucket moved, and the rest of its keys stay here. The rows of one hashPrefixBucket
+			// routingHash moved, and the rest of its keys stay here. The rows of one routingHash
 			// are one key range, so each delete is contiguous.
 			cleanupSourceStep: (plan) => {
 				const { cleanupTxLockCopyRows, cleanupPromotedKeyRows } = this.config();
@@ -1192,18 +1191,18 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 						this.#store.deleteOutboxCopiesBatch(null, cleanupTxLockCopyRows)
 					);
 				}
-				const bucket = promotedHashPrefixBucketOf(plan);
+				const routingHash = promotedRoutingHashOf(plan);
 				if (
-					!this.#store.deletePendingTxCopiesBatch(bucket, cleanupTxLockCopyRows) ||
-					!this.#store.deleteOutboxCopiesBatch(bucket, cleanupTxLockCopyRows)
+					!this.#store.deletePendingTxCopiesBatch(routingHash, cleanupTxLockCopyRows) ||
+					!this.#store.deleteOutboxCopiesBatch(routingHash, cleanupTxLockCopyRows)
 				) {
 					return false;
 				}
-				this.#store.deleteItemsBatchForHashPrefixBucket(bucket, cleanupPromotedKeyRows);
-				if (this.#store.hasItemsForHashPrefixBucket(bucket)) {
+				this.#store.deleteItemsBatchForRoutingHash(routingHash, cleanupPromotedKeyRows);
+				if (this.#store.hasItemsForRoutingHash(routingHash)) {
 					return false;
 				}
-				this.#store.keySizes.remove(bucket);
+				this.#store.keySizes.remove(routingHash);
 				return true;
 			},
 			// Size backpressure gates on "write" alone, because only a write can grow a partition: a read
@@ -1275,7 +1274,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	// of its caller.
 
 	/** Refuses a non-transactional write to an item that an in-progress transaction holds. It does not wait for the lock. */
-	private assertNotLocked(prefix: HashPrefixBucket, hashKey: KeyBytes, sortKey: KeyBytes): void {
+	private assertNotLocked(prefix: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes): void {
 		const pendingRow = this.#store.pendingLockFor(prefix, hashKey, sortKey);
 		if (pendingRow) {
 			// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
@@ -1285,7 +1284,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	private upsertNow(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		item: { hashKey: KeyBytes; sortKey: KeyBytes; data: string | Uint8Array; kind: DataKind; ttlAt?: number },
 	) {
 		return this.#store.upsertItem({
@@ -1300,7 +1299,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	/** The delete stamps the transaction order watermark, as a transactional delete does. */
-	private deleteNow(prefix: HashPrefixBucket, hashKey: KeyBytes, sortKey: KeyBytes) {
+	private deleteNow(prefix: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes) {
 		return this.#store.deleteItem({ prefix, hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
 	}
 
@@ -1310,7 +1309,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * exists. `putItem`, `deleteItem`, and each operation of a batch write share it.
 	 */
 	private conditionalWrite<W>(
-		prefix: HashPrefixBucket,
+		prefix: RoutingHash,
 		hashKey: KeyBytes,
 		sortKey: KeyBytes,
 		condition: ConditionExpression | undefined,

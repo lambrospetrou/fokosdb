@@ -1,4 +1,4 @@
-# RFC — hashPrefixBucket: route, promote, and store by a fixed-length hash of the hash key
+# RFC — routingHash: route, promote, and store by a fixed-length hash of the hash key
 
 **State:** Implemented
 **Date:** 2026-11-01
@@ -24,14 +24,14 @@
     - [4.2.1 Invariants](#421-invariants)
     - [4.2.2 Deployment](#422-deployment)
     - [4.2.3 Testing](#423-testing)
-    - [4.2.4 M1 — The hashPrefixBucket and the seed](#424-m1--the-hashprefixbucket-and-the-seed)
+    - [4.2.4 M1 — The routingHash and the seed](#424-m1--the-routinghash-and-the-seed)
     - [4.2.5 M2 — Hash routing by digits](#425-m2--hash-routing-by-digits)
     - [4.2.6 M3 — The storage layout](#426-m3--the-storage-layout)
-    - [4.2.7 M4 — Promotions by hashPrefixBucket](#427-m4--promotions-by-hashprefixbucket)
+    - [4.2.7 M4 — Promotions by routingHash](#427-m4--promotions-by-routinghash)
     - [4.2.8 M5 — The promoted set in the hash topology encoding](#428-m5--the-promoted-set-in-the-hash-topology-encoding)
     - [4.2.9 M6 — The coordinator storage](#429-m6--the-coordinator-storage)
     - [4.2.10 M7 — The materialization storage](#4210-m7--the-materialization-storage)
-    - [4.2.11 M8 — Topology admin objects for each promoted hashPrefixBucket](#4211-m8--topology-admin-objects-for-each-promoted-hashprefixbucket)
+    - [4.2.11 M8 — Topology admin objects for each promoted routingHash](#4211-m8--topology-admin-objects-for-each-promoted-routinghash)
     - [4.2.12 Performance and cost](#4212-performance-and-cost)
     - [4.2.13 Crafted hash keys](#4213-crafted-hash-keys)
   - [4.3 Decisions](#43-decisions)
@@ -50,18 +50,18 @@ promotion). Each split and each promotion copies rows into new partitions.
 
 This RFC changes three things:
 
-1. **Routing.** The hash tree routes by the digits of one fixed-length hash of the hash key, the hashPrefixBucket.
-   Each hash partition then owns one interval of hashPrefixBuckets.
-2. **Promotion.** A promotion moves one hashPrefixBucket, not one hash key. The topology then holds 8-byte values in
+1. **Routing.** The hash tree routes by the digits of one fixed-length hash of the hash key, the routingHash.
+   Each hash partition then owns one interval of routingHashes.
+2. **Promotion.** A promotion moves one routingHash, not one hash key. The topology then holds 8-byte values in
    place of variable-length hash keys.
-3. **Storage.** `items` and the other key-ordered tables lead with the column `hash_prefix_bucket`, before `hk` and
-   `sk`. The rows of a hash child, and the rows of a promoted hashPrefixBucket, are then one key range of the parent.
+3. **Storage.** `items` and the other key-ordered tables lead with the column `routing_hash`, before `hk` and
+   `sk`. The rows of a hash child, and the rows of a promoted routingHash, are then one key range of the parent.
    A delete of that range frees whole pages.
 
 The behavior of each operation does not change. Each read, write, query, and transaction gives the same result as
 today.
 
-The schemas belong to FokosDB. The sharding layer exposes the hashPrefixBucket and helpers for intervals and
+The schemas belong to FokosDB. The sharding layer exposes the routingHash and helpers for intervals and
 ownership. Each host chooses its own schema. A prefix-leading layout is a guideline for indexed migration reads and
 contiguous deletes. The sharding layer does not require it from every host table or application index.
 
@@ -72,20 +72,20 @@ this RFC.
 
 | Term | Meaning in this document |
 | --- | --- |
-| hashPrefixBucket | The 64-bit xxHash64 of the encoded hash key, with the seed of the shard group. It is 8 bytes. |
-| seed | The xxHash64 seed of the hashPrefixBuckets of one shard group: `xxh64(shardGroup, baseSeed)`. |
+| routingHash | The 64-bit xxHash64 of the encoded hash key, with the seed of the shard group. It is 8 bytes. |
+| seed | The xxHash64 seed of the routingHashes of one shard group: `xxh64(shardGroup, baseSeed)`. |
 | base seed | The xxHash64 seed that derives the seed of each shard group. The default is `GOLDEN_RATIO_BIGINT`. |
-| digit | One child index of a hashPrefixBucket: the root digit in base `rootTreesN`, then base `hashSplitN`. |
-| node interval | The half-open hashPrefixBucket interval `[start, end)` that one hash partition owns. |
-| storage prefix | The first primary-key column of an ordered table. In FokosDB it is the hashPrefixBucket. |
+| digit | One child index of a routingHash: the root digit in base `rootTreesN`, then base `hashSplitN`. |
+| node interval | The half-open routingHash interval `[start, end)` that one hash partition owns. |
+| storage prefix | The first primary-key column of an ordered table. In FokosDB it is the routingHash. |
 | composite key | A pair `(hk, sk)` of encoded keys, compared by `hk` first and then by `sk`. |
-| promoted hashPrefixBucket | A hashPrefixBucket that a promotion moved into a range tree of its own. |
+| promoted routingHash | A routingHash that a promotion moved into a range tree of its own. |
 | contiguous delete | A `DELETE` whose rows are one interval of the key order of the B-tree that it deletes from. |
 | high-water mark | The value in `item_id_counter`. Every `item_id` below it is reserved. |
 
 The draft `docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md` uses the word "bucket" for one row of
 `item_stats`. `keyPairHash` in `sharding/key-codec.ts` uses "bucket" for a slot of a `KeyPairMap`. This RFC and its
-code never use the word "bucket" alone. The term is always `hashPrefixBucket`.
+code never use the word "bucket" alone. The term is always `routingHash`.
 
 ### 1.2 The current system
 
@@ -147,45 +147,45 @@ duplicate check of `insertItemIfAbsent`). `deleteExpiredItems` deletes its victi
 
 ### 2.1 In scope
 
-1. Each shard group has one hashPrefixBucket function and one seed. The code derives the seed from the shard group
+1. Each shard group has one routingHash function and one seed. The code derives the seed from the shard group
    name. The topology and the requests do not carry it. Each partition stores it in its identity, and refuses all work
    when the stored seed differs from the derived seed.
-2. The hash tree maps a hashPrefixBucket to a partition by its digits. Each hash partition computes its node
+2. The hash tree maps a routingHash to a partition by its digits. Each hash partition computes its node
    interval, depth, root index, and child path from its partition ID and the immutable topology.
-3. `items` is a `WITHOUT ROWID` table with `PRIMARY KEY (hash_prefix_bucket, hk, sk)`. The other key-ordered tables
-   of a partition also lead with the hashPrefixBucket.
+3. `items` is a `WITHOUT ROWID` table with `PRIMARY KEY (routing_hash, hk, sk)`. The other key-ordered tables
+   of a partition also lead with the routingHash.
 4. `items.item_id` stays as the link id of future tables. A counter that reserves blocks assigns it.
-5. A promotion moves one hashPrefixBucket. A range tree orders its rows by `(hk, sk)` and has composite boundaries.
+5. A promotion moves one routingHash. A range tree orders its rows by `(hk, sk)` and has composite boundaries.
    Range DO names, route overrides, promotion caches, topology events, and range topology encodings use the
-   hashPrefixBucket as their key.
-6. The hash topology encoding holds the promoted hashPrefixBuckets as an exact sorted list up to `N` values, and as a
+   routingHash as their key.
+6. The hash topology encoding holds the promoted routingHashes as an exact sorted list up to `N` values, and as a
    Bloom filter above `N`. A caller does the same work for a positive answer of either structure.
-7. The coordinator uses the same hashPrefixBucket order and digits.
+7. The coordinator uses the same routingHash order and digits.
 8. A promotion registers with the topology admin object of the table and with a new admin object for its
-   hashPrefixBucket. Each later range split in that hashPrefixBucket registers only with the second object.
+   routingHash. Each later range split in that routingHash registers only with the second object.
 9. The runtime gives its host opaque storage prefixes, scope intervals, exact ownership checks, and the storage
    interval of each migration target. The host does not know the hash function or the width.
 10. The cleanup of items and estimates uses contiguous deletes. Section 4.2.1 lists the exceptions.
-11. `latest_items` is `WITHOUT ROWID` on `(hash_prefix_bucket, base_hk, base_sk)`. Its hashPrefixBucket uses the
+11. `latest_items` is `WITHOUT ROWID` on `(routing_hash, base_hk, base_sk)`. Its routingHash uses the
     seed of the materialization shard group. Its `item_id` stays unique, so its links stay.
 
 ### 2.2 Out of scope
 
 - **The split by storage snapshot (clone and prune).** A later RFC. This RFC makes its prune contiguous.
 - **A change of the promotion flow.** A promotion keeps the copy flow, the overrides, and the lock rules of today.
-  Only its key changes from a hash key to a hashPrefixBucket.
+  Only its key changes from a hash key to a routingHash.
 - **A delete of the item rows that a split source keeps.** `cleanupSourceStep` in `do-partition.ts` keeps them today
   (the `FIXME` there). The split by storage snapshot decides it.
 - **A redesign of the materialization change log and its linked tables.** M7 clusters `latest_items` and keeps its
   links. `change_positions`, `target_retry`, and `target_index_keys` keep their layouts and behavior.
-- **A hashPrefixBucket width of 16 bytes.** The width is the code constant `HASH_PREFIX_BUCKET_BYTES` (8). A width
+- **A routingHash width of 16 bytes.** The width is the code constant `ROUTING_HASH_BYTES` (8). A width
   of 16 needs another hash function, and after the release it needs its own migration plan.
 - **A configurable base seed in the options of `FokosDB`, `FokosShardingClient`, or the runtime.**
-  `hashPrefixBucketSeedOf` accepts a base seed, so a platform can use its own. FokosDB uses the default. A follow-up
+  `routingHashSeedOf` accepts a base seed, so a platform can use its own. FokosDB uses the default. A follow-up
   spec must give one option that reaches the client, the router, the runtime, and the identity check together. The
   option must not travel in the topology.
 - **Splits below the hash depth limit.** The limit is at most 64 (Section 4.2.5). A hash leaf at the limit can still
-  promote a hashPrefixBucket, but it cannot hash-split. A follow-up spec must define range splits after the hash
+  promote a routingHash, but it cannot hash-split. A follow-up spec must define range splits after the hash
   splits reach the limit.
 - **Compatibility with the current layout.** This RFC is a breaking change (Section 4.2.2).
 
@@ -195,23 +195,23 @@ This RFC changes the routing, the unit of a promotion, the storage layout, and t
 
 - The public API, the canonical key encoding, the meaning of expressions, and item identity.
 - Transaction guards, recovery rules, retry behavior, page budgets, and cleanup safety rules.
-- Each key field, predicate, cursor field, and tie-breaker of today. The hashPrefixBucket is an extra leading column.
+- Each key field, predicate, cursor field, and tie-breaker of today. The routingHash is an extra leading column.
   It replaces none of them.
 - The item-id uniqueness of both item stores, and the collision check of the migration.
 
 The constraints on the solution:
 
-1. **The hashPrefixBucket function, the base seed, and the seed of a table never change** (I1). A change makes data
+1. **The routingHash function, the base seed, and the seed of a table never change** (I1). A change makes data
    unreachable. A rename of a table makes a new shard group, so it is a new table.
-2. **The hashPrefixBucket is never an item identity** (I9). Two hash keys can have one hashPrefixBucket. `KeyPairMap`
+2. **The routingHash is never an item identity** (I9). Two hash keys can have one routingHash. `KeyPairMap`
    stays the identity of an item in memory.
 3. **A topology hint never changes a result.** The rules of
    `docs/agent-plans/2026-10-23-encoded-topology-auto-admin.md` (Section 2.3) stay.
 4. **The client must not import a Durable Object class as a value**, and the client entry must not reach a runtime
-   module (AGENTS.md). The hashPrefixBucket function and the digit walk go in `sharding/hash-primitives.ts`, which
+   module (AGENTS.md). The routingHash function and the digit walk go in `sharding/hash-primitives.ts`, which
    both entries use.
 5. **DO SQL cannot bind a JavaScript `bigint`** (the comment of `operations_hash` in `do-transaction-coordinator.ts`).
-   A stored hashPrefixBucket is a `BLOB`, and the code never converts it to a `number`.
+   A stored routingHash is a `BLOB`, and the code never converts it to a `number`.
 6. **A local handler is synchronous.** The item-id counter must not keep state in memory ahead of storage after a
    rollback.
 7. **A step of a background job stays inside the platform limits:** 30 s of CPU for each invocation by default
@@ -222,7 +222,7 @@ The constraints on the solution:
 9. **No production hook for a test** (AGENTS.md).
 10. **The draft item-stats RFC.** `docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md` replaces
     `key_size_estimates` with `item_stats`, and replaces `idx_items_scan`. The RFC that ships second must apply the
-    rules of the first. Each `item_stats` row leads with the hashPrefixBucket. The covering indexes of `items` and
+    rules of the first. Each `item_stats` row leads with the routingHash. The covering indexes of `items` and
     `latest_items` also lead with it. Promotion discovery keeps indexed totals and needs no full scan
     (Section 4.3.1).
 
@@ -232,75 +232,75 @@ Each milestone ships alone and keeps `pnpm check` and `pnpm test` green (run `pn
 release, each milestone edits the schema migrations in place (Section 4.2.2), so the data of an earlier milestone does
 not carry over.
 
-1. **M1 — The hashPrefixBucket and the seed** (Section 4.2.4). The functions `hashPrefixBucket` and
-   `hashPrefixBucketSeedOf`, the seed in the partition identity, and its check. Routing does not change yet.
+1. **M1 — The routingHash and the seed** (Section 4.2.4). The functions `routingHash` and
+   `routingHashSeedOf`, the seed in the partition identity, and its check. Routing does not change yet.
    **DONE.**
-2. **M2 — Hash routing by digits** (Section 4.2.5). Every hash route uses the digits of the hashPrefixBucket. Each
+2. **M2 — Hash routing by digits** (Section 4.2.5). Every hash route uses the digits of the routingHash. Each
    hash partition knows its node interval. The depth limit is a split floor. Storage does not change yet. **DONE.**
-3. **M3 — The storage layout** (Section 4.2.6). `items` is `WITHOUT ROWID` on `(hash_prefix_bucket, hk, sk)`, with
+3. **M3 — The storage layout** (Section 4.2.6). `items` is `WITHOUT ROWID` on `(routing_hash, hk, sk)`, with
    the item-id counter and a TTL sweep by primary key. `pending_transactions`, `materialization_outbox`, and
-   `key_size_estimates` lead with the hashPrefixBucket. A hash child reads its migration rows as one interval. **DONE.**
-4. **M4 — Promotions by hashPrefixBucket** (Section 4.2.7). A promotion moves one hashPrefixBucket. Range names,
-   overrides, slices, the hierarchy, caches, events, and range topology encodings use the hashPrefixBucket and composite
-   boundaries. The size estimates become one indexed total for each hashPrefixBucket. **DONE.**
+   `key_size_estimates` lead with the routingHash. A hash child reads its migration rows as one interval. **DONE.**
+4. **M4 — Promotions by routingHash** (Section 4.2.7). A promotion moves one routingHash. Range names,
+   overrides, slices, the hierarchy, caches, events, and range topology encodings use the routingHash and composite
+   boundaries. The size estimates become one indexed total for each routingHash. **DONE.**
 5. **M5 — The promoted set in the hash topology encoding** (Section 4.2.8). The hash topology encoding holds a sorted
-   list of hashPrefixBuckets up to `N`, and a Bloom filter above `N`. Each positive answer fetches the range item in
+   list of routingHashes up to `N`, and a Bloom filter above `N`. Each positive answer fetches the range item in
    the background. **DONE.**
-6. **M6 — The coordinator storage** (Section 4.2.9). The `tc_*` tables lead with the hashPrefixBucket of the token.
+6. **M6 — The coordinator storage** (Section 4.2.9). The `tc_*` tables lead with the routingHash of the token.
    **DONE.**
 7. **M7 — The materialization storage** (Section 4.2.10). `latest_items` is `WITHOUT ROWID` on
-   `(hash_prefix_bucket, base_hk, base_sk)`. A local counter assigns `item_id`, and `UNIQUE (item_id)` keeps the
+   `(routing_hash, base_hk, base_sk)`. A local counter assigns `item_id`, and `UNIQUE (item_id)` keeps the
    links and the collision check. **DONE.**
-8. **M8 — Topology admin objects for each promoted hashPrefixBucket** (Section 4.2.11). A promotion registers with
-   two admin objects. A range split registers only with the object of its hashPrefixBucket, and callers read the
+8. **M8 — Topology admin objects for each promoted routingHash** (Section 4.2.11). A promotion registers with
+   two admin objects. A range split registers only with the object of its routingHash, and callers read the
    range topology encoding from that object. **DONE.**
 
 ## 4. Proposed solution
 
 ### 4.1 High-level overview
 
-**The hashPrefixBucket.** Each hash key gets a 64-bit hashPrefixBucket: `xxh64(encodedHashKey, seed)`. The seed is
+**The routingHash.** Each hash key gets a 64-bit routingHash: `xxh64(encodedHashKey, seed)`. The seed is
 `xxh64(shardGroup, baseSeed)`, so each table, GSI, coordinator group, and materialization group has its own seed. The
 code derives the seed, and each partition stores it in its identity to detect a change. The sort key
-is not part of the hashPrefixBucket, so all items of one hash key have one hashPrefixBucket.
+is not part of the routingHash, so all items of one hash key have one routingHash.
 
-**The digits.** Read the hashPrefixBucket as a fraction `x` in `[0, 1)`. The root is the first digit of `x` in base
+**The digits.** Read the routingHash as a fraction `x` in `[0, 1)`. The root is the first digit of `x` in base
 `rootTreesN`. Each level below is the next digit in base `hashSplitN`. Thus each hash partition owns one interval of
-hashPrefixBuckets, and its children divide that interval into `hashSplitN` equal parts:
+routingHashes, and its children divide that interval into `hashSplitN` equal parts:
 
 ```
-hashPrefixBucket space [0, 2^64)        rootTreesN R = 2, hashSplitN K = 2
+routingHash space [0, 2^64)        rootTreesN R = 2, hashSplitN K = 2
 ├── root 0: [0, 2^63) ──── split ──► child 0.0: [0, 2^62)       child 0.1: [2^62, 2^63)
 └── root 1: [2^63, 2^64)            (no split)
 ```
 
 **The storage order.** Each table that a repartition cleans up keeps its rows in the order
-`(hash_prefix_bucket, hk, sk)`. Thus the rows of a hash child are one key range of the parent, and so are the rows
-of a promoted hashPrefixBucket:
+`(routing_hash, hk, sk)`. Thus the rows of a hash child are one key range of the parent, and so are the rows
+of a promoted routingHash:
 
 ```
 items B-tree of a hash partition, in primary-key order
 ┌───────────────────────────────┬──────────────────────┬───────────────────────────────┐
-│ hashPrefixBuckets of child 0  │ promoted b7          │ hashPrefixBuckets of child 1  │
-│ (hash_prefix_bucket, hk, sk)  │ (b7, hkA, sk) ...    │ (hash_prefix_bucket, hk, sk)  │
+│ routingHashes of child 0  │ promoted b7          │ routingHashes of child 1  │
+│ (routing_hash, hk, sk)  │ (b7, hkA, sk) ...    │ (routing_hash, hk, sk)  │
 └───────────────────────────────┴──────────────────────┴───────────────────────────────┘
   a prune of child 1 deletes      a promotion cleanup    a prune of child 0 deletes
   this range                      deletes this range     this range
   Each delete is one key range, so it frees whole pages.
 ```
 
-**Promotions.** A promotion moves one hashPrefixBucket to a range tree. The range tree orders its rows by `(hk, sk)`,
-so its boundaries are composite keys. Normally a hashPrefixBucket holds one hash key. Two hash keys that share all 64
+**Promotions.** A promotion moves one routingHash to a range tree. The range tree orders its rows by `(hk, sk)`,
+so its boundaries are composite keys. Normally a routingHash holds one hash key. Two hash keys that share all 64
 bits go to the same range tree. This is correct, and it is rare.
 
 **The topology.** The hash topology encoding holds the split bitmap, which does not change, and the promoted
-hashPrefixBuckets: an exact sorted list of 8-byte values up to `N`, and a Bloom filter above `N`. A range topology
-encoding uses the hashPrefixBucket as its key, and a range DO name starts with the 16 hex characters of the
-hashPrefixBucket. Each promoted hashPrefixBucket gets its own topology admin object, so the reads of many range
+routingHashes: an exact sorted list of 8-byte values up to `N`, and a Bloom filter above `N`. A range topology
+encoding uses the routingHash as its key, and a range DO name starts with the 16 hex characters of the
+routingHash. Each promoted routingHash gets its own topology admin object, so the reads of many range
 topology encodings do not go to one object. The topology stores only fixed-length values, except the composite
-boundaries inside a promoted hashPrefixBucket.
+boundaries inside a promoted routingHash.
 
-**The runtime API.** Each partition knows its scope interval in `(hash_prefix_bucket, hk, sk)` order, also a router
+**The runtime API.** Each partition knows its scope interval in `(routing_hash, hk, sk)` order, also a router
 that owns no rows. The runtime gives the host opaque storage prefixes, interval helpers, exact ownership checks, and
 the storage interval of each migration target. The host does not calculate hashes, digits, or prefix boundaries.
 
@@ -312,33 +312,33 @@ Each invariant has its rule, then its mechanism, then the milestones that add it
 
 - **I1 — `hashSplitN`, `rootTreesN`, and the seed of a shard group never change after initialization.**
   `hashSplitN` and `rootTreesN` are in `FokosTopology`, and `topologiesEqual` compares them. The seed is
-  `hashPrefixBucketSeedOf(shardGroup)`. `partitionIdentityFrom` stores it in `FokosPartitionIdentity`. When a
+  `routingHashSeedOf(shardGroup)`. `partitionIdentityFrom` stores it in `FokosPartitionIdentity`. When a
   partition loads its identity, it compares the stored seed with the derived seed. A difference fails the
   initialization: every operation answers `partition_init_failed`, and `fokosStatus` and the destroy RPCs stay
-  available. A pinned test of the seed and of one hashPrefixBucket catches a change of the derivation before a
+  available. A pinned test of the seed and of one routingHash catches a change of the derivation before a
   deployment. (M1)
-- **I2 — A table has one hashPrefixBucket width, and a partition never mixes widths.** `storagePrefix` returns
-  exactly `HASH_PREFIX_BUCKET_BYTES` bytes in every partition. (M1, M3)
+- **I2 — A table has one routingHash width, and a partition never mixes widths.** `storagePrefix` returns
+  exactly `ROUTING_HASH_BYTES` bytes in every partition. (M1, M3)
 - **I3 — The digits are exact up to the depth limit, and no hash partition exists below it.** The limit is
   `R * K^d <= 2^64` and `d <= MAX_HASH_DEPTH`. Validation refuses a deeper partition ID. The split decision returns
   the floor at the limit. (M2)
-- **I4 — The digit walk of a hashPrefixBucket and the node interval agree.** Both use the same integer arithmetic
+- **I4 — The digit walk of a routingHash and the node interval agree.** Both use the same integer arithmetic
   (Appendix B). A property test checks it. (M2)
-- **I5 — Each partition knows its scope interval in `(hash_prefix_bucket, hk, sk)` order.** A hash partition has a
-  hashPrefixBucket interval. A range partition has one hashPrefixBucket and an `(hk, sk)` interval.
+- **I5 — Each partition knows its scope interval in `(routing_hash, hk, sk)` order.** A hash partition has a
+  routingHash interval. A range partition has one routingHash and an `(hk, sk)` interval.
   `storageInterval()` gives this immutable scope, also on a router. `ownedStorageInterval()` is null on a router.
-  Its result bounds ownership, but it can include promoted hashPrefixBuckets. `owns` and `ownerCheck` check the
+  Its result bounds ownership, but it can include promoted routingHashes. `owns` and `ownerCheck` check the
   actual ownership from durable facts. (M2, M3, M4)
 - **I6 — The cleanup of items and estimates uses contiguous deletes in the prefix-leading primary B-tree.** Sections
   4.2.6 and 4.2.10 give the predicates. The exceptions are below. (M3, M6, M7)
 - **I7 — The item-id counter never gives out an id that a committed row holds.** The high-water mark only increases.
   Memory moves to a new block only after the commit. An ingest raises the mark above each copied id. (M3, M7)
-- **I8 — A range tree owns exactly one hashPrefixBucket, and all items of that hashPrefixBucket.** The promotion slice
-  is `{ kind: "promoted_hash_prefix_bucket", hashPrefixBucket }`. Its copy reads every row of the hashPrefixBucket.
+- **I8 — A range tree owns exactly one routingHash, and all items of that routingHash.** The promotion slice
+  is `{ kind: "promoted_routing_hash", routingHash }`. Its copy reads every row of the routingHash.
   (M4)
-- **I9 — The hashPrefixBucket is never an item identity.** An application-key lookup keeps both key components after
-  the hashPrefixBucket: `hk` and `sk`, or `base_hk` and `base_sk`. Internal materialization links keep their unique
-  item-id lookups. A size estimate can use the hashPrefixBucket alone as its key, because it describes a group, not
+- **I9 — The routingHash is never an item identity.** An application-key lookup keeps both key components after
+  the routingHash: `hk` and `sk`, or `base_hk` and `base_sk`. Internal materialization links keep their unique
+  item-id lookups. A size estimate can use the routingHash alone as its key, because it describes a group, not
   an item. (M3, M4, M7)
 - **I10 — The encoding of a DO name of this RFC never changes after the release.** The same rule as for
   `encodeRangeComponent` today. (M4)
@@ -375,7 +375,7 @@ format version.
   reads a topology encoding that the old code cached
   ([cache keys](https://developers.cloudflare.com/workers/cache/cache-keys/)).
 - Rollback: revert the code and deploy to new namespaces again.
-- After the public release, the layout of this RFC is fixed. A later change of the hashPrefixBucket function, the
+- After the public release, the layout of this RFC is fixed. A later change of the routingHash function, the
   width, or the storage order needs its own migration plan.
 
 #### 4.2.3 Testing
@@ -385,39 +385,39 @@ correctness, and a milestone is done when they pass.
 
 - When a test fails only because a key routes to another partition, a DO name or a partition ID has a new form, or a
   statement has a new column, update the test to the new value. Do not change what the test checks.
-- When a test needs a key in a given partition, a test helper tries keys until the digits of the hashPrefixBucket
+- When a test needs a key in a given partition, a test helper tries keys until the digits of the routingHash
   match. This is cheap at a small depth.
-- When a test needs two hash keys with one hashPrefixBucket, a test-only key generator constructs them. xxHash64 is
+- When a test needs two hash keys with one routingHash, a test-only key generator constructs them. xxHash64 is
   not a cryptographic hash, so a generator can do this (Section 4.2.13). The test checks the real hash, and it adds
   no production hook.
 
 Each milestone below lists only its new test cases: the behavior that no current test covers.
 
-#### 4.2.4 M1 — The hashPrefixBucket and the seed
+#### 4.2.4 M1 — The routingHash and the seed
 
 **The functions.** In `sharding/hash-primitives.ts`:
 
 ```ts
 /**
- * The xxHash64 seed of the hashPrefixBuckets of a shard group, as 16 lowercase hex characters: xxh64
+ * The xxHash64 seed of the routingHashes of a shard group, as 16 lowercase hex characters: xxh64
  * of its UTF-8 name with `baseSeed`. A platform can give its own `baseSeed`, and must then keep it for
  * the life of its data.
  */
-export function hashPrefixBucketSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string;
+export function routingHashSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string;
 
-/** The hashPrefixBucket of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
-export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): Uint8Array;
+/** The routingHash of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
+export function routingHash(hashKey: KeyBytes, seed: bigint): Uint8Array;
 ```
 
-- `hashPrefixBucketSeedOf` is `hash64(shardGroup, baseSeed)`. The default base seed `GOLDEN_RATIO_BIGINT` must never
+- `routingHashSeedOf` is `hash64(shardGroup, baseSeed)`. The default base seed `GOLDEN_RATIO_BIGINT` must never
   change.
 - The seed is a hex string, so it stays JSON-safe in the stored identity. A caller that hashes parses it to a
   `bigint` once for each shard group (M2).
-- The hashPrefixBucket is `hashers.h64Raw(hashKey, seed)`, written big-endian with
+- The routingHash is `hashers.h64Raw(hashKey, seed)`, written big-endian with
   `DataView.setBigUint64(0, h, false)`. Thus the unsigned byte order of the BLOB is the numeric order of the hash,
   with no sign-bit change.
 - The input is the `KeyCodec` bytes of the hash key: the bytes that the partition stores in `hk`.
-- The width is the code constant `HASH_PREFIX_BUCKET_BYTES` (8). No type, request, or stored record holds it.
+- The width is the code constant `ROUTING_HASH_BYTES` (8). No type, request, or stored record holds it.
 - `xxhash-wasm` is already a dependency of `hash-primitives.ts`, so no package is added.
 
 **The topology does not change.** `FokosTopology`, `validateTopology`, `topologiesEqual`, the topology event, the
@@ -431,18 +431,18 @@ shard group (the coordinator group, the materialization group, and each GSI) sti
 export type FokosPartitionIdentity = {
 	// ... the fields of today ...
 	/**
-	 * `hashPrefixBucketSeedOf(topology.shardGroup)` when the identity was written. A partition whose
+	 * `routingHashSeedOf(topology.shardGroup)` when the identity was written. A partition whose
 	 * stored seed differs from the seed that the code computes now refuses all work, because its
 	 * stored rows and its routes use the stored seed.
 	 */
-	hashPrefixBucketSeed: string;
+	routingHashSeed: string;
 };
 ```
 
 - `partitionIdentityFrom` sets the field for a hash partition and for a range partition. A partition writes its
   identity once, at bootstrap or at `fokosInit`.
 - When the runtime loads the identity in its constructor, it puts the identity in memory, then compares the stored
-  seed with `hashPrefixBucketSeedOf(identity.topology.shardGroup)`. A difference raises
+  seed with `routingHashSeedOf(identity.topology.shardGroup)`. A difference raises
   `partition_context_mismatch` into the initialization error of the runtime. Every operation then answers
   `partition_init_failed`, the alarm retries at `INIT_RETRY_ALARM_MS`, and `fokosStatus`, `fokosPrepareDestroy`, and
   `fokosDestroy` stay available. A deployment of the old derivation heals the object.
@@ -452,14 +452,14 @@ export type FokosPartitionIdentity = {
 
 **Code that changes.** `sharding/hash-primitives.ts`, `sharding/route-context.ts` (the identity type),
 `sharding/partition-id.ts` (`partitionIdentityFrom`), `sharding/runtime.ts` (the check at load), and
-`sharding/exports-client.ts` (it exports `hashPrefixBucket` and `hashPrefixBucketSeedOf`).
+`sharding/exports-client.ts` (it exports `routingHash` and `routingHashSeedOf`).
 
 **Invariants.** I1, I2 (the width).
 
 **New tests.**
 
-- `hashPrefixBucket` gives 8 bytes, big-endian, equal to `h64Raw` of the key bytes. A fixed shard group and a fixed
-  key give a pinned seed and a pinned hashPrefixBucket, so a change of the derivation or of the function fails the
+- `routingHash` gives 8 bytes, big-endian, equal to `h64Raw` of the key bytes. A fixed shard group and a fixed
+  key give a pinned seed and a pinned routingHash, so a change of the derivation or of the function fails the
   test.
 - A custom base seed gives `hash64(shardGroup, baseSeed)`, and the default equals `GOLDEN_RATIO_BIGINT`.
 - The partition, coordinator, materialization, and GSI groups of one table get four different seeds.
@@ -469,7 +469,7 @@ export type FokosPartitionIdentity = {
 
 #### 4.2.5 M2 — Hash routing by digits
 
-**The digit walk.** In `sharding/hash-primitives.ts`, a hashPrefixBucket is two 32-bit limbs `x = hi * 2^32 + lo`.
+**The digit walk.** In `sharding/hash-primitives.ts`, a routingHash is two 32-bit limbs `x = hi * 2^32 + lo`.
 One step with the base `M` (`rootTreesN` at the root, `hashSplitN` below) is:
 
 ```
@@ -485,23 +485,23 @@ lo'    = a mod 2^32
 no `bigint`.
 
 ```ts
-/** The digits of a hashPrefixBucket: the root digit, then one digit for each level, `depth` levels. */
-export function hashPrefixBucketDigits(
-	hashPrefixBucket: Uint8Array,
+/** The digits of a routingHash: the root digit, then one digit for each level, `depth` levels. */
+export function routingHashDigits(
+	routingHash: Uint8Array,
 	rootTreesN: number,
 	hashSplitN: number,
 	depth: number,
 ): { root: number; path: number[] };
 
 /** A cursor over the digits, for a walk that stops early (findLeaf, the hash arena). */
-export class HashPrefixBucketDigitCursor {
-	constructor(hashPrefixBucket: Uint8Array, rootTreesN: number);
+export class RoutingHashDigitCursor {
+	constructor(routingHash: Uint8Array, rootTreesN: number);
 	next(base: number): number;
 }
 ```
 
 **The node interval.** A node with the root `r` and the path `c1 .. cd` owns the real interval `[L, L + 1/D)`, with
-`D = R * K^d` and `L = numer / D`, where `numer = (((r * K + c1) * K + c2) ... ) * K + cd`. Its hashPrefixBucket
+`D = R * K^d` and `L = numer / D`, where `numer = (((r * K + c1) * K + c2) ... ) * K + cd`. Its routingHash
 interval is:
 
 ```
@@ -511,13 +511,13 @@ end   = ceil((numer + 1) * 2^64 / D)      // no upper bound when numer + 1 = D
 
 - The code computes `start` and `end` with `bigint` once for each identity, and keeps them as 8-byte BLOB values.
 - The last node of a level has `numer + 1 = D`. Its `end` is `2^64`, which has no 8-byte form. Thus its interval has
-  no upper bound, and its statements use only `hash_prefix_bucket >= start`.
-- A hashPrefixBucket `x` is in the interval if and only if its digit walk gives the path of the node (I4,
+  no upper bound, and its statements use only `routing_hash >= start`.
+- A routingHash `x` is in the interval if and only if its digit walk gives the path of the node (I4,
   Appendix B).
 - No boundary is stored. The partition ID gives `r` and the path, as today. The hash split bitmap does not change.
 
 **The depth limit.** The digits stay exact while `R * K^d <= 2^64`, because each interval then holds at least one
-hashPrefixBucket. The limit of a topology is:
+routingHash. The limit of a topology is:
 
 ```
 maxHashDepth(R, K) = min(MAX_HASH_DEPTH, the largest d with R * K^d <= 2^64)
@@ -529,32 +529,32 @@ gives 6. `R * K` is below 2^24, so every valid topology allows depth 1.
 
 `MAX_HASH_DEPTH` bounds the depth of a lopsided branch (Section 4.2.13), the arena budget of `HashTopology`, and the
 depth byte of the partition ID (at most 255). With `K = 2` and `R = 1`, 64 levels address 2^64 leaves under one root.
-This is the address space, not an allocation of leaves. A node at this limit holds one hashPrefixBucket.
+This is the address space, not an allocation of leaves. A node at this limit holds one routingHash.
 
 - `validateTopology` computes the limit. `partitionIdentityFrom` and `PartitionIdHelper.hashDescendantId` refuse a
   hash partition ID deeper than the limit, with `partition_context_options_invalid`.
 - A hash leaf at the limit cannot split. `SplitPlanner#decide` returns the new floor `max_depth` for it, after the
-  promotion step: a leaf at the limit still promotes its large hashPrefixBuckets. The split decision of the
+  promotion step: a leaf at the limit still promotes its large routingHashes. The split decision of the
   coordinator does the same.
 - The hash arena (`HashTopology.create`) takes `maxDepth` relative to its owner: `maxHashDepth - ownerAbsDepth`.
 
 **Code that changes.** Each user of `hashRootIndex` and `hashChildIndex` changes to the digits of the
-hashPrefixBucket:
+routingHash:
 
 | Code | Change |
 | --- | --- |
-| `sharding/router.ts` `FokosRouter.rootContext` | the root digit of `hashPrefixBucket(hashKey, seed)` |
-| `sharding/runtime.ts` `#hashesHere`, `#hashDescendant`, `hashPathOwns` | one hashPrefixBucket for each key |
-| `sharding/hash-topology.ts` `findLeaf`, `updateFromHint`, `invalidate` | `HashPrefixBucketDigitCursor` |
-| `sharding/topology-codec.ts` `findLeaf` | `HashPrefixBucketDigitCursor`; the root digit replaces `hashRootIndex` |
+| `sharding/router.ts` `FokosRouter.rootContext` | the root digit of `routingHash(hashKey, seed)` |
+| `sharding/runtime.ts` `#hashesHere`, `#hashDescendant`, `hashPathOwns` | one routingHash for each key |
+| `sharding/hash-topology.ts` `findLeaf`, `updateFromHint`, `invalidate` | `RoutingHashDigitCursor` |
+| `sharding/topology-codec.ts` `findLeaf` | `RoutingHashDigitCursor`; the root digit replaces `hashRootIndex` |
 | `sharding/repartition-slice.ts` `hashKeyInSlice` | the digit at `slice.depth - 1` |
-| `sharding/client.ts` (`FokosShardingClient.resolve`, `resolveRange`) | one hashPrefixBucket for each key |
+| `sharding/client.ts` (`FokosShardingClient.resolve`, `resolveRange`) | one routingHash for each key |
 | `sharding/partition-id.ts` | the re-exports go; `PartitionIdHelper` gets `hashInterval(partitionId, topology)` |
-| `sharding/exports-client.ts` | adds `hashPrefixBucketDigits` and `hashInterval`; drops the two old functions |
+| `sharding/exports-client.ts` | adds `routingHashDigits` and `hashInterval`; drops the two old functions |
 
 `seedForDepth`, `SEED_DEPTH_PRIME`, and the per-depth seeds go. The router, the client, and the runtime get the seed
-from `hashPrefixBucketSeedOf(topology.shardGroup)`, and keep its `bigint` form for each shard group. The topology does
-not carry it (Section 4.2.4). Each resolve computes the hashPrefixBucket of a key once and passes it to each step. `RouteKey` can carry it for the length of one call. The runtime must not keep it
+from `routingHashSeedOf(topology.shardGroup)`, and keep its `bigint` form for each shard group. The topology does
+not carry it (Section 4.2.4). Each resolve computes the routingHash of a key once and passes it to each step. `RouteKey` can carry it for the length of one call. The runtime must not keep it
 across calls, because the key bytes of a later call can differ.
 
 **The runtime identity.** `FokosPartitionIdentity.hash` becomes `{ rootIndex, path, depth, start, end }`. `depth`
@@ -565,14 +565,14 @@ partition keeps them after a split cutover. The root index and the path stay, al
 
 **New tests.**
 
-- The limb step equals a `bigint` reference for random hashPrefixBuckets, every base from 2 to 255 and from 1 to
+- The limb step equals a `bigint` reference for random routingHashes, every base from 2 to 255 and from 1 to
   65,000, and the values `0`, `2^64 - 1`, and each interval edge.
-- A property test, for random `R`, `K`, depths up to the limit, and hashPrefixBuckets: the digit walk gives the path
-  of a node if and only if the hashPrefixBucket is in its interval. The intervals of the `K` children tile the
+- A property test, for random `R`, `K`, depths up to the limit, and routingHashes: the digit walk gives the path
+  of a node if and only if the routingHash is in its interval. The intervals of the `K` children tile the
   interval of the parent, with no gap and no overlap.
 - `maxHashDepth` gives the examples above. A partition ID deeper than the limit fails.
-- A hash leaf at the limit with two hashPrefixBuckets and no large one returns `max_depth`. With a large one, it
-  promotes that one. A final interval with one hashPrefixBucket promotes it at any estimate. Use a topology whose
+- A hash leaf at the limit with two routingHashes and no large one returns `max_depth`. With a large one, it
+  promotes that one. A final interval with one routingHash promotes it at any estimate. Use a topology whose
   final interval can hold two values.
 - A router keeps its interval, root index, path, and depth after the cutover.
 
@@ -612,13 +612,13 @@ ownerCheck(): (key: RouteKey) => boolean;
 - `storageInterval()` comes from the partition identity and the immutable topology. It stays available after the
   cutover. It describes the address space of the partition. It does not give permission to write the old copies.
 - The scope of a hash partition is `[(start), (end))`, its node interval. After M4, the scope of a range partition
-  uses its hashPrefixBucket and its composite boundaries. An unbounded start is `(p, x'', x'')`. An unbounded end is
+  uses its routingHash and its composite boundaries. An unbounded start is `(p, x'', x'')`. An unbounded end is
   the start of the next prefix, which the runtime calculates. Only the last prefix has no upper bound. Before M4, the
   range helpers also limit the interval to the one hash key of the range tree.
 - A FokosDB host turns an interval into one row-value predicate:
-  `(hash_prefix_bucket, hk, sk) >= (?, ?, ?) AND (hash_prefix_bucket, hk, sk) < (?, ?, ?)`. A hash bound uses `x''`
+  `(routing_hash, hk, sk) >= (?, ?, ?) AND (routing_hash, hk, sk) < (?, ?, ?)`. A hash bound uses `x''`
   for `hk` and `sk`. `KeyCodec` never makes `x''` for a real hash key, so `(start, x'', x'')` is below every row of
-  the hashPrefixBucket `start`. With a null end, the host omits the upper predicate. These scope bounds do not replace
+  the routingHash `start`. With a null end, the host omits the upper predicate. These scope bounds do not replace
   the full cursor of a stream ("The migration read" below).
 - `owns` and `ownerCheck` exclude terminal promotions and answer false on a router. The batch checker reads the
   shared router facts once. It makes no topology-cache lookup and no peer RPC. Ownership does not bypass the
@@ -627,18 +627,18 @@ ownerCheck(): (key: RouteKey) => boolean;
   interval from the validated target reference, the slice, the source identity, and the immutable topology. The host
   does not compute it from `childIndex` and `depth`. After the cutover, `ownedStorageInterval()` of the source is
   null, but the target interval stays available.
-- The SQL column name is `hash_prefix_bucket`, so a reader of the schema can find it. The host code treats the value
+- The SQL column name is `routing_hash`, so a reader of the schema can find it. The host code treats the value
   as opaque bytes.
 
 Until M4, a promotion still moves one hash key, and its migration and cleanup predicates keep that hash key. M3 must
-not move or delete another hash key with the same hashPrefixBucket. M4 changes these predicates to the whole
-hashPrefixBucket.
+not move or delete another hash key with the same routingHash. M4 changes these predicates to the whole
+routingHash.
 
 ##### The `items` table
 
 ```sql
 CREATE TABLE IF NOT EXISTS items (
-    hash_prefix_bucket    BLOB    NOT NULL,
+    routing_hash    BLOB    NOT NULL,
     hk                    BLOB    NOT NULL,
     sk                    BLOB    NOT NULL DEFAULT x'',
     item_id               INTEGER NOT NULL,
@@ -650,12 +650,12 @@ CREATE TABLE IF NOT EXISTS items (
     est_row_bytes         INTEGER NOT NULL,
     data                  ANY     NOT NULL,
 
-    PRIMARY KEY (hash_prefix_bucket, hk, sk)
+    PRIMARY KEY (routing_hash, hk, sk)
 ) WITHOUT ROWID, STRICT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_items_item_id ON items (item_id);
 
-CREATE INDEX IF NOT EXISTS idx_items_scan ON items (hash_prefix_bucket, hk, sk, est_row_bytes);
+CREATE INDEX IF NOT EXISTS idx_items_scan ON items (routing_hash, hk, sk, est_row_bytes);
 
 CREATE INDEX IF NOT EXISTS idx_items_ttl ON items (ttl_epoch_utc_seconds)
     WHERE ttl_epoch_utc_seconds IS NOT NULL;
@@ -668,26 +668,26 @@ INSERT OR IGNORE INTO item_id_counter (id, hwm) VALUES (1, 1);
 ```
 
 - `WITHOUT ROWID` keeps the rows in the primary-key B-tree. Thus the table pages are in
-  `(hash_prefix_bucket, hk, sk)` order, and a delete of a key range frees whole pages.
+  `(routing_hash, hk, sk)` order, and a delete of a key range frees whole pages.
 - The record stores the primary-key columns first and the other columns in declared order, so `data` stays last. A
   read of the metadata columns does not read the overflow pages of `data`.
 - The schema comment of the migration replaces the rule "Do NOT change it to WITHOUT ROWID". The new comment gives
   the cost and the reason: a row above the inline payload limit of an index B-tree (about 1,002 bytes on a 4 KiB
   page) gets overflow pages that no other row can use. Appendix A gives the measured cost.
 - `idx_items_ttl` declares only `ttl_epoch_utc_seconds`. A `WITHOUT ROWID` index appends the primary key, so each
-  entry is `(ttl, hash_prefix_bucket, hk, sk)`. The implementation must check with `EXPLAIN QUERY PLAN` that the sweep
+  entry is `(ttl, routing_hash, hk, sk)`. The implementation must check with `EXPLAIN QUERY PLAN` that the sweep
   seeks on its row-value cursor over the appended columns. If it does not, declare the index on
-  `(ttl_epoch_utc_seconds, hash_prefix_bucket, hk, sk)`. The entries are the same, because a `WITHOUT ROWID` index
+  `(ttl_epoch_utc_seconds, routing_hash, hk, sk)`. The entries are the same, because a `WITHOUT ROWID` index
   does not store a primary-key column twice.
-- `idx_items_scan` stays, with the hashPrefixBucket before `hk` (Section 4.3.1). It keeps the covering reads of the
+- `idx_items_scan` stays, with the routingHash before `hk` (Section 4.3.1). It keeps the covering reads of the
   size checks, the count queries, and the range split planning.
 - `idx_items_item_id` stays, to keep the collision check of the migration (Section 4.3.3). It also supports a lookup
   from a linked row to its item. In a `WITHOUT ROWID` table each index entry stores the full primary key, so the index
   costs one key copy for each item and one more row written for each insert. A link from an item to its linked rows
   needs no index.
 
-**Every partition stores the full hashPrefixBucket.** Each row of each partition, hash or range, stores the full
-hashPrefixBucket of its hash key. A range partition stores the hashPrefixBucket of its range tree, which is the value
+**Every partition stores the full routingHash.** Each row of each partition, hash or range, stores the full
+routingHash of its hash key. A range partition stores the routingHash of its range tree, which is the value
 that the rows had in the hash partition. Thus a later promotion by clone keeps the rows of the range root unchanged,
 and `storagePrefix` has no special case for a partition kind.
 
@@ -725,14 +725,14 @@ Rules:
 gives today: a copied item whose id another item holds still fails. The lineage rule of
 `docs/agent-plans/2026-09-13-items-link-item_id.md` (Section 4.2.3) still applies. A child copies from one parent, the
 parent ids are unique, and the child raises its mark above every copied id. The constraint checks that rule at ingest.
-Keep `ON CONFLICT (hash_prefix_bucket, hk, sk) DO NOTHING`, so a page retry skips the same item and does not hide an
+Keep `ON CONFLICT (routing_hash, hk, sk) DO NOTHING`, so a page retry skips the same item and does not hide an
 item-id collision.
 
 ##### The other tables of a partition
 
 ```sql
 CREATE TABLE IF NOT EXISTS pending_transactions (
-    hash_prefix_bucket    BLOB    NOT NULL,
+    routing_hash    BLOB    NOT NULL,
     hk                    BLOB    NOT NULL,
     sk                    BLOB    NOT NULL DEFAULT x'',
     transaction_id        TEXT    NOT NULL,
@@ -742,98 +742,98 @@ CREATE TABLE IF NOT EXISTS pending_transactions (
     ttl_epoch_utc_seconds INTEGER,
     data                  ANY,
 
-    PRIMARY KEY (hash_prefix_bucket, hk, sk, transaction_id)
+    PRIMARY KEY (routing_hash, hk, sk, transaction_id)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id
-    ON pending_transactions (transaction_id, hash_prefix_bucket, hk, sk);
+    ON pending_transactions (transaction_id, routing_hash, hk, sk);
 
 CREATE TABLE IF NOT EXISTS materialization_outbox (
     outbox_id          INTEGER PRIMARY KEY,
-    hash_prefix_bucket BLOB    NOT NULL,
+    routing_hash BLOB    NOT NULL,
     hk                 BLOB    NOT NULL,
     sk                 BLOB    NOT NULL DEFAULT x'',
     revision           INTEGER NOT NULL,
     is_deleted         INTEGER NOT NULL,
     is_local_only      INTEGER NOT NULL DEFAULT 0,
     next_attempt_at    INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (hash_prefix_bucket, hk, sk)
+    UNIQUE (routing_hash, hk, sk)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS key_size_estimates (
-    hash_prefix_bucket BLOB    NOT NULL,
+    routing_hash BLOB    NOT NULL,
     hk                 BLOB    NOT NULL,
     est_bytes          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (hash_prefix_bucket, hk)
+    PRIMARY KEY (routing_hash, hk)
 ) WITHOUT ROWID, STRICT;
 
 CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (est_bytes);
 ```
 
 - `pending_transactions` stays a rowid table, because its rows hold data (the reason is in its migration comment).
-  Its `PRIMARY KEY` index adds the hashPrefixBucket before `hk`. `pending_transactions_transaction_id` still leads with
+  Its `PRIMARY KEY` index adds the routingHash before `hk`. `pending_transactions_transaction_id` still leads with
   `transaction_id`, and whole-transaction lookups still use it. `pending_tx_info` does not change: it has no item key.
 - A lock row of a put of a new item has no item row, and a delete in the outbox has no item row. Thus these tables
   keep the keys, and `item_id` cannot link them.
 - `materialization_outbox` keeps `outbox_id` and its rule "use
-  `INSERT ... ON CONFLICT (hash_prefix_bucket, hk, sk) DO UPDATE`".
-- In M3, `key_size_estimates` keeps one row for each hash key, under the key `(hash_prefix_bucket, hk)`. Promotion
-  discovery works as today, and does not scan or sum the keys of a hashPrefixBucket. M4 replaces these rows with one
-  total for each hashPrefixBucket (Section 4.2.7). `KeySizeStats` (`shared/partition/key-size-stats.ts`) takes the
+  `INSERT ... ON CONFLICT (routing_hash, hk, sk) DO UPDATE`".
+- In M3, `key_size_estimates` keeps one row for each hash key, under the key `(routing_hash, hk)`. Promotion
+  discovery works as today, and does not scan or sum the keys of a routingHash. M4 replaces these rows with one
+  total for each routingHash (Section 4.2.7). `KeySizeStats` (`shared/partition/key-size-stats.ts`) takes the
   opaque prefix as an argument of each method. `MaterializationStore` uses the same class, with the prefix from its
   own runtime.
-- `latest_items` gets `hash_prefix_bucket BLOB NOT NULL`, and its unique item key becomes
-  `(hash_prefix_bucket, base_hk, base_sk)`. Its point lookups and migration reads add the hashPrefixBucket. Its
-  hashPrefixBucket uses the seed of the materialization shard group, not the seed of the base partition group. It
+- `latest_items` gets `routing_hash BLOB NOT NULL`, and its unique item key becomes
+  `(routing_hash, base_hk, base_sk)`. Its point lookups and migration reads add the routingHash. Its
+  routingHash uses the seed of the materialization shard group, not the seed of the base partition group. It
   stays a rowid table until M7. Its size expression includes the new column. M7 measures the final layout.
 - No change: `deletion_metadata`, `materialization_export_state`, `ancestor_fences`, `producer_fences`.
 
-An index that leads with a transaction id or a time keeps that leading column. The hashPrefixBucket goes into its
+An index that leads with a transaction id or a time keeps that leading column. The routingHash goes into its
 item-key part.
 
 ##### The statements that change
 
 The general rule: each predicate, conflict target, cursor, and `ORDER BY` that names an item key adds
-`hash_prefix_bucket` before `hk` and `sk`. Every other field, bound value, and tie-breaker stays. The main
+`routing_hash` before `hk` and `sk`. Every other field, bound value, and tie-breaker stays. The main
 statements:
 
-- The point statements name the whole primary key: `WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`. They are
+- The point statements name the whole primary key: `WHERE routing_hash = ? AND hk = ? AND sk = ?`. They are
   `getItem`, `getItemImage`, `#storedEstRowBytes`, `measureItemBytesWithStamp`, `bumpItemReadTs`, `readItemData`,
   `deleteItem`, and `updateItemSingleShot`. `#storedEstRowBytes` keeps `INDEXED BY idx_items_scan`.
-- `upsertItem` inserts `hash_prefix_bucket` and `item_id`, with `ON CONFLICT (hash_prefix_bucket, hk, sk)`.
-- `rangeScanConditions` and `queryScanStatement` start with `hash_prefix_bucket = ? AND hk = ?`, then the sort-key
+- `upsertItem` inserts `routing_hash` and `item_id`, with `ON CONFLICT (routing_hash, hk, sk)`.
+- `rangeScanConditions` and `queryScanStatement` start with `routing_hash = ? AND hk = ?`, then the sort-key
   bounds. The count selection without an expression plan keeps its covering read of `idx_items_scan`.
-- `itemsPageStatement` and `outboxPageStatement` use the cursor `(hash_prefix_bucket, hk, sk) > (?, ?, ?)`, and the
+- `itemsPageStatement` and `outboxPageStatement` use the cursor `(routing_hash, hk, sk) > (?, ?, ?)`, and the
   same tuple in `ORDER BY`.
-- `pendingTxPageStatement` uses the cursor `(hash_prefix_bucket, hk, sk, transaction_id) > (?, ?, ?, ?)`, and all
+- `pendingTxPageStatement` uses the cursor `(routing_hash, hk, sk, transaction_id) > (?, ?, ?, ?)`, and all
   four fields in `ORDER BY`. A page boundary between two locks of one item must keep both locks. A statement with a
-  fixed hashPrefixBucket can drop it from the cursor, but it must keep every other cursor field.
+  fixed routingHash can drop it from the cursor, but it must keep every other cursor field.
 - In M3, `probeHashKeys` still finds distinct hash keys through the prefix-leading key index. In M4 it becomes
-  `probeHashPrefixBuckets`: the first hashPrefixBucket, one representative hash key, and whether another
-  hashPrefixBucket follows (`hash_prefix_bucket > ?`). The host uses the representative to request a promotion
+  `probeRoutingHashes`: the first routingHash, one representative hash key, and whether another
+  routingHash follows (`routing_hash > ?`). The host uses the representative to request a promotion
   through its hash-key API.
-- `sortKeySizes` reads `(hk, sk, est_row_bytes)` of one hashPrefixBucket in `[start, end)` from `idx_items_scan`.
-- `deleteItemsBatchForHashKey` becomes `deleteItemsBatchForHashPrefixBucket` in M4:
+- `sortKeySizes` reads `(hk, sk, est_row_bytes)` of one routingHash in `[start, end)` from `idx_items_scan`.
+- `deleteItemsBatchForHashKey` becomes `deleteItemsBatchForRoutingHash` in M4:
 
   ```sql
-  DELETE FROM items WHERE (hash_prefix_bucket, hk, sk) IN
-      (SELECT hash_prefix_bucket, hk, sk FROM items WHERE hash_prefix_bucket = ?1 ORDER BY hk, sk LIMIT ?2)
+  DELETE FROM items WHERE (routing_hash, hk, sk) IN
+      (SELECT routing_hash, hk, sk FROM items WHERE routing_hash = ?1 ORDER BY hk, sk LIMIT ?2)
   ```
 
-- `deletePendingTxCopiesBatch` and `deleteOutboxCopiesBatch` take a hashPrefixBucket in place of a hash key in M4.
+- `deletePendingTxCopiesBatch` and `deleteOutboxCopiesBatch` take a routingHash in place of a hash key in M4.
 - `pendingLockFor`, `insertPendingLock`, `deletePendingTxKeys`, `listPendingTxKeys`, and `listPendingTxItems` name the
-  hashPrefixBucket where they select or address an item key. A lock key carries its hashPrefixBucket. A
-  whole-transaction lookup still returns the locks of all hashPrefixBuckets of the transaction.
+  routingHash where they select or address an item key. A lock key carries its routingHash. A
+  whole-transaction lookup still returns the locks of all routingHashes of the transaction.
 - `#upsertOutboxRow`, `markOutboxRowExported`, `deferOutboxRow`, `deleteOutboxRow`, `discardOutboxRow`, and
-  `exportItemImage` name the hashPrefixBucket.
-- `shared/expression/plan.ts` adds the hashPrefixBucket to its item lookup joins and predicates, with the bound values.
+  `exportItemImage` name the routingHash.
+- `shared/expression/plan.ts` adds the routingHash to its item lookup joins and predicates, with the bound values.
   Expression trees, literal encoding, key references, type checks, and evaluation order stay. Query filters still
   evaluate candidates. They do not change the candidate selection or the page budgets.
 
 The hash-key walks and `sliceKeyRange` go when no caller is left ("The migration read" below). The promotion checks
 and deletes by hash key stay until M4 replaces them.
 
-The partition gets the hashPrefixBucket of a key from `this.fokos.storagePrefix(hk)`, and passes it to each store
+The partition gets the routingHash of a key from `this.fokos.storagePrefix(hk)`, and passes it to each store
 method as a parameter. The store does not call the runtime. The cost is one xxHash64 of the hash key for each key and
 each partition hop (Section 4.2.12).
 
@@ -842,29 +842,29 @@ each partition hop (Section 4.2.12).
 `deleteExpiredItems` no longer deletes by `item_id`:
 
 ```sql
-SELECT i.ttl_epoch_utc_seconds AS ttl, i.hash_prefix_bucket, i.hk, i.sk
+SELECT i.ttl_epoch_utc_seconds AS ttl, i.routing_hash, i.hk, i.sk
   FROM items i INDEXED BY idx_items_ttl
  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
    AND i.ttl_epoch_utc_seconds <= ?1
-   AND (i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk) > (?3, ?4, ?5, ?6)   -- only with a resume position
+   AND (i.ttl_epoch_utc_seconds, i.routing_hash, i.hk, i.sk) > (?3, ?4, ?5, ?6)   -- only with a resume position
    AND NOT EXISTS (SELECT 1 FROM pending_transactions p
-                    WHERE p.hash_prefix_bucket = i.hash_prefix_bucket AND p.hk = i.hk AND p.sk = i.sk)
- ORDER BY i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk
+                    WHERE p.routing_hash = i.routing_hash AND p.hk = i.hk AND p.sk = i.sk)
+ ORDER BY i.ttl_epoch_utc_seconds, i.routing_hash, i.hk, i.sk
  LIMIT ?2;
 
-DELETE FROM items WHERE hash_prefix_bucket = ?1 AND hk = ?2 AND sk = ?3
+DELETE FROM items WHERE routing_hash = ?1 AND hk = ?2 AND sk = ?3
  RETURNING est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts;
 ```
 
 - The scan rule, the scan bound `TTL_SCAN_ROWS_PER_DELETED_ROW`, the ownership filter, and the deletion bookkeeping
-  stay. `TtlScanPosition` gets the hashPrefixBucket.
+  stay. `TtlScanPosition` gets the routingHash.
 - The sweep deletes each owned candidate with one primary-key statement, in the same `transactionSync`. A multi-row
   `VALUES` list holds at most 33 rows because of the 100 bound parameters, and `json_each` cannot carry a BLOB.
 - The TTL sweep is not a repartition cleanup, so its deletes need not be contiguous.
 
 ##### The migration read
 
-A hash child owns one hashPrefixBucket interval. Before the host builds a page, the runtime computes the interval of
+A hash child owns one routingHash interval. Before the host builds a page, the runtime computes the interval of
 the target. It passes the interval to `MigrationHost.buildPage` with the slice, the ownership predicate, and the page
 budget. The interval is the scope of the target after the cutover, not the current ownership of the source.
 
@@ -874,11 +874,11 @@ budget. The interval is the scope of the target after the cutover, not the curre
 - `KeyRange` (`partition-store.ts`) becomes an alias of `FokosStorageInterval`. `collectStream` reads that interval in
   storage order.
 - `belongsToTarget` still excludes terminal promotions. In M3 a terminal promotion excludes only its hash key, and the
-  read must not skip another hash key with the same hashPrefixBucket. From M4, a terminal promotion excludes the whole
-  hashPrefixBucket, and the read skips it with one seek (`hash_prefix_bucket > ?`).
+  read must not skip another hash key with the same routingHash. From M4, a terminal promotion excludes the whole
+  routingHash, and the read skips it with one seek (`routing_hash > ?`).
 - The child writes its imported rows in storage order. The page builders of items, locks, and the outbox keep their
   budgets.
-- Each stream adds the hashPrefixBucket to the front of its full row cursor. The SQL order, the resume predicate, the
+- Each stream adds the routingHash to the front of its full row cursor. The SQL order, the resume predicate, the
   cursor comparison, and the page validation use that same full tuple. A resumed page starts at its validated cursor,
   not at the lower bound of the interval, and keeps the upper bound. Keep the row-value comparisons and the indexed
   seeks. Do not replace them with `OR` predicates or repeated scans.
@@ -888,8 +888,8 @@ budget. The interval is the scope of the target after the cutover, not the curre
 
 | Cleanup | Statement | Contiguous |
 | --- | --- | --- |
-| Promotion: items | `deleteItemsBatchForHashPrefixBucket` | yes |
-| Promotion: `key_size_estimates` | `DELETE FROM key_size_estimates WHERE hash_prefix_bucket = ?` | yes |
+| Promotion: items | `deleteItemsBatchForRoutingHash` | yes |
+| Promotion: `key_size_estimates` | `DELETE FROM key_size_estimates WHERE routing_hash = ?` | yes |
 | Promotion and split: lock copies | `deletePendingTxCopiesBatch` | no: batches of whole transactions |
 | Promotion and split: outbox copies | `deleteOutboxCopiesBatch` | no: bounded rowid batches |
 | Coordinator split source | Section 4.2.9 | yes |
@@ -913,44 +913,44 @@ lock and outbox exceptions keep the cleanup safety and batch rules of today.
 - The migration interval: with `R = 2` and `K = 2`, child 0 at depth 1 gets a different interval under root 0 and
   under root 1, although the slice fields are the same. Both children import all their rows. Repeat below a hash
   parent that is not a root.
-- Two hash keys with one hashPrefixBucket, and one of them promoted: a hash child still imports the other key, and the
+- Two hash keys with one routingHash, and one of them promoted: a hash child still imports the other key, and the
   promotion cleanup keeps it. This test applies to M3 only. M4 replaces it.
 - A storage bench, `test/storage-bench/prune-contiguity.workerd-bench.ts`, outside `pnpm test`: 8 MiB partitions,
-  keys in random order, 100 B to 2 KB items. It deletes one half, then three quarters, of the hashPrefixBucket space
+  keys in random order, 100 B to 2 KB items. It deletes one half, then three quarters, of the routingHash space
   with contiguous deletes. It reports the `databaseSize` that stays against the parent. The measurements of Appendix A
   gave 50% and 25%. The bench fails above a tolerance (`TODO: choose`). Run it with
   `pnpm bench:workerd test/storage-bench/prune-contiguity.workerd-bench.ts`.
 
-#### 4.2.7 M4 — Promotions by hashPrefixBucket
+#### 4.2.7 M4 — Promotions by routingHash
 
-##### A promotion moves one hashPrefixBucket
+##### A promotion moves one routingHash
 
 - `FokosSlice` (`repartition-slice.ts`) and `RepartitionSlice` (`sharding-store.ts`): `promoted_key { hashKey }`
-  becomes `promoted_hash_prefix_bucket { hashPrefixBucket }`, and `range { hashKey, start, end }` becomes
-  `range { hashPrefixBucket, start: FokosCompositeKey | null, end: FokosCompositeKey | null }`.
-- The promotion copy reads every row of the hashPrefixBucket, all its hash keys, in `(hk, sk)` order. A hash key that
+  becomes `promoted_routing_hash { routingHash }`, and `range { hashKey, start, end }` becomes
+  `range { routingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null }`.
+- The promotion copy reads every row of the routingHash, all its hash keys, in `(hk, sk)` order. A hash key that
   shares all 64 bits with the promoted key moves with it (I8).
 - The host keeps its hash-key API: `promotionCandidates` and `requestPromotion` take a hash key, and the runtime maps
-  it to its hashPrefixBucket. Two candidates with one hashPrefixBucket make one promotion.
-- `SplitPlanner#decide` probes hashPrefixBuckets:
-  - no hashPrefixBucket: the floor `no_hash_key`;
-  - one hashPrefixBucket: promote it, whatever its estimate;
-  - two or more: promote the hashPrefixBuckets at or above the threshold first (up to `PROMOTION_CANDIDATES_MAX`,
+  it to its routingHash. Two candidates with one routingHash make one promotion.
+- `SplitPlanner#decide` probes routingHashes:
+  - no routingHash: the floor `no_hash_key`;
+  - one routingHash: promote it, whatever its estimate;
+  - two or more: promote the routingHashes at or above the threshold first (up to `PROMOTION_CANDIDATES_MAX`,
     largest first), then split the leaf.
 
-  A hash split cannot separate two hash keys of one hashPrefixBucket, so they count as one.
-- `largestAtLeast` reads the indexed totals of the hashPrefixBuckets (below). It must not use the largest single hash
-  key as the estimate of a hashPrefixBucket. Promotion discovery runs before the depth-limit check.
+  A hash split cannot separate two hash keys of one routingHash, so they count as one.
+- `largestAtLeast` reads the indexed totals of the routingHashes (below). It must not use the largest single hash
+  key as the estimate of a routingHash. Promotion discovery runs before the depth-limit check.
 - `beforeComplete` and `cleanupSourceStep` in `do-partition.ts` remove the estimate row and the items of the
-  hashPrefixBucket.
+  routingHash.
 
-##### One indexed estimate for each hashPrefixBucket
+##### One indexed estimate for each routingHash
 
 M4 changes the M3 estimate table in place:
 
 ```sql
 CREATE TABLE IF NOT EXISTS key_size_estimates (
-    hash_prefix_bucket BLOB    NOT NULL PRIMARY KEY,
+    routing_hash BLOB    NOT NULL PRIMARY KEY,
     hk                 BLOB    NOT NULL,
     est_bytes          INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID, STRICT;
@@ -958,35 +958,35 @@ CREATE TABLE IF NOT EXISTS key_size_estimates (
 CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (est_bytes);
 ```
 
-- One row holds the total estimate of all items of that hashPrefixBucket in this partition. On a range leaf, the total
+- One row holds the total estimate of all items of that routingHash in this partition. On a range leaf, the total
   covers only the composite interval of that leaf. The host gives `KeySizeStats` an opaque storage prefix. The class
   does not calculate hashes or read prefix bytes.
-- `hk` is a representative hash key of the hashPrefixBucket, not part of the primary key. A new row stores the hash
+- `hk` is a representative hash key of the routingHash, not part of the primary key. A new row stores the hash
   key of its first item, and later writes can keep it. The representative can outlive its own items, because its hash
-  still selects the same hashPrefixBucket. It exists only for the hash-key promotion API of the host.
+  still selects the same routingHash. It exists only for the hash-key promotion API of the host.
 - Each item write applies its size delta to this one row, in the storage transaction of the item. This covers
   inserts, overwrites, updates, deletes, TTL expiry, and the temporary writes of a transaction evaluation. A rollback
   restores the row with the item changes. A row with no item bytes goes.
 - A migration page groups the deltas of its inserted rows by prefix, and updates each row once. An item that is
   already present adds nothing. The page writes the item rows, the estimate rows, and the cursor in one transaction.
-  A promotion removes the source row when the whole hashPrefixBucket moves.
+  A promotion removes the source row when the whole routingHash moves.
 - `bytesOf(prefix)` is one primary-key lookup. `largestAtLeast` seeks `key_size_estimates_by_bytes` and reads at most
   `PROMOTION_CANDIDATES_MAX` (5) rows in descending order, with at most 5 primary-key lookups. It returns their
   representative hash keys. The decision must not scan all hash keys, run a whole-table `GROUP BY`, or sum member rows
   on each call.
 - The promotion signal of the write path uses the total after the delta, not the size of the changed hash key alone.
   It passes that total and the changed hash key to `promotionCandidates`. The runtime maps the hash key to its
-  hashPrefixBucket and removes duplicate requests.
+  routingHash and removes duplicate requests.
 - `MaterializationStore` uses the same rules, with prefixes from its own runtime. The item-stats RFC can replace this
-  table later, but it must keep an indexed promotion discovery by hashPrefixBucket.
+  table later, but it must keep an indexed promotion discovery by routingHash.
 
-With one hash key for each hashPrefixBucket, the total and the write frequency are the same as today. With colliding
+With one hash key for each routingHash, the total and the write frequency are the same as today. With colliding
 keys, their combined total can start a promotion with no extra scan.
 
 ##### Composite keys
 
 ```ts
-/** A position inside one hashPrefixBucket, in the order (hk, sk). */
+/** A position inside one routingHash, in the order (hk, sk). */
 export type FokosCompositeKey = { hk: KeyBytes; sk: KeyBytes };
 ```
 
@@ -1021,11 +1021,11 @@ The sort-key range rules of today stay inside one hash key. `rangeSplitN` can st
 ##### Range partition IDs and DO names
 
 - The range ID schema `SCHEMA_RANGE_V1` (`0x01`) changes its layout in place (Section 4.2.2). It holds the flags, the
-  hashPrefixBucket (8 bytes), and the two composite boundaries, each as `hkLen u32 LE`, `skLen u32 LE`, and the bytes.
-  The hashPrefixBucket comes first, so `PartitionIdHelper.rangeHashPrefixBucket(partitionId)` reads no boundary.
-- The DO name of a range partition is `<shardGroup>~r.<hashPrefixBucket hex>.<start>.<end>`:
-  - `<hashPrefixBucket hex>` is the 16 lowercase hex characters of the hashPrefixBucket. A range root is
-    `<shardGroup>~r.<hashPrefixBucket hex>.~min.~max`, a fixed length for each shard group.
+  routingHash (8 bytes), and the two composite boundaries, each as `hkLen u32 LE`, `skLen u32 LE`, and the bytes.
+  The routingHash comes first, so `PartitionIdHelper.rangeRoutingHash(partitionId)` reads no boundary.
+- The DO name of a range partition is `<shardGroup>~r.<routingHash hex>.<start>.<end>`:
+  - `<routingHash hex>` is the 16 lowercase hex characters of the routingHash. A range root is
+    `<shardGroup>~r.<routingHash hex>.~min.~max`, a fixed length for each shard group.
   - `<start>` is `~min` or `<hk component>.<sk component>`. `<end>` is `~max` or the same two components.
   - Each component uses `encodeRangeComponent`, which never contains `.`. An empty sort key gives the empty component.
     A component never starts with `~m`. Thus a reader knows the count of components of each boundary, and the name is
@@ -1033,8 +1033,8 @@ The sort-key range rules of today stay inside one hash key. `rangeSplitN` can st
   - A DO name has no length limit, because `getByName` hashes the name
     (`docs/agent-plans/2026-09-27-range-do-name-text-encoding.md`). A child name holds the hash key once for each
     bounded edge: two times at most.
-- `resolveRangePartitionContext(base, hashPrefixBucket, start, end)` and `partitionIdentityFrom` change with it.
-  `FokosPartitionIdentity.range` becomes `{ hashPrefixBucket, start, end, depth, ancestors }`.
+- `resolveRangePartitionContext(base, routingHash, start, end)` and `partitionIdentityFrom` change with it.
+  `FokosPartitionIdentity.range` becomes `{ routingHash, start, end, depth, ancestors }`.
 
 **Follow-up, not in this RFC: prefix compression of the end boundary.** A range child with two bounded edges
 holds two composite boundaries. Normally both boundaries have the same hash key, and they often share the start of
@@ -1057,84 +1057,84 @@ The same compression can apply to two tables:
 ```sql
 CREATE TABLE IF NOT EXISTS fokos_repartitions (
     ...                                    -- the columns of today, except:
-    hash_prefix_bucket BLOB                -- the promoted hashPrefixBucket of a key_promotion; NULL for a split
+    routing_hash BLOB                -- the promoted routingHash of a key_promotion; NULL for a split
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS fokos_repartition_targets (
     ...                                    -- the columns of today, except:
-    slice_hash_prefix_bucket BLOB,         -- promoted_hash_prefix_bucket and range slices
+    slice_routing_hash BLOB,         -- promoted_routing_hash and range slices
     slice_start_hk BLOB, slice_start_sk BLOB,   -- NULL: the unbounded start
     slice_end_hk   BLOB, slice_end_sk   BLOB,   -- NULL: the unbounded end
     ...
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS fokos_route_overrides (
-    hash_prefix_bucket BLOB NOT NULL PRIMARY KEY,
+    routing_hash BLOB NOT NULL PRIMARY KEY,
     repartition_id     TEXT NOT NULL
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS fokos_range_hierarchy (
-    hash_prefix_bucket BLOB    NOT NULL,
+    routing_hash BLOB    NOT NULL,
     depth              INTEGER NOT NULL,
     start_hk           BLOB    NOT NULL DEFAULT x'',
     start_sk           BLOB    NOT NULL DEFAULT x'',
     end_hk             BLOB    NOT NULL DEFAULT x'',
     end_sk             BLOB    NOT NULL DEFAULT x'',
     learned_at         INTEGER NOT NULL,
-    PRIMARY KEY (hash_prefix_bucket, depth, start_hk, start_sk)
+    PRIMARY KEY (routing_hash, depth, start_hk, start_sk)
 ) WITHOUT ROWID, STRICT;
 ```
 
 - A route override has an 8-byte key. `routeOverrideFor`, `insertRouteOverride`, `hasTerminalRouteOverride`, and
-  `queryTerminalRouteOverridesPage` take a hashPrefixBucket. `PromotedKeyCursor` becomes `{ hashPrefixBucket }`.
+  `queryTerminalRouteOverridesPage` take a routingHash. `PromotedKeyCursor` becomes `{ routingHash }`.
 - `fokos_range_hierarchy` keeps the rule of today: an unbounded edge is `x''`, which `KeyCodec` never makes for a real
-  hash key. `findDeepestKnownRangeSlice(hashPrefixBucket, key: FokosCompositeKey)` decodes it to null.
-- The primary key of `fokos_range_hierarchy` is `(hash_prefix_bucket, depth, start)`, and the end boundary is not in a
+  hash key. `findDeepestKnownRangeSlice(routingHash, key: FokosCompositeKey)` decodes it to null.
+- The primary key of `fokos_range_hierarchy` is `(routing_hash, depth, start)`, and the end boundary is not in a
   key. The nodes of one depth do not overlap, so two nodes of one depth never have the same start. A range node never
   changes its boundaries. The table has no secondary index. Thus each row stores the hash key at most two times (the
   bounded start and the bounded end), as today. Without the change it stores the hash key four times: two columns,
   each in the table and in `idx_fokos_range_hierarchy_depth`.
 - Each statement uses the primary key:
-  - `findDeepestKnownRangeSlice` reads the deepest depth of the hashPrefixBucket. For each depth, it seeks the last row
+  - `findDeepestKnownRangeSlice` reads the deepest depth of the routingHash. For each depth, it seeks the last row
     with `(start_hk, start_sk) <= (?, ?)`, and tests the end on that one row. An unbounded end (`x''`) passes the
     test.
-  - `listLearnedRangeSlices` reads the rows of one hashPrefixBucket in `(depth, start)` order.
-  - `learnRangeBoundary` uses `ON CONFLICT (hash_prefix_bucket, depth, start_hk, start_sk)`.
+  - `listLearnedRangeSlices` reads the rows of one routingHash in `(depth, start)` order.
+  - `learnRangeBoundary` uses `ON CONFLICT (routing_hash, depth, start_hk, start_sk)`.
   - `deleteLearnedRangeSlice` takes the depth of the learned slice, and deletes by the primary key. Its callers in
     `runtime.ts` already have `learned.depth`.
   - The eviction deletes by the primary key, in the order `learned_at`, then `depth DESC`, as today.
 - The start is the key, not the end. Both give one seek for each depth, because the nodes of one depth do not overlap.
   Only the start sorts correctly with the `x''` sentinel: as an end, `x''` sorts first but means "no upper bound", and
   needs an extra column such as `end_is_max`.
-- `__fokos/cache/promotion_bloom` (`PartialRangeTopology`) holds the promoted hashPrefixBuckets that the partition
-  learned. `#learn`, `#bloomForLearning`, and the speculation guard of `#groupByOwner` work by hashPrefixBucket. The
+- `__fokos/cache/promotion_bloom` (`PartialRangeTopology`) holds the promoted routingHashes that the partition
+  learned. `#learn`, `#bloomForLearning`, and the speculation guard of `#groupByOwner` work by routingHash. The
   rules of `docs/agent-plans/2026-09-27-learned-routes-for-every-dispatch-shape.md` stay, with "hash key H" read as
-  "hashPrefixBucket B".
+  "routingHash B".
 - Only the range boundaries, the range slices, and the range topology encodings add full hash-key bytes to the
-  topology. They exist only for promoted hashPrefixBuckets.
+  topology. They exist only for promoted routingHashes.
 
 ##### The topology event and the keeper
 
-- `FokosTopologyEvent.targets[].slice` carries the hashPrefixBucket and the composite boundaries. The `repartition_key`
-  of a `range_split` is the hashPrefixBucket hex.
-- `fokos_topo_range_dirty` and `fokos_topo_bodies` use the hashPrefixBucket in place of `hash_key`.
+- `FokosTopologyEvent.targets[].slice` carries the routingHash and the composite boundaries. The `repartition_key`
+  of a `range_split` is the routingHash hex.
+- `fokos_topo_range_dirty` and `fokos_topo_bodies` use the routingHash in place of `hash_key`.
 - `fokos_topo_range_intervals` becomes
-  `(shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)`, with the primary key
-  `(shard_group, hash_prefix_bucket, start_hk, start_sk, end_is_max DESC, end_hk DESC, end_sk DESC)`. `~min` is
+  `(shard_group, routing_hash, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)`, with the primary key
+  `(shard_group, routing_hash, start_hk, start_sk, end_is_max DESC, end_hk DESC, end_sk DESC)`. `~min` is
   `(x'', x'')`. The build order stays: start ascending, then end descending, so a parent comes before its children.
 - The range topology encoding (`FKR1`) changes in place. A boundary is two byte strings, so `boundaryOffsets` gets
   `2n + 1` values. Boundary `j` is the hash key `offsets[2j] .. offsets[2j + 1]` and the sort key
   `offsets[2j + 1] .. offsets[2j + 2]`. `countBoundaries` compares in place with `KeyCodec.compareSlice` on both
   parts. The levels, the depths, the interval rule, the size cap, and `truncatedAtRank` stay.
-- `getRangeTopology(shardGroup, hashPrefixBucket)` and the path
-  `/internal/v1/topology.GetForRange?sg=<b64>&bk=<16 hex>`. The URL has a fixed length for each shard group, so the
+- `getRangeTopology(shardGroup, routingHash)` and the path
+  `/internal/v1/topology.GetForRange?sg=<b64>&rh=<16 hex>`. The URL has a fixed length for each shard group, so the
   `TODO: measure` of the URL length in the encoded topology RFC goes.
-- `cachedRangeTopology` uses the key `r|<scope>|<shardGroup>|<hashPrefixBucket hex>` for a range entry.
+- `cachedRangeTopology` uses the key `r|<scope>|<shardGroup>|<routingHash hex>` for a range entry.
 
 ##### The materialization store
 
-`MaterializationStore` is a host of the same runtime, so its promotions also move hashPrefixBuckets. Its promotion copy
-reads all hash keys of a hashPrefixBucket. It keeps the prefix-leading unique item key of M3, with the prefix from its
+`MaterializationStore` is a host of the same runtime, so its promotions also move routingHashes. Its promotion copy
+reads all hash keys of a routingHash. It keeps the prefix-leading unique item key of M3, with the prefix from its
 own shard group. The table stays a rowid table until M7 (Section 4.2.10).
 
 **Invariants.** I5 (the range part), I8, I10.
@@ -1143,31 +1143,31 @@ own shard group. The table stays a rowid table until M7 (Section 4.2.10).
 
 - `compareComposite` is a total order. `shortestCompositeSeparator` is strictly above `prev` and at or below `cur` for
   random pairs, also for `H` and `H || 0x00`.
-- The range DO name is injective for random hashPrefixBuckets and composite boundaries, empty sort keys included.
+- The range DO name is injective for random routingHashes and composite boundaries, empty sort keys included.
 - The range routing functions (`sk-interval.ts`, `range-frontier.ts`) and `planRangeBoundaries` with a
-  hashPrefixBucket that holds two hash keys, and boundaries between the two keys.
+  routingHash that holds two hash keys, and boundaries between the two keys.
 - The estimate totals: colliding hash keys update one total. A rollback restores it. A retried migration page adds
   nothing twice. A deleted representative still routes a promotion. Discovery reads at most
   `PROMOTION_CANDIDATES_MAX` rows and scans no member keys.
-- A leaf at its depth limit holds two hashPrefixBuckets. Each holds some hash keys below the threshold, but each total
+- A leaf at its depth limit holds two routingHashes. Each holds some hash keys below the threshold, but each total
   is above it. The decision promotes both and does not return `max_depth`. The write-path signal uses the same totals.
 - The range topology encoding lookups agree with a reference walk for random composite trees.
-- End to end: two hash keys with one hashPrefixBucket promote together. A range split between them puts each key in
+- End to end: two hash keys with one routingHash promote together. A range split between them puts each key in
   its own child. A query of each key returns only its rows. In the materialization store, a promotion moves every hash
-  key of its hashPrefixBucket.
+  key of its routingHash.
 
 #### 4.2.8 M5 — The promoted set in the hash topology encoding
 
-**The section.** The hash topology encoding (`FKT1`) holds one of two sections for the promoted hashPrefixBuckets:
+**The section.** The hash topology encoding (`FKT1`) holds one of two sections for the promoted routingHashes:
 
-| Count of promoted hashPrefixBuckets | Section | Answer |
+| Count of promoted routingHashes | Section | Answer |
 | --- | --- | --- |
-| at most `N` | `promoted`: `{ offset, count, width: 8 }`, a sorted array of 8-byte hashPrefixBuckets | exact |
-| more than `N` | `bloom`: the Bloom filter of today, built from the hashPrefixBuckets | a positive can be false |
+| at most `N` | `promoted`: `{ offset, count, width: 8 }`, a sorted array of 8-byte routingHashes | exact |
+| more than `N` | `bloom`: the Bloom filter of today, built from the routingHashes | a positive can be false |
 
 - The reader makes a byte view over the sorted array and searches it in place with a binary search of 8-byte compares
   (two big-endian `u32` compares). It allocates nothing.
-- `N` is 4,096, a constant of the keeper. A list of 4,096 hashPrefixBuckets is 32 KiB, and a search takes 12 compares.
+- `N` is 4,096, a constant of the keeper. A list of 4,096 routingHashes is 32 KiB, and a search takes 12 compares.
   A reader reads both sections, so a change of `N` changes only how the keeper encodes its next hash topology
   encoding. It needs no migration.
 - A negative answer is final in both structures, because a Bloom filter has no false negatives. Only a stale hash
@@ -1176,86 +1176,86 @@ own shard group. The table stays a rowid table until M7 (Section 4.2.10).
   with the new roots (`seq > built_version`) gives the new array in one pass. When the count passes `N`, the build
   reads all roots and makes the Bloom filter. `promotedKeysBloom` keeps its rules above `N`.
 
-The size of each structure, for `n` promoted hashPrefixBuckets and a false positive rate `ε`:
+The size of each structure, for `n` promoted routingHashes and a false positive rate `ε`:
 
-| Structure | Bits for each hashPrefixBucket | At `n = 4,096` | Exact |
+| Structure | Bits for each routingHash | At `n = 4,096` | Exact |
 | --- | --- | --- | --- |
 | Sorted 8-byte list | 64 | 32 KiB | yes |
 | Bloom filter | `1.44 * log2(1/ε)`: 9.6 at 1%, 11.0 at 0.5% | 4.8 KiB at 1% | no |
 | Elias-Fano or delta-coded sorted fingerprints | about `log2(1/ε) + 2`: 8.6 at 1% | 4.3 KiB at 1% | no |
 
 Today the smallest promoted-key Bloom filter of a hash topology encoding is 25,540 bytes (16,384 capacity at 0.005).
-Thus a sorted list of 4,096 hashPrefixBuckets costs 7 KiB more than the hash topology encoding of today.
+Thus a sorted list of 4,096 routingHashes costs 7 KiB more than the hash topology encoding of today.
 
 **The same work for each positive.** On a positive answer from either structure, the caller starts the background
-fetch of the range item of the hashPrefixBucket (`cachedRangeTopology`). A negative fetches nothing. Thus the latency
+fetch of the range item of the routingHash (`cachedRangeTopology`). A negative fetches nothing. Thus the latency
 of a caller does not change when the hash topology encoding of its table changes structure at `N`. The resolution of
 the encoded topology RFC (Section 4.2.9, "Resolution") stays:
 
 1. A range entry exists and is not empty: the point lookup or the range lookup.
-2. No range entry: the caller starts the refresh and sends to the range root `~r.<hashPrefixBucket hex>.~min.~max`. A
+2. No range entry: the caller starts the refresh and sends to the range root `~r.<routingHash hex>.~min.~max`. A
    Bloom false positive reaches an object that no promotion initialized. It answers
    `range_partition_not_initialized`, and the caller sends again with the hash path and no promoted-set step
    (`#missLadder`).
 3. An empty range entry: the positive was false, and the caller uses the hash path.
 
 The worst case of a caller is two cache reads: the hash item of the table (the bitmap and the promoted set), and,
-only on a positive, the range item of that hashPrefixBucket.
+only on a positive, the range item of that routingHash.
 
 **Code that changes.** `sharding/topology-codec.ts` (`parseHashBody`, `HashTopologyView`, and `maybePromoted`, which
-becomes `isPromotedHashPrefixBucket`), `sharding/topology-encode.ts` (`encodeHashBody`, a sorted-section encoder and
+becomes `isPromotedRoutingHash`), `sharding/topology-encode.ts` (`encodeHashBody`, a sorted-section encoder and
 merge), `sharding/topology-keeper.ts` (`#buildHashBody`), `sharding/topology-cache.ts`, `sharding/client.ts`, and
 `sharding/runtime.ts` (where the runtime reads the hash topology encoding).
 
 **New tests.**
 
-- The sorted search is exact for random sets of 0 to `N` hashPrefixBuckets. At `N + 1` the hash topology encoding has
+- The sorted search is exact for random sets of 0 to `N` routingHashes. At `N + 1` the hash topology encoding has
   a Bloom section. A reader refuses a `promoted` section whose `count * width` is outside the hash topology encoding,
   or whose values do not strictly increase.
 - The keeper merge gives the same array as a full build, for reports in any order.
 - A positive from the sorted section starts one range fetch, and a negative starts none.
-- End to end: a promoted hashPrefixBucket with the count below `N` and above `N`.
+- End to end: a promoted routingHash with the count below `N` and above `N`.
 
 Also run `test/topology-bench/hash-build.workerd-bench.ts` for the build cost with a sorted section.
 
 #### 4.2.9 M6 — The coordinator storage
 
-The route key of a coordinator is `tokenKey(token)`, the encoded idempotency token. Its hashPrefixBucket uses the seed
+The route key of a coordinator is `tokenKey(token)`, the encoded idempotency token. Its routingHash uses the seed
 of the coordinator group `fokos.tc.<tableName>.<fp(ns)>` (M1), and its routing uses the digits from M2. M6 changes
 its storage:
 
 ```sql
 CREATE TABLE IF NOT EXISTS tc_state (
-    hash_prefix_bucket BLOB NOT NULL,
+    routing_hash BLOB NOT NULL,
     transaction_id     TEXT NOT NULL,
     idempotency_token  TEXT NOT NULL,
     ...                                   -- the other columns of today
-    PRIMARY KEY (hash_prefix_bucket, transaction_id)
+    PRIMARY KEY (routing_hash, transaction_id)
 ) WITHOUT ROWID, STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS tc_state_idempotency_token ON tc_state (hash_prefix_bucket, idempotency_token);
+CREATE UNIQUE INDEX IF NOT EXISTS tc_state_idempotency_token ON tc_state (routing_hash, idempotency_token);
 CREATE INDEX IF NOT EXISTS idx_tc_state_completed_at ON tc_state (completed_at) WHERE completed_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tc_state_recovery ON tc_state (next_recovery_at) WHERE completed_at IS NULL;
 
--- tc_participants: PRIMARY KEY (hash_prefix_bucket, transaction_id, partition_do_name)
--- tc_items:        PRIMARY KEY (hash_prefix_bucket, transaction_id, op_index)
--- tc_results:      PRIMARY KEY (hash_prefix_bucket, transaction_id, op_index)
+-- tc_participants: PRIMARY KEY (routing_hash, transaction_id, partition_do_name)
+-- tc_items:        PRIMARY KEY (routing_hash, transaction_id, op_index)
+-- tc_results:      PRIMARY KEY (routing_hash, transaction_id, op_index)
 ```
 
-- Each `tc_*` row leads with the hashPrefixBucket of its token. The hashPrefixBucket is a function of the token, so
-  `UNIQUE (hash_prefix_bucket, idempotency_token)` gives the same rule as `UNIQUE (idempotency_token)`, in storage
+- Each `tc_*` row leads with the routingHash of its token. The routingHash is a function of the token, so
+  `UNIQUE (routing_hash, idempotency_token)` gives the same rule as `UNIQUE (idempotency_token)`, in storage
   order.
-- Each lookup, update, and delete by `transaction_id` adds the hashPrefixBucket to the transaction key. Participant
+- Each lookup, update, and delete by `transaction_id` adds the routingHash to the transaction key. Participant
   names, operation indexes, ledger-state predicates, and the other fields stay. `initiateWrite` gets the token from
   the request. `recoverTransaction` gets it from the `CoordinatorRef`.
-- The recovery and expiry scans keep their time order, and select the hashPrefixBucket with each transaction id. Each
-  selected row uses its own hashPrefixBucket for later lookups and deletes. The hashPrefixBucket of one row must not
+- The recovery and expiry scans keep their time order, and select the routingHash with each transaction id. Each
+  selected row uses its own routingHash for later lookups and deletes. The routingHash of one row must not
   limit the other due transactions.
-- `buildMigrationPage` reads the interval of the target: `WHERE (hash_prefix_bucket, transaction_id) > (?, ?)` inside
+- `buildMigrationPage` reads the interval of the target: `WHERE (routing_hash, transaction_id) > (?, ?)` inside
   the interval, in place of a scan of the whole ledger with a filter. The cursor and `ORDER BY` keep `transaction_id`
-  after the hashPrefixBucket. `validatePage` keeps its slice check. Each transaction still moves with its participant,
+  after the routingHash. `validatePage` keeps its slice check. Each transaction still moves with its participant,
   item, and result rows, inside the page budgets of today.
 - `deleteMigratedRowsStep` deletes in primary-key order, so each delete is contiguous.
-- The split floor of a coordinator is "fewer than two hashPrefixBuckets, or the depth limit", in place of "fewer than
+- The split floor of a coordinator is "fewer than two routingHashes, or the depth limit", in place of "fewer than
   two tokens".
 - `idx_tc_state_completed_at` and `idx_tc_state_recovery` lead with a time, so they are exceptions to I6
   (Section 4.2.1).
@@ -1264,7 +1264,7 @@ CREATE INDEX IF NOT EXISTS idx_tc_state_recovery ON tc_state (next_recovery_at) 
 
 **New tests.**
 
-- The recovery and expiry scans select due rows from different hashPrefixBuckets, and use the full transaction key of
+- The recovery and expiry scans select due rows from different routingHashes, and use the full transaction key of
   each row.
 - A coordinator split, with the control of `test/controlled-transaction-coordinator-do.ts`: the child gets exactly the
   transactions of its interval, and the page read reads no row outside it.
@@ -1278,7 +1278,7 @@ base-key column names:
 
 ```sql
 CREATE TABLE IF NOT EXISTS latest_items (
-    hash_prefix_bucket BLOB    NOT NULL,
+    routing_hash BLOB    NOT NULL,
     base_hk            BLOB    NOT NULL,
     base_sk            BLOB    NOT NULL DEFAULT x'',
     item_id            INTEGER NOT NULL,
@@ -1290,7 +1290,7 @@ CREATE TABLE IF NOT EXISTS latest_items (
     est_row_bytes      INTEGER NOT NULL DEFAULT 0,
     data               ANY,
 
-    PRIMARY KEY (hash_prefix_bucket, base_hk, base_sk),
+    PRIMARY KEY (routing_hash, base_hk, base_sk),
     UNIQUE (item_id)
 ) WITHOUT ROWID, STRICT;
 
@@ -1298,19 +1298,19 @@ CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc
     ON latest_items (deleted_at_ms, item_id) WHERE deleted_at_ms IS NOT NULL;
 ```
 
-##### The hashPrefixBucket and the item id
+##### The routingHash and the item id
 
-- The host gets the hashPrefixBucket from its own `fokos.storagePrefix(base_hk)`. It uses the seed of
-  `fokos.m.<tableName>.<fp(ns)>`. The hashPrefixBucket of the base partition must not pass through unchanged. The
+- The host gets the routingHash from its own `fokos.storagePrefix(base_hk)`. It uses the seed of
+  `fokos.m.<tableName>.<fp(ns)>`. The routingHash of the base partition must not pass through unchanged. The
   store takes the value as a parameter and does not calculate a hash.
-- `base_hk` and `base_sk` stay the canonical keys of the base item. The hashPrefixBucket is a separate value. It is not
+- `base_hk` and `base_sk` stay the canonical keys of the base item. The routingHash is a separate value. It is not
   an item identity and not part of the canonical key encoding.
 - The materialization store keeps its own `item_id_counter`, with the reservation and rollback rules of
   Section 4.2.6. A new item takes a local id, and an overwrite keeps it. This id is not the item id of the base
   partition. The migration copies the id unchanged and raises the local mark in the same page transaction. After the
   commit, memory drops any reserved block below the new mark.
 - `UNIQUE (item_id)` is necessary, because operations find an item through its linked rows. It also keeps the
-  collision check of `insertMigratedItem`. Its conflict target becomes `(hash_prefix_bucket, base_hk, base_sk)` in
+  collision check of `insertMigratedItem`. Its conflict target becomes `(routing_hash, base_hk, base_sk)` in
   place of `INSERT OR IGNORE`. A retry of the same item skips it, and an id collision with another item fails the
   statement (Section 4.3.2).
 
@@ -1324,20 +1324,20 @@ The links stay:
   of migrated items keep their item-id lookups.
 
 These operations seek through `UNIQUE (item_id)` in place of the rowid, with their guards and transactions of today.
-The linked tables do not repeat the hashPrefixBucket or the base keys.
+The linked tables do not repeat the routingHash or the base keys.
 
-- Point lookups and upserts use the hashPrefixBucket and both base keys. The upsert keeps the rules of the live image,
+- Point lookups and upserts use the routingHash and both base keys. The upsert keeps the rules of the live image,
   the tombstone, the revision, and the target position.
-- The migration keeps `(hash_prefix_bucket, base_hk, base_sk)` order and uses the target interval from the runtime.
+- The migration keeps `(routing_hash, base_hk, base_sk)` order and uses the target interval from the runtime.
   The item, its positions, retries, and GSI keys move together, with no id remap. Page retries stay idempotent, and
   the page cursor and all imported rows commit in one transaction.
-- The promotion cleanup selects a bounded batch in primary-key order for the promoted hashPrefixBucket. It deletes the
+- The promotion cleanup selects a bounded batch in primary-key order for the promoted routingHash. It deletes the
   positions, retries, GSI keys, and row of each item in one transaction. Ownership checks and fences stay.
 - Tombstone collection keeps the cursor `(deleted_at_ms, item_id)`, its order, and its eligibility checks. The index
   declares `item_id`, so the seek stays after the primary-key change.
 - `latestRowBytesExpr` and `LATEST_ROW_BYTES_K` must count the clustered row and the item-id index. Measure the new
   constants. Each stored estimate, estimate total, and row change stays in one transaction. If the item-stats RFC ships
-  first, keep its fields and its covering index, with the hashPrefixBucket added.
+  first, keep its fields and its covering index, with the routingHash added.
 
 `change_positions` stays a log in `seq` order. Target cursors, cursor snapshots, retries, and producer epochs keep
 their rules. Only the primary B-tree of `latest_items` gets the contiguous cleanup. Its item-id index, its
@@ -1352,42 +1352,42 @@ whole materialization database.
   rollback gives no id twice. An ingest raises the mark above the copied ids before local writes start again.
 - `EXPLAIN QUERY PLAN`: point reads seek the primary key. Target reads, retries, and tombstone deletes seek through
   `UNIQUE (item_id)`, not a full-table scan. Tombstone pages seek from their `(deleted_at_ms, item_id)` cursor.
-- A promotion cleanup removes only the rows of its hashPrefixBucket and their linked rows.
+- A promotion cleanup removes only the rows of its routingHash and their linked rows.
 
-#### 4.2.11 M8 — Topology admin objects for each promoted hashPrefixBucket
+#### 4.2.11 M8 — Topology admin objects for each promoted routingHash
 
-**The problem.** Workers Cache coalesces the requests of one cache key, and each promoted hashPrefixBucket has its own
-range cache key. Thus the range reads at one admin object add up over the hashPrefixBuckets: about
-`hot hashPrefixBuckets * upper tiers / maxAgeS`. With 10,000 hot hashPrefixBuckets, 10 upper tiers (an assumption),
+**The problem.** Workers Cache coalesces the requests of one cache key, and each promoted routingHash has its own
+range cache key. Thus the range reads at one admin object add up over the routingHashes: about
+`hot routingHashes * upper tiers / maxAgeS`. With 10,000 hot routingHashes, 10 upper tiers (an assumption),
 and `maxAgeS` 10, that is about 10,000 requests each second. The soft limit of one Durable Object is 1,000 requests
 each second ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). The
 encoded topology RFC lists this as its follow-up 6.
 
 **The design.**
 
-- Each promoted hashPrefixBucket gets one topology admin object, with the name
-  `hashPrefixBucketTopologyAdminName(shardGroup, fp, hashPrefixBucket)`:
+- Each promoted routingHash gets one topology admin object, with the name
+  `routingHashTopologyAdminName(shardGroup, fp, routingHash)`:
 
   ```ts
-  topologyAdminName(shardGroup, fp) + ".rh." + hex(hashPrefixBucket)
+  topologyAdminName(shardGroup, fp) + ".rh." + hex(routingHash)
   ```
 
   The fingerprint alphabet has no `.`, so the name is injective.
-- A `key_promotion` registers with two admin objects. The object of the shard group adds the hashPrefixBucket to the
-  promoted set of the hash topology encoding. The object of the hashPrefixBucket stores its range root.
-- Each later `range_split` in the hashPrefixBucket registers only with the object of the hashPrefixBucket.
+- A `key_promotion` registers with two admin objects. The object of the shard group adds the routingHash to the
+  promoted set of the hash topology encoding. The object of the routingHash stores its range root.
+- Each later `range_split` in the routingHash registers only with the object of the routingHash.
 - The keeper code is the same for both objects. It serves the hash and range topologies from the repartitions that
-  registered with it. The object of a hashPrefixBucket holds one range tree and no hash split.
+  registered with it. The object of a routingHash holds one range tree and no hash split.
 - The runtime keeps one outbox row for each event. The host hook `adminOutboxFor` (`shared/topology-hooks.ts`) sends a
-  `key_promotion` to both objects, and a `range_split` to the object of its hashPrefixBucket. Each keeper is idempotent
+  `key_promotion` to both objects, and a `range_split` to the object of its routingHash. Each keeper is idempotent
   by the event id, so a retry that sends to both again is safe.
 - A caller reads a range topology encoding through the entrypoint, with the props of the object of the
-  hashPrefixBucket. Workers Cache keys an entry by `ctx.props`, so each hashPrefixBucket keeps its own entry.
+  routingHash. Workers Cache keys an entry by `ctx.props`, so each routingHash keeps its own entry.
   `topologyCacheFor` sets `scope` to that address.
-- `FokosTopologyCache` (`server/topology-entrypoint.ts`) accepts the admin name of a hashPrefixBucket, and checks it as
+- `FokosTopologyCache` (`server/topology-entrypoint.ts`) accepts the admin name of a routingHash, and checks it as
   it checks the admin name today.
 
-**Destroy.** `destroy` (`client/db.ts`) resets each hashPrefixBucket admin during the traversal, before it deletes the
+**Destroy.** `destroy` (`client/db.ts`) resets each routingHash admin during the traversal, before it deletes the
 source that records the promotion. It resets the shard-group admin after the partition traversal completes. The
 traversal must keep each durable record of a discovery until the work that it identifies succeeds.
 `FokosShardingClient.destroy` keeps its fence-first, child-before-parent order, and exposes an awaited step before
@@ -1398,8 +1398,8 @@ admin addresses. The order:
    new targets and new repartition reports from this source.
 2. Fence and delete each target subtree, children before parents. This includes range targets that have not completed
    their import.
-3. After a promoted range subtree is gone, await the reset of its hashPrefixBucket admin. The source must still hold
-   the promotion reference. Each source that can report this hashPrefixBucket must already be fenced.
+3. After a promoted range subtree is gone, await the reset of its routingHash admin. The source must still hold
+   the promotion reference. Each source that can report this routingHash must already be fenced.
 4. Call `fokosDestroy` on the source only after every child deletion and every admin reset succeeds. The traversal
    must not remove a promotion reference before its admin reset succeeds.
 5. After the partition traversal of the shard group completes, reset the shard-group admin.
@@ -1412,21 +1412,21 @@ A reset can succeed and lose its response. A retry then resets the same admin ag
 The keeper must still refuse each report from before the reset. The traversal must also handle more than one
 reference to the same promoted range root.
 
-**Cost.** One more Durable Object for each promoted hashPrefixBucket, with the storage of one range tree topology. One
+**Cost.** One more Durable Object for each promoted routingHash, with the storage of one range tree topology. One
 more RPC for each promotion.
 
 **New tests.**
 
-- The admin name of a hashPrefixBucket is injective, and a short fingerprint is refused.
+- The admin name of a routingHash is injective, and a short fingerprint is refused.
 - A keeper that holds only range repartitions serves the range topology encoding and an empty hash topology encoding.
-- A promotion reaches both objects. A range split reaches only the object of the hashPrefixBucket. A caller reads the
+- A promotion reaches both objects. A range split reaches only the object of the routingHash. A caller reads the
   range topology encoding from that object. `destroy` resets both.
-- `destroy` keeps the order: fence the source, delete the range subtree, reset the hashPrefixBucket admin, delete the
+- `destroy` keeps the order: fence the source, delete the range subtree, reset the routingHash admin, delete the
   source, reset the shard-group admin.
 - A reset that fails after the deletion of the range subtree leaves the source and its promotion reference. A new
   `destroy` finds the reference and completes the reset before it deletes the source.
 - A new `destroy` completes after a lost reset response, after a partial child deletion, and with more than one
-  reference to one range root. No source makes a new report after the reset of its hashPrefixBucket admin.
+  reference to one range root. No source makes a new report after the reset of its routingHash admin.
 
 #### 4.2.12 Performance and cost
 
@@ -1457,13 +1457,13 @@ exceptions of Section 4.2.1 do not get this ratio.
 partition hop, and one digit step of two multiplications for each level (`TODO: measure` the cost of `h64Raw` on a
 41-byte key in workerd).
 
-**Count queries and range split planning** keep the covering scan index with the hashPrefixBucket added. An
+**Count queries and range split planning** keep the covering scan index with the routingHash added. An
 unfiltered count query reads `sk` and `est_row_bytes` without item data, as today. A filter that reads item data still
 reads the item row. The latency of the prefix-leading index: `TODO: measure`.
 
 **The exceptions of I6** (Section 4.2.1). The size of each exception index: `idx_items_ttl` has one entry for each
 item with a TTL, and it can cover most items of a table where most items have a TTL. `idx_items_item_id` has one entry
-for each item. `key_size_estimates_by_bytes` has one entry for each hashPrefixBucket after M4.
+for each item. `key_size_estimates_by_bytes` has one entry for each routingHash after M4.
 `pending_transactions_transaction_id` and `pending_tx_info_due` have one entry for each lock and each open transaction.
 `idx_materialization_outbox_due` has one entry for each unsent change. A cleanup can leave the pages of these
 B-trees part full. The RFC accepts this cost to keep the cleanup steps safe and bounded.
@@ -1473,7 +1473,7 @@ primary key, and adds one index write for each insert. An item-id read uses that
 in place of a rowid lookup. Measure `LATEST_ROW_BYTES_K` and the latency of the linked reads for this layout
 (`TODO: measure`).
 
-**The hash topology encoding.** The promoted set costs 64 bits for each hashPrefixBucket up to `N`, and the Bloom
+**The hash topology encoding.** The promoted set costs 64 bits for each routingHash up to `N`, and the Bloom
 bits above `N`.
 
 #### 4.2.13 Crafted hash keys
@@ -1486,14 +1486,14 @@ design does not treat a secret base seed as protection either.
 
 The RFC accepts this availability risk:
 
-- A caller can target the hashPrefixBucket or the node interval of an existing key. The constructed keys can force
+- A caller can target the routingHash or the node interval of an existing key. The constructed keys can force
   extra splits, deeper routes, and more storage and copy work. An honest key in the targeted interval can share the
   cost or the write refusal.
 - Full collisions keep distinct item identities through `hk` and `sk`. Their combined estimate can start a promotion,
   and the range tree then splits by composite keys.
 - The hash depth limit (Section 4.2.5) bounds the hash path. It does not make chosen-output keys harder to construct.
-- At the depth limit, the partition still evaluates promotions first. A leaf with one hashPrefixBucket promotes it at
-  any estimate. When a final interval holds two or more hashPrefixBuckets and none can promote, the leaf returns
+- At the depth limit, the partition still evaluates promotions first. A leaf with one routingHash promotes it at
+  any estimate. When a final interval holds two or more routingHashes and none can promote, the leaf returns
   `max_depth`. It refuses writes above 1.1 times its cap. Reads, deletes, and transaction resolution keep their rules.
 - Range splits after the hash depth limit are out of scope (Section 2.2). Until they ship, the split floor and the
   write refusal stay.
@@ -1505,21 +1505,21 @@ callers choose keys must accept or control this cost.
 
 #### 4.3.1 Keep `idx_items_scan` until the item-stats RFC
 
-Keep `idx_items_scan` as `(hash_prefix_bucket, hk, sk, est_row_bytes)`, with the covering reads of today. Compared
+Keep `idx_items_scan` as `(routing_hash, hk, sk, est_row_bytes)`, with the covering reads of today. Compared
 with the table alone, it costs one more key copy and one more index write for each insert (Section 4.2.12).
 `docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md` changes the covering columns and the item-size
 model. That RFC owns the redesign of the index, and it must keep the prefix-leading order of this RFC.
 
 #### 4.3.2 Cluster `latest_items`, and keep its `item_id` links
 
-Cluster `latest_items` by `(hash_prefix_bucket, base_hk, base_sk)` in its own milestone, M7 (Section 4.2.10). The
-hashPrefixBucket uses the seed of the materialization shard group. Keep `UNIQUE (item_id)` and the item-id links. The
+Cluster `latest_items` by `(routing_hash, base_hk, base_sk)` in its own milestone, M7 (Section 4.2.10). The
+routingHash uses the seed of the materialization shard group. Keep `UNIQUE (item_id)` and the item-id links. The
 linked tables keep their layouts. The contiguous cleanup covers only the primary B-tree of `latest_items`.
 
 #### 4.3.3 Keep the item-id duplicate check of `insertItemIfAbsent`
 
-Keep `idx_items_item_id` as `UNIQUE (item_id)`. The id stays unique across all hashPrefixBuckets of one partition, as
-today. The constraint must not become `UNIQUE (hash_prefix_bucket, item_id)`. `insertItemIfAbsent` keeps its conflict
+Keep `idx_items_item_id` as `UNIQUE (item_id)`. The id stays unique across all routingHashes of one partition, as
+today. The constraint must not become `UNIQUE (routing_hash, item_id)`. `insertItemIfAbsent` keeps its conflict
 target on the full application key: a page retry skips the same item, and a different item with a used id fails. The
 counter and the lineage rules prevent normal collisions, and the constraint keeps the failure behavior of today.
 
@@ -1536,21 +1536,21 @@ These changes do less work on the route path. They do not change a result, and n
 | --- | ---: |
 | One `h32Raw` and a modulo (one level before M2) | 34 ns |
 | `h64Raw`, which returns a `bigint` | 81 ns |
-| `hashPrefixBucket` (the hash and one 8-byte array) | 90 ns |
-| `HashPrefixBucketDigitCursor`, the root and 4 levels | 13 ns to 16 ns |
+| `routingHash` (the hash and one 8-byte array) | 90 ns |
+| `RoutingHashDigitCursor`, the root and 4 levels | 13 ns to 16 ns |
 
 The digit walk costs little. The hash is the cost, so each follow-up removes a repeated hash or an array:
 
 1. **`FokosShardingRuntime#resolve`** hashes a key in `#ownsByTopology` and again in `#hashTopologyOwner` on a router.
-   Compute the hashPrefixBucket once and give it to both.
-2. **`FokosShardingRuntime#learn`** hashes each key again for each node of the envelope. Compute the hashPrefixBucket
+   Compute the routingHash once and give it to both.
+2. **`FokosShardingRuntime#learn`** hashes each key again for each node of the envelope. Compute the routingHash
    of each key once for the call.
 3. **`FokosShardingRuntime#hashDescendant`** makes the digit array from the root, then removes the levels of the
    partition with `slice`. Step the cursor past the depth of the partition, and collect only the levels below it.
 4. **`hashKeyInSlice`** (`repartition-slice.ts`) makes a digit array for each row that a migration reads. Step the
    cursor to the digit at `slice.depth - 1`, with no array.
 5. **`FokosShardingClient#resolveKey`** hashes a key in `FokosRouter.rootContext` and again for `findLeaf`. Removing
-   the second hash needs a router method that takes a hashPrefixBucket, which adds to the public API of the sharding
+   the second hash needs a router method that takes a routingHash, which adds to the public API of the sharding
    client.
 
 ## 5. Alternative options
@@ -1560,44 +1560,44 @@ The digit walk costs little. The hash is the cost, so each follow-up removes a r
   owns the redesign of the index (Section 4.3.1).
 - **Drop `idx_items_item_id` and trust the lineage rules alone.** This saves one key copy and one index write. It
   removes the item-id collision check at ingest. Rejected: the check keeps the failure behavior of today.
-- **Keep the rowid `items` table and add the hashPrefixBucket to its unique index.** Only the index becomes
+- **Keep the rowid `items` table and add the routingHash to its unique index.** Only the index becomes
   contiguous. The table pages stay in insert order. A key-range split of a rowid table with keys in random order keeps
   69% to 71% of its size (Appendix A).
 - **Keep `latest_items` in rowid order.** This keeps direct item-id seeks, but its rows stay in insert order. M7
   accepts the item-id index to cluster the rows.
-- **Keep the per-depth xxHash32 seeds, and store by hashPrefixBucket.** A hash split is then scattered in
-  hashPrefixBucket order. The storage order then helps only promotions and range splits.
+- **Keep the per-depth xxHash32 seeds, and store by routingHash.** A hash split is then scattered in
+  routingHash order. The storage order then helps only promotions and range splits.
 - **A random 64-bit `item_id`.** Collision detection needs a unique index, and the collision probability is about
   `n^2 / 2^65`. A random id also puts rows at random positions of any B-tree that it orders
   (`docs/agent-plans/2026-09-13-items-link-item_id.md`, Section 5.2).
 - **`item_id` from `MAX(item_id) + 1`.** No rowid gives it, a `MAX` read on each insert costs a seek, and a deleted id
   can come back.
-- **The hashPrefixBucket as an `INTEGER` with the sign bit flipped.** DO SQL cannot bind a `bigint`, and a JavaScript
+- **The routingHash as an `INTEGER` with the sign bit flipped.** DO SQL cannot bind a `bigint`, and a JavaScript
   `number` loses precision above 2^53. A BLOB of fixed width has the unsigned order with no trick.
-- **Promotions of a hash key, with storage by hashPrefixBucket.** A range tree then owns one hash key inside one
-  hashPrefixBucket, which is still one interval. But the names, the overrides, and the topology keep the
+- **Promotions of a hash key, with storage by routingHash.** A range tree then owns one hash key inside one
+  routingHash, which is still one interval. But the names, the overrides, and the topology keep the
   variable-length hash key, which this RFC removes from the topology.
 - **The seed and the width in `FokosTopology`, validated on each request.** Each RPC, the topology event, the keeper,
   and the hash topology encoding then carry them. `validateTopology` always passes for a topology that the client
   derives, and each derived shard group needs a helper in place of a spread. The stored seed in the partition
   identity gives the same guard at run time with none of these costs (Section 4.2.4).
-- **A Bloom filter for every count of promoted hashPrefixBuckets** (today). It gives false positives also for a small
+- **A Bloom filter for every count of promoted routingHashes** (today). It gives false positives also for a small
   set, where an exact list costs little.
-- **Elias-Fano or delta-coded sorted fingerprints above `N`.** About `log2(1/ε) + 2` bits for each hashPrefixBucket,
+- **Elias-Fano or delta-coded sorted fingerprints above `N`.** About `log2(1/ε) + 2` bits for each routingHash,
   against `1.44 * log2(1/ε)` for a Bloom filter: 8.6 against 9.6 bits at 1%. The reader decodes a block for each
   lookup, and the code base already has a Bloom filter (`shared/bloom-filter.ts`). It can replace the Bloom section
   later, as a new section key.
-- **One admin object for all range topology encodings** (today). The reads of many hashPrefixBuckets add up at one
+- **One admin object for all range topology encodings** (today). The reads of many routingHashes add up at one
   object (Section 4.2.11).
-- **The hashPrefixBucket as a hex prefix of `transaction_id` in the coordinator.** The `tc_*` tables then need no new
-  column, because `transaction_id` order is hashPrefixBucket order. But the host then knows the width and the encoding
+- **The routingHash as a hex prefix of `transaction_id` in the coordinator.** The `tc_*` tables then need no new
+  column, because `transaction_id` order is routingHash order. But the host then knows the width and the encoding
   of the prefix, which the runtime API forbids, and the prefix is TEXT in place of a BLOB.
 - **A format version in the topology, with one code path for each format.** No table holds data that must survive the
-  change before the public release. Each extra path adds a switch to the hashPrefixBucket and digit functions, the
+  change before the public release. Each extra path adds a switch to the routingHash and digit functions, the
   partition IDs, every `PartitionStore` statement, the sharding store, and the keeper. Every test then runs once for
   each path.
 - **The empty BLOB `x''` as the storage prefix of a range partition.** Every row of a range tree has the same
-  hashPrefixBucket, so `x''` saves 8 bytes for each row and each index entry that leads with it: about 4% of a row with
+  routingHash, so `x''` saves 8 bytes for each row and each index entry that leads with it: about 4% of a row with
   100 B of data. But a promotion by clone must then change the first primary-key column of each row of the range root,
   and in a `WITHOUT ROWID` table each change is one delete and one insert. It also adds a special case to
   `storagePrefix`. The saving does not pay for either cost.
@@ -1609,11 +1609,11 @@ The digit walk costs little. The hash is the cost, so each follow-up removes a r
 
 ## 6. Frequently asked questions
 
-**Why is the sort key not part of the hashPrefixBucket?**
+**Why is the sort key not part of the routingHash?**
 All items of one hash key must stay in one partition and in one key range. Then a query of a hash key reads one
 interval, and a promotion moves one interval.
 
-**What happens when two hash keys have one hashPrefixBucket?**
+**What happens when two hash keys have one routingHash?**
 They always go to the same hash partition, and a promotion moves both. Inside a range tree they are two hash-key
 intervals. Each read and write names `hk` and `sk`, so their items stay apart (I9). With 2^64 values, the chance of a
 collision among `n` hash keys is about `n^2 / 2^65`.
@@ -1630,7 +1630,7 @@ change derives another seed, the partition refuses all work, and no write goes t
 catches the same change in CI. The stored seed is the guard at run time, and it costs nothing on a request.
 
 **Why does the last interval of a level have no upper bound?**
-Its upper bound is 2^64, which has no 8-byte form. Its statements use only `hash_prefix_bucket >= start`.
+Its upper bound is 2^64, which has no 8-byte form. Its statements use only `routing_hash >= start`.
 
 **Does `pending_transactions` become contiguous?**
 Its primary-key index is in prefix order. Its table pages stay in rowid order, because its rows hold data. The
@@ -1647,13 +1647,13 @@ No. The high-water mark only increases. Today SQLite can reuse the highest delet
 **Can `rangeSplitN` still change?**
 Yes. It applies to the range splits that start after the change, as today.
 
-**Does the hashPrefixBucket make a request slower?**
+**Does the routingHash make a request slower?**
 Each hop hashes the hash key once with xxHash64, and each level adds one digit step of two multiplications. The
 measured point read stayed at 9 µs to 15 µs. The cost of the hash: `TODO: measure`.
 
 **Why does a promotion still copy, when a clone is cheaper?**
-A promotion moves one hashPrefixBucket, often a small part of its partition. A clone gives the range root a full image
-and then deletes every other hashPrefixBucket. The split by storage snapshot decides it.
+A promotion moves one routingHash, often a small part of its partition. A clone gives the range root a full image
+and then deletes every other routingHash. The split by storage snapshot decides it.
 
 **Why `WITHOUT ROWID`, when it costs more disk for rows above 1 KB?**
 In a rowid table the pages follow the insert order, and no delete of a key range frees whole pages. Below about 900 B
@@ -1695,8 +1695,8 @@ Local workerd, 8 MiB partitions, keys in random order.
 | --- | ---: | ---: | ---: | ---: |
 | Today, a hash child keeps 1/2 | 90% to 94% | 73% | 62% to 72% | 50% to 56% |
 | Today, a hash child keeps 1/4 | 34% to 44% | | | |
-| `(hash_prefix_bucket, hk, sk)`, contiguous delete, keeps 1/2 | 50% | 50% | 50% | 50% |
-| `(hash_prefix_bucket, hk, sk)`, contiguous delete, keeps 1/4 | 25% | 25% | 25% | 25% |
+| `(routing_hash, hk, sk)`, contiguous delete, keeps 1/2 | 50% | 50% | 50% | 50% |
+| `(routing_hash, hk, sk)`, contiguous delete, keeps 1/4 | 25% | 25% | 25% | 25% |
 | A fresh copy of 1/2 (the import of today) | about 50% | | | |
 | Today, a key-range split | 69% to 71% | | | |
 
@@ -1717,7 +1717,7 @@ write of the rows that it counts.
 
 ## Appendix B. A worked example of the digits
 
-`R = 3`, `K = 2`, and the hashPrefixBucket `x = 0xC000000000000000`, which is the fraction 0.75.
+`R = 3`, `K = 2`, and the routingHash `x = 0xC000000000000000`, which is the fraction 0.75.
 
 1. Root: `floor(0.75 * 3) = 2`. The rest is `0.75 * 3 - 2 = 0.25`.
 2. Level 1: `floor(0.25 * 2) = 0`. The rest is `0.5`.

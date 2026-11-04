@@ -1,4 +1,4 @@
-import { HashPrefixBucketDigitCursor, maxHashDepth, type HashPrefixBucket } from "./hash-primitives.js";
+import { RoutingHashDigitCursor, maxHashDepth, type RoutingHash } from "./hash-primitives.js";
 
 export type HashTopologySnapshot = {
 	// Zero-copy Uint8Array view over the used portion of the arena buffer (nextFree * 4 bytes).
@@ -72,9 +72,9 @@ export class HashTopology {
 		return new HashTopology(arena, nextFree, rootTreesN, K, ownerAbsDepth, maxDepth, maxSlots);
 	}
 
-	/** The digits of `hashPrefixBucket` below the owner: the owner owns the bucket, so its own digits are skipped. */
-	private digitsBelowOwner(hashPrefixBucket: HashPrefixBucket): HashPrefixBucketDigitCursor {
-		const cursor = new HashPrefixBucketDigitCursor(hashPrefixBucket, this.rootTreesN);
+	/** The digits of `routingHash` below the owner: the owner owns the routingHash, so its own digits are skipped. */
+	private digitsBelowOwner(routingHash: RoutingHash): RoutingHashDigitCursor {
+		const cursor = new RoutingHashDigitCursor(routingHash, this.rootTreesN);
 		for (let d = 0; d < this.ownerAbsDepth; d++) {
 			cursor.next(this.K);
 		}
@@ -92,12 +92,12 @@ export class HashTopology {
 	}
 
 	/**
-	 * Traverse the cache for a hashPrefixBucket that the owner owns. Returns the relative depth of the
+	 * Traverse the cache for a routingHash that the owner owns. Returns the relative depth of the
 	 * deepest known descendant.
 	 * @return relative depth (0 = immediate child is the target; no deeper split recorded yet)
 	 */
-	findLeaf(hashPrefixBucket: HashPrefixBucket): number {
-		const digits = this.digitsBelowOwner(hashPrefixBucket);
+	findLeaf(routingHash: RoutingHash): number {
+		const digits = this.digitsBelowOwner(routingHash);
 		let block = 0;
 		let relDepth = 0;
 		while (true) {
@@ -114,12 +114,12 @@ export class HashTopology {
 
 	/**
 	 * Learn topology from a forwarded response.
-	 * @param hashPrefixBucket The hashPrefixBucket of the hash key to look up.
+	 * @param routingHash The routingHash of the hash key to look up.
 	 * @param actualRelDepth The actual relative depth of the target partition that served the request (non-split leaf).
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	updateFromHint(hashPrefixBucket: HashPrefixBucket, actualRelDepth: number): boolean {
-		const digits = this.digitsBelowOwner(hashPrefixBucket);
+	updateFromHint(routingHash: RoutingHash, actualRelDepth: number): boolean {
+		const digits = this.digitsBelowOwner(routingHash);
 		let block = 0;
 		let updated = false;
 		for (let rd = 0; rd < actualRelDepth; rd++) {
@@ -153,11 +153,11 @@ export class HashTopology {
 	 * ancestor. The orphaned block keeps its slots: the arena never frees, and the loss is bounded.
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	invalidate(hashPrefixBucket: HashPrefixBucket, relDepth: number): boolean {
+	invalidate(routingHash: RoutingHash, relDepth: number): boolean {
 		if (relDepth < 1) {
 			return false;
 		}
-		const digits = this.digitsBelowOwner(hashPrefixBucket);
+		const digits = this.digitsBelowOwner(routingHash);
 		let block = 0;
 		for (let rd = 0; rd < relDepth - 1; rd++) {
 			const ptr = this.arena[block + digits.next(this.K)];

@@ -212,7 +212,7 @@ function shortestSeparator(lo: KeyBytes, hi: KeyBytes): KeyBytes {
 	return asKeyBytes(hi.slice(0, lo.length + 1));
 }
 
-/** A position inside one hashPrefixBucket, in the order (hk, sk): a boundary of a range partition. */
+/** A position inside one routingHash, in the order (hk, sk): a boundary of a range partition. */
 export type FokosCompositeKey = { hk: KeyBytes; sk: KeyBytes };
 
 /** The order of two composite keys: by `hk`, then by `sk`. */

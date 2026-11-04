@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import type { HashPrefixBucket } from "../../src/sharding/hash-primitives.js";
+import type { RoutingHash } from "../../src/sharding/hash-primitives.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { childDigit, type DigitTopology } from "../hash-digits.js";
 import {
@@ -70,7 +70,7 @@ describe("Repartition — arbitration", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, sharding }) => {
-			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("hot")) })).toMatchObject({ id: "r1" });
+			expect(source.queue({ kind: "key_promotion", routingHash: P(kb("hot")) })).toMatchObject({ id: "r1" });
 			// queued, planned and cutover all still own the key's move.
 			expect(source.queue({ kind: "hash_split" })).toBeUndefined();
 			sharding.setRepartitionState("r1", "cutover");
@@ -88,7 +88,7 @@ describe("Repartition — arbitration", () => {
 			expect(source.queue({ kind: "hash_split" })).toMatchObject({ id: "r1" });
 			for (const state of ["queued", "planned", "cutover", "completed", "cleaned"] as const) {
 				sharding.setRepartitionState("r1", state);
-				expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("hot")) }), `blocked at ${state}`).toBeUndefined();
+				expect(source.queue({ kind: "key_promotion", routingHash: P(kb("hot")) }), `blocked at ${state}`).toBeUndefined();
 			}
 		});
 	});
@@ -97,10 +97,10 @@ describe("Repartition — arbitration", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, sharding }) => {
-			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) })).toMatchObject({ id: "r1" });
-			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) })).toBeUndefined();
+			expect(source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) })).toMatchObject({ id: "r1" });
+			expect(source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) })).toBeUndefined();
 			// A different key is unrelated: two promotions progress at the same time.
-			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("bob")) })).toMatchObject({ id: "r2" });
+			expect(source.queue({ kind: "key_promotion", routingHash: P(kb("bob")) })).toMatchObject({ id: "r2" });
 			expect(sharding.routeOverrideFor(P(kb("alice")))).toEqual({ repartitionId: "r1", state: "queued" });
 			expect(sharding.routeOverrideFor(P(kb("bob")))).toEqual({ repartitionId: "r2", state: "queued" });
 		});
@@ -113,7 +113,7 @@ describe("Repartition — arbitration", () => {
 		await root.enter(({ source }) => expect(source.queue({ kind: "range_split" })).toBeUndefined());
 		// The range node has no stored context yet, so it answers from the context the harness gave it.
 		await rangeRoot.enter(({ source }) => {
-			expect(source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) })).toBeUndefined();
+			expect(source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) })).toBeUndefined();
 			expect(source.queue({ kind: "range_split" })).toMatchObject({ kind: "range_split", state: "queued" });
 		});
 	});
@@ -279,7 +279,7 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
 			putLock(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) }, T0);
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) }, T0);
 		});
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
@@ -333,7 +333,7 @@ describe("Repartition — initialization and cutover", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) }, T0);
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) }, T0);
 		});
 		// Plan, initialize the target, and cut over.
 		for (let step = 0; step < 3; step++) {
@@ -530,7 +530,7 @@ describe("Repartition — the migration protocol", () => {
 
 		const promo = makeCluster().hashNode([0]);
 		const key = kb("alice");
-		await plan(promo, { kind: "key_promotion", hashPrefixBucket: P(key) });
+		await plan(promo, { kind: "key_promotion", routingHash: P(key) });
 		const promoTarget = await promo.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "key_promotion")[0]);
 
 		await promo.enter(({ source, sharding }) => {
@@ -757,7 +757,7 @@ describe("Repartition — promotions", () => {
 				putItem(store, "alice", sk);
 			}
 			putItem(store, "bob", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
 		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
@@ -792,7 +792,7 @@ describe("Repartition — promotions", () => {
 				putItem(store, "alice", sk);
 			}
 			putItem(store, "bob", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
 		// Rows as the source keeps them after the cutover: one transaction with MAX_ITEMS_PER_TX keys
@@ -867,7 +867,7 @@ describe("Repartition — promotions", () => {
 				putItem(store, "aaron", `s${i}`);
 				putItem(store, "bob", `s${i}`);
 			}
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => {
@@ -934,7 +934,7 @@ describe("Repartition — promotions", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => {
@@ -970,7 +970,7 @@ describe("Repartition — promotions", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => {
@@ -1017,7 +1017,7 @@ describe("Repartition — promotions", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
 			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("alice")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
 		await root.enter(({ store }) => store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 }));
@@ -1101,9 +1101,9 @@ describe("Repartition — promotions", () => {
 			putItem(store, promoted, "s1");
 			putItem(store, plain, "s1");
 			// A promotion that finished long ago, with its source rows already reclaimed.
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(promoted)) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb(promoted)) });
 			sharding.setRepartitionState("r1", "cleaned", { cutoverAt: 1, completedAt: 2 });
-			store.deleteItemsBatchForHashPrefixBucket(P(kb(promoted)), 100);
+			store.deleteItemsBatchForRoutingHash(P(kb(promoted)), 100);
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -1135,9 +1135,9 @@ describe("Repartition — promotions", () => {
 		const sibling = keyForChild(1, c.base.topology, "s");
 
 		await root.enter(({ source, sharding }) => {
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(mine)) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb(mine)) });
 			sharding.setRepartitionState("r1", "cleaned");
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(sibling)) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb(sibling)) });
 			sharding.setRepartitionState("r2", "cleaned");
 			source.queue({ kind: "hash_split" });
 		});
@@ -1238,9 +1238,9 @@ describe("Repartition — the status view", () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await root.enter(({ source }) => {
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("hot")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("hot")) });
 			// Still queued after the step below, so it has no target row. It is one entry with no target.
-			source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb("warm")) });
+			source.queue({ kind: "key_promotion", routingHash: P(kb("warm")) });
 		});
 		await plan(root);
 
@@ -1250,7 +1250,7 @@ describe("Repartition — the status view", () => {
 			page.entries.map((e) => [
 				e.repartition.seq,
 				e.repartition.state,
-				e.repartition.hashPrefixBucket,
+				e.repartition.routingHash,
 				e.target?.index,
 				e.target?.initialization,
 			]),
@@ -1266,7 +1266,7 @@ describe("Repartition — the status view", () => {
 		const root = c.hashNode([0]);
 		await root.enter(({ source }) => {
 			for (const hk of ["a", "b", "c"]) {
-				source.queue({ kind: "key_promotion", hashPrefixBucket: P(kb(hk)) });
+				source.queue({ kind: "key_promotion", routingHash: P(kb(hk)) });
 			}
 		});
 
@@ -1291,7 +1291,7 @@ describe("Repartition — the status view", () => {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-type QueueRequest = { kind: RepartitionKind; hashPrefixBucket?: HashPrefixBucket };
+type QueueRequest = { kind: RepartitionKind; routingHash?: RoutingHash };
 
 /** Queues if needed, then plans, leaving every target `pending`. */
 async function plan(node: Node, request?: QueueRequest, now = T0): Promise<void> {

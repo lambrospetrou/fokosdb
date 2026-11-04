@@ -16,7 +16,7 @@ import {
 } from "../../shared/transaction-limits.js";
 import type { DataKind } from "../../shared/types.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
-import { asHashPrefixBucket, HASH_PREFIX_BUCKET_BYTES } from "../../sharding/hash-primitives.js";
+import { asRoutingHash, ROUTING_HASH_BYTES } from "../../sharding/hash-primitives.js";
 import type { GsiKey, MaterializationStore, TargetImage } from "./materialization-store.js";
 import type { GsiTargetDefinition } from "./targets.js";
 
@@ -75,7 +75,7 @@ export function compileGsiPlans(target: GsiTargetDefinition): GsiPlans {
 /** An empty base hash key. `KeyCodec.encode` never returns an empty key, so no item has it. */
 const NO_ITEM_KEY: KeyBytes = KeyCodec.encodeOptional(undefined);
 // A syntactically valid storage prefix for the compile probe, which never reads a row.
-const NO_ITEM_PREFIX = asHashPrefixBucket(new Uint8Array(HASH_PREFIX_BUCKET_BYTES));
+const NO_ITEM_PREFIX = asRoutingHash(new Uint8Array(ROUTING_HASH_BYTES));
 
 /**
  * Compiles the plans of a GSI target, and runs each statement on no row, so that SQLite prepares it.

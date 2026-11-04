@@ -9,7 +9,7 @@ import { partitionStubByName } from "../../src/shared/do-stubs.js";
 import { gsiItemSortKey } from "../../src/shared/gsi/sort-key.js";
 import { gsiTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { FokosRouter } from "../../src/sharding/router.js";
-import { hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { kb, makeStub, materializationOf } from "../partition-do/helpers.js";
 
 const ROWS = 20_000;
@@ -56,8 +56,8 @@ it("row sizes", async () => {
 		),
 		gsi_tombstone: await bytesPerRow(base.stub, (sql, i) =>
 			sql.exec(
-				`INSERT INTO items (hash_prefix_bucket, hk, sk, item_id, data_kind, v, est_row_bytes, data) VALUES (?, ?, ?, ?, 0, 1, 0, x'')`,
-				hashPrefixBucketOf(kb("OPEN"), base.ctx.topology.shardGroup),
+				`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, v, est_row_bytes, data) VALUES (?, ?, ?, ?, 0, 1, 0, x'')`,
+				routingHashOf(kb("OPEN"), base.ctx.topology.shardGroup),
 				kb("OPEN"),
 				gsiItemSortKey(kb(`2026-10-24T17:46:00.${String(i).padStart(6, "0")}Z`), kb(`order-${String(i).padStart(8, "0")}`), kb("s")),
 				i,

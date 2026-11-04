@@ -29,13 +29,13 @@ import { planRangeBoundaries } from "./split-planner.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
-import { hashPrefixBucketOf } from "../../sharding/hash-primitives.js";
+import { routingHashOf } from "../../sharding/hash-primitives.js";
 import { rangeStorageInterval } from "../../sharding/repartition-slice.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 /** The storage prefix of a hash key. The store treats it as opaque bytes, so the shard group of the helper does not matter. */
 const STORE_TEST_GROUP = "fokos.p.store-test";
-const P = (hk: KeyBytes) => hashPrefixBucketOf(hk, STORE_TEST_GROUP);
+const P = (hk: KeyBytes) => routingHashOf(hk, STORE_TEST_GROUP);
 /**
  * The storage interval of the sort keys `[start, end)` of one hash key: a composite interval of its
  * prefix. With no end, it stops at `hk || 0x00`, the first key above every key of `hk`.
@@ -520,10 +520,10 @@ describe("PartitionStore - items", () => {
 					.toArray()
 					.map((r) => r.detail)
 					.join(" | ");
-			const where = "WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1";
+			const where = "WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1";
 
 			expect(plan(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan ${where}`)).toContain(
-				"COVERING INDEX idx_items_scan (hash_prefix_bucket=? AND hk=? AND sk=?)",
+				"COVERING INDEX idx_items_scan (routing_hash=? AND hk=? AND sk=?)",
 			);
 			expect(plan(`SELECT est_row_bytes FROM items ${where}`)).toContain("USING PRIMARY KEY");
 		});
@@ -1068,19 +1068,19 @@ describe("PartitionStore - TTL deletion", () => {
 					.join(" | ");
 			const candidates = (indexHint: string, position: string, ...positionBindings: unknown[]) =>
 				explain(
-					`SELECT i.ttl_epoch_utc_seconds AS ttl, i.hash_prefix_bucket, i.hk, i.sk FROM items i${indexHint}
+					`SELECT i.ttl_epoch_utc_seconds AS ttl, i.routing_hash, i.hk, i.sk FROM items i${indexHint}
 					  WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 					    AND i.ttl_epoch_utc_seconds <= ?1
 					    ${position}
 					    AND NOT EXISTS (SELECT 1 FROM pending_transactions p
-					                     WHERE p.hash_prefix_bucket = i.hash_prefix_bucket AND p.hk = i.hk AND p.sk = i.sk)
-					  ORDER BY i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk
+					                     WHERE p.routing_hash = i.routing_hash AND p.hk = i.hk AND p.sk = i.sk)
+					  ORDER BY i.ttl_epoch_utc_seconds, i.routing_hash, i.hk, i.sk
 					  LIMIT ?2`,
 					100,
 					10,
 					...positionBindings,
 				);
-			const afterPosition = "AND (i.ttl_epoch_utc_seconds, i.hash_prefix_bucket, i.hk, i.sk) > (?3, ?4, ?5, ?6)";
+			const afterPosition = "AND (i.ttl_epoch_utc_seconds, i.routing_hash, i.hk, i.sk) > (?3, ?4, ?5, ?6)";
 
 			for (const details of [
 				candidates(" INDEXED BY idx_items_ttl", ""),
@@ -1093,17 +1093,17 @@ describe("PartitionStore - TTL deletion", () => {
 			}
 			// The scan seeks to the position, and does not read the rows before it.
 			expect(candidates(" INDEXED BY idx_items_ttl", afterPosition, 5, P(kb("a")), kb("a"), kb("s"))).toContain(
-				"idx_items_ttl ((ttl_epoch_utc_seconds,hash_prefix_bucket,hk,sk)>(?,?,?,?) AND ttl_epoch_utc_seconds<?)",
+				"idx_items_ttl ((ttl_epoch_utc_seconds,routing_hash,hk,sk)>(?,?,?,?) AND ttl_epoch_utc_seconds<?)",
 			);
 			expect(
 				explain(
-					`DELETE FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?
+					`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?
 					 RETURNING est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 					P(kb("a")),
 					kb("a"),
 					kb("s"),
 				),
-			).toMatch(/SEARCH items USING PRIMARY KEY \(hash_prefix_bucket=\? AND hk=\? AND sk=\?\)/);
+			).toMatch(/SEARCH items USING PRIMARY KEY \(routing_hash=\? AND hk=\? AND sk=\?\)/);
 		});
 	});
 
@@ -1269,11 +1269,11 @@ describe("PartitionStore - deletion watermark", () => {
 			const before = store.getDeletionMetadata();
 			expect(before).toEqual({ maxDeleteTxOrderTs: 555, maxDeletedV: 2 });
 
-			// The cleanup a promotion runs over the hashPrefixBucket it is moving.
-			store.deleteItemsBatchForHashPrefixBucket(P(kb("alice")), 1000);
+			// The cleanup a promotion runs over the routingHash it is moving.
+			store.deleteItemsBatchForRoutingHash(P(kb("alice")), 1000);
 			store.keySizes.remove(P(kb("alice")));
 
-			expect(store.hasItemsForHashPrefixBucket(P(kb("alice")))).toBe(false);
+			expect(store.hasItemsForRoutingHash(P(kb("alice")))).toBe(false);
 			expect(store.getDeletionMetadata()).toEqual(before);
 		});
 	});
@@ -1921,9 +1921,9 @@ describe("PartitionStore - range split boundaries", () => {
 		});
 	});
 
-	// Buckets known sorted keys into the N children defined by `boundaries` and returns the count per child.
+	// Groups known sorted keys into the N children defined by `boundaries` and returns the count per child.
 	// Child i owns [b_{i-1}, b_i); mirrors the byte-space [start, end) routing the migration scans use.
-	function bucketCounts(sortedKeys: string[], boundaries: KeyBytes[]): number[] {
+	function childCounts(sortedKeys: string[], boundaries: KeyBytes[]): number[] {
 		const counts = Array.from({ length: boundaries.length + 1 }, () => 0);
 		for (const key of sortedKeys) {
 			let child = boundaries.length; // last child unless an earlier boundary claims it
@@ -1953,7 +1953,7 @@ describe("PartitionStore - range split boundaries", () => {
 				expect(KeyCodec.compare(boundaries![i - 1], boundaries![i])).toBeLessThan(0);
 			}
 			// Every child non-empty and within a loose band of the ideal 10.
-			const counts = bucketCounts(keys, boundaries!);
+			const counts = childCounts(keys, boundaries!);
 			expect(counts.length).toBe(4);
 			for (const c of counts) {
 				expect(c).toBeGreaterThanOrEqual(5);
@@ -2052,8 +2052,8 @@ describe("PartitionStore - migration pages", () => {
 			const locks = "SEARCH p USING INDEX sqlite_autoindex_pending_transactions_1";
 			const outbox = "SEARCH materialization_outbox USING INDEX sqlite_autoindex_materialization_outbox_1";
 			const info = " | SEARCH t USING INDEX sqlite_autoindex_pending_tx_info_1 (transaction_id=?)";
-			const both = "((hash_prefix_bucket,hk,sk)>(?,?,?) AND (hash_prefix_bucket,hk,sk)<(?,?,?))";
-			const lower = "((hash_prefix_bucket,hk,sk)>(?,?,?))";
+			const both = "((routing_hash,hk,sk)>(?,?,?) AND (routing_hash,hk,sk)<(?,?,?))";
+			const lower = "((routing_hash,hk,sk)>(?,?,?))";
 
 			expect(plan(itemsPageStatement(null, 5, closed))).toBe(`${items} ${both}`);
 			expect(plan(itemsPageStatement(cursor, 5, closed))).toBe(`${items} ${both}`);
@@ -2062,7 +2062,7 @@ describe("PartitionStore - migration pages", () => {
 			expect(plan(outboxPageStatement(cursor, 5, closed))).toBe(`${outbox} ${both}`);
 			expect(plan(pendingTxPageStatement(null, 5, closed))).toBe(`${locks} ${both}${info}`);
 			expect(plan(pendingTxPageStatement(lockCursor, 5, closed))).toBe(
-				`${locks} ((hash_prefix_bucket,hk,sk,transaction_id)>(?,?,?,?) AND (hash_prefix_bucket,hk,sk)<(?,?,?))${info}`,
+				`${locks} ((routing_hash,hk,sk,transaction_id)>(?,?,?,?) AND (routing_hash,hk,sk)<(?,?,?))${info}`,
 			);
 		});
 	});
@@ -2335,7 +2335,7 @@ describe("PartitionStore - the item-id counter", () => {
 		store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt, txOrderTs: 1 });
 	const idOf = (state: DurableObjectState, hk: string, sk = "s") =>
 		state.storage.sql
-			.exec<{ item_id: number }>(`SELECT item_id FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`, P(kb(hk)), kb(hk), kb(sk))
+			.exec<{ item_id: number }>(`SELECT item_id FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`, P(kb(hk)), kb(hk), kb(sk))
 			.one().item_id;
 	const highWaterMark = (state: DurableObjectState) =>
 		state.storage.sql.exec<{ hwm: number }>(`SELECT hwm FROM item_id_counter WHERE id = 1`).one().hwm;
@@ -2447,22 +2447,22 @@ describe("PartitionStore - plans of the storage order", () => {
 				plan(
 					state,
 					`SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan
-					  WHERE hash_prefix_bucket = ? AND hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
+					  WHERE routing_hash = ? AND hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
 					P(hk),
 					hk,
 					kb("a"),
 					kb("z"),
 				),
-			).toBe("SEARCH items USING COVERING INDEX idx_items_scan (hash_prefix_bucket=? AND hk=? AND sk>? AND sk<?)");
+			).toBe("SEARCH items USING COVERING INDEX idx_items_scan (routing_hash=? AND hk=? AND sk>? AND sk<?)");
 			const deletePlan = plan(
 				state,
-				`DELETE FROM items WHERE hash_prefix_bucket = ?1 AND hk = ?2
-				    AND sk IN (SELECT sk FROM items WHERE hash_prefix_bucket = ?1 AND hk = ?2 ORDER BY sk LIMIT ?3)`,
+				`DELETE FROM items WHERE routing_hash = ?1 AND hk = ?2
+				    AND sk IN (SELECT sk FROM items WHERE routing_hash = ?1 AND hk = ?2 ORDER BY sk LIMIT ?3)`,
 				P(hk),
 				hk,
 				10,
 			);
-			expect(deletePlan).toContain("SEARCH items USING PRIMARY KEY (hash_prefix_bucket=? AND hk=? AND sk=?)");
+			expect(deletePlan).toContain("SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=? AND sk=?)");
 			expect(deletePlan).not.toMatch(/SCAN items/);
 		});
 	});
@@ -2471,10 +2471,10 @@ describe("PartitionStore - plans of the storage order", () => {
 		await withStore((_store, state) => {
 			const hk = kb("hk");
 			for (const sql of [
-				`SELECT data, data_kind, v FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ? LIMIT 1`,
-				`DELETE FROM items WHERE hash_prefix_bucket = ? AND hk = ? AND sk = ?`,
+				`SELECT data, data_kind, v FROM items WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
+				`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 			]) {
-				expect(plan(state, sql, P(hk), hk, kb("s"))).toBe("SEARCH items USING PRIMARY KEY (hash_prefix_bucket=? AND hk=? AND sk=?)");
+				expect(plan(state, sql, P(hk), hk, kb("s"))).toBe("SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=? AND sk=?)");
 			}
 		});
 	});

@@ -15,9 +15,9 @@ import invariant from "../shared/invariant.js";
  *
  * The outbox holds one event type now: the report of a completed repartition of this shard group.
  * - A `hash_split` goes to the admin of the shard group.
- * - A `key_promotion` goes to the admin of its hashPrefixBucket, which stores the range root, and then
- *   to the admin of the shard group, which adds the hashPrefixBucket to the promoted set.
- * - A `range_split` goes to the admin of its hashPrefixBucket only.
+ * - A `key_promotion` goes to the admin of its routingHash, which stores the range root, and then
+ *   to the admin of the shard group, which adds the routingHash to the promoted set.
+ * - A `range_split` goes to the admin of its routingHash only.
  * Each keeper ignores a report that it has, so a retry that sends to both admins again is safe.
  */
 export function adminOutboxFor(ctx: FokosDBStubContext, binding: DataNamespaceKey): FokosAdminOutbox | undefined {
@@ -31,9 +31,9 @@ export function adminOutboxFor(ctx: FokosDBStubContext, binding: DataNamespaceKe
 			const slice = event.targets[0].slice;
 			if (slice.kind !== "hash_child") {
 				// `address` exists, so the table has `nsAdmin`.
-				const hashPrefixBucketAddress = topologyAdminAddress(env, ctx, binding, slice.hashPrefixBucket);
-				invariant(hashPrefixBucketAddress !== undefined, "hashPrefixBucketAddress must exist");
-				await topologyAdminStub(env, hashPrefixBucketAddress).registerRepartition(entry.event);
+				const routingHashAddress = topologyAdminAddress(env, ctx, binding, slice.routingHash);
+				invariant(routingHashAddress !== undefined, "routingHashAddress must exist");
+				await topologyAdminStub(env, routingHashAddress).registerRepartition(entry.event);
 			}
 			if (event.kind !== "range_split") {
 				await topologyAdminStub(env, address).registerRepartition(entry.event);

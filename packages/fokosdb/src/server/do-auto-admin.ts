@@ -6,8 +6,8 @@
  *   topology of one shard group of a table, for example its partitions (`fokos.p.<tableName>`) or its
  *   coordinators (`fokos.tc.<tableName>.<fp(ns)>`). `fp` is the fingerprint of the namespace that holds
  *   the shard group.
- * - `hashPrefixBucketTopologyAdminName(shardGroup, fp, hashPrefixBucket)` (the name above, then `.rh.` and
- *   16 hex characters) holds the range topology of one promoted hashPrefixBucket of the shard group.
+ * - `routingHashTopologyAdminName(shardGroup, fp, routingHash)` (the name above, then `.rh.` and
+ *   16 hex characters) holds the range topology of one promoted routingHash of the shard group.
  * - `fokos.admin.<tableName>~<fp(ns)>` is for the administration of a table. It holds no state yet.
  *
  * The topology role is the `FokosShardingAutoAdminDO` of the sharding library, with no change.

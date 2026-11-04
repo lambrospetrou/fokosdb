@@ -3,16 +3,16 @@
  * Durable Object, the framing of the two bodies that the admin Durable Object serves, and the readers
  * that a caller uses on the fetched bytes.
  *
- * - The hash body holds the hash split bitmap and the promoted hashPrefixBuckets, as a sorted list
+ * - The hash body holds the hash split bitmap and the promoted routingHashes, as a sorted list
  *   below the keeper's list limit and as a Bloom filter above it.
- * - The range body holds the known range intervals of one promoted hashPrefixBucket.
+ * - The range body holds the known range intervals of one promoted routingHash.
  *
  * A reader makes typed-array views over the fetched bytes and does not decode them into objects.
  * `docs/agent-plans/2026-10-23-encoded-topology-auto-admin.md` gives the formats. The writer side is
  * in `topology-encode.ts`, so a caller does not ship it.
  */
 import { layerHas } from "../shared/bloom-filter.js";
-import { HASH_PREFIX_BUCKET_BYTES, HashPrefixBucketDigitCursor, type HashPrefixBucket } from "./hash-primitives.js";
+import { ROUTING_HASH_BYTES, RoutingHashDigitCursor, type RoutingHash } from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
@@ -132,9 +132,9 @@ export type HashTopologyView = TopologyVersion & {
 	/** The count of 1 bits before each block of 512 bits, and the total at the end. A view over the body. */
 	rank: Uint32Array;
 	/**
-	 * The sorted hashPrefixBuckets of the `promoted` section, packed 8 bytes each, or null when the
+	 * The sorted routingHashes of the `promoted` section, packed 8 bytes each, or null when the
 	 * body has a `bloom` section for the promoted set (the keeper uses a list up to its
-	 * `promotedListMax` buckets).
+	 * `promotedListMax` routingHashes).
 	 */
 	promoted: { bytes: Uint8Array; count: number } | null;
 	bloom: { bits: Uint8Array; k: number; m: number; layerIndex: 0 } | null;
@@ -181,14 +181,14 @@ export function parseHashBody(input: Uint8Array): HashTopologyView {
 	if (promotedSection !== undefined) {
 		const count = intField(promotedSection, "count");
 		const width = intField(promotedSection, "width");
-		if (width !== HASH_PREFIX_BUCKET_BYTES) {
+		if (width !== ROUTING_HASH_BYTES) {
 			throw new Error("fokos/topology: the promoted section is not valid");
 		}
 		const offset = sectionOffset(body, promotedSection, count * width, "promoted");
 		const bytes = body.subarray(offset, offset + count * width);
-		// The binary search of isPromotedHashPrefixBucket is wrong on an unordered section, so a
+		// The binary search of isPromotedRoutingHash is wrong on an unordered section, so a
 		// reader must refuse one.
-		if (!promotedBucketsInOrder(bytes)) {
+		if (!promotedRoutingHashesInOrder(bytes)) {
 			throw new Error("fokos/topology: the promoted section is not in order");
 		}
 		promoted = { bytes, count };
@@ -240,17 +240,17 @@ export function hashRank1(view: HashTopologyView, pos: number): number {
 }
 
 /**
- * The deepest known hash partition of a hashPrefixBucket: its bitmap position, its root index, and
+ * The deepest known hash partition of a routingHash: its bitmap position, its root index, and
  * its child path from the root. The walk stops before a position in `cut`.
  */
 export function findLeaf(
 	view: HashTopologyView,
 	rootTreesN: number,
 	hashSplitN: number,
-	hashPrefixBucket: HashPrefixBucket,
+	routingHash: RoutingHash,
 	cut: ReadonlySet<number>,
 ): { pos: number; root: number; path: number[] } {
-	const digits = new HashPrefixBucketDigitCursor(hashPrefixBucket, rootTreesN);
+	const digits = new RoutingHashDigitCursor(routingHash, rootTreesN);
 	const root = digits.root;
 	const path: number[] = [];
 	let pos = root;
@@ -267,13 +267,13 @@ export function findLeaf(
 }
 
 /**
- * True when the packed hashPrefixBuckets of a `promoted` section are in strict ascending byte order,
+ * True when the packed routingHashes of a `promoted` section are in strict ascending byte order,
  * with no repeated value. It compares the bytes in place: it makes no views and no copies.
  */
-export function promotedBucketsInOrder(bytes: Uint8Array): boolean {
-	const width = HASH_PREFIX_BUCKET_BYTES;
+export function promotedRoutingHashesInOrder(bytes: Uint8Array): boolean {
+	const width = ROUTING_HASH_BYTES;
 	for (let cur = width; cur < bytes.length; cur += width) {
-		// The same compare as the search of isPromotedHashPrefixBucket, so the two agree on the order.
+		// The same compare as the search of isPromotedRoutingHash, so the two agree on the order.
 		if (KeyCodec.compareSlices(bytes, cur - width, cur, bytes, cur, cur + width) >= 0) {
 			return false;
 		}
@@ -282,33 +282,32 @@ export function promotedBucketsInOrder(bytes: Uint8Array): boolean {
 }
 
 /**
- * Whether the promoted set of the body holds `hashPrefixBucket`:
+ * Whether the promoted set of the body holds `routingHash`:
  * - "exact": the `promoted` section holds it. This answer is always correct.
  * - "maybe": the `bloom` section holds it. This answer can be a false positive.
  * - false: the body does not hold it. This answer is always correct.
  *
  * The search compares each candidate in place: nothing is copied out of the section.
  */
-export function isPromotedHashPrefixBucket(view: HashTopologyView, hashPrefixBucket: HashPrefixBucket): "exact" | "maybe" | false {
+export function isPromotedRoutingHash(view: HashTopologyView, routingHash: RoutingHash): "exact" | "maybe" | false {
 	const promoted = view.promoted;
 	if (promoted === null) {
-		return view.bloom !== null && layerHas(view.bloom, hashPrefixBucket) ? "maybe" : false;
+		return view.bloom !== null && layerHas(view.bloom, routingHash) ? "maybe" : false;
 	}
 	const bytes = promoted.bytes;
-	const key = KeyCodec.asKeyBytes(hashPrefixBucket);
+	const key = KeyCodec.asKeyBytes(routingHash);
 	let a = 0;
 	let b = promoted.count;
 	while (a < b) {
 		// `a + (b - a) / 2` stays below `b`, so it does not overflow the 32 bits of `>>>`.
 		const mid = a + ((b - a) >>> 1);
-		if (KeyCodec.compareSlice(bytes, mid * HASH_PREFIX_BUCKET_BYTES, (mid + 1) * HASH_PREFIX_BUCKET_BYTES, key) < 0) {
+		if (KeyCodec.compareSlice(bytes, mid * ROUTING_HASH_BYTES, (mid + 1) * ROUTING_HASH_BYTES, key) < 0) {
 			a = mid + 1;
 		} else {
 			b = mid;
 		}
 	}
-	const found =
-		a < promoted.count && KeyCodec.compareSlice(bytes, a * HASH_PREFIX_BUCKET_BYTES, (a + 1) * HASH_PREFIX_BUCKET_BYTES, key) === 0;
+	const found = a < promoted.count && KeyCodec.compareSlice(bytes, a * ROUTING_HASH_BYTES, (a + 1) * ROUTING_HASH_BYTES, key) === 0;
 	return found ? "exact" : false;
 }
 
@@ -333,7 +332,7 @@ export type RangeTopologyView = TopologyVersion & {
 	offsets: Uint32Array;
 	bytes: Uint8Array;
 	levels: Uint16Array | Uint32Array;
-	/** `n + 1` values, or none when the hashPrefixBucket is not promoted. */
+	/** `n + 1` values, or none when the routingHash is not promoted. */
 	depths: Uint16Array | Uint32Array;
 	truncatedAtRank: number | null;
 	byteLength: number;

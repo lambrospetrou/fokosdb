@@ -13,7 +13,7 @@ import {
 	type KeyBytes,
 } from "../../src/sharding/index-server.js";
 import {
-	isPromotedHashPrefixBucket,
+	isPromotedRoutingHash,
 	parseHashBody,
 	parseRangeBody,
 	rangeBoundaryAt,
@@ -23,12 +23,12 @@ import {
 	type RangeTarget,
 	type RangeTopologyView,
 } from "../../src/sharding/topology-codec.js";
-import { bucketPromotionReport, hashSplitReport, promotionReport, rangeSplitReport } from "./topology-events.js";
-import { asHashPrefixBucket, compareHashPrefixBuckets, hashPrefixBucketOf } from "../../src/sharding/hash-primitives.js";
+import { routingHashPromotionReport, hashSplitReport, promotionReport, rangeSplitReport } from "./topology-events.js";
+import { asRoutingHash, compareRoutingHashes, routingHashOf } from "../../src/sharding/hash-primitives.js";
 import type { FokosCompositeKey } from "../../src/sharding/key-codec.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
 import { fokosErrorWith, invariantFailure } from "../errors-matchers.js";
-import { promotedSectionBuckets } from "../../src/sharding/topology-encode.js";
+import { promotedSectionRoutingHashes } from "../../src/sharding/topology-encode.js";
 
 const LATER = Number.MAX_SAFE_INTEGER;
 
@@ -191,9 +191,9 @@ describe("topology keeper — reports", () => {
 						}
 					}
 					for (const [key, rank] of promoted) {
-						// Each shard group has its own seed, so both groups get the bucket of one fixed group.
-						const bucket = hashPrefixBucketOf(k(`p${key}`), "fixed");
-						reports.push({ rank, report: (sg) => bucketPromotionReport(sg, bucket, 0, 3, 2) });
+						// Each shard group has its own seed, so both groups get the routingHash of one fixed group.
+						const routingHash = routingHashOf(k(`p${key}`), "fixed");
+						reports.push({ rank, report: (sg) => routingHashPromotionReport(sg, routingHash, 0, 3, 2) });
 					}
 					reports.sort((a, b) => a.rank - b.rank);
 					const keeper = newKeeper();
@@ -218,41 +218,41 @@ describe("topology keeper — reports", () => {
 		});
 	});
 
-	it("puts the promoted hashPrefixBuckets in the promoted list of the hash body", async () => {
+	it("puts the promoted routingHashes in the promoted list of the hash body", async () => {
 		await withKeeper(async (keeper, { sg }) => {
 			await keeper.registerRepartition(promotionReport(sg, KeyCodec.encode("u42"), 0, 2, 2));
 			keeper.runDueBuilds(LATER);
 			const view = parseHashBody(body(keeper.getTopology(sg)));
-			expect(isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode("u42"), sg))).toBe("exact");
-			expect(isPromotedHashPrefixBucket(view, hashPrefixBucketOf(KeyCodec.encode("u43"), sg))).toBe(false);
+			expect(isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode("u42"), sg))).toBe("exact");
+			expect(isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode("u43"), sg))).toBe(false);
 		});
 	});
 
 	it("merges the reports of later builds into the promoted list, equal to a full build", async () => {
 		await withKeeper(async (keeper, { sg }) => {
-			const buckets = Array.from({ length: 30 }, () => asHashPrefixBucket(crypto.getRandomValues(new Uint8Array(8))));
-			// Register the buckets in three unordered batches, with a build after each one.
-			for (const batch of [buckets.slice(20), buckets.slice(0, 10), buckets.slice(10, 20)]) {
-				for (const bucket of batch) {
-					await keeper.registerRepartition(bucketPromotionReport(sg, bucket, 0, 2, 2));
+			const routingHashes = Array.from({ length: 30 }, () => asRoutingHash(crypto.getRandomValues(new Uint8Array(8))));
+			// Register the routingHashes in three unordered batches, with a build after each one.
+			for (const batch of [routingHashes.slice(20), routingHashes.slice(0, 10), routingHashes.slice(10, 20)]) {
+				for (const routingHash of batch) {
+					await keeper.registerRepartition(routingHashPromotionReport(sg, routingHash, 0, 2, 2));
 				}
 				keeper.runDueBuilds(LATER);
 			}
 			// A repeated report adds nothing.
-			await keeper.registerRepartition(bucketPromotionReport(sg, buckets[0], 0, 2, 2));
+			await keeper.registerRepartition(routingHashPromotionReport(sg, routingHashes[0], 0, 2, 2));
 			keeper.runDueBuilds(LATER);
 			const view = parseHashBody(body(keeper.getTopology(sg)));
 			expect(view.bloom).toBeNull();
-			expect([...promotedSectionBuckets(view.promoted!)]).toEqual([...buckets].sort(compareHashPrefixBuckets));
+			expect([...promotedSectionRoutingHashes(view.promoted!)]).toEqual([...routingHashes].sort(compareRoutingHashes));
 		});
 	});
 
 	it("moves the promoted set into a Bloom filter once it is above promotedListMax", async () => {
 		await withKeeper(
 			async (keeper, { sg, storage }) => {
-				const buckets = Array.from({ length: 5 }, () => asHashPrefixBucket(crypto.getRandomValues(new Uint8Array(8))));
-				for (const bucket of buckets.slice(0, 4)) {
-					await keeper.registerRepartition(bucketPromotionReport(sg, bucket, 0, 2, 2));
+				const routingHashes = Array.from({ length: 5 }, () => asRoutingHash(crypto.getRandomValues(new Uint8Array(8))));
+				for (const routingHash of routingHashes.slice(0, 4)) {
+					await keeper.registerRepartition(routingHashPromotionReport(sg, routingHash, 0, 2, 2));
 				}
 				keeper.runDueBuilds(LATER);
 				let view = parseHashBody(body(keeper.getTopology(sg)));
@@ -261,12 +261,12 @@ describe("topology keeper — reports", () => {
 				// reads only the new root. The test deletes the stored root rows to show that the build
 				// does not read them.
 				storage.sql.exec(`DELETE FROM fokos_topo_range_intervals WHERE shard_group = ?1`, sg);
-				await keeper.registerRepartition(bucketPromotionReport(sg, buckets[4], 0, 2, 2));
+				await keeper.registerRepartition(routingHashPromotionReport(sg, routingHashes[4], 0, 2, 2));
 				keeper.runDueBuilds(LATER);
 				view = parseHashBody(body(keeper.getTopology(sg)));
 				expect([view.promoted, view.bloom === null]).toEqual([null, false]);
-				for (const bucket of buckets) {
-					expect(isPromotedHashPrefixBucket(view, bucket)).toBe("maybe");
+				for (const routingHash of routingHashes) {
+					expect(isPromotedRoutingHash(view, routingHash)).toBe("maybe");
 				}
 			},
 			{ promotedListMax: 4 },
@@ -349,9 +349,9 @@ const k = (s: string) => KeyCodec.encode(s);
 const HK = k("u42");
 /** The composite key of the sort key `s` of `HK`. */
 const c = (s: string): FokosCompositeKey => ({ hk: HK, sk: k(s) });
-/** The range body of the hashPrefixBucket of `hashKey`. */
+/** The range body of the routingHash of `hashKey`. */
 const rangeBody = (keeper: FokosTopologyKeeper, sg: string, hashKey: KeyBytes = HK) =>
-	body(keeper.getRangeTopology(sg, hashPrefixBucketOf(hashKey, sg)));
+	body(keeper.getRangeTopology(sg, routingHashOf(hashKey, sg)));
 
 function rangeOf(view: RangeTopologyView, target: RangeTarget | null) {
 	if (!target) {
@@ -391,8 +391,8 @@ describe("topology keeper — range build", () => {
 		});
 	});
 
-	it("serves the range body from range reports only, and a hash body with no hash node and only that hashPrefixBucket", async () => {
-		// The admin of one promoted hashPrefixBucket gets only its promotion and its range splits.
+	it("serves the range body from range reports only, and a hash body with no hash node and only that routingHash", async () => {
+		// The admin of one promoted routingHash gets only its promotion and its range splits.
 		await withKeeper(async (keeper, { sg, storage }) => {
 			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [c("g")]));
 			keeper.runDueBuilds(LATER);
@@ -400,7 +400,7 @@ describe("topology keeper — range build", () => {
 			expect(rangeOf(view, rangePointLookup(view, c("h"), new Set()))).toEqual(["g", null, 1]);
 			expect(storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_hash_nodes").one().n).toBe(0);
 			const hash = parseHashBody(body(keeper.getTopology(sg)));
-			expect([...promotedSectionBuckets(hash.promoted!)]).toEqual([hashPrefixBucketOf(HK, sg)]);
+			expect([...promotedSectionRoutingHashes(hash.promoted!)]).toEqual([routingHashOf(HK, sg)]);
 		});
 	});
 
@@ -438,7 +438,7 @@ describe("topology keeper — range build", () => {
 		await withKeeper(
 			async (keeper, { sg, storage }) => {
 				const dirty = () => storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_range_dirty").one().n;
-				const rangeEtag = (key: KeyBytes) => keeper.getRangeTopology(sg, hashPrefixBucketOf(key, sg)).etag;
+				const rangeEtag = (key: KeyBytes) => keeper.getRangeTopology(sg, routingHashOf(key, sg)).etag;
 				const keys = [k("u1"), k("u2"), k("u3")];
 				for (const key of keys) {
 					await keeper.registerRepartition(promotionReport(sg, key));
@@ -506,7 +506,7 @@ describe("topology keeper — range build", () => {
 
 /**
  * An interval of integer edges. 0 is ~min and 1000 is ~max. The integers map to composite keys of two
- * hash keys of one hashPrefixBucket, in the same order: below `SPLIT` a sort key of `HA`, at `SPLIT` the
+ * hash keys of one routingHash, in the same order: below `SPLIT` a sort key of `HA`, at `SPLIT` the
  * empty sort key of `HB`, and above `SPLIT` a sort key of `HB`. Thus a tree has boundaries inside each
  * hash key and between the two hash keys.
  */
@@ -632,15 +632,15 @@ describe("topology entrypoint", () => {
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
 		let seen: string | undefined;
 		const conditional = await fokosTopologyEntrypointFetch(
-			new Request(`http://topology/internal/v1/topology.GetForRange?sg=${sg}&bk=0123456789abcdef`, {
+			new Request(`http://topology/internal/v1/topology.GetForRange?sg=${sg}&rh=0123456789abcdef`, {
 				headers: { "If-None-Match": '"1.4"' },
 			}),
 			{
 				...opts,
 				admin: () => ({
 					getTopology: ok,
-					getRangeTopology: async (_sg, bucket, ifNoneMatch) => {
-						seen = `${bucket.toHex()} ${ifNoneMatch}`;
+					getRangeTopology: async (_sg, routingHash, ifNoneMatch) => {
+						seen = `${routingHash.toHex()} ${ifNoneMatch}`;
 						return { status: 304, etag: '"1.4"' };
 					},
 				}),

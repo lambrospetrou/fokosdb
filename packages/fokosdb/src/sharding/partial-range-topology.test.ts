@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { AddResult } from "../shared/bloom-filter.js";
-import { hashPrefixBucketOf } from "./hash-primitives.js";
+import { routingHashOf } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
 
-/** The hashPrefixBucket of a hash key in one test shard group. */
-const kb = (s: string) => hashPrefixBucketOf(KeyCodec.encode(s), "fokos.p.bloom-test");
+/** The routingHash of a hash key in one test shard group. */
+const kb = (s: string) => routingHashOf(KeyCodec.encode(s), "fokos.p.bloom-test");
 
 function createSmall() {
 	return PartialRangeTopology.create({ maxSizeBytes: 1024 * 1024, errorRate: 0.01, initialCapacityN: 100 });
@@ -19,7 +19,7 @@ describe("PartialRangeTopology", () => {
 
 		it("isEmpty() is false after adding a key", () => {
 			const prt = createSmall();
-			prt.learnPromotedHashPrefixBucket(kb("user-123"));
+			prt.learnPromotedRoutingHash(kb("user-123"));
 			expect(prt.isEmpty()).toBe(false);
 		});
 	});
@@ -32,7 +32,7 @@ describe("PartialRangeTopology", () => {
 
 		it("returns true for learned keys", () => {
 			const prt = createSmall();
-			prt.learnPromotedHashPrefixBucket(kb("user-123"));
+			prt.learnPromotedRoutingHash(kb("user-123"));
 			expect(prt.maybePromoted(kb("user-123"))).toBe(true);
 		});
 
@@ -40,7 +40,7 @@ describe("PartialRangeTopology", () => {
 			const prt = createSmall();
 			const keys = ["a", "b", "c", "d"];
 			for (const key of keys) {
-				prt.learnPromotedHashPrefixBucket(kb(key));
+				prt.learnPromotedRoutingHash(kb(key));
 			}
 			for (const key of keys) {
 				expect(prt.maybePromoted(kb(key))).toBe(true);
@@ -48,16 +48,16 @@ describe("PartialRangeTopology", () => {
 		});
 	});
 
-	describe("learnPromotedHashPrefixBucket", () => {
+	describe("learnPromotedRoutingHash", () => {
 		it("returns Added when key is new", () => {
 			const prt = createSmall();
-			expect(prt.learnPromotedHashPrefixBucket(kb("key1"))).toBe(AddResult.Added);
+			expect(prt.learnPromotedRoutingHash(kb("key1"))).toBe(AddResult.Added);
 		});
 
 		it("returns AlreadyPresent when key was already added", () => {
 			const prt = createSmall();
-			prt.learnPromotedHashPrefixBucket(kb("key1"));
-			expect(prt.learnPromotedHashPrefixBucket(kb("key1"))).toBe(AddResult.AlreadyPresent);
+			prt.learnPromotedRoutingHash(kb("key1"));
+			expect(prt.learnPromotedRoutingHash(kb("key1"))).toBe(AddResult.AlreadyPresent);
 		});
 	});
 
@@ -66,7 +66,7 @@ describe("PartialRangeTopology", () => {
 			const prt = createSmall();
 			const keys = ["user-1", "user-2", "user-3"];
 			for (const key of keys) {
-				prt.learnPromotedHashPrefixBucket(kb(key));
+				prt.learnPromotedRoutingHash(kb(key));
 			}
 
 			const snapshot = prt.toSnapshot();
@@ -84,7 +84,7 @@ describe("PartialRangeTopology", () => {
 			const restoredEmpty = PartialRangeTopology.fromSnapshot(empty.toSnapshot());
 			expect(restoredEmpty.isEmpty()).toBe(true);
 
-			empty.learnPromotedHashPrefixBucket(kb("k"));
+			empty.learnPromotedRoutingHash(kb("k"));
 			const restoredNonEmpty = PartialRangeTopology.fromSnapshot(empty.toSnapshot());
 			expect(restoredNonEmpty.isEmpty()).toBe(false);
 		});
@@ -100,14 +100,14 @@ describe("PartialRangeTopology", () => {
 
 		it("reports correct key count after adds", () => {
 			const prt = createSmall();
-			prt.learnPromotedHashPrefixBucket(kb("a"));
-			prt.learnPromotedHashPrefixBucket(kb("b"));
+			prt.learnPromotedRoutingHash(kb("a"));
+			prt.learnPromotedRoutingHash(kb("b"));
 			expect(prt.stats().bloomAdditionsCount).toBe(2);
 		});
 	});
 
 	describe("full bloom filter", () => {
-		it("learnPromotedHashPrefixBucket returns Full when bloom filter is full", () => {
+		it("learnPromotedRoutingHash returns Full when bloom filter is full", () => {
 			const prt = PartialRangeTopology.create({
 				maxSizeBytes: 256,
 				errorRate: 0.01,
@@ -116,7 +116,7 @@ describe("PartialRangeTopology", () => {
 			let added = 0;
 			let lastResult: AddResult = AddResult.Added;
 			for (let i = 0; i < 10_000 && lastResult !== AddResult.Full; i++) {
-				lastResult = prt.learnPromotedHashPrefixBucket(kb(`key-${i}`));
+				lastResult = prt.learnPromotedRoutingHash(kb(`key-${i}`));
 				if (lastResult !== AddResult.Full) {
 					added++;
 				}

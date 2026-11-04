@@ -9,14 +9,14 @@ import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js"
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
-import { asHashPrefixBucket, compareHashPrefixBuckets, HASH_PREFIX_BUCKET_BYTES, type HashPrefixBucket } from "./hash-primitives.js";
+import { asRoutingHash, compareRoutingHashes, ROUTING_HASH_BYTES, type RoutingHash } from "./hash-primitives.js";
 import {
 	BODY_SCHEMA,
 	HASH_BODY_MAGIC,
 	hashBit,
 	hashRank1,
 	popcount32,
-	promotedBucketsInOrder,
+	promotedRoutingHashesInOrder,
 	RANGE_BODY_MAGIC,
 	TOPOLOGY_RANK_BLOCK_WORDS,
 	type FokosTopologyEvent,
@@ -62,12 +62,12 @@ function keyFromWire(value: unknown, field: string): KeyBytes {
 	}
 }
 
-function hashPrefixBucketFromWire(value: unknown): HashPrefixBucket {
-	const bucket = keyFromWire(value, "slice.hashPrefixBucket");
-	if (bucket.length !== HASH_PREFIX_BUCKET_BYTES) {
-		throw invalidEvent("slice.hashPrefixBucket must be 8 bytes");
+function routingHashFromWire(value: unknown): RoutingHash {
+	const routingHash = keyFromWire(value, "slice.routingHash");
+	if (routingHash.length !== ROUTING_HASH_BYTES) {
+		throw invalidEvent("slice.routingHash must be 8 bytes");
 	}
-	return asHashPrefixBucket(bucket);
+	return asRoutingHash(routingHash);
 }
 
 function boundaryFromWire(value: unknown): FokosCompositeKey | null {
@@ -95,12 +95,12 @@ function sliceFromWire(value: unknown): FokosSlice {
 		case "range":
 			return {
 				kind: "range",
-				hashPrefixBucket: hashPrefixBucketFromWire(s.hashPrefixBucket),
+				routingHash: routingHashFromWire(s.routingHash),
 				start: boundaryFromWire(s.start),
 				end: boundaryFromWire(s.end),
 			};
-		case "promoted_hash_prefix_bucket":
-			return { kind: "promoted_hash_prefix_bucket", hashPrefixBucket: hashPrefixBucketFromWire(s.hashPrefixBucket) };
+		case "promoted_routing_hash":
+			return { kind: "promoted_routing_hash", routingHash: routingHashFromWire(s.routingHash) };
 		default:
 			throw invalidEvent("unknown slice kind", { kind: s.kind });
 	}
@@ -452,31 +452,31 @@ function rankIndex(bits: Uint8Array, bitCount: number): Uint32Array {
 
 export type TopologyBloomSection = { bits: Uint8Array; k: number; m: number; capacity: number; count: number; errorRate: number };
 
-/** The hashPrefixBuckets of a parsed `promoted` section, in their stored order. */
-export function* promotedSectionBuckets(section: { bytes: Uint8Array; count: number }): Iterable<HashPrefixBucket> {
+/** The routingHashes of a parsed `promoted` section, in their stored order. */
+export function* promotedSectionRoutingHashes(section: { bytes: Uint8Array; count: number }): Iterable<RoutingHash> {
 	for (let i = 0; i < section.count; i++) {
-		yield asHashPrefixBucket(section.bytes.subarray(i * HASH_PREFIX_BUCKET_BYTES, (i + 1) * HASH_PREFIX_BUCKET_BYTES));
+		yield asRoutingHash(section.bytes.subarray(i * ROUTING_HASH_BYTES, (i + 1) * ROUTING_HASH_BYTES));
 	}
 }
 
 /**
- * The merge of two sorted hashPrefixBucket streams, packed for a `promoted` section. An equal value
+ * The merge of two sorted routingHash streams, packed for a `promoted` section. An equal value
  * goes in once, from the same stream or from the two streams.
  */
-export function mergePromotedBuckets(base: Iterable<HashPrefixBucket>, added: Iterable<HashPrefixBucket>): Uint8Array {
+export function mergePromotedRoutingHashes(base: Iterable<RoutingHash>, added: Iterable<RoutingHash>): Uint8Array {
 	const a = base[Symbol.iterator]();
 	const b = added[Symbol.iterator]();
 	let x = a.next();
 	let y = b.next();
-	const chunks: HashPrefixBucket[] = [];
-	const take = (v: HashPrefixBucket) => {
+	const chunks: RoutingHash[] = [];
+	const take = (v: RoutingHash) => {
 		// The output is sorted, so a repeated value is equal to the last value that went in.
-		if (chunks.length === 0 || compareHashPrefixBuckets(chunks[chunks.length - 1], v) !== 0) {
+		if (chunks.length === 0 || compareRoutingHashes(chunks[chunks.length - 1], v) !== 0) {
 			chunks.push(v);
 		}
 	};
 	while (!x.done || !y.done) {
-		if (y.done || (!x.done && compareHashPrefixBuckets(x.value, y.value) <= 0)) {
+		if (y.done || (!x.done && compareRoutingHashes(x.value, y.value) <= 0)) {
 			take(x.value!);
 			x = a.next();
 		} else {
@@ -484,8 +484,8 @@ export function mergePromotedBuckets(base: Iterable<HashPrefixBucket>, added: It
 			y = b.next();
 		}
 	}
-	const out = new Uint8Array(chunks.length * HASH_PREFIX_BUCKET_BYTES);
-	chunks.forEach((chunk, i) => out.set(chunk, i * HASH_PREFIX_BUCKET_BYTES));
+	const out = new Uint8Array(chunks.length * ROUTING_HASH_BYTES);
+	chunks.forEach((chunk, i) => out.set(chunk, i * ROUTING_HASH_BYTES));
 	return out;
 }
 
@@ -495,7 +495,7 @@ export function encodeHashBody(input: {
 	rootTreesN: number;
 	hashSplitN: number;
 	bitmap: { bits: Uint8Array; bitCount: number };
-	/** The packed sorted hashPrefixBuckets of the `promoted` section, or null when the body uses `bloom`. */
+	/** The packed sorted routingHashes of the `promoted` section, or null when the body uses `bloom`. */
 	promoted: Uint8Array | null;
 	bloom: TopologyBloomSection | null;
 }): Uint8Array {
@@ -510,16 +510,13 @@ export function encodeHashBody(input: {
 		{ name: "rank", bytes: new Uint8Array(rank.buffer), meta: { count: rank.length } },
 	];
 	if (input.promoted) {
-		invariant(
-			input.promoted.length % HASH_PREFIX_BUCKET_BYTES === 0,
-			"fokos/topology-encode: the promoted section is not packed hashPrefixBuckets",
-		);
+		invariant(input.promoted.length % ROUTING_HASH_BYTES === 0, "fokos/topology-encode: the promoted section is not packed routingHashes");
 		// A reader refuses an unordered section, so the keeper must not store one.
-		invariant(promotedBucketsInOrder(input.promoted), "fokos/topology-encode: the promoted section is not in strict order");
+		invariant(promotedRoutingHashesInOrder(input.promoted), "fokos/topology-encode: the promoted section is not in strict order");
 		sections.push({
 			name: "promoted",
 			bytes: input.promoted,
-			meta: { count: input.promoted.length / HASH_PREFIX_BUCKET_BYTES, width: HASH_PREFIX_BUCKET_BYTES },
+			meta: { count: input.promoted.length / ROUTING_HASH_BYTES, width: ROUTING_HASH_BYTES },
 		});
 	}
 	if (input.bloom) {
@@ -577,10 +574,10 @@ export function promotedKeysBloom(
 // ─── the range body ──────────────────────────────────────────────────────────
 
 /**
- * The known intervals of one promoted hashPrefixBucket. `boundaries` are the inner composite
+ * The known intervals of one promoted routingHash. `boundaries` are the inner composite
  * boundaries in key order, `levels[j]` is the rank of the deepest known interval that has boundary j
  * strictly inside it, and `depths[i]` is the rank of the deepest known interval that holds segment i.
- * No segment: the hashPrefixBucket is not promoted. Each boundary is two byte strings, so the offsets
+ * No segment: the routingHash is not promoted. Each boundary is two byte strings, so the offsets
  * section holds `2n + 1` values.
  */
 export function encodeRangeBody(input: {

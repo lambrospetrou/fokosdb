@@ -39,7 +39,7 @@ import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
 import { topologyCacheFor } from "../shared/topology-hooks.js";
 import { FOKOS_HASH_PARTITIONS_MAX, FokosTopology, type FokosPartitionRef } from "../sharding/route-context.js";
-import type { HashPrefixBucket } from "../sharding/hash-primitives.js";
+import type { RoutingHash } from "../sharding/hash-primitives.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
@@ -1679,20 +1679,19 @@ export class FokosDB {
 		// The client owns the traversal: the fence, the target order and the dedup.
 		const { topology, policy } = this.#table;
 		const fp = tableFingerprint(env, this.#table);
-		const adminOf = (shardGroup: string, binding: DataNamespaceKey, hashPrefixBucket?: HashPrefixBucket) =>
-			topologyAdminAddress(env, { topology: { ...topology, shardGroup }, policy }, binding, hashPrefixBucket);
-		// The admin of a promoted hashPrefixBucket is reset after its range tree is gone, while the fenced
+		const adminOf = (shardGroup: string, binding: DataNamespaceKey, routingHash?: RoutingHash) =>
+			topologyAdminAddress(env, { topology: { ...topology, shardGroup }, policy }, binding, routingHash);
+		// The admin of a promoted routingHash is reset after its range tree is gone, while the fenced
 		// partition that promoted it still links it. A destroy that stops before the reset finds the link
 		// again.
-		const resetPromoted =
-			(shardGroup: string, binding: DataNamespaceKey) => async (_ref: FokosPartitionRef, promoted: HashPrefixBucket[]) => {
-				for (const hashPrefixBucket of promoted) {
-					const admin = adminOf(shardGroup, binding, hashPrefixBucket);
-					if (admin !== undefined) {
-						await topologyAdminStub(env, admin).resetShardGroup(shardGroup);
-					}
+		const resetPromoted = (shardGroup: string, binding: DataNamespaceKey) => async (_ref: FokosPartitionRef, promoted: RoutingHash[]) => {
+			for (const routingHash of promoted) {
+				const admin = adminOf(shardGroup, binding, routingHash);
+				if (admin !== undefined) {
+					await topologyAdminStub(env, admin).resetShardGroup(shardGroup);
 				}
-			};
+			}
+		};
 		await this.#coordinators.destroy({
 			onDestroyed: (ref) => console.warn(`Destroyed transaction coordinator ${ref.doName}`),
 			beforeDestroy: resetPromoted(coordinatorShardGroup(topology, fp), policy.nsTx),

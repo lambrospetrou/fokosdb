@@ -17,7 +17,7 @@
  */
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../../shared/invariant.js";
-import { compareHashPrefixBuckets, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { compareRoutingHashes, type RoutingHash } from "../../sharding/hash-primitives.js";
 import { collectStream, comparePositions, rowFilter, type StreamReader } from "../../shared/partition/fokos-migration-host.js";
 import type { KeyRange, StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
@@ -44,7 +44,7 @@ export type MaterializationMigrationHostDeps = {
 	/** The `DurableObjectId` of this partition, in hex: the producer ID of its target calls. */
 	selfId: () => string;
 	/** The storage prefix of a hash key in the shard group of this partition. */
-	storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket;
+	storagePrefix: (hashKey: KeyBytes) => RoutingHash;
 };
 
 const STREAM_ORDER: Record<MaterializationHostCursor["stream"], number> = { items: 0, producer_fences: 1, state: 2 };
@@ -116,7 +116,7 @@ export class MaterializationMigrationHost implements MigrationHost {
 			case "items": {
 				// An item that is present already contributes nothing, so a retried page does not count
 				// its rows two times.
-				const added: Array<{ prefix: HashPrefixBucket; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
+				const added: Array<{ prefix: RoutingHash; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
 				let maxItemId = 0;
 				for (const item of p.items) {
 					if (store.insertMigratedItem(item)) {
@@ -171,7 +171,7 @@ export class MaterializationMigrationHost implements MigrationHost {
 				// The row is stored under the prefix it carries, so a wrong prefix puts it outside the
 				// range of its own hash key, where a later read by prefix cannot find it.
 				invariant(
-					compareHashPrefixBuckets(item.prefix, this.deps.storagePrefix(item.hk)) === 0,
+					compareRoutingHashes(item.prefix, this.deps.storagePrefix(item.hk)) === 0,
 					() =>
 						`fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)} with a prefix that is not the storage prefix of the hash key`,
 				);
@@ -185,8 +185,8 @@ export class MaterializationMigrationHost implements MigrationHost {
 	 */
 	#cursors(slice: FokosSlice): ReadonlyMap<string, number> {
 		const { store } = this.deps;
-		if (slice.kind === "promoted_hash_prefix_bucket") {
-			const snapshot = store.cursorSnapshot(slice.hashPrefixBucket);
+		if (slice.kind === "promoted_routing_hash") {
+			const snapshot = store.cursorSnapshot(slice.routingHash);
 			invariant(snapshot !== undefined, "fokos/mat-migration: a promotion source has no cursor snapshot");
 			return snapshot;
 		}

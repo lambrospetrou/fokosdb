@@ -17,16 +17,16 @@ import {
 	type TopologyVersion,
 } from "./topology-codec.js";
 import type { FokosTopology } from "./route-context.js";
-import type { HashPrefixBucket } from "./hash-primitives.js";
+import type { RoutingHash } from "./hash-primitives.js";
 
 export type FokosTopologyCacheOptions = {
 	/**
 	 * Host code. Fetches one encoded topology, for example through `ctx.exports.FokosDBTopologyCache.fetch`.
 	 * Give `signal` to the fetch, so the request stops when the refresh stops waiting for it.
-	 * `hashPrefixBucket` is the hashPrefixBucket of a range topology, and undefined for the hash topology,
+	 * `routingHash` is the routingHash of a range topology, and undefined for the hash topology,
 	 * so the host can read each one from a different source.
 	 */
-	fetch(this: void, path: string, signal: AbortSignal, hashPrefixBucket?: HashPrefixBucket): Promise<Response>;
+	fetch(this: void, path: string, signal: AbortSignal, routingHash?: RoutingHash): Promise<Response>;
 	/** The `waitUntil` of the request (Worker) or of the `DurableObjectState` (Durable Object). */
 	waitUntil(this: void, promise: Promise<unknown>): void;
 	/**
@@ -86,11 +86,11 @@ export function topologyGetPath(shardGroup: string): string {
 }
 
 /**
- * The path of `topology.GetForRange` for one hashPrefixBucket of a shard group, with its 16 hex
+ * The path of `topology.GetForRange` for one routingHash of a shard group, with its 16 hex
  * characters. The path has a fixed length for each shard group.
  */
-export function topologyGetForRangePath(shardGroup: string, hashPrefixBucket: HashPrefixBucket): string {
-	return `${topologyGetPath(shardGroup).replace("topology.Get", "topology.GetForRange")}&bk=${hashPrefixBucket.toHex()}`;
+export function topologyGetForRangePath(shardGroup: string, routingHash: RoutingHash): string {
+	return `${topologyGetPath(shardGroup).replace("topology.Get", "topology.GetForRange")}&rh=${routingHash.toHex()}`;
 }
 
 /** The scope part of a cache key. A JSON string ends at its closing quote, so no two scopes give the same prefix. */
@@ -130,16 +130,16 @@ export function cachedHashTopology(opts: FokosTopologyCacheOptions, topology: Fo
 	return entry;
 }
 
-/** The range entry of one hashPrefixBucket, or undefined. It starts a refresh when the entry is absent or old. */
+/** The range entry of one routingHash, or undefined. It starts a refresh when the entry is absent or old. */
 export function cachedRangeTopology(
 	opts: FokosTopologyCacheOptions,
 	shardGroup: string,
-	hashPrefixBucket: HashPrefixBucket,
+	routingHash: RoutingHash,
 ): TopologyEntry<RangeTopologyView> | undefined {
-	const key = `r|${scopeOf(opts)}|${shardGroup}|${hashPrefixBucket.toHex()}`;
+	const key = `r|${scopeOf(opts)}|${shardGroup}|${routingHash.toHex()}`;
 	const entry = cache.get(key) as TopologyEntry<RangeTopologyView> | undefined;
 	if (shouldRefresh(opts, key, entry)) {
-		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, hashPrefixBucket), parseRangeBody, hashPrefixBucket));
+		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, routingHash), parseRangeBody, routingHash));
 	}
 	return entry;
 }
@@ -180,13 +180,13 @@ async function refresh(
 	key: string,
 	path: string,
 	parse: (body: Uint8Array) => HashTopologyView | RangeTopologyView,
-	hashPrefixBucket?: HashPrefixBucket,
+	routingHash?: RoutingHash,
 ): Promise<void> {
 	const startedAt = refreshStartedAt.get(key);
 	const signal = AbortSignal.timeout(opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS);
 	try {
 		const read = async () => {
-			const response = await opts.fetch(path, signal, hashPrefixBucket);
+			const response = await opts.fetch(path, signal, routingHash);
 			if (response.status !== 200) {
 				await response.body?.cancel();
 				throw new Error(`the topology read answered ${response.status}`);

@@ -129,7 +129,7 @@ export type TransactionCoordinatorDOConfig = Readonly<{
 	sweepBatchRows: number;
 	/**
 	 * The transactions in one `DELETE` statement of the idempotency sweep. Each transaction binds two
-	 * parameters, its hashPrefixBucket and its ID, so at most 50: half the bound parameter limit.
+	 * parameters, its routingHash and its ID, so at most 50: half the bound parameter limit.
 	 */
 	sweepDeleteChunkRows: number;
 	/** The non-terminal transactions that one step of the `tx_recovery` job reads. */

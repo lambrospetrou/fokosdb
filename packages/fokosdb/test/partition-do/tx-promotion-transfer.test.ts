@@ -43,7 +43,7 @@ function cutOverPromotion(state: DurableObjectState, hashKey: string | null): vo
 		seq,
 		kind: "key_promotion",
 		state: "cutover",
-		hashPrefixBucket: hashKey === null ? null : partitionPrefixOf(state)(kb(hashKey)),
+		routingHash: hashKey === null ? null : partitionPrefixOf(state)(kb(hashKey)),
 		queuedAt: now,
 		cutoverAt: now,
 		nextAttemptAt: now + PARKED_MS,

@@ -579,7 +579,7 @@ describe("query statement", () => {
 				const sql = composeQueryStatement(plan, {
 					select: "projection",
 					direction,
-					scanConditions: ["hash_prefix_bucket = ?", "hk = ?", "sk >= ?"],
+					scanConditions: ["routing_hash = ?", "hk = ?", "sk >= ?"],
 				});
 				const details = state.storage.sql
 					.exec<{ detail: string }>(

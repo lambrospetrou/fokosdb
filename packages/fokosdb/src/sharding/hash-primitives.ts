@@ -11,33 +11,33 @@ import { CORE_INTERNAL_CODES, FokosInternalError } from "../shared/errors.js";
 // Golden Ratio constant for better hash scattering.
 // See https://softwareengineering.stackexchange.com/a/402543
 export const GOLDEN_RATIO = 0x9e3779b1;
-// The default base seed of `hashPrefixBucketSeedOf`, so a change moves every stored hashPrefixBucket. It must never change.
+// The default base seed of `routingHashSeedOf`, so a change moves every stored routingHash. It must never change.
 export const GOLDEN_RATIO_BIGINT = BigInt(0x9e3779b1);
 
-declare const HASH_PREFIX_BUCKET_BRAND: unique symbol;
+declare const ROUTING_HASH_BRAND: unique symbol;
 
 /**
  * A storage prefix: the xxHash64 of an encoded hash key, seeded per shard group, as 8 bytes,
  * most significant byte first. The brand separates it from `KeyBytes` and from the interval bounds
  * of `FokosStorageKey`, which are positions in the storage order and can be shorter.
  */
-export type HashPrefixBucket = Uint8Array & { readonly [HASH_PREFIX_BUCKET_BRAND]: true };
+export type RoutingHash = Uint8Array & { readonly [ROUTING_HASH_BRAND]: true };
 
-/** The byte length of a hashPrefixBucket. */
-export const HASH_PREFIX_BUCKET_BYTES = 8;
+/** The byte length of a routingHash. */
+export const ROUTING_HASH_BYTES = 8;
 
 /**
- * Brands `bytes` as a hashPrefixBucket after the length check, so a wrong-length value fails where it
+ * Brands `bytes` as a routingHash after the length check, so a wrong-length value fails where it
  * enters, not later in a routing or a storage read.
  */
-export function asHashPrefixBucket(bytes: Uint8Array): HashPrefixBucket {
-	if (bytes.length !== HASH_PREFIX_BUCKET_BYTES) {
+export function asRoutingHash(bytes: Uint8Array): RoutingHash {
+	if (bytes.length !== ROUTING_HASH_BYTES) {
 		throw new FokosInternalError(CORE_INTERNAL_CODES.invariant_failed, {
 			message: "an internal invariant failed",
-			attributes: { detail: `fokos/hash-primitives: a hashPrefixBucket is ${HASH_PREFIX_BUCKET_BYTES} bytes, got ${bytes.length}` },
+			attributes: { detail: `fokos/hash-primitives: a routingHash is ${ROUTING_HASH_BYTES} bytes, got ${bytes.length}` },
 		});
 	}
-	return bytes as HashPrefixBucket;
+	return bytes as RoutingHash;
 }
 
 export function hash64(data: string | Uint8Array, seed?: bigint): bigint {
@@ -48,25 +48,25 @@ export function hash64(data: string | Uint8Array, seed?: bigint): bigint {
 }
 
 /**
- * The xxHash64 seed of the hashPrefixBuckets of a shard group, as 16 lowercase hex characters: xxh64
+ * The xxHash64 seed of the routingHashes of a shard group, as 16 lowercase hex characters: xxh64
  * of its UTF-8 name with `baseSeed`. A platform can give its own `baseSeed`, and must then keep it for
  * the life of its data.
  */
-export function hashPrefixBucketSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string {
+export function routingHashSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string {
 	return hash64(shardGroup, baseSeed).toString(16).padStart(16, "0");
 }
 
-/** The hashPrefixBucket of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
-export function hashPrefixBucket(hashKey: KeyBytes, seed: bigint): HashPrefixBucket {
-	return bucketBytes(hashers.h64Raw(hashKey, seed));
+/** The routingHash of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
+export function routingHash(hashKey: KeyBytes, seed: bigint): RoutingHash {
+	return routingHashBytes(hashers.h64Raw(hashKey, seed));
 }
 
 /** The seed of each shard group that this isolate hashed for. A shard group is a table, a GSI, or a derived group. */
 const shardGroupSeeds = new Map<string, bigint>();
 const SHARD_GROUP_SEEDS_MAX = 1024;
 
-/** The hashPrefixBucket of an encoded hash key in `shardGroup`, with the seed `hashPrefixBucketSeedOf(shardGroup)`. */
-export function hashPrefixBucketOf(hashKey: KeyBytes, shardGroup: string): HashPrefixBucket {
+/** The routingHash of an encoded hash key in `shardGroup`, with the seed `routingHashSeedOf(shardGroup)`. */
+export function routingHashOf(hashKey: KeyBytes, shardGroup: string): RoutingHash {
 	let seed = shardGroupSeeds.get(shardGroup);
 	if (seed === undefined) {
 		// The oldest seed goes. A hit stays one lookup, and a seed is cheap to compute again.
@@ -76,7 +76,7 @@ export function hashPrefixBucketOf(hashKey: KeyBytes, shardGroup: string): HashP
 		seed = hash64(shardGroup);
 		shardGroupSeeds.set(shardGroup, seed);
 	}
-	return hashPrefixBucket(hashKey, seed);
+	return routingHash(hashKey, seed);
 }
 
 /** The deepest hash partition of any topology. It bounds a lopsided branch, the hash arena, and the depth byte of a partition ID. */
@@ -87,19 +87,19 @@ const TWO_64 = 1n << 64n;
 const TWO_32 = 0x1_0000_0000;
 
 /**
- * A cursor over the digits of a hashPrefixBucket `x`, read as the fraction `x / 2^64`: the root digit
+ * A cursor over the digits of a routingHash `x`, read as the fraction `x / 2^64`: the root digit
  * in base `rootTreesN`, then one digit for each `next(base)`. The value is two 32-bit limbs
  * `hi * 2^32 + lo`. One step multiplies it by `base` (at most 65,000), so each product is below 2^53
  * and exact in a number. The digit is the part above 2^64, and the rest stays in the limbs.
  */
-export class HashPrefixBucketDigitCursor {
+export class RoutingHashDigitCursor {
 	#hi: number;
 	#lo: number;
 	readonly root: number;
 
-	constructor(hashPrefixBucket: HashPrefixBucket, rootTreesN: number) {
+	constructor(routingHash: RoutingHash, rootTreesN: number) {
 		// Read the bytes directly: a `DataView` for each cursor costs more than the whole walk.
-		const b = hashPrefixBucket;
+		const b = routingHash;
 		this.#hi = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
 		this.#lo = ((b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]) >>> 0;
 		this.root = this.next(rootTreesN);
@@ -116,14 +116,14 @@ export class HashPrefixBucketDigitCursor {
 	}
 }
 
-/** The digits of a hashPrefixBucket: the root digit, then one digit for each level, `depth` levels. */
-export function hashPrefixBucketDigits(
-	hashPrefixBucket: HashPrefixBucket,
+/** The digits of a routingHash: the root digit, then one digit for each level, `depth` levels. */
+export function routingHashDigits(
+	routingHash: RoutingHash,
 	rootTreesN: number,
 	hashSplitN: number,
 	depth: number,
 ): { root: number; path: number[] } {
-	const cursor = new HashPrefixBucketDigitCursor(hashPrefixBucket, rootTreesN);
+	const cursor = new RoutingHashDigitCursor(routingHash, rootTreesN);
 	const path: number[] = [];
 	for (let d = 0; d < depth; d++) {
 		path.push(cursor.next(hashSplitN));
@@ -134,7 +134,7 @@ export function hashPrefixBucketDigits(
 /**
  * The deepest hash partition of a topology: at most `MAX_HASH_DEPTH`, and the largest `d` with
  * `rootTreesN * hashSplitN^d <= 2^64`. Down to that depth each node interval holds at least one
- * hashPrefixBucket, so the digits of a hashPrefixBucket are exact.
+ * routingHash, so the digits of a routingHash are exact.
  */
 export function maxHashDepth(rootTreesN: number, hashSplitN: number): number {
 	const memoKey = rootTreesN * 256 + hashSplitN;
@@ -152,17 +152,17 @@ export function maxHashDepth(rootTreesN: number, hashSplitN: number): number {
 }
 
 /**
- * The hashPrefixBucket interval `[start, end)` of the hash node at `root` and `path`. A null `end` has
- * no upper bound: the last node of a level ends at 2^64, which has no 8-byte form. A hashPrefixBucket
+ * The routingHash interval `[start, end)` of the hash node at `root` and `path`. A null `end` has
+ * no upper bound: the last node of a level ends at 2^64, which has no 8-byte form. A routingHash
  * is in the interval exactly when its digits give `root` and `path`, because both are
  * `floor(x * D / 2^64)` with `D = rootTreesN * hashSplitN^depth`.
  */
-export function hashPrefixBucketInterval(
+export function routingHashInterval(
 	rootTreesN: number,
 	hashSplitN: number,
 	root: number,
 	path: ArrayLike<number>,
-): { start: HashPrefixBucket; end: HashPrefixBucket | null } {
+): { start: RoutingHash; end: RoutingHash | null } {
 	invariant(root < rootTreesN, "fokos/hash-primitives: the hash node is outside the topology");
 	const k = BigInt(hashSplitN);
 	let numer = BigInt(root);
@@ -172,28 +172,28 @@ export function hashPrefixBucketInterval(
 		numer = numer * k + BigInt(path[d]);
 		nodes *= k;
 	}
-	const start = bucketBytes(ceilDiv(numer << 64n, nodes));
-	return { start, end: numer + 1n === nodes ? null : bucketBytes(ceilDiv((numer + 1n) << 64n, nodes)) };
+	const start = routingHashBytes(ceilDiv(numer << 64n, nodes));
+	return { start, end: numer + 1n === nodes ? null : routingHashBytes(ceilDiv((numer + 1n) << 64n, nodes)) };
 }
 
 function ceilDiv(a: bigint, b: bigint): bigint {
 	return (a + b - 1n) / b;
 }
 
-// One view for every write. A `DataView` for each hashPrefixBucket made a route resolve several times
+// One view for every write. A `DataView` for each routingHash made a route resolve several times
 // slower. The write and the copy have no `await` between them, so no other call can use the view.
 const scratchView = new DataView(new ArrayBuffer(8));
 const scratchBytes = new Uint8Array(scratchView.buffer);
 
 /** The 8 bytes of `value`, most significant byte first, in a new array. */
-function bucketBytes(value: bigint): HashPrefixBucket {
+function routingHashBytes(value: bigint): RoutingHash {
 	scratchView.setBigUint64(0, value, false);
-	return scratchBytes.slice() as HashPrefixBucket;
+	return scratchBytes.slice() as RoutingHash;
 }
 
-/** The unsigned byte order of two hashPrefixBuckets, which is their numeric order. */
-export function compareHashPrefixBuckets(a: HashPrefixBucket, b: HashPrefixBucket): number {
-	for (let i = 0; i < HASH_PREFIX_BUCKET_BYTES; i++) {
+/** The unsigned byte order of two routingHashes, which is their numeric order. */
+export function compareRoutingHashes(a: RoutingHash, b: RoutingHash): number {
+	for (let i = 0; i < ROUTING_HASH_BYTES; i++) {
 		if (a[i] !== b[i]) {
 			return a[i] - b[i];
 		}
@@ -201,13 +201,9 @@ export function compareHashPrefixBuckets(a: HashPrefixBucket, b: HashPrefixBucke
 	return 0;
 }
 
-/** True when `hashPrefixBucket` is in `[start, end)`. A null `end` has no upper bound. */
-export function inHashPrefixBucketInterval(
-	hashPrefixBucket: HashPrefixBucket,
-	start: HashPrefixBucket,
-	end: HashPrefixBucket | null,
-): boolean {
-	return compareHashPrefixBuckets(hashPrefixBucket, start) >= 0 && (end === null || compareHashPrefixBuckets(hashPrefixBucket, end) < 0);
+/** True when `routingHash` is in `[start, end)`. A null `end` has no upper bound. */
+export function inRoutingHashInterval(routingHash: RoutingHash, start: RoutingHash, end: RoutingHash | null): boolean {
+	return compareRoutingHashes(routingHash, start) >= 0 && (end === null || compareRoutingHashes(routingHash, end) < 0);
 }
 
 export function hash32(data: string | Uint8Array, seed?: number): number {

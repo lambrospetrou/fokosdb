@@ -1,4 +1,4 @@
-import { hash64, hashPrefixBucketDigits, hashPrefixBucketOf } from "../src/sharding/hash-primitives.js";
+import { hash64, routingHashDigits, routingHashOf } from "../src/sharding/hash-primitives.js";
 import type { KeyBytes } from "../src/sharding/key-codec.js";
 import type { FokosTopology } from "../src/sharding/route-context.js";
 
@@ -6,7 +6,7 @@ export type DigitTopology = Pick<FokosTopology, "shardGroup" | "rootTreesN" | "h
 
 /** The digits of a hash key in a topology: the root index, then the child index of each level, `depth` levels. */
 export function hashDigits(topology: DigitTopology, hashKey: KeyBytes, depth: number): { root: number; path: number[] } {
-	return hashPrefixBucketDigits(hashPrefixBucketOf(hashKey, topology.shardGroup), topology.rootTreesN, topology.hashSplitN, depth);
+	return routingHashDigits(routingHashOf(hashKey, topology.shardGroup), topology.rootTreesN, topology.hashSplitN, depth);
 }
 
 /** The child index of a hash key below a hash partition at `parentDepth`. */
@@ -40,7 +40,7 @@ function inverse64(a: bigint): bigint {
 	return x;
 }
 
-/** One 8-byte lane of xxHash64, in its little-endian order (not the big-endian of a hashPrefixBucket). */
+/** One 8-byte lane of xxHash64, in its little-endian order (not the big-endian of a routingHash). */
 const lane64 = (b: Uint8Array, at: number) => new DataView(b.buffer, b.byteOffset + at, 8).getBigUint64(0, true);
 
 /** The keyed step `rotl64(lane * P2, 31) * P1`. A rotate and an odd multiply are both invertible. */
@@ -57,7 +57,7 @@ const xxhUnround = (k: bigint) => mul64(rotl64(mul64(k, inverse64(XXH_P1)), 33n)
 const xxhLane = (state: bigint, lane: bigint) => (mul64(rotl64(state ^ xxhRound(lane), 27n), XXH_P1) + XXH_P4) & U64;
 
 /**
- * Two binary hash keys of 16 bytes whose encoded keys have one hashPrefixBucket in `shardGroup`.
+ * Two binary hash keys of 16 bytes whose encoded keys have one routingHash in `shardGroup`.
  *
  * An encoded binary key is the tag 0xFF and the raw bytes: 17 bytes. xxHash64 reads an input of 17
  * bytes as two 8-byte lanes and one last byte, and each step is invertible. The two keys differ in

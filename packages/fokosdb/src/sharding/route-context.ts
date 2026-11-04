@@ -7,7 +7,7 @@
  * value that it stores, compares, and forwards.
  */
 import type { FokosCompositeKey } from "./key-codec.js";
-import type { HashPrefixBucket } from "./hash-primitives.js";
+import type { RoutingHash } from "./hash-primitives.js";
 import type { RangeAncestorInfo } from "./types.js";
 import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
@@ -17,20 +17,20 @@ import { SHARD_GROUP_SEPARATOR } from "./partition-id.js";
  * The immutable topology of a shard group. `shardGroup`, `rootTreesN`, and `hashSplitN` must never
  * change after initialization, because they decide the partition of each stored hash key.
  *
- * Each hash key maps to a 64-bit hashPrefixBucket. Read as a fraction in `[0, 1)`, its first digit
+ * Each hash key maps to a 64-bit routingHash. Read as a fraction in `[0, 1)`, its first digit
  * in base `rootTreesN` selects the root, and each next digit in base `hashSplitN` selects the child
- * at one level. Thus each hash partition owns one interval of hashPrefixBuckets.
+ * at one level. Thus each hash partition owns one interval of routingHashes.
  *
  * Use a power of two for both `rootTreesN` and `hashSplitN`. Then each node interval is an exact
  * binary fraction of 2^64: all siblings have the same size, and the interval edges need no rounding.
- * Other values are correct, but sibling sizes can differ by one hashPrefixBucket. Also, at the depth
- * limit some leaves can hold two hashPrefixBuckets, and such a leaf cannot split.
+ * Other values are correct, but sibling sizes can differ by one routingHash. Also, at the depth
+ * limit some leaves can hold two routingHashes, and such a leaf cannot split.
  */
 export type FokosTopology = {
 	/**
 	 * The name of the shard group, for example a table, a GSI, or a coordinator group. It names the
-	 * Durable Objects of the group and gives the seed of its hashPrefixBucket
-	 * (`hashPrefixBucketSeedOf`). It must not be empty and must not contain `SHARD_GROUP_SEPARATOR`.
+	 * Durable Objects of the group and gives the seed of its routingHash
+	 * (`routingHashSeedOf`). It must not be empty and must not contain `SHARD_GROUP_SEPARATOR`.
 	 */
 	shardGroup: string;
 	/**
@@ -66,7 +66,7 @@ export type FokosRouteContext<TPolicy> = {
 	 * a hash partition, and `"01"` and two base64url parts for a range partition.
 	 */
 	partitionId: string;
-	/** `<shardGroup>~h.<root>[.<child>...]` or `<shardGroup>~r.<hashPrefixBucket hex>.<start>.<end>`. */
+	/** `<shardGroup>~h.<root>[.<child>...]` or `<shardGroup>~r.<routingHash hex>.<start>.<end>`. */
 	doName: string;
 	/** Immutable topology of the shard group. Persisted at creation. A later mismatch is an error. */
 	topology: FokosTopology;
@@ -92,16 +92,16 @@ export type FokosPartitionIdentity = {
 	ref: FokosPartitionRef;
 	kind: "hash" | "range";
 	/**
-	 * Hash: the root index and the child path, decoded from `ref.partitionId`, and the hashPrefixBucket
+	 * Hash: the root index and the child path, decoded from `ref.partitionId`, and the routingHash
 	 * interval `[start, end)` of the node. `depth` is `path.length`, and a null `end` has no upper bound.
 	 */
-	hash?: { rootIndex: number; path: number[]; depth: number; start: HashPrefixBucket; end: HashPrefixBucket | null };
+	hash?: { rootIndex: number; path: number[]; depth: number; start: RoutingHash; end: RoutingHash | null };
 	/**
-	 * Range: the promoted hashPrefixBucket of the range tree, and the composite interval
+	 * Range: the promoted routingHash of the range tree, and the composite interval
 	 * `[start, end)` of this node inside it. A null edge is unbounded.
 	 */
 	range?: {
-		hashPrefixBucket: HashPrefixBucket;
+		routingHash: RoutingHash;
 		start: FokosCompositeKey | null;
 		end: FokosCompositeKey | null;
 		depth: number;
@@ -110,11 +110,11 @@ export type FokosPartitionIdentity = {
 	};
 	topology: FokosTopology;
 	/**
-	 * `hashPrefixBucketSeedOf(topology.shardGroup)` when the identity was written. A partition whose
+	 * `routingHashSeedOf(topology.shardGroup)` when the identity was written. A partition whose
 	 * stored seed differs from the seed that the code computes now refuses all work, because its
 	 * stored rows and its routes use the stored seed.
 	 */
-	hashPrefixBucketSeed: string;
+	routingHashSeed: string;
 };
 
 /** The mutable part of the last route context a partition received, under `__fokos/policy`. */

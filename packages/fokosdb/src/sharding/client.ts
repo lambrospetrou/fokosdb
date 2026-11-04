@@ -5,7 +5,7 @@ import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
-import { hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
+import { routingHashOf, type RoutingHash } from "./hash-primitives.js";
 import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
 import { isRangePartition, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
@@ -15,7 +15,7 @@ import type { RepartitionKind } from "./sharding-store.js";
 import { cachedHashTopology, cachedRangeTopology, cutTopologyHint, type FokosTopologyCacheOptions } from "./topology-cache.js";
 import {
 	findLeaf,
-	isPromotedHashPrefixBucket,
+	isPromotedRoutingHash,
 	rangeBoundaryAt,
 	rangeCutKey,
 	rangeIntervalLookup,
@@ -191,14 +191,14 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		if (!hash) {
 			return root;
 		}
-		// A promotion moves the whole hashPrefixBucket of a key, so the promoted set and the range
-		// entries are by hashPrefixBucket.
-		const bucket = hashPrefixBucketOf(hashKey, topology.shardGroup);
-		const hit = bloom ? isPromotedHashPrefixBucket(hash.view, bucket) : false;
+		// A promotion moves the whole routingHash of a key, so the promoted set and the range
+		// entries are by routingHash.
+		const routingHash = routingHashOf(hashKey, topology.shardGroup);
+		const hit = bloom ? isPromotedRoutingHash(hash.view, routingHash) : false;
 		if (hit) {
-			const cached = cachedRangeTopology(opts, topology.shardGroup, bucket);
+			const cached = cachedRangeTopology(opts, topology.shardGroup, routingHash);
 			// A range entry with no segment comes from a Bloom false positive, or from a promoted
-			// bucket whose range body the keeper did not build yet. Both cases have no range
+			// routingHash whose range body the keeper did not build yet. Both cases have no range
 			// boundaries to use, so the code below uses the entry only when it has a segment.
 			const range = cached && cached.view.depths.length > 0 ? cached : undefined;
 			// The hit is "exact" when it came from the `promoted` list, and "maybe" when it came
@@ -218,7 +218,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 				if (target) {
 					const start = range ? rangeBoundaryAt(range.view, target.start) : null;
 					const end = range ? rangeBoundaryAt(range.view, target.end) : null;
-					const ctx = resolveRangePartitionContext(root, bucket, start, end);
+					const ctx = resolveRangePartitionContext(root, routingHash, start, end);
 					this.#fallbacks.set(ctx, {
 						root,
 						next: (e) => {
@@ -237,7 +237,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 				}
 			}
 		}
-		const leaf = findLeaf(hash.view, topology.rootTreesN, topology.hashSplitN, bucket, hash.cut);
+		const leaf = findLeaf(hash.view, topology.rootTreesN, topology.hashSplitN, routingHash, hash.cut);
 		if (leaf.path.length === 0) {
 			return root;
 		}
@@ -415,13 +415,13 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * children.
 	 *
 	 * `beforeDestroy` runs after the targets of a partition are gone and before its `fokosDestroy`,
-	 * with the hashPrefixBuckets of its promotions. When it throws, the traversal stops, and the
+	 * with the routingHashes of its promotions. When it throws, the traversal stops, and the
 	 * partition keeps its promotions for the next destroy.
 	 */
 	async destroy(
 		opts: {
 			onDestroyed?(ref: FokosPartitionRef): void;
-			beforeDestroy?(ref: FokosPartitionRef, promoted: HashPrefixBucket[]): Promise<void>;
+			beforeDestroy?(ref: FokosPartitionRef, promoted: RoutingHash[]): Promise<void>;
 		} = {},
 	): Promise<void> {
 		const visited = new Set<string>();
@@ -435,11 +435,11 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 			const stub = this.#rpc(ctx);
 			await stub.fokosPrepareDestroy({ rootContext });
 			const status = await stub.fokosStatus({ rootContext });
-			const promoted: HashPrefixBucket[] = [];
+			const promoted: RoutingHash[] = [];
 			for await (const { repartition, target } of this.#targets(stub, status.split)) {
 				await destroyPartition(this.#targetContext(target.ref));
-				if (repartition.hashPrefixBucket !== null) {
-					promoted.push(repartition.hashPrefixBucket);
+				if (repartition.routingHash !== null) {
+					promoted.push(repartition.routingHash);
 				}
 			}
 			await opts.beforeDestroy?.(refOf(ctx), promoted);

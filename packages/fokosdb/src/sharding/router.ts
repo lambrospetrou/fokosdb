@@ -1,5 +1,5 @@
 import { PartitionIdHelper } from "./partition-id.js";
-import { HashPrefixBucketDigitCursor, hashPrefixBucketOf } from "./hash-primitives.js";
+import { RoutingHashDigitCursor, routingHashOf } from "./hash-primitives.js";
 import type { KeyBytes } from "./key-codec.js";
 import {
 	validatePolicyVersion,
@@ -32,8 +32,8 @@ export class FokosRouter<TPolicy> {
 
 	/** The root partition that owns `hashKey`. Keys arrive already encoded. */
 	rootContext(hashKey: KeyBytes): FokosRouteContext<TPolicy> {
-		const bucket = hashPrefixBucketOf(hashKey, this.topology.shardGroup);
-		return this.#root(new HashPrefixBucketDigitCursor(bucket, this.topology.rootTreesN).root);
+		const routingHash = routingHashOf(hashKey, this.topology.shardGroup);
+		return this.#root(new RoutingHashDigitCursor(routingHash, this.topology.rootTreesN).root);
 	}
 
 	/** Every root partition. A whole-tree traversal starts from these. */

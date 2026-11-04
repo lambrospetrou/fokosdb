@@ -35,7 +35,7 @@ import {
 	type StorageCursor,
 } from "./partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
-import { compareHashPrefixBuckets, type HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import { compareRoutingHashes, type RoutingHash } from "../../sharding/hash-primitives.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
 import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js";
 
@@ -80,7 +80,7 @@ export type FokosMigrationHostDeps = {
 	/** The `DurableObjectId` of this partition, in hex: the producer ID of its export calls. */
 	selfId: () => string;
 	/** The storage prefix of a hash key in the shard group of this partition. */
-	storagePrefix: (hashKey: KeyBytes) => HashPrefixBucket;
+	storagePrefix: (hashKey: KeyBytes) => RoutingHash;
 };
 
 export class FokosMigrationHost implements MigrationHost {
@@ -157,7 +157,7 @@ export class FokosMigrationHost implements MigrationHost {
 			// The row is stored under the prefix it carries, so a wrong prefix puts it outside the range
 			// of its own hash key, where a later read by prefix cannot find it.
 			invariant(
-				compareHashPrefixBuckets(row.prefix, this.deps.storagePrefix(row.hk)) === 0,
+				compareRoutingHashes(row.prefix, this.deps.storagePrefix(row.hk)) === 0,
 				() =>
 					`fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)} with a prefix that is not the storage prefix of the hash key`,
 			);
@@ -186,7 +186,7 @@ export class FokosMigrationHost implements MigrationHost {
 		// The exact stored sizes, added per page, are what removes the whole-table estimate rebuild that
 		// used to close an import. A row already present contributes nothing, so a retried page cannot
 		// count its rows twice.
-		const added: Array<{ prefix: HashPrefixBucket; hk: KeyBytes; bytes: number }> = [];
+		const added: Array<{ prefix: RoutingHash; hk: KeyBytes; bytes: number }> = [];
 		let maxItemId = 0;
 		for (const item of items) {
 			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);

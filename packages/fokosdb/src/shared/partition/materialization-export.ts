@@ -14,7 +14,7 @@
  */
 import type { LatestImage } from "../../server/materialization/do-materialization.js";
 import { KeyCodec, KeyPairMap, type KeyBytes } from "../../sharding/key-codec.js";
-import type { HashPrefixBucket } from "../../sharding/hash-primitives.js";
+import type { RoutingHash } from "../../sharding/hash-primitives.js";
 import invariant from "../invariant.js";
 import type { DueOutboxRow, ExportFence, PartitionStore } from "./partition-store.js";
 
@@ -80,7 +80,7 @@ function isRetryableUnprocessed(outcome: ExportItemOutcome): boolean {
 }
 
 /** A claimed call and the keys of its items, each with the storage prefix of its outbox row. */
-type ClaimedCall = { call: ExportCall; keys: KeyPairMap<HashPrefixBucket> };
+type ClaimedCall = { call: ExportCall; keys: KeyPairMap<RoutingHash> };
 
 export class MaterializationExporter {
 	readonly #deps: MaterializationExporterDeps;
@@ -224,13 +224,13 @@ export class MaterializationExporter {
 	}
 
 	/** The images of the due rows that the next call carries, within the item and byte limits. */
-	#claimRows(): { images: LatestImage[]; keys: KeyPairMap<HashPrefixBucket> } {
+	#claimRows(): { images: LatestImage[]; keys: KeyPairMap<RoutingHash> } {
 		const { store } = this.#deps;
 		const config = this.#deps.config();
 		const now = this.#deps.now();
 		const owns = this.#deps.ownerCheck();
 		const images: LatestImage[] = [];
-		const keys = new KeyPairMap<HashPrefixBucket>();
+		const keys = new KeyPairMap<RoutingHash>();
 		let bytes = 0;
 		for (const row of store.dueOutboxRows(now, config.maxScannedRows)) {
 			if (images.length >= config.maxItems) {
@@ -349,7 +349,7 @@ export class MaterializationExporter {
 	}
 
 	/** The write for one owned item of the answer. A call that failed as a whole writes no row for an item. */
-	#applyItemOutcome(prefix: HashPrefixBucket, image: LatestImage, outcome: ExportItemOutcome, failedAsWhole: boolean): void {
+	#applyItemOutcome(prefix: RoutingHash, image: LatestImage, outcome: ExportItemOutcome, failedAsWhole: boolean): void {
 		const { store } = this.#deps;
 		const config = this.#deps.config();
 		const now = this.#deps.now();

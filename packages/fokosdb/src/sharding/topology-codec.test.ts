@@ -1,14 +1,8 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import {
-	asHashPrefixBucket,
-	compareHashPrefixBuckets,
-	hashPrefixBucketDigits,
-	hashPrefixBucketOf,
-	type HashPrefixBucket,
-} from "./hash-primitives.js";
+import { asRoutingHash, compareRoutingHashes, routingHashDigits, routingHashOf, type RoutingHash } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
-import { findLeaf, isPromotedHashPrefixBucket, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
+import { findLeaf, isPromotedRoutingHash, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import {
 	encodeHashBitmap,
@@ -16,9 +10,9 @@ import {
 	encodeRangeBody,
 	hashNodeKey,
 	mergeHashBitmap,
-	mergePromotedBuckets,
+	mergePromotedRoutingHashes,
 	promotedKeysBloom,
-	promotedSectionBuckets,
+	promotedSectionRoutingHashes,
 	TOPOLOGY_BLOOM_MIN_CAPACITY,
 } from "./topology-encode.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
@@ -53,15 +47,15 @@ function positions(forest: Forest): Map<string, number> {
 	return out;
 }
 
-/** The hashPrefixBucket of a test key. */
-const bk = (key: string) => hashPrefixBucketOf(KeyCodec.encode(key), "codec-test");
+/** The routingHash of a test key. */
+const rh = (key: string) => routingHashOf(KeyCodec.encode(key), "codec-test");
 
-/** The reference walk: follow the digits of the hashPrefixBucket through the split nodes, and stop before a cut node. */
-function referenceLeaf(forest: Forest, bucket: HashPrefixBucket, cut: ReadonlySet<string>): { node: string; path: number[] } {
-	let node = String(hashPrefixBucketDigits(bucket, forest.R, forest.K, 0).root);
+/** The reference walk: follow the digits of the routingHash through the split nodes, and stop before a cut node. */
+function referenceLeaf(forest: Forest, routingHash: RoutingHash, cut: ReadonlySet<string>): { node: string; path: number[] } {
+	let node = String(routingHashDigits(routingHash, forest.R, forest.K, 0).root);
 	const path: number[] = [];
 	while (forest.children.has(node)) {
-		const child = hashPrefixBucketDigits(bucket, forest.R, forest.K, path.length + 1).path[path.length];
+		const child = routingHashDigits(routingHash, forest.R, forest.K, path.length + 1).path[path.length];
 		const next = `${node}.${child}`;
 		if (cut.has(next)) {
 			break;
@@ -102,7 +96,7 @@ describe("topology codec — hash body", () => {
 				fc.integer({ min: 1, max: 5 }),
 				fc.integer({ min: 2, max: 4 }),
 				fc.array(fc.nat(), { maxLength: 60 }),
-				fc.array(fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asHashPrefixBucket), { minLength: 1, maxLength: 30 }),
+				fc.array(fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asRoutingHash), { minLength: 1, maxLength: 30 }),
 				fc.array(fc.nat(), { maxLength: 4 }),
 				(R, K, picks, keys, cutPicks) => {
 					const forest = buildForest(R, K, picks);
@@ -111,13 +105,13 @@ describe("topology codec — hash body", () => {
 					const nonRoots = [...pos.keys()].filter((node) => node.includes("."));
 					const cutNodes = new Set(nonRoots.length === 0 ? [] : cutPicks.map((p) => nonRoots[p % nonRoots.length]));
 					const cutPositions = new Set([...cutNodes].map((node) => pos.get(node)!));
-					for (const bucket of keys) {
+					for (const routingHash of keys) {
 						for (const [cut, cutPos] of [
 							[new Set<string>(), new Set<number>()],
 							[cutNodes, cutPositions],
 						] as const) {
-							const expected = referenceLeaf(forest, bucket, cut);
-							const leaf = findLeaf(view, R, K, bucket, cutPos);
+							const expected = referenceLeaf(forest, routingHash, cut);
+							const leaf = findLeaf(view, R, K, routingHash, cutPos);
 							expect(leaf.path).toEqual(expected.path);
 							expect(leaf.pos).toBe(pos.get(expected.node));
 						}
@@ -141,9 +135,9 @@ describe("topology codec — hash body", () => {
 			}),
 		);
 		expect(view.bitCount).toBe(0);
-		const bucket = bk("k");
-		const root = hashPrefixBucketDigits(bucket, 8, 4, 0).root;
-		expect(findLeaf(view, 8, 4, bucket, new Set())).toEqual({ pos: root, root, path: [] });
+		const routingHash = rh("k");
+		const root = routingHashDigits(routingHash, 8, 4, 0).root;
+		expect(findLeaf(view, 8, 4, routingHash, new Set())).toEqual({ pos: root, root, path: [] });
 	});
 
 	it("reads the splits of a deep chain across the 512-bit blocks of the rank index", () => {
@@ -157,9 +151,9 @@ describe("topology codec — hash body", () => {
 		expect(view.bitCount).toBe(3 + 2 * 300);
 		const pos = positions(forest);
 		for (let i = 0; i < 200; i++) {
-			const bucket = bk(`key-${i}`);
-			const expected = referenceLeaf(forest, bucket, new Set());
-			expect(findLeaf(view, 3, 2, bucket, new Set()).pos).toBe(pos.get(expected.node));
+			const routingHash = rh(`key-${i}`);
+			const expected = referenceLeaf(forest, routingHash, new Set());
+			expect(findLeaf(view, 3, 2, routingHash, new Set()).pos).toBe(pos.get(expected.node));
 		}
 	});
 
@@ -192,45 +186,45 @@ describe("topology codec — the promoted list", () => {
 			bloom: null,
 		});
 
-	const bucketArb = fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asHashPrefixBucket);
+	const routingHashArb = fc.uint8Array({ minLength: 8, maxLength: 8 }).map(asRoutingHash);
 
-	it("finds each bucket of the list and no other, at every size up to the limit", () => {
+	it("finds each routingHash of the list and no other, at every size up to the limit", () => {
 		fc.assert(
-			fc.property(fc.uniqueArray(bucketArb, { maxLength: 4_096 }), fc.array(bucketArb, { maxLength: 20 }), (members, probes) => {
-				const sorted = [...members].sort(compareHashPrefixBuckets);
-				const view = parseHashBody(emptyBody(mergePromotedBuckets([], sorted)));
-				for (const bucket of members) {
-					expect(isPromotedHashPrefixBucket(view, bucket)).toBe("exact");
+			fc.property(fc.uniqueArray(routingHashArb, { maxLength: 4_096 }), fc.array(routingHashArb, { maxLength: 20 }), (members, probes) => {
+				const sorted = [...members].sort(compareRoutingHashes);
+				const view = parseHashBody(emptyBody(mergePromotedRoutingHashes([], sorted)));
+				for (const routingHash of members) {
+					expect(isPromotedRoutingHash(view, routingHash)).toBe("exact");
 				}
 				const held = new Set(members.map((b) => b.toHex()));
 				for (const probe of probes) {
-					expect(isPromotedHashPrefixBucket(view, probe)).toBe(held.has(probe.toHex()) ? "exact" : false);
+					expect(isPromotedRoutingHash(view, probe)).toBe(held.has(probe.toHex()) ? "exact" : false);
 				}
 			}),
 			{ numRuns: 30 },
 		);
 	});
 
-	it("finds each bucket of the largest list", () => {
+	it("finds each routingHash of the largest list", () => {
 		const members = Array.from({ length: 4_096 }, (_, i) => {
-			const bucket = new Uint8Array(8);
-			new DataView(bucket.buffer).setUint32(4, i);
-			return asHashPrefixBucket(bucket);
+			const routingHash = new Uint8Array(8);
+			new DataView(routingHash.buffer).setUint32(4, i);
+			return asRoutingHash(routingHash);
 		});
-		const view = parseHashBody(emptyBody(mergePromotedBuckets([], members)));
+		const view = parseHashBody(emptyBody(mergePromotedRoutingHashes([], members)));
 		expect(view.promoted?.count).toBe(4_096);
-		for (const bucket of members) {
-			expect(isPromotedHashPrefixBucket(view, bucket)).toBe("exact");
+		for (const routingHash of members) {
+			expect(isPromotedRoutingHash(view, routingHash)).toBe("exact");
 		}
 		const absent = new Uint8Array(8);
 		new DataView(absent.buffer).setUint32(4, 4_096);
-		expect(isPromotedHashPrefixBucket(view, asHashPrefixBucket(absent))).toBe(false);
+		expect(isPromotedRoutingHash(view, asRoutingHash(absent))).toBe(false);
 	});
 
 	it("refuses a section with another width, a count outside the body, or values out of order", () => {
-		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
-		const b2 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
-		const ordered = mergePromotedBuckets([], [b1, b2]);
+		const b1 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b2 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
+		const ordered = mergePromotedRoutingHashes([], [b1, b2]);
 		// The header is JSON, so a one-digit field changes in place, at the same length.
 		const patched = (from: string, to: string) => {
 			const body = emptyBody(ordered);
@@ -256,7 +250,7 @@ describe("topology codec — the promoted list", () => {
 	});
 
 	it("refuses a body with a promoted section and a bloom section", () => {
-		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b1 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
 		const body = encodeHashBody({
 			epoch: 1,
 			version: 1,
@@ -287,8 +281,8 @@ describe("topology codec — the promoted list", () => {
 	});
 
 	it("does not encode a list out of order, or a body with both sections", () => {
-		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
-		const b2 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
+		const b1 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b2 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
 		expect(() => emptyBody(new Uint8Array([...b2, ...b1]))).toThrow(invariantFailure(/not in strict order/));
 		expect(() => emptyBody(new Uint8Array([...b1, ...b1]))).toThrow(invariantFailure(/not in strict order/));
 		expect(() =>
@@ -305,22 +299,22 @@ describe("topology codec — the promoted list", () => {
 	});
 
 	it("writes a repeated value once, from one stream or from both", () => {
-		const b1 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
-		const b2 = asHashPrefixBucket(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
+		const b1 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1]));
+		const b2 = asRoutingHash(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 2]));
 		const once = new Uint8Array([...b1, ...b2]);
-		expect(mergePromotedBuckets([], [b1, b1, b2])).toEqual(once);
-		expect(mergePromotedBuckets([b1, b1], [b2, b2])).toEqual(once);
-		expect(mergePromotedBuckets([b1, b2], [b1, b2])).toEqual(once);
+		expect(mergePromotedRoutingHashes([], [b1, b1, b2])).toEqual(once);
+		expect(mergePromotedRoutingHashes([b1, b1], [b2, b2])).toEqual(once);
+		expect(mergePromotedRoutingHashes([b1, b2], [b1, b2])).toEqual(once);
 	});
 
 	it("merges a stored list and new roots in one pass, equal to a build of every root", () => {
 		fc.assert(
-			fc.property(fc.uniqueArray(bucketArb, { maxLength: 200 }), fc.uniqueArray(bucketArb, { maxLength: 200 }), (base, added) => {
-				const stored = mergePromotedBuckets([], [...base].sort(compareHashPrefixBuckets));
+			fc.property(fc.uniqueArray(routingHashArb, { maxLength: 200 }), fc.uniqueArray(routingHashArb, { maxLength: 200 }), (base, added) => {
+				const stored = mergePromotedRoutingHashes([], [...base].sort(compareRoutingHashes));
 				const view = parseHashBody(emptyBody(stored));
 				// The keeper sorts the reported roots before the merge; the index gives them in seq order.
-				const merged = mergePromotedBuckets(promotedSectionBuckets(view.promoted!), [...added].sort(compareHashPrefixBuckets));
-				const all = mergePromotedBuckets([], [...base, ...added].sort(compareHashPrefixBuckets));
+				const merged = mergePromotedRoutingHashes(promotedSectionRoutingHashes(view.promoted!), [...added].sort(compareRoutingHashes));
+				const all = mergePromotedRoutingHashes([], [...base, ...added].sort(compareRoutingHashes));
 				expect(merged).toEqual(all);
 			}),
 			{ numRuns: 50 },
@@ -463,7 +457,7 @@ describe("topology codec — body framing", () => {
 		);
 		const view = parseHashBody(body);
 		expect(view.version).toBe(9n);
-		expect(findLeaf(view, 1, 2, bk("x"), new Set()).path).toHaveLength(1);
+		expect(findLeaf(view, 1, 2, rh("x"), new Set()).path).toHaveLength(1);
 	});
 
 	it("refuses another magic, another schema, a section outside the body, and an offset that is not a multiple of 8", () => {

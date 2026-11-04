@@ -58,7 +58,7 @@ describe("FokosDBPartitionDO — outbox migration", () => {
 describe("FokosMigrationHost — the export fences of the outbox stream", () => {
 	type Page = { page: unknown; nextCursor: unknown };
 	const budget = { pageBytes: 1024 * 1024, pageRows: 1, scanRows: 100 };
-	const slice = { kind: "promoted_hash_prefix_bucket" as const, hashPrefixBucket: prefixOf(kb("moved")) };
+	const slice = { kind: "promoted_routing_hash" as const, routingHash: prefixOf(kb("moved")) };
 	const inSlice = (key: { hashKey: KeyBytes }) => KeyCodec.compare(key.hashKey, kb("moved")) === 0;
 
 	function hostOf(store: PartitionStore, selfId: string, state: DurableObjectState): FokosMigrationHost {

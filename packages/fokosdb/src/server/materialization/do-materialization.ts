@@ -17,7 +17,7 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusRequest,
 } from "../../sharding/repartition-types.js";
-import { promotedHashPrefixBucketOf } from "../../sharding/repartition-slice.js";
+import { promotedRoutingHashOf } from "../../sharding/repartition-slice.js";
 import { identityDepth } from "../../sharding/partition-id.js";
 import { materializationStubByName, partitionStubByName, pushTargetStub } from "../../shared/do-stubs.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
@@ -136,8 +136,8 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		this.#splitPlanner = new SplitPlanner({
 			keySizes: this.#store.keySizes,
 			source: {
-				probeHashPrefixBuckets: () => this.#store.probeHashPrefixBuckets(),
-				compositeKeySizes: (hashPrefixBucket, start, end) => this.#store.compositeKeySizes(hashPrefixBucket, start, end),
+				probeRoutingHashes: () => this.#store.probeRoutingHashes(),
+				compositeKeySizes: (routingHash, start, end) => this.#store.compositeKeySizes(routingHash, start, end),
 			},
 			databaseSize: () => this.#store.databaseSize,
 			promotionFraction: () => this.config().promotionFraction,
@@ -351,8 +351,8 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		return {
 			evaluateSplit: (input) => this.#splitPlanner.evaluateSplit(input),
-			computeRangeBoundaries: ({ hashPrefixBucket, start, end, childCount }) =>
-				this.#splitPlanner.rangeBoundaries(hashPrefixBucket, start, end, childCount),
+			computeRangeBoundaries: ({ routingHash, start, end, childCount }) =>
+				this.#splitPlanner.rangeBoundaries(routingHash, start, end, childCount),
 			migration: new MaterializationMigrationHost({
 				store: this.#store,
 				selfId: () => this.ctx.id.toString(),
@@ -365,31 +365,31 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 			onRepartitionCutover: (plan) => {
 				this.#store.raiseAllTargetEpochs();
 				if (plan.kind === "key_promotion") {
-					this.#store.storeCursorSnapshot(promotedHashPrefixBucketOf(plan));
+					this.#store.storeCursorSnapshot(promotedRoutingHashOf(plan));
 				}
 			},
-			// The child has each row of the promoted hashPrefixBucket now. Each new write of it goes to the
+			// The child has each row of the promoted routingHash now. Each new write of it goes to the
 			// child, so the estimate is not necessary, and the cleanup can delete the rows above the
 			// snapshot.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
-					const bucket = promotedHashPrefixBucketOf(plan);
-					this.#store.keySizes.remove(bucket);
-					this.#store.deleteCursorSnapshot(bucket);
+					const routingHash = promotedRoutingHashOf(plan);
+					this.#store.keySizes.remove(routingHash);
+					this.#store.deleteCursorSnapshot(routingHash);
 				}
 			},
 			// A split keeps its rows, as `FokosDBPartitionDO` does. A promotion deletes the items of its
-			// hashPrefixBucket in steps of a limited size, because one large delete holds each request of
+			// routingHash in steps of a limited size, because one large delete holds each request of
 			// this partition until its write is durable.
 			cleanupSourceStep: (plan) => {
 				if (plan.kind !== "key_promotion") {
 					return true;
 				}
-				const bucket = promotedHashPrefixBucketOf(plan);
-				if (!this.#store.transactionSync(() => this.#store.deleteItemsOfHashPrefixBucket(bucket, this.config().cleanup.deleteRows))) {
+				const routingHash = promotedRoutingHashOf(plan);
+				if (!this.#store.transactionSync(() => this.#store.deleteItemsOfRoutingHash(routingHash, this.config().cleanup.deleteRows))) {
 					return false;
 				}
-				this.#store.keySizes.remove(bucket);
+				this.#store.keySizes.remove(routingHash);
 				return true;
 			},
 			jobs: [

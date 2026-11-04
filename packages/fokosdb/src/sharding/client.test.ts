@@ -9,7 +9,7 @@ import { FokosShardingClient, type FokosCallCost, type FokosRetryPolicy } from "
 import { attachRouting } from "./envelope.js";
 import { SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import { KeyCodec } from "./key-codec.js";
-import { asHashPrefixBucket, type HashPrefixBucket } from "./hash-primitives.js";
+import { asRoutingHash, type RoutingHash } from "./hash-primitives.js";
 import type { FokosPromotionsPage, FokosStatusEntry, FokosStatusPage, RouteKey } from "./repartition-types.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { FokosEnvelope, FokosRouteNode, FokosRouting } from "./runtime-types.js";
@@ -206,13 +206,13 @@ type Partition = {
 	failDestroy?: number;
 };
 
-/** The hashPrefixBucket of the promotion to a range root in the doubles: the first 8 characters of its name. */
-const bucketOfRangeRoot = (doName: string) => asHashPrefixBucket(new TextEncoder().encode(doName.padEnd(8, "_").slice(0, 8)));
+/** The routingHash of the promotion to a range root in the doubles: the first 8 characters of its name. */
+const routingHashOfRangeRoot = (doName: string) => asRoutingHash(new TextEncoder().encode(doName.padEnd(8, "_").slice(0, 8)));
 
 /**
  * A recorded cluster: every partition answers from `partitions`. A target whose ref is a range root is
  * a promotion, one per promotions page. Any other target is a split target in the status.
- * `beforeDestroy` records `before:<name>[<the hashPrefixBuckets as text>]`.
+ * `beforeDestroy` records `before:<name>[<the routingHashes as text>]`.
  */
 function makeCluster(partitions: Record<string, Partition>) {
 	/** Every call in order: `fence:<name>`, `status:<name>`, `page:<name>#<seq>`, `destroy:<name>`, `before:<name>[...]`. */
@@ -230,7 +230,7 @@ function makeCluster(partitions: Record<string, Partition>) {
 			seq,
 			kind,
 			state: target.state ?? "completed",
-			hashPrefixBucket: kind === "key_promotion" ? bucketOfRangeRoot(target.ref.doName) : null,
+			routingHash: kind === "key_promotion" ? routingHashOfRangeRoot(target.ref.doName) : null,
 		},
 		target: { index, ref: target.ref, initialization: "initialized", acknowledged: true },
 	});
@@ -274,7 +274,7 @@ function makeCluster(partitions: Record<string, Partition>) {
 		},
 	});
 	const of = (kind: string) => events.filter((e) => e.startsWith(`${kind}:`)).map((e) => e.slice(kind.length + 1));
-	const beforeDestroy = async (r: FokosPartitionRef, promoted: HashPrefixBucket[]) => {
+	const beforeDestroy = async (r: FokosPartitionRef, promoted: RoutingHash[]) => {
 		events.push(`before:${r.doName}[${promoted.map((b) => new TextDecoder().decode(b)).join(",")}]`);
 	};
 	/** The fences, the hook calls, and the deletions, in order. */
@@ -351,7 +351,7 @@ describe("FokosShardingClient.destroy", () => {
 		expect(c.destroyed()).toHaveLength(3);
 	});
 
-	it("runs beforeDestroy after the targets of a partition are gone and before the partition goes, with its promoted hashPrefixBuckets", async () => {
+	it("runs beforeDestroy after the targets of a partition are gone and before the partition goes, with its promoted routingHashes", async () => {
 		const { cluster, root } = clusterOf((r) => ({
 			[r]: { targets: [child("child-a"), { ref: rangeRef("range-root") }] },
 			"range-root": { targets: [child("range-child")] },
@@ -379,7 +379,7 @@ describe("FokosShardingClient.destroy", () => {
 		const { cluster, root } = clusterOf((r) => ({ [r]: { targets: [{ ref: rangeRef("range-root") }] } }));
 		// The first reset fails, also when its admin applied it: a lost answer looks the same.
 		let failures = 1;
-		const beforeDestroy = async (r: FokosPartitionRef, promoted: HashPrefixBucket[]) => {
+		const beforeDestroy = async (r: FokosPartitionRef, promoted: RoutingHash[]) => {
 			await cluster.beforeDestroy(r, promoted);
 			if (promoted.length > 0 && failures-- > 0) {
 				throw new Error("the reset failed");
@@ -402,7 +402,7 @@ describe("FokosShardingClient.destroy", () => {
 	});
 
 	it("runs beforeDestroy for each partition that links one range root, after the range root is gone", async () => {
-		// A hash split gives the link of a promoted hashPrefixBucket to the child that holds it.
+		// A hash split gives the link of a promoted routingHash to the child that holds it.
 		const { cluster, root } = clusterOf((r) => ({
 			[r]: { targets: [child("child-a"), { ref: rangeRef("range-root") }] },
 			"child-a": { targets: [{ ref: rangeRef("range-root") }] },
