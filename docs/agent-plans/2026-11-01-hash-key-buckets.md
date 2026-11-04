@@ -247,9 +247,10 @@ not carry over.
    list of hashPrefixBuckets up to `N`, and a Bloom filter above `N`. Each positive answer fetches the range item in
    the background. **DONE.**
 6. **M6 — The coordinator storage** (Section 4.2.9). The `tc_*` tables lead with the hashPrefixBucket of the token.
+   **DONE.**
 7. **M7 — The materialization storage** (Section 4.2.10). `latest_items` is `WITHOUT ROWID` on
    `(hash_prefix_bucket, base_hk, base_sk)`. A local counter assigns `item_id`, and `UNIQUE (item_id)` keeps the
-   links and the collision check.
+   links and the collision check. **DONE.**
 8. **M8 — Topology admin objects for each promoted hashPrefixBucket** (Section 4.2.11). A promotion registers with
    two admin objects. A range split registers only with the object of its hashPrefixBucket, and callers read the
    range topology encoding from that object.

@@ -192,17 +192,19 @@ describe("MaterializationMigrationHost", () => {
 		expect(moved.map((item) => [item.hk, KeyCodec.decode(item.sk)])).toEqual(expected);
 		expect(source.left).toEqual([false, false, false, true]);
 
-		const childBytes = await inPartition("mat-child", (store) => {
+		const child = await inPartition("mat-child", (store, sql) => {
 			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), storagePrefix: P });
 			for (const page of source.pages) {
 				store.transactionSync(() => host.applyPage(page, slice));
 			}
 			// A retried page adds no bytes.
 			store.transactionSync(() => host.applyPage(source.pages[0], slice));
-			return store.keySizes.bytesOf(bucket);
+			return { bytes: store.keySizes.bytesOf(bucket), hwm: sql.exec<{ hwm: number }>(`SELECT hwm FROM item_id_counter`).one().hwm };
 		});
 		// The child has one total for the two hash keys, the same as the source.
-		expect(childBytes).toBe(source.bucketBytes);
+		expect(child.bytes).toBe(source.bucketBytes);
+		// The ingest raised the item-id mark above each copied id.
+		expect(child.hwm).toBe(Math.max(...moved.map((item) => item.item_id)) + 1);
 	});
 
 	it("gives no fence to a target that has no inherited work", async () => {

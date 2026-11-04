@@ -50,17 +50,23 @@ export type LatestImage =
 	  }
 	| { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; revision: number; deleted: true };
 
-/** The fixed part of the `est_row_bytes` of a `latest_items` row. The migration tells what it covers. */
-const LATEST_ROW_BYTES_K = 60;
+/**
+ * The fixed part of the `est_row_bytes` of a `latest_items` row. The migration tells what it covers.
+ * test/storage-bench/row-bytes.workerd-bench.ts measures the storage of a row. With the key copies of
+ * `latestRowBytesExpr`, the fixed part was 39 to 88 bytes for a live row and 61 to 102 bytes for a
+ * tombstone, 69 on average.
+ */
+const LATEST_ROW_BYTES_K = 70;
 
 /**
  * The SQL of the `est_row_bytes` of a `latest_items` row, with the base hash key in `?1` and the base
  * sort key in `?2`. `prefixParam` holds the storage prefix. `dataParam` holds the stored `data` value,
- * or is null for a tombstone.
+ * or is null for a tombstone. The prefix and the keys count two times for a live row (the row and the
+ * `item_id` index) and three times for a tombstone (also the tombstone index).
  */
 function latestRowBytesExpr(prefixParam: string, dataParam: string | null): string {
-	const fixed = `2 * (octet_length(${prefixParam}) + octet_length(?1) + octet_length(?2)) + ${LATEST_ROW_BYTES_K}`;
-	return dataParam === null ? fixed : `octet_length(${dataParam}) + ${fixed}`;
+	const keys = `(octet_length(${prefixParam}) + octet_length(?1) + octet_length(?2))`;
+	return dataParam === null ? `3 * ${keys} + ${LATEST_ROW_BYTES_K}` : `octet_length(${dataParam}) + 2 * ${keys} + ${LATEST_ROW_BYTES_K}`;
 }
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -70,22 +76,31 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// latest_items:
 		// - One row for each base item: its newest live image, or a tombstone (`deleted_at_ms` is not
 		//   NULL, `data` is NULL). `revision` is the base revision of the image.
-		// - A rowid table with `data` last, for the reasons of the items table of PartitionStore: a large
-		//   payload does not get a private overflow page, and a read of the metadata columns reads no
-		//   overflow page.
+		// - A WITHOUT ROWID table with `data` last, as the items table of PartitionStore: the rows are in
+		//   primary-key order, and a read of the metadata columns reads no overflow page.
 		// - `hash_prefix_bucket` is the storage prefix of `base_hk` in the shard group of this partition,
-		//   which the runtime gives (`storagePrefix`). The store treats it as opaque bytes. The unique key
-		//   leads with it, so the rows of one hash child are one key range of the index.
+		//   which the runtime gives (`storagePrefix`). The store treats it as opaque bytes. It is not an
+		//   item identity: `base_hk` and `base_sk` keep the items apart. The primary key leads with it, so
+		//   the rows of one hash child or of one promoted hashPrefixBucket are one key range of the table.
 		// - `item_id` links the rows of other tables to the item, so `(base_hk, base_sk)` is stored one
-		//   time. Each statement that deletes a row must delete its linked rows in the same transaction,
-		//   because SQLite can give the id to a new row again.
+		//   time. `UNIQUE (item_id)` gives the linked reads a seek. The counter in `item_id_counter`
+		//   assigns it (`#nextItemId`), and the mark only increases, so a deleted id never comes back.
+		//   Each statement that deletes a row must still delete its linked rows in the same transaction.
+		//   Migration copies `item_id` without change: a copied item whose id another item holds fails
+		//   the insert, and the child raises its mark above each copied id.
 		// - No rule reads the value of `deleted_at_ms`. It orders the garbage collection of tombstones.
+		//   The tombstone index declares `item_id`, because a WITHOUT ROWID index holds only the primary
+		//   key after its own columns, and the collection seeks on `(deleted_at_ms, item_id)`.
 		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The prefix and the
-		//   keys count two times, because the UNIQUE index holds a second copy of them. LATEST_ROW_BYTES_K gives the
-		//   fixed part: the integer columns, the record header, the rowid, and the fixed part of the
-		//   index entry. It is an approximate value for size accounting (promotion, split, batch and page
-		//   budgets). A change of the formula needs no data migration, because each change of a key
-		//   size estimate uses the value that the row stores.
+		//   keys count two times, because the `item_id` index holds a second copy of them, and three
+		//   times for a tombstone, because the tombstone index holds a third. LATEST_ROW_BYTES_K gives the
+		//   fixed part: the integer columns, the record header, and the fixed part of the index entries.
+		//   It is an approximate value for size accounting (promotion, split, batch and page budgets). A
+		//   change of the formula needs no data migration, because each change of a key size estimate
+		//   uses the value that the row stores.
+		//
+		// item_id_counter:
+		// - One row (id = 1). Every `item_id` below `hwm` is reserved.
 		//
 		// producer_fences:
 		// - The highest epoch of each producer, by its DurableObjectId in hex. A call with a lower epoch
@@ -113,10 +128,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   is left.
 		sql: `
             CREATE TABLE IF NOT EXISTS latest_items (
-                item_id            INTEGER PRIMARY KEY,
                 hash_prefix_bucket BLOB    NOT NULL,
                 base_hk            BLOB    NOT NULL,
                 base_sk            BLOB    NOT NULL DEFAULT x'',
+                item_id            INTEGER NOT NULL,
                 revision           INTEGER NOT NULL,
                 deleted_at_ms      INTEGER,
                 newest_seq         INTEGER,
@@ -124,10 +139,18 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 ttl_at             INTEGER,
                 est_row_bytes      INTEGER NOT NULL DEFAULT 0,
                 data               ANY,
-                UNIQUE (hash_prefix_bucket, base_hk, base_sk)
-            ) STRICT;
 
-            CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc ON latest_items (deleted_at_ms) WHERE deleted_at_ms IS NOT NULL;
+                PRIMARY KEY (hash_prefix_bucket, base_hk, base_sk),
+                UNIQUE (item_id)
+            ) WITHOUT ROWID, STRICT;
+
+            CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc ON latest_items (deleted_at_ms, item_id) WHERE deleted_at_ms IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS item_id_counter (
+                id  INTEGER PRIMARY KEY CHECK (id = 1),
+                hwm INTEGER NOT NULL
+            ) STRICT;
+            INSERT OR IGNORE INTO item_id_counter (id, hwm) VALUES (1, 1);
 
             CREATE TABLE IF NOT EXISTS producer_fences (
                 producer_id TEXT    PRIMARY KEY,
@@ -194,11 +217,21 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 ];
 
+/** The count of item ids that one reservation of `item_id_counter` takes. */
+const ITEM_ID_BLOCK = 1024;
+
 export class MaterializationStore {
 	/** The size estimate of each base hash key. */
 	readonly keySizes: KeySizeStats;
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
+	/**
+	 * The reserved block of item ids `[#nextId, #idLimit)`. Both are 0 until the first reservation, and
+	 * an ingest sets both to 0 again. A rollback restores the values from before its transaction
+	 * (`transactionSync`), so memory never uses a block that storage did not commit.
+	 */
+	#nextId = 0;
+	#idLimit = 0;
 
 	constructor(storage: DurableObjectStorage) {
 		this.#storage = storage;
@@ -219,8 +252,48 @@ export class MaterializationStore {
 		return this.#storage.sql.databaseSize;
 	}
 
+	/**
+	 * A write that creates an item can reserve a block of item ids inside `fn`. When `fn` throws, the
+	 * storage transaction rolls the reservation back, so this restores the block from before `fn`.
+	 * Every write that can create an item must run in this method or outside any storage transaction,
+	 * never inside another `transactionSync` of the same storage.
+	 */
 	transactionSync<T>(fn: () => T): T {
-		return this.#storage.transactionSync(fn);
+		const nextId = this.#nextId;
+		const idLimit = this.#idLimit;
+		try {
+			return this.#storage.transactionSync(fn);
+		} catch (error) {
+			this.#nextId = nextId;
+			this.#idLimit = idLimit;
+			throw error;
+		}
+	}
+
+	/**
+	 * The `item_id` of a new row. It reserves a block of `ITEM_ID_BLOCK` ids when the block in memory is
+	 * used up: one row written for each block. See `transactionSync` for the rollback rule.
+	 */
+	#nextItemId(): number {
+		if (this.#nextId === this.#idLimit) {
+			const { hwm } = one(
+				this.#storage.sql.exec<{ hwm: number }>(`UPDATE item_id_counter SET hwm = hwm + ?1 WHERE id = 1 RETURNING hwm`, ITEM_ID_BLOCK),
+			);
+			this.#nextId = hwm - ITEM_ID_BLOCK;
+			this.#idLimit = hwm;
+		}
+		return this.#nextId++;
+	}
+
+	/**
+	 * Raises the high-water mark of the item ids above `maxItemId`, after a migration ingest copied rows
+	 * with their ids. Memory drops its block, so the next new row reserves above every copied id. The
+	 * drop is safe also when the ingest rolls back: the next reservation reads the mark again.
+	 */
+	raiseItemIdMark(maxItemId: number): void {
+		this.#storage.sql.exec(`UPDATE item_id_counter SET hwm = ?1 WHERE id = 1 AND hwm < ?1`, maxItemId + 1);
+		this.#nextId = 0;
+		this.#idLimit = 0;
 	}
 
 	/** The stored epoch of a producer, or 0 when the producer never called. */
@@ -278,10 +351,13 @@ export class MaterializationStore {
 		const sql = this.#storage.sql;
 		const position = this.#planPosition(current?.newestSeq ?? null, targets);
 		const newestSeq = position === null ? (current?.newestSeq ?? null) : position.seq;
+		// An overwrite keeps its id, and the insert branch does not run for it, so it binds -1, which no
+		// row holds.
+		const newItemId = current === undefined ? this.#nextItemId() : -1;
 		const row = image.deleted
 			? sql.exec<{ item_id: number; est_row_bytes: number }>(
-					`INSERT INTO latest_items (hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?6, ?1, ?2, ?3, ?4, ?5, NULL, NULL, ${latestRowBytesExpr("?6", null)}, NULL)
+					`INSERT INTO latest_items (hash_prefix_bucket, base_hk, base_sk, item_id, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
+					 VALUES (?6, ?1, ?2, ?7, ?3, ?4, ?5, NULL, NULL, ${latestRowBytesExpr("?6", null)}, NULL)
 					 ON CONFLICT (hash_prefix_bucket, base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = excluded.deleted_at_ms, newest_seq = excluded.newest_seq,
 					   data_kind = NULL, ttl_at = NULL, est_row_bytes = excluded.est_row_bytes, data = NULL
@@ -292,10 +368,11 @@ export class MaterializationStore {
 					nowMs,
 					newestSeq,
 					prefix,
+					newItemId,
 				)
 			: sql.exec<{ item_id: number; est_row_bytes: number }>(
-					`INSERT INTO latest_items (hash_prefix_bucket, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?8, ?1, ?2, ?3, NULL, ?7, ?4, ?5, ${latestRowBytesExpr("?8", "?6")}, ?6)
+					`INSERT INTO latest_items (hash_prefix_bucket, base_hk, base_sk, item_id, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
+					 VALUES (?8, ?1, ?2, ?9, ?3, NULL, ?7, ?4, ?5, ${latestRowBytesExpr("?8", "?6")}, ?6)
 					 ON CONFLICT (hash_prefix_bucket, base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = NULL, newest_seq = excluded.newest_seq,
 					   data_kind = excluded.data_kind, ttl_at = excluded.ttl_at, est_row_bytes = excluded.est_row_bytes, data = excluded.data
@@ -308,6 +385,7 @@ export class MaterializationStore {
 					image.data,
 					newestSeq,
 					prefix,
+					newItemId,
 				);
 		const { item_id: itemId, est_row_bytes: newEst } = row.one();
 		if (position?.kind === "insert") {
@@ -819,8 +897,9 @@ export class MaterializationStore {
 	}
 
 	/**
-	 * Deletes up to `limit` items of the storage prefix `prefix`, with their positions and their
-	 * `target_retry` rows. Returns true when no item of the prefix is left. The size estimate of the
+	 * Deletes the first `limit` items of the storage prefix `prefix` in primary-key order, with their
+	 * positions, their `target_retry` rows, and their GSI keys. The items are one key range, so one
+	 * statement deletes them. Returns true when no item of the prefix is left. The size estimate of the
 	 * prefix is not changed: the caller deletes it.
 	 */
 	deleteItemsOfHashPrefixBucket(prefix: HashPrefixBucket, limit: number): boolean {
@@ -829,17 +908,32 @@ export class MaterializationStore {
 		// `limit` bounds the array.
 		const rows = sql
 			.exec<{
+				base_hk: ArrayBuffer;
+				base_sk: ArrayBuffer;
 				item_id: number;
 				newest_seq: number | null;
-			}>(`SELECT item_id, newest_seq FROM latest_items WHERE hash_prefix_bucket = ?1 LIMIT ?2`, prefix, limit)
+			}>(
+				`SELECT base_hk, base_sk, item_id, newest_seq FROM latest_items WHERE hash_prefix_bucket = ?1 ORDER BY base_hk, base_sk LIMIT ?2`,
+				prefix,
+				limit,
+			)
 			.toArray();
+		if (rows.length === 0) {
+			return true;
+		}
 		for (const row of rows) {
 			this.#deletePositions(row.newest_seq);
 			sql.exec(`DELETE FROM target_retry WHERE target_id IN (SELECT target_id FROM materialization_targets) AND item_id = ?1`, row.item_id);
 			sql.exec(`DELETE FROM target_index_keys WHERE item_id = ?1`, row.item_id);
-			sql.exec(`DELETE FROM latest_items WHERE item_id = ?1`, row.item_id);
 		}
-		return !exists(sql.exec(`SELECT 1 FROM latest_items WHERE hash_prefix_bucket = ?1 LIMIT 1`, prefix));
+		const last = rows[rows.length - 1];
+		sql.exec(
+			`DELETE FROM latest_items WHERE hash_prefix_bucket = ?1 AND (base_hk, base_sk) <= (?2, ?3)`,
+			prefix,
+			last.base_hk,
+			last.base_sk,
+		);
+		return rows.length < limit;
 	}
 
 	/**
@@ -858,7 +952,7 @@ export class MaterializationStore {
 
 	/**
 	 * One base hash key of the first storage prefix, and whether another prefix follows it. Two seeks
-	 * of the unique key index.
+	 * of the primary key.
 	 */
 	probeHashPrefixBuckets(): { first: KeyBytes; more: boolean } | null {
 		const sql = this.#storage.sql;
@@ -993,8 +1087,9 @@ export class MaterializationStore {
 	 * Inserts a migrated item with its positions and its `target_retry` rows, which it marks as
 	 * inherited. A target takes no write while it imports, so an item that is present came from an
 	 * earlier try of the same page, and the insert keeps it. The conflict target stays
-	 * `(hash_prefix_bucket, base_hk, base_sk)`, for the reason of `PartitionStore.insertItemIfAbsent`.
-	 * Returns true when it inserted the item.
+	 * `(hash_prefix_bucket, base_hk, base_sk)`, so an `item_id` that another item holds fails the
+	 * statement, as in `PartitionStore.insertItemIfAbsent`. The caller raises the item-id mark after the
+	 * page (`raiseItemIdMark`). Returns true when it inserted the item.
 	 */
 	insertMigratedItem(item: MigratedLatestItem): boolean {
 		const sql = this.#storage.sql;

@@ -117,12 +117,17 @@ export class MaterializationMigrationHost implements MigrationHost {
 				// An item that is present already contributes nothing, so a retried page does not count
 				// its rows two times.
 				const added: Array<{ prefix: HashPrefixBucket; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
+				let maxItemId = 0;
 				for (const item of p.items) {
 					if (store.insertMigratedItem(item)) {
 						added.push({ prefix: item.prefix, hk: item.hk, bytes: item.est_row_bytes });
 					}
+					maxItemId = Math.max(maxItemId, item.item_id);
 				}
 				store.keySizes.addRows(added);
+				if (p.items.length > 0) {
+					store.raiseItemIdMark(maxItemId);
+				}
 				return;
 			}
 			case "producer_fences":
