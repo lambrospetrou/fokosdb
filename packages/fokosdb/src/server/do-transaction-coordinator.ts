@@ -268,7 +268,7 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 }
 
 /** A read `routing_hash` column as a routingHash. */
-function prefixFromBlob(value: ArrayBuffer): RoutingHash {
+function routingHashFromBlob(value: ArrayBuffer): RoutingHash {
 	return asRoutingHash(new Uint8Array(value));
 }
 
@@ -308,7 +308,7 @@ type CoordinatorRpc = FokosShardingRpc & {
  * The position of a migration page: the primary key of the last `tc_state` row that the page read. The
  * runtime stores it with structured clone, so the routingHash stays bytes.
  */
-type MigrationCursor = { prefix: RoutingHash; transactionId: string };
+type MigrationCursor = { routingHash: RoutingHash; transactionId: string };
 
 /**
  * One transaction and its rows in the four tables, as a migration page carries it. The page carries
@@ -569,7 +569,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				whileMigrating: "throw",
 				localMode: "async",
 				key: (req) => tokenKey(req.idempotencyToken),
-				local: async (req) => await this.recoverTransactionLocal(this.prefixOf(req.idempotencyToken), req.transactionId),
+				local: async (req) => await this.recoverTransactionLocal(this.routingHashOfToken(req.idempotencyToken), req.transactionId),
 			},
 		};
 	}
@@ -621,7 +621,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					return "allow";
 				}
 				const token = KeyCodec.decode(keys[0].hashKey) as string;
-				if (this.hasStateRowForToken(this.fokos.storagePrefix(keys[0].hashKey), token)) {
+				if (this.hasStateRowForToken(this.fokos.routingHashForKey(keys[0].hashKey), token)) {
 					return "allow";
 				}
 				return {
@@ -687,11 +687,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/**
-	 * The storage prefix of the rows of a transaction: the routingHash of its idempotency token. A
+	 * The routingHash of the rows of a transaction: the routingHash of its idempotency token. A
 	 * request computes it one time and passes it to each statement.
 	 */
-	private prefixOf(idempotencyToken: string): RoutingHash {
-		return this.fokos.storagePrefix(tokenKey(idempotencyToken).hashKey);
+	private routingHashOfToken(idempotencyToken: string): RoutingHash {
+		return this.fokos.routingHashForKey(tokenKey(idempotencyToken).hashKey);
 	}
 
 	/**
@@ -767,12 +767,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private async initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		const idempotencyToken = request.clientRequestToken;
-		const prefix = this.prefixOf(idempotencyToken);
+		const routingHash = this.routingHashOfToken(idempotencyToken);
 
 		// Computed once and used twice: to validate a replay, and as the stored fingerprint below.
 		const operationsHash = withExpressionErrors(() => hashTransactionOperations(request.items, request.executionMode ?? "standard"));
 
-		const existingRow = this.loadStateRowByToken(prefix, idempotencyToken);
+		const existingRow = this.loadStateRowByToken(routingHash, idempotencyToken);
 		if (existingRow) {
 			if (existingRow.operations_hash !== operationsHash) {
 				// Answering with the stored outcome here would report "committed" for operations that
@@ -783,7 +783,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					attributes: { clientRequestToken: idempotencyToken },
 				});
 			}
-			return await this.resumeTransaction(prefix, existingRow, idempotencyToken);
+			return await this.resumeTransaction(routingHash, existingRow, idempotencyToken);
 		}
 
 		// Key/operation validation is the client's single boundary (FokosDB.transactWriteItems); the TC
@@ -827,7 +827,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			this.ctx.storage.sql.exec(
 				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash)
                  VALUES (?, ?, ?, 'CREATED', ?, ?, ?, ?)`,
-				prefix,
+				routingHash,
 				transactionId,
 				idempotencyToken,
 				transactionTs,
@@ -839,7 +839,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					prefix,
+					routingHash,
 					transactionId,
 					op.hashKey,
 					op.sortKey,
@@ -858,7 +858,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			for (const p of participants) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?, ?)`,
-					prefix,
+					routingHash,
 					transactionId,
 					p.doName,
 					// TODO Skip the doName since it can be generated by partitionId to save bytes?
@@ -873,14 +873,21 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow() + this.config().staleTransactionMs);
 		this.fokos.requestSplitEvaluation();
 
-		return await this.drivePrepare(prefix, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, new RequestPartitions(), {
-			transactionTs,
-			participants,
-		});
+		return await this.drivePrepare(
+			routingHash,
+			transactionId,
+			idempotencyToken,
+			this.config().fanoutRequestBudgetMs,
+			new RequestPartitions(),
+			{
+				transactionTs,
+				participants,
+			},
+		);
 	}
 
 	private async resumeTransaction(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		existingRow: TcStateRow,
 		idempotencyToken: string,
 	): Promise<InitiateWriteResponseEncoded> {
@@ -888,24 +895,24 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const seen = new RequestPartitions();
 		switch (existingRow.state) {
 			case "COMMITTED":
-				return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen, existingRow);
+				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen, existingRow);
 			case "CANCELLED":
-				return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen, existingRow);
+				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen, existingRow);
 			case "PREPARING": {
-				await this.runPrepareRecovery(prefix, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
-				return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen);
+				await this.runPrepareRecovery(routingHash, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
 			}
 			case "PREPARED":
 			case "COMMITTING": {
-				await this.runCommit(prefix, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
-				return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen);
+				await this.runCommit(routingHash, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
 			}
 			case "CANCELLING": {
-				await this.runCancel(prefix, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
-				return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen);
+				await this.runCancel(routingHash, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
 			}
 			case "CREATED":
-				return await this.drivePrepare(prefix, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
+				return await this.drivePrepare(routingHash, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
 		}
 	}
 
@@ -929,13 +936,13 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * the pending errors.
 	 */
 	private loadFinalResponse(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		seen = new RequestPartitions(),
 		existingRow?: TcStateRow,
 	): InitiateWriteResponseEncoded {
-		const row = existingRow ?? this.loadStateRow(prefix, transactionId);
+		const row = existingRow ?? this.loadStateRow(routingHash, transactionId);
 		invariant(row, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
 		switch (row.state) {
 			case "COMMITTED":
@@ -964,7 +971,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				// results_json is positional to the request and tc_results.op_index is that same request
 				// index, so entry i owns the image row with op_index i. The cap already applied before
 				// the array was stored, so a replay answers with exactly the images the first call did.
-				for (const img of this.loadResultImages(prefix, transactionId)) {
+				for (const img of this.loadResultImages(routingHash, transactionId)) {
 					const res = results[img.op_index];
 					if (res?.outcome !== "rejected" || res.reason.code !== "condition_failed") {
 						continue;
@@ -1012,12 +1019,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * that does not complete keeps its payload only until its first claim. It writes no row when the
 	 * payload is already removed.
 	 */
-	private stripPayload(prefix: RoutingHash, transactionId: string): void {
+	private stripPayload(routingHash: RoutingHash, transactionId: string): void {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL, update_json = NULL
 			  WHERE routing_hash = ? AND transaction_id = ?
 			    AND (data IS NOT NULL OR data_kind IS NOT NULL OR conditions_json IS NOT NULL OR update_json IS NOT NULL)`,
-			prefix,
+			routingHash,
 			transactionId,
 		);
 	}
@@ -1028,7 +1035,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * COMMITTING or CANCELLING state.
 	 */
 	private async completeTransaction(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
@@ -1041,15 +1048,15 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				`UPDATE tc_state SET state = ?, completed_at = ?, next_recovery_at = NULL WHERE routing_hash = ? AND transaction_id = ? AND state = ?`,
 				terminalState,
 				completedAt,
-				prefix,
+				routingHash,
 				transactionId,
 				expectedState,
 			);
 			if (transition.rowsWritten === 0) {
 				return;
 			}
-			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, prefix, transactionId);
-			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE routing_hash = ? AND transaction_id = ?`, prefix, transactionId);
+			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId);
+			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId);
 			transitioned = true;
 		});
 		if (transitioned) {
@@ -1081,9 +1088,9 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 *
 	 * Returns true when it stored the answer.
 	 */
-	private storePrepareAnswer(prefix: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
+	private storePrepareAnswer(routingHash: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
 		return this.ctx.storage.transactionSync(() => {
-			if (this.loadStateRow(prefix, transactionId)?.state !== "PREPARING") {
+			if (this.loadStateRow(routingHash, transactionId)?.state !== "PREPARING") {
 				return false;
 			}
 			// A stored fatal error decides the transaction: it cancels. An answer of a concurrent drive
@@ -1091,7 +1098,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const stored = tryOne(
 				this.ctx.storage.sql.exec<{ error_json: string | null }>(
 					`SELECT error_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
-					prefix,
+					routingHash,
 					transactionId,
 					partitionDoName,
 				),
@@ -1104,7 +1111,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				  WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
 				answer.outcome,
 				answer.outcome === "rejected" ? stringifyTagged(stripImagesFromPrepareResponse(answer)) : null,
-				prefix,
+				routingHash,
 				transactionId,
 				partitionDoName,
 			);
@@ -1115,11 +1122,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			if (answer.outcome !== "rejected" || !answer.results.some((res) => res.outcome === "rejected" && res.imageBytes !== undefined)) {
 				return true;
 			}
-			const aboveCap = this.imagesAboveCap(prefix, transactionId);
+			const aboveCap = this.imagesAboveCap(routingHash, transactionId);
 			for (const opIndex of aboveCap) {
 				this.ctx.storage.sql.exec(
 					`DELETE FROM tc_results WHERE routing_hash = ? AND transaction_id = ? AND op_index = ?`,
-					prefix,
+					routingHash,
 					transactionId,
 					opIndex,
 				);
@@ -1134,7 +1141,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				this.ctx.storage.sql.exec(
 					`INSERT OR REPLACE INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
 					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					prefix,
+					routingHash,
 					transactionId,
 					res.opIndex,
 					DATA_KINDS.indexOf(img.kind),
@@ -1148,11 +1155,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** The operations whose image the combined cap drops, from the prepare answers that are stored now. */
-	private imagesAboveCap(prefix: RoutingHash, transactionId: string): Set<number> {
+	private imagesAboveCap(routingHash: RoutingHash, transactionId: string): Set<number> {
 		const results: ParticipantOperationResultEncoded[] = [];
 		for (const { answer_json } of this.ctx.storage.sql.exec<{ answer_json: string }>(
 			`SELECT answer_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
-			prefix,
+			routingHash,
 			transactionId,
 		)) {
 			const answer = parseTagged<PrepareOutcome>(answer_json);
@@ -1174,7 +1181,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * for example a transport failure, must not replace it, because recovery cancels on it. A new error
 	 * can replace a transient one. The read and the write run in one storage transaction.
 	 */
-	private storePrepareError(prefix: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void {
+	private storePrepareError(routingHash: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void {
 		dropCallCost(err);
 		this.ctx.storage.transactionSync(() => {
 			const row = tryOne(
@@ -1183,7 +1190,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					   JOIN tc_state s ON s.routing_hash = p.routing_hash AND s.transaction_id = p.transaction_id
 					  WHERE p.routing_hash = ? AND p.transaction_id = ? AND p.partition_do_name = ? AND p.prepare_outcome IS NULL
 					    AND s.state = 'PREPARING'`,
-					prefix,
+					routingHash,
 					transactionId,
 					partitionDoName,
 				),
@@ -1197,7 +1204,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET error_json = ? WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
 				JSON.stringify(wire),
-				prefix,
+				routingHash,
 				transactionId,
 				partitionDoName,
 			);
@@ -1211,9 +1218,9 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * Both drivePrepare and runPrepareRecovery call it, so the two writers of CANCELLING cannot merge
 	 * differently: the answers come from storage, never from what the caller still holds in memory.
 	 */
-	private cancelTransactionInStore(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void {
+	private cancelTransactionInStore(routingHash: RoutingHash, transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () => {
-			const items = this.loadItems(prefix, transactionId);
+			const items = this.loadItems(routingHash, transactionId);
 			const itemsByPartition = groupByPartition(items);
 
 			// results_json is positional to the request: entry i answers the operation the caller sent at
@@ -1221,7 +1228,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			// fills 0..n-1, and loadFinalResponse joins a stored image to its entry by that same index.
 			// An operation no participant reported stays not_evaluated rather than shifting its neighbours.
 			const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
-			for (const p of this.loadParticipants(prefix, transactionId)) {
+			for (const p of this.loadParticipants(routingHash, transactionId)) {
 				const owned = itemsByPartition.get(p.partition_do_name) ?? [];
 				const answer = p.prepare_outcome === "rejected" && p.answer_json ? parseTagged<PrepareOutcome>(p.answer_json) : null;
 				let answered: ParticipantOperationResultEncoded[];
@@ -1274,7 +1281,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const transition = this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'CANCELLING', results_json = ? WHERE routing_hash = ? AND transaction_id = ? AND state = 'PREPARING'`,
 				stringifyTagged(finalResults),
-				prefix,
+				routingHash,
 				transactionId,
 			);
 			// Another writer already decided this transaction. Its results_json names the images that are
@@ -1286,7 +1293,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			for (const opIndex of cappedOutOpIndexes) {
 				this.ctx.storage.sql.exec(
 					`DELETE FROM tc_results WHERE routing_hash = ? AND transaction_id = ? AND op_index = ?`,
-					prefix,
+					routingHash,
 					transactionId,
 					opIndex,
 				);
@@ -1361,12 +1368,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * The statement writes nothing when the state is not PREPARING. In that case, another drive has
 	 * already written a decision, and the caller follows the stored state.
 	 */
-	private markCommitting(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void {
+	private markCommitting(routingHash: RoutingHash, transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () =>
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'COMMITTING' WHERE routing_hash = ?1 AND transaction_id = ?2 AND state = 'PREPARING'
 				   AND NOT EXISTS (SELECT 1 FROM tc_participants WHERE routing_hash = ?1 AND transaction_id = ?2 AND prepare_outcome IS NOT 'accepted')`,
-				prefix,
+				routingHash,
 				transactionId,
 			),
 		);
@@ -1379,7 +1386,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * transaction, the `tx_recovery` job, recovery) has no in-memory copy and loads the fan-out from SQLite.
 	 */
 	private async drivePrepare(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1389,20 +1396,20 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const row = this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'PREPARING' WHERE routing_hash = ? AND transaction_id = ? AND state = 'CREATED'`,
-				prefix,
+				routingHash,
 				transactionId,
 			);
-			return this.loadStateRow(prefix, transactionId);
+			return this.loadStateRow(routingHash, transactionId);
 		});
 		invariant(row, () => `fokos/tc: drivePrepare found no tc_state row for transaction ${transactionId}`);
 		// Another drive can start between the insert of the transaction and this call, for example a
 		// retry with the same token. When that drive has already decided, a prepare from this drive can
 		// lock keys after the cancel released them.
 		if (row.state !== "PREPARING") {
-			return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen, row);
+			return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen, row);
 		}
 
-		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(prefix, transactionId);
+		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(routingHash, transactionId);
 		// Each participant stores this reference in its lock, and calls it back on recovery.
 		const coordinator = this.coordinatorRef(idempotencyToken);
 		const retry = this.config().participantRetry;
@@ -1445,10 +1452,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						// 3. Set `p.context` to the root context, and send `txPrepare` again.
 						// The commit, the cancel, and the recovery read `partition_context_json`, so they also
 						// go to the root. Two drives that miss at the same time write the same root context.
-						this.storePrepareError(prefix, transactionId, p.doName, err);
+						this.storePrepareError(routingHash, transactionId, p.doName, err);
 						throw err;
 					});
-				seen.addPrepare(answer, this.storePrepareAnswer(prefix, transactionId, p.doName, answer.value));
+				seen.addPrepare(answer, this.storePrepareAnswer(routingHash, transactionId, p.doName, answer.value));
 				return { partitionDoName: p.doName, result: answer.value };
 			}),
 		);
@@ -1457,8 +1464,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 		if (allAccepted) {
 			// All answers in memory are accepted. markCommitting checks the stored answers again.
-			this.markCommitting(prefix, transactionId, idempotencyToken);
-			await this.runCommit(prefix, transactionId, idempotencyToken, requestBudgetMs, seen).catch((e: unknown) => {
+			this.markCommitting(routingHash, transactionId, idempotencyToken);
+			await this.runCommit(routingHash, transactionId, idempotencyToken, requestBudgetMs, seen).catch((e: unknown) => {
 				// A split moved the token: the client retries, and the new owner commits.
 				if (FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
 					throw e;
@@ -1470,12 +1477,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					error: String(e),
 				});
 			});
-			return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen);
+			return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
 		}
 
-		this.cancelTransactionInStore(prefix, transactionId, idempotencyToken);
-		await this.runCancel(prefix, transactionId, idempotencyToken, requestBudgetMs, seen);
-		return this.loadFinalResponse(prefix, transactionId, idempotencyToken, seen);
+		this.cancelTransactionInStore(routingHash, transactionId, idempotencyToken);
+		await this.runCancel(routingHash, transactionId, idempotencyToken, requestBudgetMs, seen);
+		return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
 	}
 
 	/**
@@ -1484,7 +1491,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * stays unconfirmed, and the transaction stays non-terminal for the `tx_recovery` job.
 	 */
 	private async runCommit(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1501,10 +1508,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const stateRow = this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'COMMITTING' WHERE routing_hash = ? AND transaction_id = ? AND state = 'PREPARED'`,
-				prefix,
+				routingHash,
 				transactionId,
 			);
-			return this.loadStateRow(prefix, transactionId);
+			return this.loadStateRow(routingHash, transactionId);
 		});
 		invariant(stateRow, () => `fokos/tc: runCommit found no tc_state row for transaction ${transactionId}`);
 		if (stateRow.state !== "COMMITTING") {
@@ -1514,7 +1521,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Keys only, as in runCancel: every participant applies the payload from its own
 		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
 		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
-		const keysByPartition = groupByPartition(this.loadItemKeys(prefix, transactionId));
+		const keysByPartition = groupByPartition(this.loadItemKeys(routingHash, transactionId));
 		const deadlineMs = this.fokosNow() + requestBudgetMs;
 
 		// A participant with a stored 'committed' outcome got its commit from an earlier drive, and this
@@ -1523,7 +1530,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
                  FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL`,
-				prefix,
+				routingHash,
 				transactionId,
 			)
 			.toArray();
@@ -1583,7 +1590,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						`UPDATE tc_participants SET commit_outcome = 'committed'
 						  WHERE routing_hash = ?1 AND transaction_id = ?2 AND partition_do_name = ?3 AND commit_outcome IS NULL
 						    AND EXISTS (SELECT 1 FROM tc_state WHERE routing_hash = ?1 AND transaction_id = ?2 AND state = 'COMMITTING')`,
-						prefix,
+						routingHash,
 						transactionId,
 						partitionDoName,
 					);
@@ -1591,7 +1598,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				return one(
 					this.ctx.storage.sql.exec<{ n: number }>(
 						`SELECT COUNT(*) as n FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL`,
-						prefix,
+						routingHash,
 						transactionId,
 					),
 				).n;
@@ -1600,12 +1607,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				return;
 			}
 		}
-		await this.completeTransaction(prefix, transactionId, idempotencyToken, "COMMITTED");
+		await this.completeTransaction(routingHash, transactionId, idempotencyToken, "COMMITTED");
 	}
 
 	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
 	private async runCancel(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
@@ -1614,13 +1621,13 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Sends cancels only when the stored decision is cancel, to avoid racy runs breaking atomicity.
 		// A cancel after a commit decision makes a participant release a lock that the commit must apply,
 		// and the participant then answers that commit with the idempotent success.
-		if (this.loadStateRow(prefix, transactionId)?.state !== "CANCELLING") {
+		if (this.loadStateRow(routingHash, transactionId)?.state !== "CANCELLING") {
 			return;
 		}
 		// Keys only: cancel routes on them but never reads the payload, and this path runs on every
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
-		const keysByPartition = groupByPartition(this.loadItemKeys(prefix, transactionId));
+		const keysByPartition = groupByPartition(this.loadItemKeys(routingHash, transactionId));
 		const deadlineMs = this.fokosNow() + requestBudgetMs;
 
 		// Cancel any participant not yet cancelled — this includes both
@@ -1631,7 +1638,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
                  FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND cancel_outcome IS NULL`,
-				prefix,
+				routingHash,
 				transactionId,
 			)
 			.toArray();
@@ -1661,7 +1668,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				);
 				this.ctx.storage.sql.exec(
 					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
-					prefix,
+					routingHash,
 					transactionId,
 					p.partition_do_name,
 				);
@@ -1673,39 +1680,39 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const stillPending = one(
 			this.ctx.storage.sql.exec<{ n: number }>(
 				`SELECT COUNT(*) as n FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
-				prefix,
+				routingHash,
 				transactionId,
 			),
 		).n;
 		if (stillPending === 0) {
-			await this.completeTransaction(prefix, transactionId, idempotencyToken, "CANCELLED");
+			await this.completeTransaction(routingHash, transactionId, idempotencyToken, "CANCELLED");
 		}
 	}
 
 	private async runPrepareRecovery(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
 		seen = new RequestPartitions(),
 	): Promise<void> {
-		const stateRow = this.loadStateRow(prefix, transactionId);
+		const stateRow = this.loadStateRow(routingHash, transactionId);
 		if (stateRow?.state !== "PREPARING") {
 			return;
 		}
 
-		const items = this.loadItems(prefix, transactionId);
+		const items = this.loadItems(routingHash, transactionId);
 		const itemsByPartition = groupByPartition(items);
 		const coordinator = this.coordinatorRef(idempotencyToken);
 
-		const existingParticipants = this.loadParticipants(prefix, transactionId);
+		const existingParticipants = this.loadParticipants(routingHash, transactionId);
 
 		const nullParticipants = existingParticipants.filter((p) => p.prepare_outcome === null);
 		// A fatal error that an earlier drive stored, for example before a restart. The same prepare
 		// gets the same error, so the drive cancels at once and sends no prepare.
 		if (nullParticipants.some((p) => isFatalPrepareError(p.error_json))) {
-			this.cancelTransactionInStore(prefix, transactionId, idempotencyToken);
-			await this.runCancel(prefix, transactionId, idempotencyToken, requestBudgetMs, seen);
+			this.cancelTransactionInStore(routingHash, transactionId, idempotencyToken);
+			await this.runCancel(routingHash, transactionId, idempotencyToken, requestBudgetMs, seen);
 			return;
 		}
 		const retry = this.config().participantRetry;
@@ -1724,14 +1731,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						{ retry: prepareRetry(retry, retry.prepareRecoveryMaxAttempts) },
 					)
 					.catch((err: unknown) => {
-						this.storePrepareError(prefix, transactionId, p.partition_do_name, err);
+						this.storePrepareError(routingHash, transactionId, p.partition_do_name, err);
 						throw err;
 					});
-				seen.addPrepare(answer, this.storePrepareAnswer(prefix, transactionId, p.partition_do_name, answer.value));
+				seen.addPrepare(answer, this.storePrepareAnswer(routingHash, transactionId, p.partition_do_name, answer.value));
 			}),
 		);
 
-		const allParticipants = this.loadParticipants(prefix, transactionId);
+		const allParticipants = this.loadParticipants(routingHash, transactionId);
 		// A participant that is still NULL threw again. A transient throw is retryable: on its own it
 		// decides nothing, so the transaction stays PREPARING for the `tx_recovery` job to drive later.
 		// Only a real rejection, a fatal error of this fan-out or of a concurrent drive, or exceeding the
@@ -1744,11 +1751,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const heldTooLong = this.fokosNow() - stateRow.created_at > maxPreparingHoldMs(this.config());
 
 		if (allAccepted) {
-			this.markCommitting(prefix, transactionId, idempotencyToken);
-			await this.runCommit(prefix, transactionId, idempotencyToken, requestBudgetMs, seen);
+			this.markCommitting(routingHash, transactionId, idempotencyToken);
+			await this.runCommit(routingHash, transactionId, idempotencyToken, requestBudgetMs, seen);
 		} else if (anyRejected || heldTooLong) {
-			this.cancelTransactionInStore(prefix, transactionId, idempotencyToken);
-			await this.runCancel(prefix, transactionId, idempotencyToken, requestBudgetMs, seen);
+			this.cancelTransactionInStore(routingHash, transactionId, idempotencyToken);
+			await this.runCancel(routingHash, transactionId, idempotencyToken, requestBudgetMs, seen);
 		}
 		// If some participants are still NULL and under the hold deadline, leave in PREPARING; the `tx_recovery` job retries it.
 	}
@@ -1783,7 +1790,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				claimed++;
 				try {
 					await this.driveTransaction(
-						row.prefix,
+						row.routingHash,
 						row.transaction_id,
 						row.idempotency_token,
 						row.state,
@@ -1814,7 +1821,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		dueAt: number,
 		limit: number,
 		staleTransactionMs: number,
-	): { prefix: RoutingHash; transaction_id: string; idempotency_token: string; state: TCState }[] {
+	): { routingHash: RoutingHash; transaction_id: string; idempotency_token: string; state: TCState }[] {
 		const now = this.fokosNow();
 		return this.ctx.storage.transactionSync(() => {
 			const rows = this.ctx.storage.sql
@@ -1825,16 +1832,16 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					limit,
 				)
 				.toArray()
-				.map(({ routing_hash, ...row }) => ({ ...row, prefix: prefixFromBlob(routing_hash) }));
+				.map(({ routing_hash, ...row }) => ({ ...row, routingHash: routingHashFromBlob(routing_hash) }));
 			for (const row of rows) {
 				this.ctx.storage.sql.exec(
 					`UPDATE tc_state SET next_recovery_at = ? WHERE routing_hash = ? AND transaction_id = ?`,
 					nextRecoveryAt(now, row.created_at, staleTransactionMs),
-					row.prefix,
+					row.routingHash,
 					row.transaction_id,
 				);
 				if (isPastPrepare(row.state)) {
-					this.stripPayload(row.prefix, row.transaction_id);
+					this.stripPayload(row.routingHash, row.transaction_id);
 				}
 			}
 			return rows;
@@ -1854,7 +1861,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/** Drives one non-terminal transaction from its stored state. `budgetMs` bounds the participant retries. */
 	private async driveTransaction(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		state: TCState,
@@ -1862,17 +1869,17 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	): Promise<void> {
 		switch (state) {
 			case "CREATED":
-				await this.drivePrepare(prefix, transactionId, idempotencyToken, budgetMs);
+				await this.drivePrepare(routingHash, transactionId, idempotencyToken, budgetMs);
 				break;
 			case "PREPARING":
-				await this.runPrepareRecovery(prefix, transactionId, idempotencyToken, budgetMs);
+				await this.runPrepareRecovery(routingHash, transactionId, idempotencyToken, budgetMs);
 				break;
 			case "PREPARED":
 			case "COMMITTING":
-				await this.runCommit(prefix, transactionId, idempotencyToken, budgetMs);
+				await this.runCommit(routingHash, transactionId, idempotencyToken, budgetMs);
 				break;
 			case "CANCELLING":
-				await this.runCancel(prefix, transactionId, idempotencyToken, budgetMs);
+				await this.runCancel(routingHash, transactionId, idempotencyToken, budgetMs);
 				break;
 		}
 	}
@@ -1928,11 +1935,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * A drive here would run beside the other drives of the transaction, one for each call. The job
 	 * runs in the passes of the scheduler, one at a time, so calls from many participants give one drive.
 	 */
-	private async recoverTransactionLocal(prefix: RoutingHash, transactionId: string): Promise<RecoverTransactionResult> {
+	private async recoverTransactionLocal(routingHash: RoutingHash, transactionId: string): Promise<RecoverTransactionResult> {
 		const state = tryOne(
 			this.ctx.storage.sql.exec<{ state: TCState }>(
 				`SELECT state FROM tc_state WHERE routing_hash = ? AND transaction_id = ?`,
-				prefix,
+				routingHash,
 				transactionId,
 			),
 		)?.state;
@@ -1946,7 +1953,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET next_recovery_at = MIN(next_recovery_at, ?) WHERE routing_hash = ? AND transaction_id = ? AND completed_at IS NULL`,
 			now,
-			prefix,
+			routingHash,
 			transactionId,
 		);
 		await this.fokos.scheduleJob(JOB_TX_RECOVERY, now);
@@ -1976,10 +1983,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		);
 		// Each bound stays a row-value comparison, so SQLite seeks on the primary key.
 		const conds = [cursor === null ? `routing_hash >= ?` : `(routing_hash, transaction_id) > (?, ?)`];
-		const params: unknown[] = cursor === null ? [interval.start.prefix] : [cursor.prefix, cursor.transactionId];
+		const params: unknown[] = cursor === null ? [interval.start.routingHash] : [cursor.routingHash, cursor.transactionId];
 		if (interval.end !== null) {
 			conds.push(`routing_hash < ?`);
-			params.push(interval.end.prefix);
+			params.push(interval.end.routingHash);
 		}
 		const rows = this.ctx.storage.sql.exec<TcStateRow & { routing_hash: ArrayBuffer }>(
 			`SELECT routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
@@ -1996,15 +2003,15 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			if (scanned === budget.scanRows || page.length === budget.pageRows) {
 				return { page, nextCursor: last };
 			}
-			const prefix = prefixFromBlob(routing_hash);
+			const routingHash = routingHashFromBlob(routing_hash);
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {
 				const tx: MigratedTransaction = {
 					state: row,
 					// A transaction past its prepare needs only the keys. Its payload can still be on disk
 					// before its first recovery claim, and the page does not carry it.
-					items: this.loadItems(prefix, row.transaction_id, !isPastPrepare(row.state)),
-					participants: this.loadParticipants(prefix, row.transaction_id),
-					results: this.loadResultImages(prefix, row.transaction_id),
+					items: this.loadItems(routingHash, row.transaction_id, !isPastPrepare(row.state)),
+					participants: this.loadParticipants(routingHash, row.transaction_id),
+					results: this.loadResultImages(routingHash, row.transaction_id),
 				};
 				const txBytes = migratedTransactionBytes(tx);
 				if (page.length > 0 && bytes + txBytes > budget.pageBytes) {
@@ -2014,7 +2021,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				bytes += txBytes;
 			}
 			scanned += 1;
-			last = { prefix, transactionId: row.transaction_id };
+			last = { routingHash, transactionId: row.transaction_id };
 		}
 		return { page, nextCursor: null };
 	}
@@ -2027,11 +2034,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private applyMigrationPage(page: MigratedTransaction[]): void {
 		const sql = this.ctx.storage.sql;
 		for (const { state, items, participants, results } of page) {
-			const prefix = this.prefixOf(state.idempotency_token);
+			const routingHash = this.routingHashOfToken(state.idempotency_token);
 			sql.exec(
 				`INSERT OR REPLACE INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				prefix,
+				routingHash,
 				state.transaction_id,
 				state.idempotency_token,
 				state.state,
@@ -2046,7 +2053,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				sql.exec(
 					`INSERT OR REPLACE INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					prefix,
+					routingHash,
 					r.transaction_id,
 					r.hk,
 					r.sk,
@@ -2065,7 +2072,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				sql.exec(
 					`INSERT OR REPLACE INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					prefix,
+					routingHash,
 					r.transaction_id,
 					r.partition_do_name,
 					r.partition_context_json,
@@ -2080,7 +2087,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				sql.exec(
 					`INSERT OR REPLACE INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
 					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					prefix,
+					routingHash,
 					r.transaction_id,
 					r.op_index,
 					r.image_kind,
@@ -2115,23 +2122,23 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		return !exists(sql.exec(`SELECT 1 FROM tc_state LIMIT 1`));
 	}
 
-	private loadStateRow(prefix: RoutingHash, transactionId: string): TcStateRow | undefined {
+	private loadStateRow(routingHash: RoutingHash, transactionId: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
 				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
                  FROM tc_state WHERE routing_hash = ? AND transaction_id = ?`,
-				prefix,
+				routingHash,
 				transactionId,
 			),
 		);
 	}
 
 	/** One seek of the unique token index, and no row read: the admission hook needs only to know that a row exists. */
-	private hasStateRowForToken(prefix: RoutingHash, idempotencyToken: string): boolean {
+	private hasStateRowForToken(routingHash: RoutingHash, idempotencyToken: string): boolean {
 		return exists(
 			this.ctx.storage.sql.exec(
 				`SELECT 1 FROM tc_state WHERE routing_hash = ? AND idempotency_token = ? LIMIT 1`,
-				prefix,
+				routingHash,
 				idempotencyToken,
 			),
 		);
@@ -2144,25 +2151,25 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		return first !== undefined && exists(sql.exec(`SELECT 1 FROM tc_state WHERE routing_hash > ? LIMIT 1`, first.routing_hash));
 	}
 
-	private loadStateRowByToken(prefix: RoutingHash, idempotencyToken: string): TcStateRow | undefined {
+	private loadStateRowByToken(routingHash: RoutingHash, idempotencyToken: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
 				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
                  FROM tc_state WHERE routing_hash = ? AND idempotency_token = ?`,
-				prefix,
+				routingHash,
 				idempotencyToken,
 			),
 		);
 	}
 
 	/** The prepare fan-out of a stored transaction: the state, the participants, and their items. */
-	private loadPrepareFanout(prefix: RoutingHash, transactionId: string): PrepareFanout {
-		const stateRow = this.loadStateRow(prefix, transactionId);
+	private loadPrepareFanout(routingHash: RoutingHash, transactionId: string): PrepareFanout {
+		const stateRow = this.loadStateRow(routingHash, transactionId);
 		invariant(stateRow, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
-		const itemsByPartition = groupByPartition(this.loadItems(prefix, transactionId));
+		const itemsByPartition = groupByPartition(this.loadItems(routingHash, transactionId));
 		return {
 			transactionTs: stateRow.transaction_ts,
-			participants: this.loadParticipants(prefix, transactionId).map((p) => ({
+			participants: this.loadParticipants(routingHash, transactionId).map((p) => ({
 				doName: p.partition_do_name,
 				context: deserializePartitionContext(p.partition_context_json),
 				items: toTransactionItems(itemsByPartition.get(p.partition_do_name) ?? []),
@@ -2171,7 +2178,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** With `withPayload` false, the payload columns are NULL, so the rows do not hold the payload in memory. */
-	private loadItems(prefix: RoutingHash, transactionId: string, withPayload = true): TcItemRow[] {
+	private loadItems(routingHash: RoutingHash, transactionId: string, withPayload = true): TcItemRow[] {
 		const payload = withPayload
 			? "data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json"
 			: "NULL AS data, NULL AS data_kind, ttl_epoch_utc_seconds, NULL AS conditions_json, NULL AS update_json";
@@ -2179,7 +2186,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			.exec<TcItemRow>(
 				`SELECT transaction_id, hk, sk, op_index, operation, ${payload}, partition_do_name, return_values_on_condition_check_failure
                  FROM tc_items WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index`,
-				prefix,
+				routingHash,
 				transactionId,
 			)
 			.toArray();
@@ -2189,31 +2196,31 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * The routing half of loadItems: no data, no conditions — see runCancel. Each key comes one time,
 	 * because commit and cancel send each key one time. SQLite compares the BLOB keys by bytes.
 	 */
-	private loadItemKeys(prefix: RoutingHash, transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
+	private loadItemKeys(routingHash: RoutingHash, transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
 		return this.ctx.storage.sql
 			.exec<
 				Pick<TcItemRow, "hk" | "sk" | "partition_do_name">
-			>(`SELECT DISTINCT hk, sk, partition_do_name FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, prefix, transactionId)
+			>(`SELECT DISTINCT hk, sk, partition_do_name FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId)
 			.toArray();
 	}
 
-	private loadResultImages(prefix: RoutingHash, transactionId: string): TcResultRow[] {
+	private loadResultImages(routingHash: RoutingHash, transactionId: string): TcResultRow[] {
 		return this.ctx.storage.sql
 			.exec<TcResultRow>(
 				`SELECT transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data
                  FROM tc_results WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index`,
-				prefix,
+				routingHash,
 				transactionId,
 			)
 			.toArray();
 	}
 
-	private loadParticipants(prefix: RoutingHash, transactionId: string): TcParticipantRow[] {
+	private loadParticipants(routingHash: RoutingHash, transactionId: string): TcParticipantRow[] {
 		return this.ctx.storage.sql
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json
                  FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name`,
-				prefix,
+				routingHash,
 				transactionId,
 			)
 			.toArray();

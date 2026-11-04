@@ -8,16 +8,16 @@ import type { RouteKey } from "../../sharding/repartition-types.js";
 import { MaterializationStore, type LatestImage } from "./materialization-store.js";
 import { MaterializationMigrationHost, type MaterializationHostPage } from "./materialization-migration-host.js";
 import type { PushSinkTargetDefinition } from "./targets.js";
-import { ALL_ROWS, prefixOf } from "../../../test/storage-prefix.js";
+import { ALL_ROWS, routingHashFor } from "../../../test/routing-hash.js";
 import { collidingHashKeys } from "../../../test/hash-digits.js";
 import { compareRoutingHashes } from "../../sharding/hash-primitives.js";
 import { rangeStorageInterval } from "../../sharding/repartition-slice.js";
 
-/** The shard group of `prefixOf`. */
+/** The shard group of `routingHashFor`. */
 const STORE_GROUP = "fokos.p.store-test";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const SOURCE_ID = "aa".repeat(32);
@@ -73,7 +73,7 @@ describe("MaterializationMigrationHost", () => {
 			store.updateTarget("t1", 4, false);
 			store.updateTarget("t2", 4, false);
 
-			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, routingHashForKey: P });
 			const out: MaterializationHostPage[] = [];
 			let cursor: unknown = null;
 			for (let i = 0; i < 20; i++) {
@@ -97,7 +97,7 @@ describe("MaterializationMigrationHost", () => {
 		]);
 
 		const child = await inPartition("mat-child", (store, sql) => {
-			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), routingHashForKey: P });
 			for (const page of pages) {
 				store.transactionSync(() => host.applyPage(page, slice));
 			}
@@ -148,10 +148,10 @@ describe("MaterializationMigrationHost", () => {
 
 	it("moves every hash key of the promoted routingHash, and the source cleanup deletes them all", async () => {
 		const [a, b] = collidingHashKeys(STORE_GROUP).map((raw) => KeyCodec.encode(raw));
-		const routingHash = prefixOf(a);
-		expect(prefixOf(b)).toEqual(routingHash);
+		const routingHash = routingHashFor(a);
+		expect(routingHashFor(b)).toEqual(routingHash);
 		const slice: FokosSlice = { kind: "promoted_routing_hash", routingHash: routingHash };
-		const inSlice = (key: RouteKey) => compareRoutingHashes(prefixOf(key.hashKey), routingHash) === 0;
+		const inSlice = (key: RouteKey) => compareRoutingHashes(routingHashFor(key.hashKey), routingHash) === 0;
 		const bytesImage = (hashKey: KeyBytes, sk: string): LatestImage => ({ ...image("x", sk), hashKey });
 
 		const source = await inPartition("mat-source", (store) => {
@@ -163,10 +163,10 @@ describe("MaterializationMigrationHost", () => {
 				[kb("cold"), "s"],
 			] as const) {
 				const img = bytesImage(hashKey, sk);
-				store.putLatestImage(prefixOf(hashKey), img, 1_000, store.storedImage(prefixOf(hashKey), hashKey, img.sortKey), []);
+				store.putLatestImage(routingHashFor(hashKey), img, 1_000, store.storedImage(routingHashFor(hashKey), hashKey, img.sortKey), []);
 			}
 			store.storeCursorSnapshot(routingHash);
-			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, routingHashForKey: P });
 			const pages: MaterializationHostPage[] = [];
 			let cursor: unknown = null;
 			do {
@@ -178,7 +178,7 @@ describe("MaterializationMigrationHost", () => {
 			while (!store.deleteItemsOfRoutingHash(routingHash, 1)) {
 				// One bounded step at a time, as the cleanup runs.
 			}
-			const has = (hashKey: KeyBytes, sk: string) => store.storedImage(prefixOf(hashKey), hashKey, kb(sk)) !== undefined;
+			const has = (hashKey: KeyBytes, sk: string) => store.storedImage(routingHashFor(hashKey), hashKey, kb(sk)) !== undefined;
 			return { pages, routingHashBytes, left: [has(a, "s1"), has(b, "s1"), has(b, "s2"), has(kb("cold"), "s")] };
 		});
 		const moved = source.pages.flatMap((p) => (p.stream === "items" ? p.items : []));
@@ -193,7 +193,7 @@ describe("MaterializationMigrationHost", () => {
 		expect(source.left).toEqual([false, false, false, true]);
 
 		const child = await inPartition("mat-child", (store, sql) => {
-			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), routingHashForKey: P });
 			for (const page of source.pages) {
 				store.transactionSync(() => host.applyPage(page, slice));
 			}
@@ -218,7 +218,7 @@ describe("MaterializationMigrationHost", () => {
 			store.updateTarget("t1", 1, false);
 			store.raiseAllTargetEpochs();
 			store.storeCursorSnapshot(P(kb("hot")));
-			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, routingHashForKey: P });
 			const out: MaterializationHostPage[] = [];
 			for (let cursor: unknown = null; ; ) {
 				const { page, nextCursor } = host.buildPage(cursor, slice, inSlice, BUDGET, ALL_ROWS);
@@ -230,7 +230,7 @@ describe("MaterializationMigrationHost", () => {
 			}
 		});
 		const fences = await inPartition("mat-child", (store, sql) => {
-			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), routingHashForKey: P });
 			for (const page of pages) {
 				store.transactionSync(() => host.applyPage(page, slice));
 			}
@@ -249,7 +249,7 @@ describe("MaterializationMigrationHost", () => {
 			store.putLatestImage(P(image("hot", "s1").hashKey), image("hot", "s1"), 1_000, undefined, positions);
 			store.raiseAllTargetEpochs();
 			store.storeCursorSnapshot(P(kb("hot")));
-			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, routingHashForKey: P });
 			const out: MaterializationHostPage[] = [];
 			for (let cursor: unknown = null; ; ) {
 				const { page, nextCursor } = host.buildPage(cursor, slice, inSlice, BUDGET, ALL_ROWS);
@@ -261,7 +261,7 @@ describe("MaterializationMigrationHost", () => {
 			}
 		});
 		const child = await inPartition("mat-child", (store, sql) => {
-			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), routingHashForKey: P });
 			for (const page of pages) {
 				store.transactionSync(() => host.applyPage(page, slice));
 			}
@@ -290,7 +290,7 @@ describe("MaterializationMigrationHost", () => {
 				store.addIndexKey("t1", store.storedImage(P(kb("hot")), kb("hot"), kb("s"))!.itemId, key);
 			}
 			store.storeCursorSnapshot(P(kb("hot")));
-			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, routingHashForKey: P });
 			const out: MaterializationHostPage[] = [];
 			let cursor: unknown = null;
 			do {
@@ -301,7 +301,7 @@ describe("MaterializationMigrationHost", () => {
 			return out;
 		});
 		const copied = await inPartition("mat-keys-target", (store) => {
-			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), storagePrefix: P });
+			const host = new MaterializationMigrationHost({ store, selfId: () => "bb".repeat(32), routingHashForKey: P });
 			for (const page of pages) {
 				host.applyPage(page, slice);
 			}

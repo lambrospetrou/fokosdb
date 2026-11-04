@@ -5,7 +5,7 @@ import type { QuerySelect } from "../types.js";
 import type { ExpressionRequiredColumn } from "./semantic.js";
 
 export const CONDITION_PLAN_VERSION = 1 as const;
-/** hk, sk, and the storage prefix of the item, bound before the plan in a condition statement. */
+/** hk, sk, and the routingHash of the item, bound before the plan in a condition statement. */
 export const CONDITION_FIXED_BINDING_COUNT = 3;
 
 export const UPDATE_PLAN_VERSION = 1 as const;
@@ -13,7 +13,7 @@ export const UPDATE_PLAN_VERSION = 1 as const;
 export const PROJECTION_PLAN_VERSION = 1 as const;
 export const QUERY_PLAN_VERSION = 1 as const;
 
-/** hk, sk, and the storage prefix of the item, bound after the pool in a projected point read. */
+/** hk, sk, and the routingHash of the item, bound after the pool in a projected point read. */
 export const PROJECTION_FIXED_BINDING_COUNT = 3;
 /**
  * The parameter every pool-layout plan owns, bound always, with the text "[]" when the plan has no
@@ -23,14 +23,14 @@ export const PROJECTION_FIXED_BINDING_COUNT = 3;
  * parameters follow the statement's fixed head.
  */
 export const POOL_PARAM = 1;
-/** The storage prefix, hk, near bound, far bound, LIMIT: the widest scan tail after the pool of a query plan. */
+/** The routingHash, hk, near bound, far bound, LIMIT: the widest scan tail after the pool of a query plan. */
 export const QUERY_MAX_TRAILING_BINDING_COUNT = 5;
 /** The scan terms of the widest query statement, used for the SQL size check. */
 export const QUERY_WIDEST_SCAN_CONDITIONS: readonly string[] = ["routing_hash = ?", "hk = ?", "sk >= ?", "sk <= ?"];
 
 /**
  * Parameters every statement that runs an update plan binds BEFORE the plan's own, in this order:
- * the hash key, the sort key, and the storage prefix of the item. The compiler offsets the plan's
+ * the hash key, the sort key, and the routingHash of the item. The compiler offsets the plan's
  * parameters past them, exactly as it does for a condition, so every such statement shares one
  * numbering and one binding order.
  */
@@ -61,7 +61,7 @@ LEFT JOIN items AS i
 /**
  * The statement that reads what an update plan gives for one item, and writes nothing.
  *
- * ?1 and ?2 are the keys and ?3 is the storage prefix, as they are in every statement that runs an
+ * ?1 and ?2 are the keys and ?3 is the routingHash, as they are in every statement that runs an
  * update plan.
  *
  * value_type_ok names ONE cause of an inapplicable update, so a caller learns that its value was
@@ -89,7 +89,7 @@ export const UPDATE_STORED_TTL_SQL = "i.ttl_epoch_utc_seconds";
 /**
  * The statement that applies an update plan to one item, and creates the item when it is absent.
  *
- * ?1 and ?2 are the keys, and ?3 is the storage prefix. `txOrderTsParam`, `itemIdParam`, and
+ * ?1 and ?2 are the keys, and ?3 is the routingHash. `txOrderTsParam`, `itemIdParam`, and
  * `limitParam` are parameters of the statement tail. `itemIdParam` is the `item_id` of a row that
  * the statement creates.
  * `ttlSql` is a tail parameter for an operation that sets a TTL, and UPDATE_STORED_TTL_SQL for one
@@ -303,7 +303,7 @@ export type CompiledProjectionPlan = {
 	bindings: readonly ExpressionBindingDescriptor[];
 	/** Number of binding descriptors in this plan. */
 	bindingCount: number;
-	/** POOL_PARAM plus PROJECTION_FIXED_BINDING_COUNT (3: hk, sk, prefix); the pool is bound also when the plan has no descriptor. */
+	/** POOL_PARAM plus PROJECTION_FIXED_BINDING_COUNT (3: hk, sk, routingHash); the pool is bound also when the plan has no descriptor. */
 	completeBindingCount: number;
 	/** Storage columns required to execute the projection statement. */
 	requiredColumns: readonly ExpressionRequiredColumn[];

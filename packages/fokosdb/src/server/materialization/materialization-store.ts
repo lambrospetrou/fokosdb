@@ -60,12 +60,12 @@ const LATEST_ROW_BYTES_K = 70;
 
 /**
  * The SQL of the `est_row_bytes` of a `latest_items` row, with the base hash key in `?1` and the base
- * sort key in `?2`. `prefixParam` holds the storage prefix. `dataParam` holds the stored `data` value,
- * or is null for a tombstone. The prefix and the keys count two times for a live row (the row and the
+ * sort key in `?2`. `routingHashParam` holds the routingHash. `dataParam` holds the stored `data` value,
+ * or is null for a tombstone. The routingHash and the keys count two times for a live row (the row and the
  * `item_id` index) and three times for a tombstone (also the tombstone index).
  */
-function latestRowBytesExpr(prefixParam: string, dataParam: string | null): string {
-	const keys = `(octet_length(${prefixParam}) + octet_length(?1) + octet_length(?2))`;
+function latestRowBytesExpr(routingHashParam: string, dataParam: string | null): string {
+	const keys = `(octet_length(${routingHashParam}) + octet_length(?1) + octet_length(?2))`;
 	return dataParam === null ? `3 * ${keys} + ${LATEST_ROW_BYTES_K}` : `octet_length(${dataParam}) + 2 * ${keys} + ${LATEST_ROW_BYTES_K}`;
 }
 
@@ -78,8 +78,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   NULL, `data` is NULL). `revision` is the base revision of the image.
 		// - A WITHOUT ROWID table with `data` last, as the items table of PartitionStore: the rows are in
 		//   primary-key order, and a read of the metadata columns reads no overflow page.
-		// - `routing_hash` is the storage prefix of `base_hk` in the shard group of this partition,
-		//   which the runtime gives (`storagePrefix`). The store treats it as opaque bytes. It is not an
+		// - `routing_hash` is the routingHash of `base_hk` in the shard group of this partition,
+		//   which the runtime gives (`routingHashForKey`). The store treats it as opaque bytes. It is not an
 		//   item identity: `base_hk` and `base_sk` keep the items apart. The primary key leads with it, so
 		//   the rows of one hash child or of one promoted routingHash are one key range of the table.
 		// - `item_id` links the rows of other tables to the item, so `(base_hk, base_sk)` is stored one
@@ -91,7 +91,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - No rule reads the value of `deleted_at_ms`. It orders the garbage collection of tombstones.
 		//   The tombstone index declares `item_id`, because a WITHOUT ROWID index holds only the primary
 		//   key after its own columns, and the collection seeks on `(deleted_at_ms, item_id)`.
-		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The prefix and the
+		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The routingHash and the
 		//   keys count two times, because the `item_id` index holds a second copy of them, and three
 		//   times for a tombstone, because the tombstone index holds a third. LATEST_ROW_BYTES_K gives the
 		//   fixed part: the integer columns, the record header, and the fixed part of the index entries.
@@ -318,11 +318,11 @@ export class MaterializationStore {
 	}
 
 	/** The stored image of a base item, live or tombstone, or undefined when it has none. */
-	storedImage(prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): StoredImage | undefined {
+	storedImage(routingHash: RoutingHash, hk: KeyBytes, sk: KeyBytes): StoredImage | undefined {
 		const row = tryOne(
 			this.#storage.sql.exec<{ item_id: number; revision: number; est_row_bytes: number; newest_seq: number | null }>(
 				`SELECT item_id, revision, est_row_bytes, newest_seq FROM latest_items WHERE routing_hash = ? AND base_hk = ? AND base_sk = ?`,
-				prefix,
+				routingHash,
 				hk,
 				sk,
 			),
@@ -342,7 +342,7 @@ export class MaterializationStore {
 	 * Returns the new size estimate of the base hash key when the size of the row changed, or undefined.
 	 */
 	putLatestImage(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		image: LatestImage,
 		nowMs: number,
 		current: StoredImage | undefined,
@@ -367,7 +367,7 @@ export class MaterializationStore {
 					image.revision,
 					nowMs,
 					newestSeq,
-					prefix,
+					routingHash,
 					newItemId,
 				)
 			: sql.exec<{ item_id: number; est_row_bytes: number }>(
@@ -384,7 +384,7 @@ export class MaterializationStore {
 					image.ttlAt,
 					image.data,
 					newestSeq,
-					prefix,
+					routingHash,
 					newItemId,
 				);
 		const { item_id: itemId, est_row_bytes: newEst } = row.one();
@@ -403,7 +403,7 @@ export class MaterializationStore {
 		}
 		// The ingest reads the new estimate only when the key grew, so an equal size needs no read.
 		const oldEst = current?.estRowBytes ?? 0;
-		return newEst === oldEst ? undefined : this.keySizes.change(prefix, image.hashKey, oldEst, newEst);
+		return newEst === oldEst ? undefined : this.keySizes.change(routingHash, image.hashKey, oldEst, newEst);
 	}
 
 	/**
@@ -532,21 +532,21 @@ export class MaterializationStore {
 
 	// ─── cursor snapshots ─────────────────────────────────────────────────────
 
-	/** Stores the cursor of each target as the snapshot of the promotion of `prefix`. */
-	storeCursorSnapshot(prefix: RoutingHash): void {
+	/** Stores the cursor of each target as the snapshot of the promotion of `routingHash`. */
+	storeCursorSnapshot(routingHash: RoutingHash): void {
 		const snapshots = this.#cursorSnapshots();
-		snapshots.set(prefix.toHex(), new Map(this.targetRows().map((row) => [row.targetId, row.cursorSeq])));
+		snapshots.set(routingHash.toHex(), new Map(this.targetRows().map((row) => [row.targetId, row.cursorSeq])));
 		this.#storage.kv.put(CURSOR_SNAPSHOTS_KV_KEY, snapshots);
 	}
 
-	/** The cursor of each target in the snapshot of the promotion of `prefix`, or undefined when it has none. */
-	cursorSnapshot(prefix: RoutingHash): ReadonlyMap<string, number> | undefined {
-		return this.#cursorSnapshots().get(prefix.toHex());
+	/** The cursor of each target in the snapshot of the promotion of `routingHash`, or undefined when it has none. */
+	cursorSnapshot(routingHash: RoutingHash): ReadonlyMap<string, number> | undefined {
+		return this.#cursorSnapshots().get(routingHash.toHex());
 	}
 
-	deleteCursorSnapshot(prefix: RoutingHash): void {
+	deleteCursorSnapshot(routingHash: RoutingHash): void {
 		const snapshots = this.#cursorSnapshots();
-		snapshots.delete(prefix.toHex());
+		snapshots.delete(routingHash.toHex());
 		if (snapshots.size === 0) {
 			this.#storage.kv.delete(CURSOR_SNAPSHOTS_KV_KEY);
 		} else {
@@ -674,14 +674,14 @@ export class MaterializationStore {
 		if (!row) {
 			return undefined;
 		}
-		const prefix = asRoutingHash(new Uint8Array(row.routing_hash));
+		const routingHash = asRoutingHash(new Uint8Array(row.routing_hash));
 		const hk = new Uint8Array(row.base_hk) as KeyBytes;
 		const sk = new Uint8Array(row.base_sk) as KeyBytes;
 		if (row.deleted === 1 || row.data === null || row.data_kind === null) {
-			return { prefix, hk, sk, revision: row.revision, deleted: true };
+			return { routingHash, hk, sk, revision: row.revision, deleted: true };
 		}
 		const data = typeof row.data === "string" ? row.data : new Uint8Array(row.data);
-		return { prefix, hk, sk, revision: row.revision, deleted: false, kind: DATA_KINDS[row.data_kind], data, ttlAt: row.ttl_at };
+		return { routingHash, hk, sk, revision: row.revision, deleted: false, kind: DATA_KINDS[row.data_kind], data, ttlAt: row.ttl_at };
 	}
 
 	/** The revision of an item, or undefined when it has no row. */
@@ -799,7 +799,7 @@ export class MaterializationStore {
 	 * columns of `latest_items` the names of the items table, so the compiled SQL reads the columns
 	 * that it expects. Undefined when the item has no row.
 	 */
-	evaluateProjection(plan: CompiledProjectionPlan, prefix: RoutingHash, hk: KeyBytes, sk: KeyBytes): ProjectedWireRow | undefined {
+	evaluateProjection(plan: CompiledProjectionPlan, routingHash: RoutingHash, hk: KeyBytes, sk: KeyBytes): ProjectedWireRow | undefined {
 		const columns = plan.valueSql.flatMap((valueSql, index) => [`${valueSql} AS p${index}`, `${plan.typeSql[index]} AS t${index}`]);
 		const row = tryOne(
 			this.#storage.sql.exec<Record<string, SqlStorageValue>>(
@@ -810,7 +810,7 @@ export class MaterializationStore {
 				...materializedPlanBindings(plan, "pool"),
 				hk,
 				sk,
-				prefix,
+				routingHash,
 			),
 		);
 		return row === undefined ? undefined : decodeProjectedRow(row, plan.names.length);
@@ -897,12 +897,12 @@ export class MaterializationStore {
 	}
 
 	/**
-	 * Deletes the first `limit` items of the storage prefix `prefix` in primary-key order, with their
+	 * Deletes the first `limit` items of `routingHash` in primary-key order, with their
 	 * positions, their `target_retry` rows, and their GSI keys. The items are one key range, so one
-	 * statement deletes them. Returns true when no item of the prefix is left. The size estimate of the
-	 * prefix is not changed: the caller deletes it.
+	 * statement deletes them. Returns true when no item of the routingHash is left. The size estimate of the
+	 * routingHash is not changed: the caller deletes it.
 	 */
-	deleteItemsOfRoutingHash(prefix: RoutingHash, limit: number): boolean {
+	deleteItemsOfRoutingHash(routingHash: RoutingHash, limit: number): boolean {
 		const sql = this.#storage.sql;
 		// The rows are read before the deletes, because the loop deletes from the table that it reads.
 		// `limit` bounds the array.
@@ -914,7 +914,7 @@ export class MaterializationStore {
 				newest_seq: number | null;
 			}>(
 				`SELECT base_hk, base_sk, item_id, newest_seq FROM latest_items WHERE routing_hash = ?1 ORDER BY base_hk, base_sk LIMIT ?2`,
-				prefix,
+				routingHash,
 				limit,
 			)
 			.toArray();
@@ -927,7 +927,12 @@ export class MaterializationStore {
 			sql.exec(`DELETE FROM target_index_keys WHERE item_id = ?1`, row.item_id);
 		}
 		const last = rows[rows.length - 1];
-		sql.exec(`DELETE FROM latest_items WHERE routing_hash = ?1 AND (base_hk, base_sk) <= (?2, ?3)`, prefix, last.base_hk, last.base_sk);
+		sql.exec(
+			`DELETE FROM latest_items WHERE routing_hash = ?1 AND (base_hk, base_sk) <= (?2, ?3)`,
+			routingHash,
+			last.base_hk,
+			last.base_sk,
+		);
 		return rows.length < limit;
 	}
 
@@ -946,7 +951,7 @@ export class MaterializationStore {
 	// ─── split decisions ──────────────────────────────────────────────────────
 
 	/**
-	 * One base hash key of the first storage prefix, and whether another prefix follows it. Two seeks
+	 * One base hash key of the first routingHash, and whether another routingHash follows it. Two seeks
 	 * of the primary key.
 	 */
 	probeRoutingHashes(): { first: KeyBytes; more: boolean } | null {
@@ -966,16 +971,16 @@ export class MaterializationStore {
 	}
 
 	/**
-	 * The items of `prefix` in the composite interval `[start, end)` of `(base_hk, base_sk)`, in that
+	 * The items of `routingHash` in the composite interval `[start, end)` of `(base_hk, base_sk)`, in that
 	 * order, each with its `est_row_bytes`. A null edge is unbounded. It reads one row at a time.
 	 */
 	*compositeKeySizes(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 	): Generator<{ hk: KeyBytes; sk: KeyBytes; bytes: number }> {
 		const conds = ["routing_hash = ?"];
-		const params: unknown[] = [prefix];
+		const params: unknown[] = [routingHash];
 		if (start !== null) {
 			conds.push("(base_hk, base_sk) >= (?, ?)");
 			params.push(start.hk, start.sk);
@@ -1004,7 +1009,7 @@ export class MaterializationStore {
 		const { conds, params } = intervalTerms(
 			["routing_hash", "base_hk", "base_sk"],
 			interval,
-			cursor && [cursor.prefix, cursor.hk, cursor.sk],
+			cursor && [cursor.routingHash, cursor.hk, cursor.sk],
 		);
 		const rows = this.#storage.sql.exec<{
 			item_id: number;
@@ -1027,7 +1032,7 @@ export class MaterializationStore {
 		for (const { routing_hash, base_hk, base_sk, data, ...row } of rows) {
 			yield {
 				...row,
-				prefix: asRoutingHash(new Uint8Array(routing_hash)),
+				routingHash: asRoutingHash(new Uint8Array(routing_hash)),
 				hk: asKey(base_hk),
 				sk: asKey(base_sk),
 				data: data === null || typeof data === "string" ? data : new Uint8Array(data),
@@ -1104,7 +1109,7 @@ export class MaterializationStore {
 				item.ttl_at,
 				item.est_row_bytes,
 				item.data,
-				item.prefix,
+				item.routingHash,
 			),
 		);
 		if (inserted === undefined) {
@@ -1226,7 +1231,7 @@ export type TargetItemRef = { itemId: number; estRowBytes: number };
 
 export type TargetPosition = TargetItemRef & { seq: number; inRetry: boolean };
 
-export type TargetImage = { prefix: RoutingHash; hk: KeyBytes; sk: KeyBytes; revision: number } & (
+export type TargetImage = { routingHash: RoutingHash; hk: KeyBytes; sk: KeyBytes; revision: number } & (
 	| { deleted: true }
 	| { deleted: false; kind: DataKind; data: string | Uint8Array; ttlAt: number | null }
 );
@@ -1243,8 +1248,8 @@ export type MigratedRetryRow = { target_id: string; kind: string; not_before: nu
  */
 export type MigratedLatestItem = {
 	item_id: number;
-	/** The storage prefix of `hk`. */
-	prefix: RoutingHash;
+	/** The routingHash of `hk`. */
+	routingHash: RoutingHash;
 	hk: KeyBytes;
 	sk: KeyBytes;
 	revision: number;

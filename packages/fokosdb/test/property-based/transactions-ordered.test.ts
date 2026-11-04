@@ -27,10 +27,10 @@ import { TX_ORDER_TS_UNITS_PER_MS } from "../../src/shared/transaction-limits.js
 import type { TransactionItem, TransactionItemKey } from "../../src/shared/transaction-wire-types.js";
 import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
 import { propertyRuns } from "./harness.js";
-import { prefixOf } from "../storage-prefix.js";
+import { routingHashFor } from "../routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
 
 const PROPERTY_RUNS = propertyRuns(100);
 // One second for each run, which is far more than a run on one Durable Object takes.
@@ -102,7 +102,7 @@ function seed(store: PartitionStore, start: (number | undefined)[], deletedV: nu
 	// A deleted row with v = deletedV raises max_deleted_v, so a new row starts above it.
 	for (let i = 0; i < deletedV; i++) {
 		store.upsertItem({
-			prefix: P(KeyCodec.encode("gone")),
+			routingHash: P(KeyCodec.encode("gone")),
 			hk: KeyCodec.encode("gone"),
 			sk: KeyCodec.encode("s"),
 			data: "g",
@@ -112,12 +112,12 @@ function seed(store: PartitionStore, start: (number | undefined)[], deletedV: nu
 		});
 	}
 	if (deletedV > 0) {
-		store.deleteItem({ prefix: P(KeyCodec.encode("gone")), hk: KeyCodec.encode("gone"), sk: KeyCodec.encode("s"), txOrderTs: 2 });
+		store.deleteItem({ routingHash: P(KeyCodec.encode("gone")), hk: KeyCodec.encode("gone"), sk: KeyCodec.encode("s"), txOrderTs: 2 });
 	}
 	start.forEach((size, i) => {
 		if (size !== undefined) {
 			store.upsertItem({
-				prefix: P(KEYS[i].hashKey),
+				routingHash: P(KEYS[i].hashKey),
 				hk: KEYS[i].hashKey,
 				sk: KEYS[i].sortKey,
 				data: JSON.stringify({ s: "y".repeat(size) }),
@@ -170,7 +170,7 @@ describe("ordered per-item execution — the paths agree with the reference run"
 				const store = new PartitionStore(state.storage);
 				const participant = new TransactionParticipant({
 					store,
-					storagePrefix: P,
+					routingHashForKey: P,
 					now: () => BASE_NOW,
 					maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 					staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,

@@ -14,7 +14,7 @@ import { MaterializationStore } from "../../src/server/materialization/materiali
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import { prefixOf } from "../storage-prefix.js";
+import { routingHashFor } from "../routing-hash.js";
 
 const ROWS = 20_000;
 /** [hash key bytes, sort key bytes, data bytes, TTL] */
@@ -36,13 +36,13 @@ it("measures the storage of one items row", async () => {
 			const store = new PartitionStore(state.storage);
 			// Encoded as a binary key, so each key has exactly the length of the case.
 			const hk = KeyCodec.encode(new Uint8Array(hkBytes - 1).fill(0x61));
-			const prefix = prefixOf(hk);
+			const routingHash = routingHashFor(hk);
 			const before = store.databaseSize;
 			store.transactionSync(() => {
 				for (let i = 0; i < ROWS; i++) {
 					const sk = KeyCodec.encode(String(i).padStart(skBytes, "0"));
 					const data = "d".repeat(dataBytes);
-					store.upsertItem({ prefix, hk, sk, data, kind: "text", ttlAt: ttl ? 2_000_000_000 : null, txOrderTs: 1 });
+					store.upsertItem({ routingHash, hk, sk, data, kind: "text", ttlAt: ttl ? 2_000_000_000 : null, txOrderTs: 1 });
 				}
 			});
 			return (store.databaseSize - before) / ROWS;
@@ -71,7 +71,7 @@ it("measures the storage of one latest_items row", async () => {
 		const perRow = await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
 			const store = new MaterializationStore(state.storage);
 			const hashKey = KeyCodec.encode(new Uint8Array(hkBytes - 1).fill(0x61));
-			const prefix = prefixOf(hashKey);
+			const routingHash = routingHashFor(hashKey);
 			const before = store.databaseSize;
 			store.transactionSync(() => {
 				for (let i = 0; i < ROWS; i++) {
@@ -88,12 +88,12 @@ it("measures the storage of one latest_items row", async () => {
 								kind: "text" as const,
 								ttlAt: null,
 							};
-					store.putLatestImage(prefix, image, 1_000, undefined, []);
+					store.putLatestImage(routingHash, image, 1_000, undefined, []);
 				}
 			});
 			return (store.databaseSize - before) / ROWS;
 		});
-		// The estimate counts the 8-byte prefix and the keys two times (the row and the item-id index),
+		// The estimate counts the 8-byte routingHash and the keys two times (the row and the item-id index),
 		// and three times for a tombstone (also the tombstone index).
 		const k = perRow - dataBytes - (deleted ? 3 : 2) * (8 + hkBytes + skBytes);
 		lines.push(`| ${hkBytes} | ${skBytes} | ${dataBytes} | ${deleted ? "yes" : "no"} | ${perRow.toFixed(0)} | ${k.toFixed(0)} |`);

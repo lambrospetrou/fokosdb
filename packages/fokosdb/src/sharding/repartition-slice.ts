@@ -72,7 +72,7 @@ export function promotedRoutingHashOf(plan: { targets: ReadonlyArray<{ slice: Fo
 
 /** The storage interval of a hash node interval `[start, end)`. A null `end` has no upper bound. */
 export function hashStorageInterval(start: RoutingHash, end: RoutingHash | null): FokosStorageInterval {
-	return { start: { prefix: start }, end: end === null ? null : { prefix: end } };
+	return { start: { routingHash: start }, end: end === null ? null : { routingHash: end } };
 }
 
 /** The next routingHash in numeric order, or null after the last one. */
@@ -100,7 +100,7 @@ export function rangeStorageInterval(
 ): FokosStorageInterval {
 	const next = end === null ? nextRoutingHash(routingHash) : null;
 	return {
-		start: start === null ? { prefix: routingHash } : { prefix: routingHash, hk: start.hk, sk: start.sk },
-		end: end !== null ? { prefix: routingHash, hk: end.hk, sk: end.sk } : next === null ? null : { prefix: next },
+		start: start === null ? { routingHash: routingHash } : { routingHash: routingHash, hk: start.hk, sk: start.sk },
+		end: end !== null ? { routingHash: routingHash, hk: end.hk, sk: end.sk } : next === null ? null : { routingHash: next },
 	};
 }

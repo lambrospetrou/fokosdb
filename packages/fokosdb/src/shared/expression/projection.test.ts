@@ -298,7 +298,7 @@ describe("query compiler", () => {
 	it("keeps the widest scan tail in step with the store's scan shape", () => {
 		// The widest scan tail in the plan module must follow the store's scan shape.
 		const { sql } = queryScanStatement({
-			prefix: asRoutingHash(new Uint8Array(8)),
+			routingHash: asRoutingHash(new Uint8Array(8)),
 			hk: KeyCodec.encode("h"),
 			lower: KeyCodec.encode("a"),
 			lowerInclusive: true,

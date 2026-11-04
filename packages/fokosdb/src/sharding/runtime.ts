@@ -1160,15 +1160,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * The storage prefix of a hash key in this partition: the first primary-key column of its rows. The
+	 * The routingHash of a hash key in this partition: the first primary-key column of its rows. The
 	 * host treats it as opaque bytes, and must not keep it for a key of another call.
 	 */
-	storagePrefix(hashKey: KeyBytes): RoutingHash {
+	routingHashForKey(hashKey: KeyBytes): RoutingHash {
 		return this.#routingHash(hashKey);
 	}
 
 	/**
-	 * The immutable scope of this partition in the storage order `(prefix, hk, sk)`. A router keeps this
+	 * The immutable scope of this partition in the storage order `(routingHash, hk, sk)`. A router keeps this
 	 * interval, but it owns no rows in it.
 	 */
 	storageInterval(): FokosStorageInterval {
@@ -1181,7 +1181,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * The bounds of the rows that this partition owns, or null on a router. A moved prefix inside the
+	 * The bounds of the rows that this partition owns, or null on a router. A moved routingHash inside the
 	 * bounds stays in them, so a host must also use `owns` or `ownerCheck` before it changes a row.
 	 */
 	ownedStorageInterval(): FokosStorageInterval | null {

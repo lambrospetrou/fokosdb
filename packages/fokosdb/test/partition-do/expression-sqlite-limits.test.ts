@@ -7,7 +7,7 @@ import { CONDITION_FIXED_BINDING_COUNT } from "../../src/shared/expression/plan.
 import type { ConditionExpression, ExpressionValue, UpdateExpression } from "../../src/shared/expression/types.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { kb, makeStub } from "./helpers.js";
-import { partitionPrefixOf } from "../storage-prefix.js";
+import { partitionRoutingHashOf } from "../routing-hash.js";
 
 /**
  * SQLite refuses a statement whose expression is deeper than 100 levels, and the error does not name
@@ -91,7 +91,7 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 
 		await runInDurableObject(stub, (_instance, state) => {
 			const store = new PartitionStore(state.storage);
-			const P = partitionPrefixOf(state);
+			const P = partitionRoutingHashOf(state);
 			const contexts = {
 				condition: (value: ExpressionValue) => {
 					const condition: ConditionExpression = { op: "eq", args: [value, value] };
@@ -113,7 +113,7 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 						compile: () => compileUpdateExpression(update),
 						run: () => {
 							store.probeUpdate(update, P(key.hashKey), key.hashKey, key.sortKey);
-							store.updateItemSingleShot({ prefix: P(key.hashKey), hk: key.hashKey, sk: key.sortKey, plan: update, txOrderTs: 1 });
+							store.updateItemSingleShot({ routingHash: P(key.hashKey), hk: key.hashKey, sk: key.sortKey, plan: update, txOrderTs: 1 });
 						},
 					};
 				},

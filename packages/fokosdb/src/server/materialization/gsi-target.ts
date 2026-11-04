@@ -74,7 +74,7 @@ export function compileGsiPlans(target: GsiTargetDefinition): GsiPlans {
 
 /** An empty base hash key. `KeyCodec.encode` never returns an empty key, so no item has it. */
 const NO_ITEM_KEY: KeyBytes = KeyCodec.encodeOptional(undefined);
-// A syntactically valid storage prefix for the compile probe, which never reads a row.
+// A syntactically valid routingHash for the compile probe, which never reads a row.
 const NO_ITEM_PREFIX = asRoutingHash(new Uint8Array(ROUTING_HASH_BYTES));
 
 /**
@@ -103,7 +103,7 @@ export function desiredGsiEntry(store: MaterializationStore, plans: GsiPlans, im
 		return { kind: "absent" };
 	}
 	try {
-		const keys = store.evaluateProjection(plans.keys, image.prefix, image.hk, image.sk);
+		const keys = store.evaluateProjection(plans.keys, image.routingHash, image.hk, image.sk);
 		if (keys === undefined) {
 			return { kind: "absent" };
 		}
@@ -121,7 +121,7 @@ export function desiredGsiEntry(store: MaterializationStore, plans: GsiPlans, im
 		let data: string | Uint8Array = image.data;
 		let dataKind: DataKind = image.kind;
 		if (plans.projection !== undefined) {
-			const row = store.evaluateProjection(plans.projection, image.prefix, image.hk, image.sk) ?? [];
+			const row = store.evaluateProjection(plans.projection, image.routingHash, image.hk, image.sk) ?? [];
 			if (row.some((cell) => cell instanceof Uint8Array)) {
 				return { kind: "violation", code: GSI_PROJECTION_BYTES };
 			}

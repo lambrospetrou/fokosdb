@@ -21,7 +21,7 @@ import { childDigit } from "../hash-digits.js";
 import type { MigrationStream } from "../controlled-partition-do.js";
 import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
-import { partitionPrefixOf } from "../storage-prefix.js";
+import { partitionRoutingHashOf } from "../routing-hash.js";
 
 const IMPORT_KEY = FOKOS_KV_KEYS.IMPORT;
 const HELD_KEY = "alice";
@@ -127,7 +127,7 @@ describe("FokosDBPartitionDO — a migration page that outlives its import recor
 			state.storage.sql.exec(
 				`INSERT INTO pending_transactions (routing_hash, hk, sk, transaction_id, operation, op_list)
 				 VALUES (?, ?, ?, 'tx-stale', 'put', '[[0,"put"]]')`,
-				partitionPrefixOf(state)(kb(HELD_KEY)),
+				partitionRoutingHashOf(state)(kb(HELD_KEY)),
 				kb(HELD_KEY),
 				kb("sk"),
 			);

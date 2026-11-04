@@ -5,10 +5,10 @@ import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { asRoutingHash } from "../../sharding/hash-primitives.js";
 import { KeySizeStats } from "./key-size-stats.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 const kb = (s: string) => KeyCodec.encode(s);
 const keyLabel = (key: KeyBytes) => KeyCodec.decode(key) as string;
@@ -85,32 +85,32 @@ describe("KeySizeStats", () => {
 
 	it("keeps one total for the hash keys of one routingHash, and a rollback restores it", async () => {
 		await withStats((stats, state) => {
-			// Two hash keys with one prefix: the test gives the prefix, as a host does.
-			const prefix = asRoutingHash(Uint8Array.fromHex("0102030405060708"));
-			expect(stats.change(prefix, kb("a"), 0, 100)).toBe(100);
-			expect(stats.change(prefix, kb("b"), 0, 50)).toBe(150);
-			expect(stats.bytesOf(prefix)).toBe(150);
+			// Two hash keys with one routingHash: the test gives the routingHash, as a host does.
+			const routingHash = asRoutingHash(Uint8Array.fromHex("0102030405060708"));
+			expect(stats.change(routingHash, kb("a"), 0, 100)).toBe(100);
+			expect(stats.change(routingHash, kb("b"), 0, 50)).toBe(150);
+			expect(stats.bytesOf(routingHash)).toBe(150);
 			// The first hash key stays the representative, also after its own bytes go.
-			stats.subtract(prefix, 100);
+			stats.subtract(routingHash, 100);
 			expect(stats.largestAtLeast(0, 5).map(keyLabel)).toEqual(["a"]);
 			expect(() =>
 				state.storage.transactionSync(() => {
-					stats.change(prefix, kb("b"), 50, 500);
+					stats.change(routingHash, kb("b"), 50, 500);
 					throw new Error("roll back");
 				}),
 			).toThrow("roll back");
-			expect(stats.bytesOf(prefix)).toBe(50);
+			expect(stats.bytesOf(routingHash)).toBe(50);
 		});
 	});
 
-	it("adds the rows of a page once for each run of one prefix", async () => {
+	it("adds the rows of a page once for each run of one routingHash", async () => {
 		await withStats((stats) => {
 			const p1 = asRoutingHash(Uint8Array.fromHex("0000000000000001"));
 			const p2 = asRoutingHash(Uint8Array.fromHex("0000000000000002"));
 			stats.addRows([
-				{ prefix: p1, hk: kb("a"), bytes: 10 },
-				{ prefix: p1, hk: kb("b"), bytes: 20 },
-				{ prefix: p2, hk: kb("c"), bytes: 5 },
+				{ routingHash: p1, hk: kb("a"), bytes: 10 },
+				{ routingHash: p1, hk: kb("b"), bytes: 20 },
+				{ routingHash: p2, hk: kb("c"), bytes: 5 },
 			]);
 			expect(stats.bytesOf(p1)).toBe(30);
 			expect(stats.bytesOf(p2)).toBe(5);

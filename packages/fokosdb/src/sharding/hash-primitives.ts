@@ -17,7 +17,7 @@ export const GOLDEN_RATIO_BIGINT = BigInt(0x9e3779b1);
 declare const ROUTING_HASH_BRAND: unique symbol;
 
 /**
- * A storage prefix: the xxHash64 of an encoded hash key, seeded per shard group, as 8 bytes,
+ * A routingHash: the xxHash64 of an encoded hash key, seeded per shard group, as 8 bytes,
  * most significant byte first. The brand separates it from `KeyBytes` and from the interval bounds
  * of `FokosStorageKey`, which are positions in the storage order and can be shorter.
  */

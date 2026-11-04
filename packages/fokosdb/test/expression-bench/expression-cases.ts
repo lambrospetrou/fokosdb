@@ -28,7 +28,7 @@ import type {
 	UpdateExpression,
 } from "../../src/shared/expression/types.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { prefixOf } from "../storage-prefix.js";
+import { routingHashFor } from "../routing-hash.js";
 
 type QueryTree = { filter?: ConditionExpression; projection?: readonly ProjectionExpression[] };
 
@@ -160,8 +160,8 @@ export const CASES: readonly ExpressionCase[] = [
 
 /** The hash key of every benchmark item. */
 export const BENCH_HASH_KEY = KeyCodec.encode("bench");
-/** The storage prefix of `BENCH_HASH_KEY` in a test shard group. A bench over a partition gives the prefix of that partition. */
-export const BENCH_PREFIX = prefixOf(BENCH_HASH_KEY);
+/** The routingHash of `BENCH_HASH_KEY` in a test shard group. A bench over a partition gives the routingHash of that partition. */
+export const BENCH_ROUTING_HASH = routingHashFor(BENCH_HASH_KEY);
 /** The number of items that a query case scans. */
 export const BENCH_ITEM_COUNT = 200;
 
@@ -250,26 +250,30 @@ export type PreparedStatement = { sql: string; params: unknown[]; bindingCount: 
 export function prepareCase(
 	c: ExpressionCase,
 	sortKey: Uint8Array = benchSortKey(0),
-	prefix: Uint8Array = BENCH_PREFIX,
+	routingHash: Uint8Array = BENCH_ROUTING_HASH,
 ): PreparedStatement {
 	switch (c.kind) {
 		case "condition": {
 			const plan = compileConditionExpression(c.tree);
 			const sql = composeConditionStatement(plan.sql);
-			return { sql, params: [BENCH_HASH_KEY, sortKey, prefix, ...materializedPlanBindings(plan)], bindingCount: plan.bindingCount };
+			return { sql, params: [BENCH_HASH_KEY, sortKey, routingHash, ...materializedPlanBindings(plan)], bindingCount: plan.bindingCount };
 		}
 		case "update": {
 			const plan = compileUpdateExpression(c.tree);
 			return {
 				sql: plan.probeSql,
-				params: [BENCH_HASH_KEY, sortKey, prefix, ...materializedPlanBindings(plan)],
+				params: [BENCH_HASH_KEY, sortKey, routingHash, ...materializedPlanBindings(plan)],
 				bindingCount: plan.bindingCount,
 			};
 		}
 		case "projection": {
 			const plan = compileProjectionExpression(c.tree);
 			const sql = composeProjectionStatement(plan);
-			return { sql, params: [...materializedPlanBindings(plan, "pool"), BENCH_HASH_KEY, sortKey, prefix], bindingCount: plan.bindingCount };
+			return {
+				sql,
+				params: [...materializedPlanBindings(plan, "pool"), BENCH_HASH_KEY, sortKey, routingHash],
+				bindingCount: plan.bindingCount,
+			};
 		}
 		case "query": {
 			const plan = compileQueryExpression(c.tree);
@@ -280,7 +284,7 @@ export function prepareCase(
 			});
 			return {
 				sql,
-				params: [...materializedPlanBindings(plan, "pool"), prefix, BENCH_HASH_KEY, BENCH_ITEM_COUNT],
+				params: [...materializedPlanBindings(plan, "pool"), routingHash, BENCH_HASH_KEY, BENCH_ITEM_COUNT],
 				bindingCount: plan.bindingCount,
 			};
 		}

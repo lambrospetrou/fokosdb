@@ -5,7 +5,7 @@ import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { kb } from "./helpers.js";
 import { makePartition, makeRangeRoot, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition, rangeOf } from "./partition-harness.js";
-import { partitionPrefixOf } from "../storage-prefix.js";
+import { partitionRoutingHashOf } from "../routing-hash.js";
 
 // The seeded state migration has to carry: a marker item whose read watermark is above its write
 // watermark (so the two columns are visibly different), and one real user delete so both deletion
@@ -22,9 +22,9 @@ const SEED = { readTs: 999_000_000, writeTs: 500_000, deleteWatermarkTs: 777_000
 async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk: KeyBytes }, victim: { hk: KeyBytes; sk: KeyBytes }) {
 	return await runInDurableObject(node.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		const P = partitionPrefixOf(state);
+		const P = partitionRoutingHashOf(state);
 		store.upsertItem({
-			prefix: P(marker.hk),
+			routingHash: P(marker.hk),
 			hk: marker.hk,
 			sk: marker.sk,
 			data: "marker-data",
@@ -34,7 +34,7 @@ async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk:
 		});
 		for (let i = 0; i < 3; i++) {
 			store.upsertItem({
-				prefix: P(victim.hk),
+				routingHash: P(victim.hk),
 				hk: victim.hk,
 				sk: victim.sk,
 				data: "victim-data",
@@ -44,7 +44,7 @@ async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk:
 			});
 		}
 		store.bumpItemReadTs(P(marker.hk), marker.hk, marker.sk, SEED.readTs);
-		store.deleteItem({ prefix: P(victim.hk), hk: victim.hk, sk: victim.sk, txOrderTs: SEED.deleteWatermarkTs });
+		store.deleteItem({ routingHash: P(victim.hk), hk: victim.hk, sk: victim.sk, txOrderTs: SEED.deleteWatermarkTs });
 		return { row: store.getItem(P(marker.hk), marker.hk, marker.sk).row, meta: store.getDeletionMetadata() };
 	});
 }
@@ -53,7 +53,7 @@ async function seedForMigration(node: TestPartition, marker: { hk: KeyBytes; sk:
 async function storeStateOf(node: TestPartition, marker: { hk: KeyBytes; sk: KeyBytes }) {
 	return await runInDurableObject(node.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		const P = partitionPrefixOf(state);
+		const P = partitionRoutingHashOf(state);
 		return { row: store.getItem(P(marker.hk), marker.hk, marker.sk).row, meta: store.getDeletionMetadata() };
 	});
 }

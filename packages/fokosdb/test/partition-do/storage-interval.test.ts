@@ -52,8 +52,8 @@ async function rowsOf(partition: TestPartition, interval: FokosStorageInterval):
 			state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items ${where}`, ...params).one().n;
 		const rows = count("");
 		const inside = interval.end
-			? count(`WHERE routing_hash >= ? AND routing_hash < ?`, interval.start.prefix, interval.end.prefix)
-			: count(`WHERE routing_hash >= ?`, interval.start.prefix);
+			? count(`WHERE routing_hash >= ? AND routing_hash < ?`, interval.start.routingHash, interval.end.routingHash)
+			: count(`WHERE routing_hash >= ?`, interval.start.routingHash);
 		return { rows, outside: rows - inside };
 	});
 }
@@ -126,9 +126,9 @@ describe("FokosDBPartitionDO — storage intervals", () => {
 		const interval = rangeStorageInterval(routingHash, null, null);
 		expect(await intervalsOf(rangeRoot)).toEqual({ scope: interval, owned: interval });
 		// The interval starts at the routingHash and ends at the start of the next routingHash.
-		expect(interval.start).toEqual({ prefix: routingHash });
+		expect(interval.start).toEqual({ routingHash: routingHash });
 		// The end bound is the start of the next routingHash, which is a routingHash value itself.
-		expect(interval.end === null || compareRoutingHashes(asRoutingHash(interval.end.prefix), routingHash) > 0).toBe(true);
+		expect(interval.end === null || compareRoutingHashes(asRoutingHash(interval.end.routingHash), routingHash) > 0).toBe(true);
 	});
 
 	// Two hash keys can have one routingHash. A promotion moves the whole routingHash, so both keys

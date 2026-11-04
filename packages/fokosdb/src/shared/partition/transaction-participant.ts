@@ -91,8 +91,8 @@ function isWrite(operation: string): boolean {
 
 /** The operations of one item in a request, in `opIndex` order, and the state of their evaluation. */
 type ItemSequence = {
-	/** The storage prefix of `hashKey`, computed once for the request. */
-	prefix: RoutingHash;
+	/** The routingHash of `hashKey`, computed once for the request. */
+	routingHash: RoutingHash;
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
 	ops: [TransactionItem, ...TransactionItem[]];
@@ -121,7 +121,7 @@ type SequencePlan = {
  * Sorts the operations by `opIndex` and groups them by item with `KeyPairMap`. It also runs the
  * version-reference check, before the first SQL statement, so a refusal writes nothing.
  */
-function sequencePlanOf(items: readonly TransactionItem[], storagePrefix: (hashKey: KeyBytes) => RoutingHash): SequencePlan {
+function sequencePlanOf(items: readonly TransactionItem[], routingHashForKey: (hashKey: KeyBytes) => RoutingHash): SequencePlan {
 	const ops = [...items].sort((a, b) => a.opIndex - b.opIndex);
 	const sequences = new KeyPairMap<ItemSequence>();
 	const seqs = ops.map((op, i) => {
@@ -131,7 +131,7 @@ function sequencePlanOf(items: readonly TransactionItem[], storagePrefix: (hashK
 			seq.ops.push(op);
 		} else {
 			seq = {
-				prefix: storagePrefix(op.hashKey),
+				routingHash: routingHashForKey(op.hashKey),
 				hashKey: op.hashKey,
 				sortKey: op.sortKey,
 				ops: [op],
@@ -161,7 +161,7 @@ function lockOperationOf(ops: readonly [TransactionItem, ...TransactionItem[]]):
 type WriteSource = { from: "request"; item: TransactionItem } | { from: "lock"; row: PendingLock };
 
 type ApplyEntry = TransactionItemKey & {
-	prefix: RoutingHash;
+	routingHash: RoutingHash;
 	opIndex: number;
 	operation: TransactionOperationType;
 	source: WriteSource;
@@ -262,8 +262,8 @@ export type TransactionParticipantDeps = {
 	 * The participant gets a new check for each synchronous block.
 	 */
 	ownerCheck: () => (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
-	/** The storage prefix of a hash key, which each store method takes with the key. */
-	storagePrefix: (hashKey: KeyBytes) => RoutingHash;
+	/** The routingHash of a hash key, which each store method takes with the key. */
+	routingHashForKey: (hashKey: KeyBytes) => RoutingHash;
 };
 
 /**
@@ -293,7 +293,7 @@ export class TransactionParticipant {
 	#staleTransactionMs: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
 	#ownerCheck: () => (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
-	#storagePrefix: (hashKey: KeyBytes) => RoutingHash;
+	#routingHashForKey: (hashKey: KeyBytes) => RoutingHash;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
@@ -302,7 +302,7 @@ export class TransactionParticipant {
 		this.#staleTransactionMs = deps.staleTransactionMs;
 		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
 		this.#ownerCheck = deps.ownerCheck;
-		this.#storagePrefix = deps.storagePrefix;
+		this.#routingHashForKey = deps.routingHashForKey;
 	}
 
 	/**
@@ -310,11 +310,11 @@ export class TransactionParticipant {
 	 * asked for none or the item does not exist. It runs in the same storage transaction as the
 	 * condition, with no `await` between them, so it returns the row the condition compared.
 	 */
-	#imageForFailedCondition(item: TransactionItem, prefix: RoutingHash, itemPresent: boolean) {
+	#imageForFailedCondition(item: TransactionItem, routingHash: RoutingHash, itemPresent: boolean) {
 		if (item.returnValuesOnConditionCheckFailure !== "all_old" || !itemPresent) {
 			return undefined;
 		}
-		return this.#store.getItemImage(prefix, item.hashKey, item.sortKey).row;
+		return this.#store.getItemImage(routingHash, item.hashKey, item.sortKey).row;
 	}
 
 	/**
@@ -337,7 +337,7 @@ export class TransactionParticipant {
 	 */
 	#precheckWrite(
 		item: TransactionItem,
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		readStamp: boolean,
 	): { reason: RejectionReasonEncoded | null; read: ItemRead | null } {
 		const { hashKey: hk, sortKey: sk } = item;
@@ -347,7 +347,7 @@ export class TransactionParticipant {
 				item.data !== undefined && item.kind !== undefined,
 				() => `fokos/partition.precheck: "put" item has no data/kind (${KeyCodec.pairForLog(hk, sk)})`,
 			);
-			const measureOpts = { prefix, hk, sk, data: item.data, kind: item.kind };
+			const measureOpts = { routingHash, hk, sk, data: item.data, kind: item.kind };
 			const read = readStamp ? this.#store.measureItemBytesWithStamp(measureOpts) : null;
 			const bytes = read ? read.estRowBytes : this.#store.measureItemBytes(measureOpts);
 			return { reason: bytes > MAX_ITEM_BYTES ? { code: "item_too_large", ...decodeItemKeys(hk, sk) } : null, read };
@@ -355,7 +355,7 @@ export class TransactionParticipant {
 
 		if (item.operation === "update") {
 			invariant(item.update, "fokos/partition.precheck: update item missing update plan");
-			const probe = this.#store.probeUpdate(item.update, prefix, hk, sk);
+			const probe = this.#store.probeUpdate(item.update, routingHash, hk, sk);
 			if (!probe.applicable) {
 				// A value that evaluated to bytes is the one cause the probe separates out, because the
 				// caller can act on it. Every other cause — a non-json item, a missing target path, a
@@ -384,7 +384,7 @@ export class TransactionParticipant {
 		invariant(request.coordinator.doName, "fokos/partition.prepare: the coordinator doName is required");
 		const coordinatorJson = JSON.stringify(request.coordinator);
 		// The version-reference check refuses a request that is not valid, before every other answer.
-		const plan = sequencePlanOf(request.items, this.#storagePrefix);
+		const plan = sequencePlanOf(request.items, this.#routingHashForKey);
 
 		const now = this.#now();
 
@@ -531,7 +531,7 @@ export class TransactionParticipant {
 			const first = op === seq.ops[0];
 
 			if (first) {
-				const pendingRow = this.#store.pendingLockFor(seq.prefix, op.hashKey, op.sortKey);
+				const pendingRow = this.#store.pendingLockFor(seq.routingHash, op.hashKey, op.sortKey);
 				if (pendingRow && path.twoPhase && pendingRow.transaction_id === path.transactionId) {
 					// A repeated prepare: the lock row holds the result of the first prepare. The
 					// single-partition path writes no lock, so every lock is a conflict there.
@@ -547,16 +547,16 @@ export class TransactionParticipant {
 				continue;
 			}
 
-			const conditionResult = op.condition ? this.#store.evaluateCondition(op.condition, seq.prefix, op.hashKey, op.sortKey) : null;
+			const conditionResult = op.condition ? this.#store.evaluateCondition(op.condition, seq.routingHash, op.hashKey, op.sortKey) : null;
 			if (conditionResult && !conditionResult.conditionOk) {
-				const image = this.#imageForFailedCondition(op, seq.prefix, conditionResult.itemPresent);
+				const image = this.#imageForFailedCondition(op, seq.routingHash, conditionResult.itemPresent);
 				reject(i, conditionFailedReason(decodeItemKeys(op.hashKey, op.sortKey), image), image?.imageBytes);
 				continue;
 			}
 
 			// A prepare reads the item stamps at the first operation of the item. When no condition read
 			// the row, a put reads the stamps in the statement that measures it.
-			const { reason: writeReason, read } = this.#precheckWrite(op, seq.prefix, path.twoPhase && first && !conditionResult);
+			const { reason: writeReason, read } = this.#precheckWrite(op, seq.routingHash, path.twoPhase && first && !conditionResult);
 			if (writeReason) {
 				reject(i, writeReason);
 				continue;
@@ -570,7 +570,7 @@ export class TransactionParticipant {
 					// use these stamps.
 					const itemRead = conditionResult ?? read;
 					seq.committedStamp =
-						(itemRead ? itemStampOf(itemRead) : this.#store.getItemStamp(seq.prefix, op.hashKey, op.sortKey).row) ?? null;
+						(itemRead ? itemStampOf(itemRead) : this.#store.getItemStamp(seq.routingHash, op.hashKey, op.sortKey).row) ?? null;
 				}
 				const stamp = seq.committedStamp;
 				invariant(stamp !== undefined, "fokos/partition.prepare: the first operation of an item read no stamps");
@@ -597,12 +597,12 @@ export class TransactionParticipant {
 			// with two or more operations, and each delete, because a delete can raise max_deleted_v. The
 			// single-partition path keeps every write.
 			if (plan.repeated && (!path.twoPhase || op.operation === "delete" || (isWrite(op.operation) && seq.ops.length > 1))) {
-				growth.record(op, this.#writeRequest(op, seq.prefix, path.txTimestamp));
+				growth.record(op, this.#writeRequest(op, seq.routingHash, path.txTimestamp));
 				temporaryWrites = true;
 				// Only the lock block of a prepare reads the last-write data. The single-partition path keeps
 				// its writes, so it needs no copy.
 				if (op === seq.lastWrite && path.twoPhase) {
-					seq.lastWriteData = this.#store.readItemData(seq.prefix, op.hashKey, op.sortKey);
+					seq.lastWriteData = this.#store.readItemData(seq.routingHash, op.hashKey, op.sortKey);
 					invariant(seq.lastWriteData, () => `fokos/partition: no row after a write of ${KeyCodec.pairForLog(op.hashKey, op.sortKey)}`);
 				}
 			}
@@ -628,14 +628,14 @@ export class TransactionParticipant {
 			if (seq.lockedBefore) {
 				continue;
 			}
-			const { prefix, hashKey: hk, sortKey: sk, ops } = seq;
+			const { routingHash, hashKey: hk, sortKey: sk, ops } = seq;
 			const opList: OpList = ops.map((op) => [op.opIndex, op.operation]);
 			const [only] = ops;
 			let inserted: boolean;
 			if (ops.length === 1 && only.operation === "update") {
 				invariant(only.update, "fokos/partition.prepare: update item missing update plan");
 				inserted =
-					this.#store.insertPendingUpdateLock({ prefix, hk, sk, tx, plan: only.update, ttlAt: only.ttlAt, opList }).rowsWritten > 0;
+					this.#store.insertPendingUpdateLock({ routingHash, hk, sk, tx, plan: only.update, ttlAt: only.ttlAt, opList }).rowsWritten > 0;
 			} else {
 				// One operation takes its data from the request: a put carries data and kind, and a delete or
 				// a check carries neither. A longer sequence takes the data that the evaluate step read after
@@ -648,7 +648,7 @@ export class TransactionParticipant {
 					ops.length === 1
 						? { data: only.data ?? null, kind: only.kind ?? null, ttl_epoch_utc_seconds: only.ttlAt ?? null }
 						: (seq.lastWriteData ?? { data: null, kind: null, ttl_epoch_utc_seconds: null });
-				inserted = this.#store.insertPendingLock({ ...tx, ...data, prefix, hk, sk, operation: lockOperationOf(ops), op_list: opList });
+				inserted = this.#store.insertPendingLock({ ...tx, ...data, routingHash, hk, sk, operation: lockOperationOf(ops), op_list: opList });
 			}
 			// The evaluate step found no lock of another transaction on this key. An accepted item with no
 			// lock row makes the commit find no row to apply, and report success for a write it skipped.
@@ -662,7 +662,7 @@ export class TransactionParticipant {
 	 * after a put or an update.
 	 */
 	#write(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		hk: KeyBytes,
 		sk: KeyBytes,
 		operation: TransactionOperationType,
@@ -670,7 +670,7 @@ export class TransactionParticipant {
 		ts: number,
 	): number | undefined {
 		if (operation === "delete") {
-			this.#store.deleteItem({ prefix, hk, sk, txOrderTs: ts, bumpTxOrderTsAlways: true });
+			this.#store.deleteItem({ routingHash, hk, sk, txOrderTs: ts, bumpTxOrderTsAlways: true });
 			return undefined;
 		}
 		if (operation === "check") {
@@ -678,7 +678,7 @@ export class TransactionParticipant {
 			// the item's read watermark. An absent item has no row to hold it, so the check then raises the
 			// deletion watermark of the partition, as a delete of an absent item does. A later two-phase
 			// write of the key thus cannot order below this read.
-			if (!this.#store.bumpItemReadTs(prefix, hk, sk, ts).itemPresent) {
+			if (!this.#store.bumpItemReadTs(routingHash, hk, sk, ts).itemPresent) {
 				this.#store.bumpMaxDeleteTxOrderTs(ts);
 			}
 			return undefined;
@@ -693,13 +693,20 @@ export class TransactionParticipant {
 			);
 			// For kind=json, a put's row holds JSON text, which upsertItem encodes to JSONB, and the row of an
 			// update or of a longer sequence holds the stored JSONB, which binds verbatim.
-			return this.#store.upsertItem({ prefix, hk, sk, data: row.data, kind: row.kind, ttlAt: row.ttl_epoch_utc_seconds, txOrderTs: ts })
-				.keyEstBytes;
+			return this.#store.upsertItem({
+				routingHash,
+				hk,
+				sk,
+				data: row.data,
+				kind: row.kind,
+				ttlAt: row.ttl_epoch_utc_seconds,
+				txOrderTs: ts,
+			}).keyEstBytes;
 		}
 		const { item } = source;
 		if (operation === "update") {
 			invariant(item.update, "fokos/partition: update item missing update plan");
-			return this.#store.updateItemSingleShot({ prefix, hk, sk, plan: item.update, ttlAt: item.ttlAt, txOrderTs: ts }).keyEstBytes;
+			return this.#store.updateItemSingleShot({ routingHash, hk, sk, plan: item.update, ttlAt: item.ttlAt, txOrderTs: ts }).keyEstBytes;
 		}
 		// A put always carries both data and kind; assert together so upsertItem gets a real kind.
 		invariant(
@@ -707,13 +714,13 @@ export class TransactionParticipant {
 			() => `fokos/partition: "put" item has no data/kind (${KeyCodec.pairForLog(hk, sk)})`,
 		);
 		// For kind=json, data is raw JSON text; upsertItem encodes it to JSONB.
-		return this.#store.upsertItem({ prefix, hk, sk, data: item.data, kind: item.kind, ttlAt: item.ttlAt ?? null, txOrderTs: ts })
+		return this.#store.upsertItem({ routingHash, hk, sk, data: item.data, kind: item.kind, ttlAt: item.ttlAt ?? null, txOrderTs: ts })
 			.keyEstBytes;
 	}
 
 	/** One store write of one request operation at `ts`. */
-	#writeRequest(op: TransactionItem, prefix: RoutingHash, ts: number): number | undefined {
-		return this.#write(prefix, op.hashKey, op.sortKey, op.operation, { from: "request", item: op }, ts);
+	#writeRequest(op: TransactionItem, routingHash: RoutingHash, ts: number): number | undefined {
+		return this.#write(routingHash, op.hashKey, op.sortKey, op.operation, { from: "request", item: op }, ts);
 	}
 
 	/**
@@ -731,7 +738,7 @@ export class TransactionParticipant {
 		for (let i = 0; i < entries.length; i++) {
 			const entry = entries[i];
 			invariant(i === 0 || entries[i - 1].opIndex !== entry.opIndex, () => `fokos/partition: apply got opIndex ${entry.opIndex} two times`);
-			growth.record(entry, this.#write(entry.prefix, entry.hashKey, entry.sortKey, entry.operation, entry.source, ts));
+			growth.record(entry, this.#write(entry.routingHash, entry.hashKey, entry.sortKey, entry.operation, entry.source, ts));
 		}
 		return growth.candidates();
 	}
@@ -799,7 +806,7 @@ export class TransactionParticipant {
 			for (const row of ownedRows.values()) {
 				const source: WriteSource = { from: "lock", row };
 				for (const [opIndex, operation] of row.op_list) {
-					entries.push({ opIndex, operation, prefix: row.prefix, hashKey: row.hk, sortKey: row.sk, source });
+					entries.push({ opIndex, operation, routingHash: row.routingHash, hashKey: row.hk, sortKey: row.sk, source });
 				}
 			}
 			const candidates = this.#apply(entries, request.transactionTimestamp);
@@ -807,7 +814,7 @@ export class TransactionParticipant {
 			// by one, and keeps the copies of a moved key.
 			this.#store.deletePendingTxKeys(
 				request.transactionId,
-				[...ownedRows.values()].map((row) => ({ prefix: row.prefix, hashKey: row.hk, sortKey: row.sk })),
+				[...ownedRows.values()].map((row) => ({ routingHash: row.routingHash, hashKey: row.hk, sortKey: row.sk })),
 			);
 			return candidates;
 		});
@@ -829,7 +836,7 @@ export class TransactionParticipant {
 	 */
 	executeSingleShot(request: SingleShotRequest): SingleShotResult {
 		const transactionTimestamp = this.#txOrderTimestamp();
-		const plan = sequencePlanOf(request.items, this.#storagePrefix);
+		const plan = sequencePlanOf(request.items, this.#routingHashForKey);
 
 		// One storage transaction. When one operation failed, the block throws, and SQLite rolls back
 		// every write. In a request with an item of two or more operations, the temporary writes of the
@@ -850,7 +857,7 @@ export class TransactionParticipant {
 				}
 				// `plan.ops` is in `opIndex` order, and each `opIndex` occurs one time in it.
 				const growth = new ItemGrowth();
-				plan.ops.forEach((op, i) => growth.record(op, this.#writeRequest(op, plan.seqs[i].prefix, transactionTimestamp)));
+				plan.ops.forEach((op, i) => growth.record(op, this.#writeRequest(op, plan.seqs[i].routingHash, transactionTimestamp)));
 				return { response: { outcome: "committed" }, promotionCandidates: growth.candidates() };
 			});
 		} catch (err) {
@@ -871,7 +878,7 @@ export class TransactionParticipant {
 	cancelLocal(transactionId: string, ownedKeys: readonly TransactionItemKey[]): void {
 		this.#store.deletePendingTxKeys(
 			transactionId,
-			ownedKeys.map((key) => ({ prefix: this.#storagePrefix(key.hashKey), hashKey: key.hashKey, sortKey: key.sortKey })),
+			ownedKeys.map((key) => ({ routingHash: this.#routingHashForKey(key.hashKey), hashKey: key.hashKey, sortKey: key.sortKey })),
 		);
 	}
 
@@ -889,12 +896,12 @@ export class TransactionParticipant {
 
 		for (const item of request.items) {
 			const sk = item.sortKey;
-			const prefix = this.#storagePrefix(item.hashKey);
+			const routingHash = this.#routingHashForKey(item.hashKey);
 
 			const itemRow = item.projection
-				? this.#store.getItemProjected(item.projection, prefix, item.hashKey, sk).row
-				: this.#store.getItem(prefix, item.hashKey, sk).row;
-			const pendingRow = this.#store.pendingLockFor(prefix, item.hashKey, sk);
+				? this.#store.getItemProjected(item.projection, routingHash, item.hashKey, sk).row
+				: this.#store.getItem(routingHash, item.hashKey, sk).row;
+			const pendingRow = this.#store.pendingLockFor(routingHash, item.hashKey, sk);
 
 			const hasPendingWrite = pendingRow != null && !READ_ONLY_PENDING_OPERATIONS.has(pendingRow.operation);
 			// Echo the requested keys as canonical KeyBytes: the TC pairs phase 1 with phase 2 by bytes,

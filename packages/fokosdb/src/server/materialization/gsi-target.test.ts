@@ -8,10 +8,10 @@ import { resolveLimits } from "../../shared/transaction-limits.js";
 import { checkGsiPlans, desiredGsiEntry, GSI_SQLITE_UNRECOVERABLE_ERROR } from "./gsi-target.js";
 import { MaterializationStore } from "./materialization-store.js";
 import { validateTargets, type GsiTargetDefinition } from "./targets.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);

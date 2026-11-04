@@ -69,11 +69,11 @@ const TOKEN = "tok-1";
 const BASE_TIME = 2_000_000_000_000;
 
 /** The position of a migration page of the coordinator. */
-type MigrationCursor = { prefix: RoutingHash; transactionId: string };
+type MigrationCursor = { routingHash: RoutingHash; transactionId: string };
 
-/** The storage prefix of the rows of a token in `tc`. */
+/** The routingHash of the rows of a token in `tc`. */
 function P(tc: CoordinatorInternals, token = TOKEN): RoutingHash {
-	return tc.fokos.storagePrefix(KeyCodec.encode(token));
+	return tc.fokos.routingHashForKey(KeyCodec.encode(token));
 }
 
 afterEach(() => {
@@ -90,10 +90,16 @@ type CoordinatorInternals = {
 	fokosNow(): number;
 	hooks(): FokosShardingHooks<FokosDBPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
-	recoverTransactionLocal(prefix: RoutingHash, transactionId: string): Promise<unknown>;
+	recoverTransactionLocal(routingHash: RoutingHash, transactionId: string): Promise<unknown>;
 	/** The step of the `tx_recovery` job. */
 	recoverStaleTransactions(): Promise<void>;
-	driveTransaction(prefix: RoutingHash, transactionId: string, idempotencyToken: string, state: TCState, budgetMs: number): Promise<void>;
+	driveTransaction(
+		routingHash: RoutingHash,
+		transactionId: string,
+		idempotencyToken: string,
+		state: TCState,
+		budgetMs: number,
+	): Promise<void>;
 	earliestRecoveryAt(): number | null;
 	/** The step of the `idempotency_sweep` job. */
 	sweepExpiredTransactions(): number | null;
@@ -111,23 +117,23 @@ type CoordinatorInternals = {
 		nextCursor: MigrationCursor | null;
 	};
 	applyMigrationPage(page: unknown[]): void;
-	loadFinalResponse(prefix: RoutingHash, transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
-	cancelTransactionInStore(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void;
-	storePrepareAnswer(prefix: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
-	storePrepareError(prefix: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void;
-	markCommitting(prefix: RoutingHash, transactionId: string, idempotencyToken: string): void;
+	loadFinalResponse(routingHash: RoutingHash, transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
+	cancelTransactionInStore(routingHash: RoutingHash, transactionId: string, idempotencyToken: string): void;
+	storePrepareAnswer(routingHash: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean;
+	storePrepareError(routingHash: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void;
+	markCommitting(routingHash: RoutingHash, transactionId: string, idempotencyToken: string): void;
 	drivePrepare(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		requestBudgetMs: number,
 	): Promise<InitiateWriteResponseEncoded>;
-	runPrepareRecovery(prefix: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	runCommit(prefix: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	runCancel(prefix: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
-	stripPayload(prefix: RoutingHash, transactionId: string): void;
+	runPrepareRecovery(routingHash: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCommit(routingHash: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCancel(routingHash: RoutingHash, transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	stripPayload(routingHash: RoutingHash, transactionId: string): void;
 	completeTransaction(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		transactionId: string,
 		idempotencyToken: string,
 		terminalState: "COMMITTED" | "CANCELLED",
@@ -563,15 +569,15 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				insertState(tc, state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt });
 			}
 			const drives: { transactionId: string; budgetMs: number }[] = [];
-			const prefixMatches: boolean[] = [];
-			vi.spyOn(tc, "driveTransaction").mockImplementation(async (prefix, transactionId, token, _state, budgetMs) => {
+			const routingHashMatches: boolean[] = [];
+			vi.spyOn(tc, "driveTransaction").mockImplementation(async (routingHash, transactionId, token, _state, budgetMs) => {
 				// Each claimed row keeps the routingHash of its own token.
-				prefixMatches.push(compareRoutingHashes(prefix, P(tc, token)) === 0);
+				routingHashMatches.push(compareRoutingHashes(routingHash, P(tc, token)) === 0);
 				drives.push({ transactionId, budgetMs });
 			});
 
 			await tc.recoverStaleTransactions();
-			expect(prefixMatches).toEqual([true, true]);
+			expect(routingHashMatches).toEqual([true, true]);
 
 			expect(drives).toEqual([
 				{ transactionId: "tx-earlier", budgetMs: DEFAULT_COORDINATOR_CONFIG.fanoutRequestBudgetMs },
@@ -2026,7 +2032,7 @@ describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
 	/** The transactions in storage order: by the routingHash of the token, then by the ID. */
 	const inStorageOrder = (tc: CoordinatorInternals, ids: string[]) =>
 		[...ids].sort((a, b) => compareRoutingHashes(P(tc, tokenOf(a)), P(tc, tokenOf(b))) || (a < b ? -1 : 1));
-	const cursorAt = (tc: CoordinatorInternals, id: string): MigrationCursor => ({ prefix: P(tc, tokenOf(id)), transactionId: id });
+	const cursorAt = (tc: CoordinatorInternals, id: string): MigrationCursor => ({ routingHash: P(tc, tokenOf(id)), transactionId: id });
 	const insertCommitted = (tc: CoordinatorInternals, state: DurableObjectState, ids: string[]) => {
 		for (const id of ids) {
 			insertState(tc, state, { token: tokenOf(id), transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
@@ -2085,8 +2091,8 @@ describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
 	] as const)("reads only %s of the routingHash space when the target owns it", async (_name, start, end) => {
 		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 3, scanRows: 4 };
 		const interval = hashStorageInterval(start, end);
-		const inside = (prefix: RoutingHash) =>
-			compareRoutingHashes(prefix, start) >= 0 && (end === null || compareRoutingHashes(prefix, end) < 0);
+		const inside = (routingHash: RoutingHash) =>
+			compareRoutingHashes(routingHash, start) >= 0 && (end === null || compareRoutingHashes(routingHash, end) < 0);
 		await withCoordinator((tc, state) => {
 			const inserted = Array.from({ length: 30 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
 			insertCommitted(tc, state, inserted);

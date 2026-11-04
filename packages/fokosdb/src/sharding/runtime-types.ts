@@ -92,12 +92,12 @@ export type FokosOwner =
 export type FokosChild = { ref: FokosPartitionRef; start: FokosCompositeKey | null; end: FokosCompositeKey | null };
 
 /**
- * A position in the storage order `(prefix, hk, sk)`. An absent `hk` or `sk` is the empty key, the
- * minimum. `prefix` is a `RoutingHash` for a bound at a routingHash edge, but a bound can also be the
+ * A position in the storage order `(routingHash, hk, sk)`. An absent `hk` or `sk` is the empty key, the
+ * minimum. `routingHash` is a `RoutingHash` for a bound at a routingHash edge, but a bound can also be the
  * empty byte string, so the field stays unbranded. The host treats it as opaque bytes: the first
  * primary-key column of its rows.
  */
-export type FokosStorageKey = { prefix: Uint8Array; hk?: KeyBytes; sk?: KeyBytes };
+export type FokosStorageKey = { routingHash: Uint8Array; hk?: KeyBytes; sk?: KeyBytes };
 
 /** A half-open storage interval. A null end has no upper bound. */
 export type FokosStorageInterval = { start: FokosStorageKey; end: FokosStorageKey | null };

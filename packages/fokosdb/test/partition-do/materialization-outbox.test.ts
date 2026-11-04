@@ -6,7 +6,7 @@ import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { kb, makeStub } from "./helpers.js";
 import { PROMOTION_TEST_MAX_SIZE_MB, TestPartition, drainUntil, makePartition } from "./partition-harness.js";
-import { ALL_ROWS, partitionPrefixOf, prefixOf } from "../storage-prefix.js";
+import { ALL_ROWS, partitionRoutingHashOf, routingHashFor } from "../routing-hash.js";
 
 type OutboxRow = { hk: string; revision: number; is_deleted: number; is_local_only: number };
 
@@ -58,7 +58,7 @@ describe("FokosDBPartitionDO — outbox migration", () => {
 describe("FokosMigrationHost — the export fences of the outbox stream", () => {
 	type Page = { page: unknown; nextCursor: unknown };
 	const budget = { pageBytes: 1024 * 1024, pageRows: 1, scanRows: 100 };
-	const slice = { kind: "promoted_routing_hash" as const, routingHash: prefixOf(kb("moved")) };
+	const slice = { kind: "promoted_routing_hash" as const, routingHash: routingHashFor(kb("moved")) };
 	const inSlice = (key: { hashKey: KeyBytes }) => KeyCodec.compare(key.hashKey, kb("moved")) === 0;
 
 	function hostOf(store: PartitionStore, selfId: string, state: DurableObjectState): FokosMigrationHost {
@@ -67,7 +67,7 @@ describe("FokosMigrationHost — the export fences of the outbox stream", () => 
 			logParams: () => ({}),
 			captureChanges: () => true,
 			selfId: () => selfId,
-			storagePrefix: partitionPrefixOf(state),
+			routingHashForKey: partitionRoutingHashOf(state),
 		});
 	}
 
@@ -76,13 +76,13 @@ describe("FokosMigrationHost — the export fences of the outbox stream", () => 
 		const target = makeStub({ captureChanges: true });
 		const pages = await runInDurableObject(source.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage, { captureChanges: () => true });
-			const P = partitionPrefixOf(state);
+			const P = partitionRoutingHashOf(state);
 			for (const sk of ["1", "2"]) {
-				store.upsertItem({ prefix: P(kb("moved")), hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ routingHash: P(kb("moved")), hk: kb("moved"), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			store.upsertItem({ prefix: P(kb("stays")), hk: kb("stays"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(kb("stays")), hk: kb("stays"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			// The source is a split child too: its own inherited row keeps a fence of its parent.
-			store.insertMigratedOutboxRow({ prefix: P(kb("old")), hk: kb("old"), sk: kb("s"), revision: 1, is_deleted: 1 });
+			store.insertMigratedOutboxRow({ routingHash: P(kb("old")), hk: kb("old"), sk: kb("s"), revision: 1, is_deleted: 1 });
 			store.importExportFences("grandparent", 3, []);
 			const before = store.exportState().epoch;
 

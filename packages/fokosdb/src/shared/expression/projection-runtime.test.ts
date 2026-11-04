@@ -16,10 +16,10 @@ import { estimateProjectedRowBytes } from "../partition/partition-store.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, PROJECTION_PRESENCE_FIXTURES } from "./test-fixtures.js";
 import type { ConditionExpression, ProjectionExpression } from "./types.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 type StoredFixture = {
 	hashKey: string | Uint8Array;
@@ -31,7 +31,7 @@ type StoredFixture = {
 
 function putFixture(storage: DurableObjectStorage, hashKey: KeyBytes, sortKey: KeyBytes, item: StoredFixture): void {
 	new PartitionStore(storage).upsertItem({
-		prefix: P(hashKey),
+		routingHash: P(hashKey),
 		hk: hashKey,
 		sk: sortKey,
 		data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
@@ -649,7 +649,7 @@ describe("projected point read — limits", () => {
 			const storedBytes = store.measureItemBytes({ hk: hashKey, sk: sortKey, data, kind: "json" });
 			expect(storedBytes).toBeLessThanOrEqual(MAX_ITEM_BYTES);
 			expect(storedBytes).toBeGreaterThan(MAX_ITEM_BYTES - 4 * 1024);
-			store.upsertItem({ prefix: P(hashKey), hk: hashKey, sk: sortKey, data, kind: "json", ttlAt: null, txOrderTs: 0 });
+			store.upsertItem({ routingHash: P(hashKey), hk: hashKey, sk: sortKey, data, kind: "json", ttlAt: null, txOrderTs: 0 });
 
 			const plan = compileProjectionExpression([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "sortKey" } }]);
 			const row = state.storage.sql

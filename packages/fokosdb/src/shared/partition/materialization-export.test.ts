@@ -10,10 +10,10 @@ import {
 	type ExportItemOutcome,
 	type MaterializationExportConfig,
 } from "./materialization-export.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const label = (key: KeyBytes) => KeyCodec.decode(key) as string;
@@ -89,8 +89,8 @@ async function withExporter(
 			exporter,
 			calls,
 			put: (hk, data = "d") =>
-				store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt: null, txOrderTs: 1 }).version,
-			del: (hk) => void store.deleteItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), txOrderTs: 1 }),
+				store.upsertItem({ routingHash: P(kb(hk)), hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt: null, txOrderTs: 1 }).version,
+			del: (hk) => void store.deleteItem({ routingHash: P(kb(hk)), hk: kb(hk), sk: kb("s"), txOrderTs: 1 }),
 			outbox: () =>
 				state.storage.sql
 					.exec<{ hk: ArrayBuffer; revision: number; is_deleted: number; is_local_only: number; next_attempt_at: number }>(
@@ -321,7 +321,7 @@ describe("MaterializationExporter — epochs", () => {
 
 	it("each call carries the export fences while a row of the inherited work remains", async () => {
 		await withExporter({}, async (h) => {
-			h.store.insertMigratedOutboxRow({ prefix: P(kb("inherited")), hk: kb("inherited"), sk: kb("s"), revision: 1, is_deleted: 1 });
+			h.store.insertMigratedOutboxRow({ routingHash: P(kb("inherited")), hk: kb("inherited"), sk: kb("s"), revision: 1, is_deleted: 1 });
 			h.store.importExportFences("parent", 7, [{ ancestorId: "grandparent", minEpoch: 3 }]);
 			expect(h.store.exportFences()).toEqual([
 				{ ancestorId: "grandparent", minEpoch: 3 },

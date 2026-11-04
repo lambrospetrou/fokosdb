@@ -187,7 +187,7 @@ export function compileConditionExpression(
 export function compileUpdateExpression(update: UpdateExpression): CompiledUpdatePlan {
 	const analysis = validateUpdateExpression(update);
 	const orderedActions = orderUpdateActions(update);
-	// The keys take ?1 and ?2 and the storage prefix ?3 in every statement that runs this plan, as they do for a condition.
+	// The keys take ?1 and ?2 and the routingHash ?3 in every statement that runs this plan, as they do for a condition.
 	const context = createContext("update-value", UPDATE_PRE_IMAGE, "direct", UPDATE_FIXED_BINDING_COUNT);
 
 	let accumulator = context.preImage.data;

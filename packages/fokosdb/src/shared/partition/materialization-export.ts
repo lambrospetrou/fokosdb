@@ -79,7 +79,7 @@ function isRetryableUnprocessed(outcome: ExportItemOutcome): boolean {
 	return outcome.outcome === "unprocessed" && outcome.code !== PRODUCER_EPOCH_FENCED;
 }
 
-/** A claimed call and the keys of its items, each with the storage prefix of its outbox row. */
+/** A claimed call and the keys of its items, each with the routingHash of its outbox row. */
 type ClaimedCall = { call: ExportCall; keys: KeyPairMap<RoutingHash> };
 
 export class MaterializationExporter {
@@ -242,7 +242,7 @@ export class MaterializationExporter {
 			// A copy of a moved key: the new owner exports it. The wait keeps the copy from blocking the
 			// owned rows behind it, and from making the alarm due again at once.
 			if (!owns(row)) {
-				store.deferOutboxRow(row.prefix, row.hk, row.sk, row.revision, now + config.unownedRetryMs);
+				store.deferOutboxRow(row.routingHash, row.hk, row.sk, row.revision, now + config.unownedRetryMs);
 				continue;
 			}
 			const claimed = this.#imageOf(row, images.length);
@@ -254,10 +254,10 @@ export class MaterializationExporter {
 			}
 			bytes += claimed.bytes;
 			images.push(claimed.image);
-			keys.set(row.hk, row.sk, row.prefix);
+			keys.set(row.hk, row.sk, row.routingHash);
 			// From now on a receiver can hold this revision, so a delete must reach it.
 			if (row.isLocalOnly) {
-				store.markOutboxRowExported(row.prefix, row.hk, row.sk);
+				store.markOutboxRowExported(row.routingHash, row.hk, row.sk);
 			}
 		}
 		return { images, keys };
@@ -273,14 +273,14 @@ export class MaterializationExporter {
 		if (row.isDeleted) {
 			return { image: { opIndex, hashKey: row.hk, sortKey: row.sk, revision: row.revision, deleted: true }, bytes: 0 };
 		}
-		const item = store.exportItemImage(row.prefix, row.hk, row.sk);
+		const item = store.exportItemImage(row.routingHash, row.hk, row.sk);
 		if (item === undefined || item.v !== row.revision) {
 			this.#logError("fokos/partition: an outbox row does not match its item, and the export drops it", {
 				key: KeyCodec.pairForLog(row.hk, row.sk),
 				revision: row.revision,
 				itemVersion: item?.v ?? null,
 			});
-			store.discardOutboxRow(row.prefix, row.hk, row.sk);
+			store.discardOutboxRow(row.routingHash, row.hk, row.sk);
 			return undefined;
 		}
 		const image: LatestImage = {
@@ -339,9 +339,9 @@ export class MaterializationExporter {
 			}
 			const image = call.images[i];
 			if (owns({ hk: image.hashKey, sk: image.sortKey })) {
-				const prefix = keys.get(image.hashKey, image.sortKey);
-				invariant(prefix !== undefined, "fokos/export: an answered image is not a key of its call");
-				this.#applyItemOutcome(prefix, image, o, failedAsWhole);
+				const routingHash = keys.get(image.hashKey, image.sortKey);
+				invariant(routingHash !== undefined, "fokos/export: an answered image is not a key of its call");
+				this.#applyItemOutcome(routingHash, image, o, failedAsWhole);
 			}
 		}
 		store.updateExportState({ raiseEpoch: raise, ...closeCall });
@@ -349,17 +349,17 @@ export class MaterializationExporter {
 	}
 
 	/** The write for one owned item of the answer. A call that failed as a whole writes no row for an item. */
-	#applyItemOutcome(prefix: RoutingHash, image: LatestImage, outcome: ExportItemOutcome, failedAsWhole: boolean): void {
+	#applyItemOutcome(routingHash: RoutingHash, image: LatestImage, outcome: ExportItemOutcome, failedAsWhole: boolean): void {
 		const { store } = this.#deps;
 		const config = this.#deps.config();
 		const now = this.#deps.now();
 		switch (outcome.outcome) {
 			case "acknowledged":
-				store.deleteOutboxRow(prefix, image.hashKey, image.sortKey, image.revision);
+				store.deleteOutboxRow(routingHash, image.hashKey, image.sortKey, image.revision);
 				return;
 			case "unprocessed":
 				if (!failedAsWhole) {
-					store.deferOutboxRow(prefix, image.hashKey, image.sortKey, image.revision, now + config.unprocessedRetryMs);
+					store.deferOutboxRow(routingHash, image.hashKey, image.sortKey, image.revision, now + config.unprocessedRetryMs);
 				}
 				return;
 			case "rejected":
@@ -368,7 +368,7 @@ export class MaterializationExporter {
 					revision: image.revision,
 					code: outcome.code,
 				});
-				store.deferOutboxRow(prefix, image.hashKey, image.sortKey, image.revision, now + config.rejectedRetryMs);
+				store.deferOutboxRow(routingHash, image.hashKey, image.sortKey, image.revision, now + config.rejectedRetryMs);
 				return;
 			case "unknown":
 				return;

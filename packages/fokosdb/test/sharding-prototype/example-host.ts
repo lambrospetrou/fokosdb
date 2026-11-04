@@ -177,7 +177,7 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 				// The promotion moves every hash key of the routingHash.
 				const routingHashHex = slice.routingHash.toHex();
 				for (const { hk } of sql.exec<{ hk: ArrayBuffer }>("SELECT DISTINCT hk FROM docs").toArray()) {
-					if (this.fokos.storagePrefix(new Uint8Array(hk) as KeyBytes).toHex() === routingHashHex) {
+					if (this.fokos.routingHashForKey(new Uint8Array(hk) as KeyBytes).toHex() === routingHashHex) {
 						sql.exec("DELETE FROM docs WHERE hk = ?", hk);
 					}
 				}

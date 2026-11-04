@@ -77,7 +77,6 @@ this RFC.
 | base seed | The xxHash64 seed that derives the seed of each shard group. The default is `GOLDEN_RATIO_BIGINT`. |
 | digit | One child index of a routingHash: the root digit in base `rootTreesN`, then base `hashSplitN`. |
 | node interval | The half-open routingHash interval `[start, end)` that one hash partition owns. |
-| storage prefix | The first primary-key column of an ordered table. In FokosDB it is the routingHash. |
 | composite key | A pair `(hk, sk)` of encoded keys, compared by `hk` first and then by `sk`. |
 | promoted routingHash | A routingHash that a promotion moved into a range tree of its own. |
 | contiguous delete | A `DELETE` whose rows are one interval of the key order of the B-tree that it deletes from. |
@@ -163,7 +162,7 @@ duplicate check of `insertItemIfAbsent`). `deleteExpiredItems` deletes its victi
 7. The coordinator uses the same routingHash order and digits.
 8. A promotion registers with the topology admin object of the table and with a new admin object for its
    routingHash. Each later range split in that routingHash registers only with the second object.
-9. The runtime gives its host opaque storage prefixes, scope intervals, exact ownership checks, and the storage
+9. The runtime gives its host opaque routingHashes, scope intervals, exact ownership checks, and the storage
    interval of each migration target. The host does not know the hash function or the width.
 10. The cleanup of items and estimates uses contiguous deletes. Section 4.2.1 lists the exceptions.
 11. `latest_items` is `WITHOUT ROWID` on `(routing_hash, base_hk, base_sk)`. Its routingHash uses the
@@ -301,7 +300,7 @@ topology encodings do not go to one object. The topology stores only fixed-lengt
 boundaries inside a promoted routingHash.
 
 **The runtime API.** Each partition knows its scope interval in `(routing_hash, hk, sk)` order, also a router
-that owns no rows. The runtime gives the host opaque storage prefixes, interval helpers, exact ownership checks, and
+that owns no rows. The runtime gives the host opaque routingHashes, interval helpers, exact ownership checks, and
 the storage interval of each migration target. The host does not calculate hashes, digits, or prefix boundaries.
 
 ### 4.2 Technical details
@@ -317,7 +316,7 @@ Each invariant has its rule, then its mechanism, then the milestones that add it
   initialization: every operation answers `partition_init_failed`, and `fokosStatus` and the destroy RPCs stay
   available. A pinned test of the seed and of one routingHash catches a change of the derivation before a
   deployment. (M1)
-- **I2 — A table has one routingHash width, and a partition never mixes widths.** `storagePrefix` returns
+- **I2 — A table has one routingHash width, and a partition never mixes widths.** `routingHashForKey` returns
   exactly `ROUTING_HASH_BYTES` bytes in every partition. (M1, M3)
 - **I3 — The digits are exact up to the depth limit, and no hash partition exists below it.** The limit is
   `R * K^d <= 2^64` and `d <= MAX_HASH_DEPTH`. Validation refuses a deeper partition ID. The split decision returns
@@ -580,24 +579,24 @@ partition keeps them after a split cutover. The root index and the path stay, al
 
 ##### The runtime API for storage intervals and ownership
 
-The host treats a storage prefix as opaque bytes. It must not calculate the hash, its digits, or prefix boundaries.
+The host treats a routingHash as opaque bytes. It must not calculate the hash, its digits, or routingHash boundaries.
 `sharding/runtime-types.ts` and `sharding/runtime.ts` expose these helpers:
 
 ```ts
-/** A position in the storage order (prefix, hk, sk). Absent `hk` and `sk` are the empty key, the minimum. */
-export type FokosStorageKey = { prefix: Uint8Array; hk?: KeyBytes; sk?: KeyBytes };
+/** A position in the storage order (routingHash, hk, sk). Absent `hk` and `sk` are the empty key, the minimum. */
+export type FokosStorageKey = { routingHash: Uint8Array; hk?: KeyBytes; sk?: KeyBytes };
 
 /** A half-open storage interval. A null end has no upper bound. */
 export type FokosStorageInterval = { start: FokosStorageKey; end: FokosStorageKey | null };
 
-/** The storage prefix of a hash key in this partition: the first primary-key column of its rows. */
-storagePrefix(hashKey: KeyBytes): Uint8Array;
+/** The routingHash of a hash key in this partition: the first primary-key column of its rows. */
+routingHashForKey(hashKey: KeyBytes): Uint8Array;
 
 /** This node's immutable scope interval. A router retains this interval but owns no rows. */
 storageInterval(): FokosStorageInterval;
 
 /**
- * Bounds the rows this node owns. Null on a router. Moved prefixes inside the interval remain in
+ * Bounds the rows this node owns. Null on a router. Moved routingHashes inside the interval remain in
  * these bounds, so a host must also use the exact ownership check before it changes rows.
  */
 ownedStorageInterval(): FokosStorageInterval | null;
@@ -689,7 +688,7 @@ INSERT OR IGNORE INTO item_id_counter (id, hwm) VALUES (1, 1);
 **Every partition stores the full routingHash.** Each row of each partition, hash or range, stores the full
 routingHash of its hash key. A range partition stores the routingHash of its range tree, which is the value
 that the rows had in the hash partition. Thus a later promotion by clone keeps the rows of the range root unchanged,
-and `storagePrefix` has no special case for a partition kind.
+and `routingHashForKey` has no special case for a partition kind.
 
 ##### The item-id counter
 
@@ -833,7 +832,7 @@ statements:
 The hash-key walks and `sliceKeyRange` go when no caller is left ("The migration read" below). The promotion checks
 and deletes by hash key stay until M4 replaces them.
 
-The partition gets the routingHash of a key from `this.fokos.storagePrefix(hk)`, and passes it to each store
+The partition gets the routingHash of a key from `this.fokos.routingHashForKey(hk)`, and passes it to each store
 method as a parameter. The store does not call the runtime. The cost is one xxHash64 of the hash key for each key and
 each partition hop (Section 4.2.12).
 
@@ -959,7 +958,7 @@ CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (es
 ```
 
 - One row holds the total estimate of all items of that routingHash in this partition. On a range leaf, the total
-  covers only the composite interval of that leaf. The host gives `KeySizeStats` an opaque storage prefix. The class
+  covers only the composite interval of that leaf. The host gives `KeySizeStats` an opaque routingHash. The class
   does not calculate hashes or read prefix bytes.
 - `hk` is a representative hash key of the routingHash, not part of the primary key. A new row stores the hash
   key of its first item, and later writes can keep it. The representative can outlive its own items, because its hash
@@ -1300,7 +1299,7 @@ CREATE INDEX IF NOT EXISTS idx_latest_items_deleted_gc
 
 ##### The routingHash and the item id
 
-- The host gets the routingHash from its own `fokos.storagePrefix(base_hk)`. It uses the seed of
+- The host gets the routingHash from its own `fokos.routingHashForKey(base_hk)`. It uses the seed of
   `fokos.m.<tableName>.<fp(ns)>`. The routingHash of the base partition must not pass through unchanged. The
   store takes the value as a parameter and does not calculate a hash.
 - `base_hk` and `base_sk` stay the canonical keys of the base item. The routingHash is a separate value. It is not
@@ -1596,11 +1595,11 @@ The digit walk costs little. The hash is the cost, so each follow-up removes a r
   change before the public release. Each extra path adds a switch to the routingHash and digit functions, the
   partition IDs, every `PartitionStore` statement, the sharding store, and the keeper. Every test then runs once for
   each path.
-- **The empty BLOB `x''` as the storage prefix of a range partition.** Every row of a range tree has the same
+- **The empty BLOB `x''` as the routingHash of a range partition.** Every row of a range tree has the same
   routingHash, so `x''` saves 8 bytes for each row and each index entry that leads with it: about 4% of a row with
   100 B of data. But a promotion by clone must then change the first primary-key column of each row of the range root,
   and in a `WITHOUT ROWID` table each change is one delete and one insert. It also adds a special case to
-  `storagePrefix`. The saving does not pay for either cost.
+  `routingHashForKey`. The saving does not pay for either cost.
 - **A list from `ownedPrefixRanges()` in place of a storage interval.** A range partition also needs composite
   boundaries, and one storage-interval type covers both partition kinds. The exact ownership checks exclude moved
   prefixes without a list of every remaining interval.

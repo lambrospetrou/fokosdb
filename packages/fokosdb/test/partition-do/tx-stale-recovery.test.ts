@@ -15,7 +15,7 @@ import { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { captureConsoleError, kb, makeStub } from "./helpers.js";
-import { partitionPrefixOf } from "../storage-prefix.js";
+import { partitionRoutingHashOf } from "../routing-hash.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 
@@ -40,9 +40,9 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const createdAt = options?.createdAt ?? Date.now() - 10_000;
 		const operation = options?.operation ?? "put";
 		const store = new PartitionStore(state.storage);
-		const P = partitionPrefixOf(state);
+		const P = partitionRoutingHashOf(state);
 		store.insertPendingLock({
-			prefix: P(kb(options?.hashKey ?? `stale-${transactionId}`)),
+			routingHash: P(kb(options?.hashKey ?? `stale-${transactionId}`)),
 			hk: kb(options?.hashKey ?? `stale-${transactionId}`),
 			sk: kb("sk"),
 			transaction_id: transactionId,
@@ -64,7 +64,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 	function releasePendingLock(store: PartitionStore, transactionId: string): void {
 		store.deletePendingTxKeys(
 			transactionId,
-			store.listPendingTxKeys(transactionId).map((row) => ({ prefix: row.prefix, hashKey: row.hk, sortKey: row.sk })),
+			store.listPendingTxKeys(transactionId).map((row) => ({ routingHash: row.routingHash, hashKey: row.hk, sortKey: row.sk })),
 		);
 	}
 
@@ -312,7 +312,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
-			const P = partitionPrefixOf(state);
+			const P = partitionRoutingHashOf(state);
 			const [lock] = store.listPendingTxItems(transactionId);
 			expect(lock).toBeDefined();
 			// The coordinator answers not_found, as after its sweep, and the lock is older than the window.
@@ -363,10 +363,10 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = new PartitionStore(state.storage);
-			const P = partitionPrefixOf(state);
+			const P = partitionRoutingHashOf(state);
 			// The checked item has a stamp of 10. With a put in the request, the check alone is covered.
 			store.upsertItem({
-				prefix: P(kb(`checked-${transactionId}`)),
+				routingHash: P(kb(`checked-${transactionId}`)),
 				hk: kb(`checked-${transactionId}`),
 				sk: kb("sk"),
 				data: "v",
@@ -622,7 +622,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			state.storage.sql.exec(
 				`INSERT INTO tc_state (routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, operations_hash)
 				 VALUES (?, ?, ?, 'COMMITTED', ?, ?, ?, ?)`,
-				instance.fokos.storagePrefix(KeyCodec.encode(`stale-${transactionId}`)),
+				instance.fokos.routingHashForKey(KeyCodec.encode(`stale-${transactionId}`)),
 				`stale-${transactionId}`,
 				transactionId,
 				transactionTimestamp,
@@ -634,9 +634,9 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const getCoordinatorStub = vi.spyOn(doStubs, "txCoordinatorStubForParticipant");
 		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
-			const P = partitionPrefixOf(state);
+			const P = partitionRoutingHashOf(state);
 			store.insertPendingLock({
-				prefix: P(kb("stale-ttl")),
+				routingHash: P(kb("stale-ttl")),
 				hk: kb("stale-ttl"),
 				sk: kb("sk"),
 				transaction_id: transactionId,

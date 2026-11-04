@@ -13,10 +13,10 @@ import { conditionTree, updateTree } from "../expression/test-fixtures.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
-import { ALL_ROWS, prefixOf } from "../../../test/storage-prefix.js";
+import { ALL_ROWS, routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
 
 /** Matches the `results` of a rejected answer that hold a rejected entry whose reason matches `reason`. */
 function aRejection(reason: Record<string, unknown>) {
@@ -43,7 +43,7 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 		const clock = { now: BASE_NOW };
 		const participant = new TransactionParticipant({
 			store,
-			storagePrefix: P,
+			routingHashForKey: P,
 			now: () => clock.now,
 			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 			staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
@@ -132,7 +132,7 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with condition_failed when an item condition does not hold", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ prefix: P(kb("hk")), hk: kb("hk"), sk: kb("sk"), data: "existing", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("sk"), data: "existing", kind: "text", ttlAt: null, txOrderTs: 1 });
 
 			const request = prepareReq({
 				items: [
@@ -168,7 +168,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			const keys = Array.from({ length: itemCount }, (_v, i) => kb(`capped-${String(i).padStart(3, "0")}`));
 			for (const hk of keys) {
-				store.upsertItem({ prefix: P(hk), hk, sk: KeyCodec.encodeOptional(undefined), data, kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ routingHash: P(hk), hk, sk: KeyCodec.encodeOptional(undefined), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 
 			const request = prepareReq({
@@ -211,7 +211,7 @@ describe("TransactionParticipant - prepare", () => {
 			// The item exists but is kind: "text", not json. An absent item is NOT this case: it has the
 			// empty document as its pre-image, so the update creates it.
 			store.upsertItem({
-				prefix: P(kb("text-item")),
+				routingHash: P(kb("text-item")),
 				hk: kb("text-item"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "text content",
@@ -300,7 +300,7 @@ describe("TransactionParticipant - prepare", () => {
 			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
 			const sk = KeyCodec.encodeOptional(undefined);
 			const binaryKey = KeyCodec.encode(new Uint8Array([1, 2, 3]));
-			store.upsertItem({ prefix: P(binaryKey), hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(binaryKey), hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const request = prepareReq({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toMatchObject({
@@ -326,7 +326,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
-				prefix: P(kb("user")),
+				routingHash: P(kb("user")),
 				hk: kb("user"),
 				sk,
 				data: JSON.stringify({ name: "Alice", score: 10 }),
@@ -404,7 +404,7 @@ describe("TransactionParticipant - prepare", () => {
 	it("rejects with timestamp_conflict when the item's read watermark is not older", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
-				prefix: P(kb("hk")),
+				routingHash: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "v",
@@ -434,7 +434,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = kb("sk");
 			store.upsertItem({
-				prefix: P(kb("hk")),
+				routingHash: P(kb("hk")),
 				hk: kb("hk"),
 				sk,
 				data: "v",
@@ -477,7 +477,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = kb("sk");
 			store.upsertItem({
-				prefix: P(kb("hk")),
+				routingHash: P(kb("hk")),
 				hk: kb("hk"),
 				sk,
 				data: "v",
@@ -510,7 +510,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			// 1. A transaction committed with a coordinator clock running ahead of this partition's.
 			store.upsertItem({
-				prefix: P(kb("hk")),
+				routingHash: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "from-tx",
@@ -521,7 +521,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			// 2. A non-transactional put lands next, stamped with the partition's own (lower) clock.
 			store.upsertItem({
-				prefix: P(kb("hk")),
+				routingHash: P(kb("hk")),
 				hk: kb("hk"),
 				sk: kb("sk"),
 				data: "from-put",
@@ -548,7 +548,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			// A transactional delete bumps the watermark even though the row never existed.
 			store.deleteItem({
-				prefix: P(kb("gone")),
+				routingHash: P(kb("gone")),
 				hk: kb("gone"),
 				sk: KeyCodec.encodeOptional(undefined),
 				txOrderTs: (BASE_NOW + 200) * TX_ORDER_TS_UNITS_PER_MS,
@@ -595,7 +595,7 @@ describe("TransactionParticipant - prepare", () => {
 			[
 				"a single-item delete",
 				(_p: TransactionParticipant, store: PartitionStore) =>
-					store.deleteItem({ prefix: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, txOrderTs: BASE_NOW * TX_ORDER_TS_UNITS_PER_MS }),
+					store.deleteItem({ routingHash: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, txOrderTs: BASE_NOW * TX_ORDER_TS_UNITS_PER_MS }),
 			],
 		])("after the transaction put X and %s removed it", async (_name, deleteX) => {
 			await withParticipant(({ participant, store }) => {
@@ -622,7 +622,7 @@ describe("TransactionParticipant - prepare", () => {
 				"a single-item put",
 				(_p: TransactionParticipant, store: PartitionStore) =>
 					store.upsertItem({
-						prefix: P(X.hashKey),
+						routingHash: P(X.hashKey),
 						hk: X.hashKey,
 						sk: X.sortKey,
 						data: "new",
@@ -633,7 +633,7 @@ describe("TransactionParticipant - prepare", () => {
 			],
 		])("after the transaction deleted X and %s created it again", async (_name, putX) => {
 			await withParticipant(({ participant, store }) => {
-				store.upsertItem({ prefix: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, data: "old", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ routingHash: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, data: "old", kind: "text", ttlAt: null, txOrderTs: 1 });
 				const request = commitAhead(participant, { ...X, operation: "delete" });
 				putX(participant, store);
 				// X had v = 1. Its delete has the revision 2, so the new row starts at v = 3.
@@ -727,7 +727,7 @@ describe("TransactionParticipant - prepare", () => {
 
 		it("does not raise the deletion watermark when the item has a row", async () => {
 			await withParticipant(({ participant, store }) => {
-				store.upsertItem({ prefix: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, data: "v", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ routingHash: P(X.hashKey), hk: X.hashKey, sk: X.sortKey, data: "v", kind: "text", ttlAt: null, txOrderTs: 1 });
 				const check = prepareReq({ transactionTimestamp: checkTs, items: [{ ...X, operation: "check" }] });
 				expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
 				expect(participant.commitLocal(check).response).toEqual({ outcome: "committed" });
@@ -771,7 +771,7 @@ describe("TransactionParticipant - prepare", () => {
 	it("locks nothing when any item in the request is rejected", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
-				prefix: P(kb("conflicting")),
+				routingHash: P(kb("conflicting")),
 				hk: kb("conflicting"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "v",
@@ -801,7 +801,7 @@ describe("TransactionParticipant - commit", () => {
 	it("applies put, delete, and check operations and clears the locks", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
-				prefix: P(kb("to-delete")),
+				routingHash: P(kb("to-delete")),
 				hk: kb("to-delete"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "old",
@@ -810,7 +810,7 @@ describe("TransactionParticipant - commit", () => {
 				txOrderTs: 1,
 			});
 			store.upsertItem({
-				prefix: P(kb("to-check")),
+				routingHash: P(kb("to-check")),
 				hk: kb("to-check"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "kept",
@@ -902,7 +902,7 @@ describe("TransactionParticipant - commit", () => {
 			const asked: string[] = [];
 			const source = new TransactionParticipant({
 				store,
-				storagePrefix: P,
+				routingHashForKey: P,
 				maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 				staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 				ownerCheck: () => (key) => {
@@ -990,7 +990,7 @@ describe("TransactionParticipant - single shot", () => {
 		await withParticipant(({ participant, store }) => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
-				prefix: P(kb("u1")),
+				routingHash: P(kb("u1")),
 				hk: kb("u1"),
 				sk: sortKey,
 				data: JSON.stringify({ count: 1, name: "item1" }),
@@ -1077,7 +1077,7 @@ describe("TransactionParticipant - cancel", () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
-				prefix: P(kb("user")),
+				routingHash: P(kb("user")),
 				hk: kb("user"),
 				sk,
 				data: JSON.stringify({ score: 10 }),
@@ -1123,10 +1123,10 @@ describe("TransactionParticipant - readForTransaction", () => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			// Two writes carrying the same transaction order timestamp: the item timestamps are identical, only `v`
 			// moves. This is the pair the two-phase read must be able to tell apart.
-			store.upsertItem({ prefix: P(kb("k")), hk: kb("k"), sk, data: "first", kind: "text", ttlAt: 777, txOrderTs: 100 });
+			store.upsertItem({ routingHash: P(kb("k")), hk: kb("k"), sk, data: "first", kind: "text", ttlAt: 777, txOrderTs: 100 });
 			const before = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
-			store.upsertItem({ prefix: P(kb("k")), hk: kb("k"), sk, data: "second", kind: "text", ttlAt: 777, txOrderTs: 100 });
+			store.upsertItem({ routingHash: P(kb("k")), hk: kb("k"), sk, data: "second", kind: "text", ttlAt: 777, txOrderTs: 100 });
 			const after = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
 			invariant(before.found && after.found);
@@ -1140,7 +1140,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 	it("echoes canonical KeyBytes and returns data, maxDeletedV of an absent item, and hasPendingWrite per item", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
-				prefix: P(kb("existing")),
+				routingHash: P(kb("existing")),
 				hk: kb("existing"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "value",
@@ -1196,12 +1196,12 @@ describe("TransactionParticipant - readForTransaction", () => {
 						{ hashKey: kb("absent"), sortKey: sk },
 					],
 				}).items;
-			store.upsertItem({ prefix: P(kb("found")), hk: kb("found"), sk, data: "f", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ prefix: P(kb("other")), hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
-			store.upsertItem({ prefix: P(kb("other")), hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(kb("found")), hk: kb("found"), sk, data: "f", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(kb("other")), hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(kb("other")), hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
 
 			const before = read();
-			store.deleteItem({ prefix: P(kb("other")), hk: kb("other"), sk, txOrderTs: 2 });
+			store.deleteItem({ routingHash: P(kb("other")), hk: kb("other"), sk, txOrderTs: 2 });
 			const after = read();
 
 			// The found item carries no delete value, so the delete of another item leaves it unchanged.
@@ -1216,7 +1216,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 		await withParticipant(({ participant, store }) => {
 			const hk = kb("k");
 			const sk = KeyCodec.encodeOptional(undefined);
-			store.upsertItem({ prefix: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ routingHash: P(hk), hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const hasPendingWrite = () => participant.readForTransactionLocal({ items: [{ hashKey: hk, sortKey: sk }] }).items[0].hasPendingWrite;
 
 			// A pending check cannot change the item, so the read may serialize on either side of it.
@@ -1253,7 +1253,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 
 			// An operation value the code does not know counts as a pending write, not a read.
 			store.insertPendingLock({
-				prefix: P(hk),
+				routingHash: P(hk),
 				hk,
 				sk,
 				transaction_id: "unknown-op",
@@ -1325,7 +1325,7 @@ describe("TransactionParticipant - claimStaleTransactions", () => {
 			const staleMs = DEFAULT_PARTITION_CONFIG.staleTransactionMs;
 			const lock = (name: string, createdAt: number, nextRecoveryAt: number) =>
 				store.insertPendingLock({
-					prefix: P(kb(name)),
+					routingHash: P(kb(name)),
 					hk: kb(name),
 					sk: kb("sk"),
 					transaction_id: name,

@@ -14,10 +14,10 @@ import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.
 import type { PrepareRequest, TransactionItem, TransactionItemKey } from "../transaction-wire-types.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
 
 const kb = (s: string) => KeyCodec.encode(s);
 const SK = kb("sk");
@@ -33,7 +33,7 @@ async function withPartition<R>(fn: (h: Harness) => R): Promise<R> {
 		const store = new PartitionStore(state.storage);
 		const participant = new TransactionParticipant({
 			store,
-			storagePrefix: P,
+			routingHashForKey: P,
 			now: () => BASE_NOW,
 			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 			staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
@@ -100,9 +100,17 @@ function uniqueKeys(items: readonly TransactionItem[]): TransactionItemKey[] {
  * from a deleted item. Every stamp is older than T.
  */
 function seed(store: PartitionStore): void {
-	store.upsertItem({ prefix: P(kb("A")), hk: kb("A"), sk: SK, data: JSON.stringify({ n: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
 	store.upsertItem({
-		prefix: P(kb("A")),
+		routingHash: P(kb("A")),
+		hk: kb("A"),
+		sk: SK,
+		data: JSON.stringify({ n: 1 }),
+		kind: "json",
+		ttlAt: null,
+		txOrderTs: 1,
+	});
+	store.upsertItem({
+		routingHash: P(kb("A")),
 		hk: kb("A"),
 		sk: SK,
 		data: JSON.stringify({ n: 1, a: true }),
@@ -110,11 +118,19 @@ function seed(store: PartitionStore): void {
 		ttlAt: 500,
 		txOrderTs: 2,
 	});
-	store.upsertItem({ prefix: P(kb("B")), hk: kb("B"), sk: SK, data: JSON.stringify({ b: 1 }), kind: "json", ttlAt: null, txOrderTs: 3 });
+	store.upsertItem({
+		routingHash: P(kb("B")),
+		hk: kb("B"),
+		sk: SK,
+		data: JSON.stringify({ b: 1 }),
+		kind: "json",
+		ttlAt: null,
+		txOrderTs: 3,
+	});
 	for (let i = 0; i < 3; i++) {
-		store.upsertItem({ prefix: P(kb("gone")), hk: kb("gone"), sk: SK, data: "x", kind: "text", ttlAt: null, txOrderTs: 4 });
+		store.upsertItem({ routingHash: P(kb("gone")), hk: kb("gone"), sk: SK, data: "x", kind: "text", ttlAt: null, txOrderTs: 4 });
 	}
-	store.deleteItem({ prefix: P(kb("gone")), hk: kb("gone"), sk: SK, txOrderTs: 5 });
+	store.deleteItem({ routingHash: P(kb("gone")), hk: kb("gone"), sk: SK, txOrderTs: 5 });
 }
 
 const b64 = (value: unknown) => (typeof value === "string" ? value : new Uint8Array(value as ArrayBuffer).toBase64());
@@ -329,7 +345,7 @@ describe("ordered per-item execution: evaluate", () => {
 	])("returns the same failure image on both paths after %s of another item", async (_name, beforeDelete, version) => {
 		await withPartition(({ participant, store, storage }) => {
 			for (let i = 0; i < 50; i++) {
-				store.upsertItem({ prefix: P(kb("A")), hk: kb("A"), sk: SK, data: '{"n":1}', kind: "json", ttlAt: null, txOrderTs: 1 });
+				store.upsertItem({ routingHash: P(kb("A")), hk: kb("A"), sk: SK, data: '{"n":1}', kind: "json", ttlAt: null, txOrderTs: 1 });
 			}
 			const before = snapshot(storage);
 			const ops = withOpIndex([
@@ -499,7 +515,7 @@ describe("ordered per-item execution: versions", () => {
 			// A delete of another item at v = 50 between prepare and commit raises max_deleted_v to its
 			// delete revision 51.
 			storage.sql.exec(`UPDATE items SET v = 50 WHERE hk = ?`, kb("B"));
-			store.deleteItem({ prefix: P(kb("B")), hk: kb("B"), sk: SK, txOrderTs: 10 });
+			store.deleteItem({ routingHash: P(kb("B")), hk: kb("B"), sk: SK, txOrderTs: 10 });
 			expect(store.getMaxDeletedV()).toBe(51);
 
 			participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: T, items: uniqueKeys(request.items) });
@@ -604,7 +620,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			for (const key of ["A", "C"]) {
 				store.insertPendingLock({
 					...tx,
-					prefix: P(kb(key)),
+					routingHash: P(kb(key)),
 					hk: kb(key),
 					sk: SK,
 					operation: "put",
@@ -656,7 +672,7 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(warn).not.toHaveBeenCalled();
 
-			store.deletePendingTxKeys(request.transactionId, [{ prefix: P(kb("C")), hashKey: kb("C"), sortKey: SK }]);
+			store.deletePendingTxKeys(request.transactionId, [{ routingHash: P(kb("C")), hashKey: kb("C"), sortKey: SK }]);
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(warn.mock.calls[0][0]).toMatchObject({ transactionId: request.transactionId, lockedItems: 1, items: 2, outcome: "accepted" });

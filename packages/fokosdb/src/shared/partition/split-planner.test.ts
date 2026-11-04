@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { collidingHashKeys } from "../../../test/hash-digits.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 import { PartitionStore } from "./partition-store.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import type { FokosPartitionIdentity } from "../../sharding/route-context.js";
@@ -140,8 +140,8 @@ describe("SplitPlanner over a PartitionStore at the hash depth limit", () => {
 			});
 			const data = "x".repeat(300 * 1024);
 			for (const [first, second] of collidingPairs) {
-				const prefix = prefixOf(first, group);
-				const put = (hk: KeyBytes) => store.upsertItem({ prefix, hk, sk: kb("s"), data, kind: "text", ttlAt: null, txOrderTs: 1 });
+				const routingHash = routingHashFor(first, group);
+				const put = (hk: KeyBytes) => store.upsertItem({ routingHash, hk, sk: kb("s"), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 				const one = put(first).keyEstBytes;
 				const both = put(second).keyEstBytes;
 				expect(one).toBeLessThan(threshold);

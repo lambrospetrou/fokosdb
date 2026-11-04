@@ -7,10 +7,10 @@ import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";
 import { invariantFailure } from "../../../test/errors-matchers.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NOW_SECONDS = 100;
@@ -35,7 +35,7 @@ function config(overrides: Partial<TtlSweepConfig> = {}): TtlSweepConfig {
 }
 
 function putExpired(store: PartitionStore, hk: string, ttlAt: number, data = "d"): number {
-	store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, txOrderTs: 1 });
+	store.upsertItem({ routingHash: P(kb(hk)), hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, txOrderTs: 1 });
 	return new TextEncoder().encode(data).length + kb(hk).byteLength + kb("s").byteLength + EST_ROW_BYTES_K;
 }
 

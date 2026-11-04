@@ -18,7 +18,7 @@ import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
 import type { FokosStorageInterval, RouteKey } from "../../src/sharding/runtime-types.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
-import { partitionPrefixOf } from "../storage-prefix.js";
+import { partitionRoutingHashOf } from "../routing-hash.js";
 import { captureConsoleError } from "../partition-do/helpers.js";
 import {
 	controlledPartition,
@@ -46,7 +46,7 @@ function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: 
 	state.storage.sql.exec(
 		`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
 		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000')`,
-		instance.fokos.storagePrefix(tokenKey(token).hashKey),
+		instance.fokos.routingHashForKey(tokenKey(token).hashKey),
 		`tx-${crypto.randomUUID()}`,
 		token,
 		Date.now(),
@@ -74,12 +74,12 @@ async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<
 	);
 }
 
-/** True when `prefix` is inside the routingHash interval `[start, end)`. */
-function inInterval(prefix: RoutingHash, interval: FokosStorageInterval): boolean {
-	const bound = (key: { prefix: Uint8Array }) => asRoutingHash(key.prefix);
+/** True when `routingHash` is inside the routingHash interval `[start, end)`. */
+function inInterval(routingHash: RoutingHash, interval: FokosStorageInterval): boolean {
+	const bound = (key: { routingHash: Uint8Array }) => asRoutingHash(key.routingHash);
 	return (
-		compareRoutingHashes(prefix, bound(interval.start)) >= 0 &&
-		(interval.end === null || compareRoutingHashes(prefix, bound(interval.end)) < 0)
+		compareRoutingHashes(routingHash, bound(interval.start)) >= 0 &&
+		(interval.end === null || compareRoutingHashes(routingHash, bound(interval.end)) < 0)
 	);
 }
 
@@ -175,7 +175,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				read(
 					cursor,
 					(key) => {
-						reads.push(inInterval(instance.fokos.storagePrefix(key.hashKey), interval));
+						reads.push(inInterval(instance.fokos.routingHashForKey(key.hashKey), interval));
 						return belongsToTarget(key);
 					},
 					budget,
@@ -198,7 +198,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 						const interval = instance.fokos.storageInterval();
 						const rows = state.storage.sql.exec<{ idempotency_token: string }>(`SELECT idempotency_token FROM tc_state`).toArray();
 						const outside = rows.filter(
-							(row) => !inInterval(instance.fokos.storagePrefix(tokenKey(row.idempotency_token).hashKey), interval),
+							(row) => !inInterval(instance.fokos.routingHashForKey(tokenKey(row.idempotency_token).hashKey), interval),
 						);
 						expect(outside).toEqual([]);
 						return rows.map((row) => row.idempotency_token);
@@ -268,7 +268,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			state.storage.sql.exec(
 				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
 				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
-				instance.fokos.storagePrefix(tokenKey(token).hashKey),
+				instance.fokos.routingHashForKey(tokenKey(token).hashKey),
 				transactionId,
 				token,
 				Date.now() - 60_000,
@@ -310,7 +310,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		await rpc.status(pCtx);
 		await runInDurableObject(stub, async (_instance, state: DurableObjectState) => {
 			new PartitionStore(state.storage).insertPendingLock({
-				prefix: partitionPrefixOf(state)(KeyCodec.encode(lockKey.hashKey)),
+				routingHash: partitionRoutingHashOf(state)(KeyCodec.encode(lockKey.hashKey)),
 				hk: KeyCodec.encode(lockKey.hashKey),
 				sk: KeyCodec.encode(lockKey.sortKey),
 				transaction_id: first.transactionId,

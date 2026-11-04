@@ -79,8 +79,8 @@ export type FokosMigrationHostDeps = {
 	captureChanges: () => boolean;
 	/** The `DurableObjectId` of this partition, in hex: the producer ID of its export calls. */
 	selfId: () => string;
-	/** The storage prefix of a hash key in the shard group of this partition. */
-	storagePrefix: (hashKey: KeyBytes) => RoutingHash;
+	/** The routingHash of a hash key in the shard group of this partition. */
+	routingHashForKey: (hashKey: KeyBytes) => RoutingHash;
 };
 
 export class FokosMigrationHost implements MigrationHost {
@@ -154,12 +154,12 @@ export class FokosMigrationHost implements MigrationHost {
 					() => `fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)}, outside the slice`,
 				);
 			}
-			// The row is stored under the prefix it carries, so a wrong prefix puts it outside the range
-			// of its own hash key, where a later read by prefix cannot find it.
+			// The row is stored under the routingHash it carries, so a wrong routingHash puts it outside the range
+			// of its own hash key, where a later read by routingHash cannot find it.
 			invariant(
-				compareRoutingHashes(row.prefix, this.deps.storagePrefix(row.hk)) === 0,
+				compareRoutingHashes(row.routingHash, this.deps.routingHashForKey(row.hk)) === 0,
 				() =>
-					`fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)} with a prefix that is not the storage prefix of the hash key`,
+					`fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)} with a routingHash that is not the routingHash of the hash key`,
 			);
 		}
 	}
@@ -170,9 +170,9 @@ export class FokosMigrationHost implements MigrationHost {
 		const { store } = this.deps;
 		const reader: StreamReader<MigratedItem, StorageCursor> = {
 			read: (c, limit, interval) => store.queryItemsPage(c, limit, interval),
-			cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk }),
-			// A migrated item carries its storage prefix on the wire beside the item fields.
-			estimateBytes: (row) => row.prefix.byteLength + estimateItemBytes(row),
+			cursorOf: (row) => ({ routingHash: row.routingHash, hk: row.hk, sk: row.sk }),
+			// A migrated item carries its routingHash on the wire beside the item fields.
+			estimateBytes: (row) => row.routingHash.byteLength + estimateItemBytes(row),
 		};
 		const { rows, nextCursor } = collectStream(reader, cursor, read);
 		// A drained stream hands over to the next one with a fresh cursor. That costs one extra RPC and
@@ -186,12 +186,12 @@ export class FokosMigrationHost implements MigrationHost {
 		// The exact stored sizes, added per page, are what removes the whole-table estimate rebuild that
 		// used to close an import. A row already present contributes nothing, so a retried page cannot
 		// count its rows twice.
-		const added: Array<{ prefix: RoutingHash; hk: KeyBytes; bytes: number }> = [];
+		const added: Array<{ routingHash: RoutingHash; hk: KeyBytes; bytes: number }> = [];
 		let maxItemId = 0;
 		for (const item of items) {
 			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);
 			if (inserted) {
-				added.push({ prefix: item.prefix, hk: item.hk, bytes: estRowBytes });
+				added.push({ routingHash: item.routingHash, hk: item.hk, bytes: estRowBytes });
 			}
 			maxItemId = Math.max(maxItemId, item.item_id);
 		}
@@ -210,7 +210,7 @@ export class FokosMigrationHost implements MigrationHost {
 		const { store } = this.deps;
 		const reader: StreamReader<PendingTxItem, PendingTransactionCursor> = {
 			read: (c, limit, interval) => store.queryPendingTxPage(c, limit, interval),
-			cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
+			cursorOf: (row) => ({ routingHash: row.routingHash, hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 			estimateBytes: estimatePendingTxBytes,
 		};
 		const { rows, nextCursor } = collectStream(reader, cursor, read);
@@ -251,8 +251,8 @@ export class FokosMigrationHost implements MigrationHost {
 		const { store } = this.deps;
 		const reader: StreamReader<MigratedOutboxRow, StorageCursor> = {
 			read: (c, limit, interval) => store.queryOutboxPage(c, limit, interval),
-			cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk }),
-			estimateBytes: (row) => row.prefix.byteLength + row.hk.byteLength + row.sk.byteLength + OUTBOX_ROW_FIXED_BYTES,
+			cursorOf: (row) => ({ routingHash: row.routingHash, hk: row.hk, sk: row.sk }),
+			estimateBytes: (row) => row.routingHash.byteLength + row.hk.byteLength + row.sk.byteLength + OUTBOX_ROW_FIXED_BYTES,
 		};
 		const { rows, nextCursor } = collectStream(reader, cursor, read);
 		if (nextCursor) {
@@ -408,11 +408,11 @@ function assertStreamCursor(c: FokosDBHostCursor): void {
 	if (cursor === null) {
 		return;
 	}
-	const row: { prefix?: unknown; hk?: unknown; sk?: unknown; transaction_id?: unknown } = cursor;
+	const row: { routingHash?: unknown; hk?: unknown; sk?: unknown; transaction_id?: unknown } = cursor;
 	const isKey = (value: unknown) => value instanceof Uint8Array;
 	invariant(
-		isKey(row.prefix) && isKey(row.hk) && isKey(row.sk),
-		() => `fokos/migration-host: the ${stream} cursor has no storage prefix, hash key, or sort key`,
+		isKey(row.routingHash) && isKey(row.hk) && isKey(row.sk),
+		() => `fokos/migration-host: the ${stream} cursor has no routingHash, hash key, or sort key`,
 	);
 	invariant(
 		stream !== "pending_tx" || typeof row.transaction_id === "string",
@@ -469,14 +469,14 @@ function movesForward(requested: FokosDBHostCursor, next: FokosDBHostCursor): bo
 export type StreamPosition = NonNullable<KeyStreamCursor["cursor"]>;
 
 /**
- * Compares two positions of one stream in its read order: `(prefix, hk, sk)` for items, and
- * `(prefix, hk, sk, transaction_id)` for locks. Each key compares by unsigned bytes, as SQLite
+ * Compares two positions of one stream in its read order: `(routingHash, hk, sk)` for items, and
+ * `(routingHash, hk, sk, transaction_id)` for locks. Each key compares by unsigned bytes, as SQLite
  * compares a BLOB. A transaction id is ASCII, so the string order of JavaScript is the byte order of
  * SQLite.
  */
 export function comparePositions(a: StreamPosition, b: StreamPosition): number {
 	const byKey =
-		KeyCodec.compare(KeyCodec.asKeyBytes(a.prefix), KeyCodec.asKeyBytes(b.prefix)) ||
+		KeyCodec.compare(KeyCodec.asKeyBytes(a.routingHash), KeyCodec.asKeyBytes(b.routingHash)) ||
 		KeyCodec.compare(a.hk, b.hk) ||
 		KeyCodec.compare(a.sk, b.sk);
 	if (byKey !== 0) {

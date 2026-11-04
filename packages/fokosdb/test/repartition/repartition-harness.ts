@@ -19,7 +19,7 @@ import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../src/sharding/key-codec.js";
 import type { RoutingHash } from "../../src/sharding/hash-primitives.js";
-import { ALL_ROWS, prefixOf } from "../storage-prefix.js";
+import { ALL_ROWS, routingHashFor } from "../routing-hash.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import {
 	isRangePartition,
@@ -104,12 +104,12 @@ export type Cluster = {
 
 /**
  * The table of every cluster. A cluster keeps its storage apart with the suffix of its stub names, so
- * two clusters can share the table, and `P` gives the storage prefix of each node.
+ * two clusters can share the table, and `P` gives the routingHash of each node.
  */
 const CLUSTER_TABLE = "repartition";
 
-/** The storage prefix of a hash key in the shard group of every cluster, as a node of the cluster stores it. */
-export const P = (hk: KeyBytes): RoutingHash => prefixOf(hk, `fokos.p.${CLUSTER_TABLE}`);
+/** The routingHash of a hash key in the shard group of every cluster, as a node of the cluster stores it. */
+export const P = (hk: KeyBytes): RoutingHash => routingHashFor(hk, `fokos.p.${CLUSTER_TABLE}`);
 
 export type ClusterOptions = {
 	hashSplitN?: number;
@@ -243,7 +243,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					logParams: () => ({ doName, partitionId: ctx.partitionId }),
 					captureChanges: () => false,
 					selfId: () => doName,
-					storagePrefix: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
+					routingHashForKey: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
 				}),
 				computeRangeBoundaries: ({ routingHash, start, end, childCount }) => {
 					const plan = planRangeBoundaries(
@@ -302,7 +302,7 @@ export const CLEANUP_BATCH = 2;
 
 /** Writes one committed item straight into a node's store, as a user write would leave it. */
 export function putItem(store: PartitionStore, hk: string, sk: string, data = `d-${hk}-${sk}`): void {
-	store.upsertItem({ prefix: P(kb(hk)), hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt: null, txOrderTs: 1 });
+	store.upsertItem({ routingHash: P(kb(hk)), hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 }
 
 /** Writes one pending lock. The lock moves with its key to the target that owns the key. */
@@ -313,7 +313,7 @@ export function putLock(store: PartitionStore, hk: string, sk: string, transacti
 /** One unguarded lock row, for a test that writes it itself or compares an imported copy with it. */
 export function lockRow(hk: string, sk: string, transactionId = "tx-1"): PendingTxItem {
 	return {
-		prefix: P(kb(hk)),
+		routingHash: P(kb(hk)),
 		hk: kb(hk),
 		sk: kb(sk),
 		transaction_id: transactionId,

@@ -356,7 +356,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 			migration: new MaterializationMigrationHost({
 				store: this.#store,
 				selfId: () => this.ctx.id.toString(),
-				storagePrefix: (hashKey) => this.fokos.storagePrefix(hashKey),
+				routingHashForKey: (hashKey) => this.fokos.routingHashForKey(hashKey),
 			}),
 			// Each call of a target from before the cutover then has an epoch below the epoch that the
 			// child gets with its inherited work, so each receiver rejects a late call. A promotion
@@ -501,15 +501,15 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 					if (req.epoch > stored) {
 						this.#store.raiseProducerEpoch(req.producerId, req.epoch);
 					}
-					const prefix = this.fokos.storagePrefix(item.hashKey);
-					const current = this.#store.storedImage(prefix, item.hashKey, item.sortKey);
+					const routingHash = this.fokos.routingHashForKey(item.hashKey);
+					const current = this.#store.storedImage(routingHash, item.hashKey, item.sortKey);
 					if (current !== undefined && item.revision <= current.revision) {
 						return "applied";
 					}
 					if (overSize && !item.deleted) {
 						return "over_size";
 					}
-					const keyEstBytes = this.#store.putLatestImage(prefix, item, this.fokosNow(), current, targets);
+					const keyEstBytes = this.#store.putLatestImage(routingHash, item, this.fokosNow(), current, targets);
 					if (keyEstBytes !== undefined && !item.deleted) {
 						grown.push({ hashKey: item.hashKey, keyEstBytes });
 					}

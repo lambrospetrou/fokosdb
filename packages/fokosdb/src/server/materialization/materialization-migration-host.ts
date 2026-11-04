@@ -43,8 +43,8 @@ export type MaterializationMigrationHostDeps = {
 	store: MaterializationStore;
 	/** The `DurableObjectId` of this partition, in hex: the producer ID of its target calls. */
 	selfId: () => string;
-	/** The storage prefix of a hash key in the shard group of this partition. */
-	storagePrefix: (hashKey: KeyBytes) => RoutingHash;
+	/** The routingHash of a hash key in the shard group of this partition. */
+	routingHashForKey: (hashKey: KeyBytes) => RoutingHash;
 };
 
 const STREAM_ORDER: Record<MaterializationHostCursor["stream"], number> = { items: 0, producer_fences: 1, state: 2 };
@@ -68,7 +68,7 @@ export class MaterializationMigrationHost implements MigrationHost {
 				const minSeq = cursors.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...cursors);
 				const reader: StreamReader<MigratedLatestItem, StorageCursor> = {
 					read: (c, limit, i) => store.queryMigrationItems(c, limit, i, minSeq),
-					cursorOf: (row) => ({ prefix: row.prefix, hk: row.hk, sk: row.sk }),
+					cursorOf: (row) => ({ routingHash: row.routingHash, hk: row.hk, sk: row.sk }),
 					estimateBytes: (row) =>
 						row.est_row_bytes +
 						(row.positions.length + row.retries.length) * LINKED_ROW_BYTES +
@@ -116,11 +116,11 @@ export class MaterializationMigrationHost implements MigrationHost {
 			case "items": {
 				// An item that is present already contributes nothing, so a retried page does not count
 				// its rows two times.
-				const added: Array<{ prefix: RoutingHash; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
+				const added: Array<{ routingHash: RoutingHash; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
 				let maxItemId = 0;
 				for (const item of p.items) {
 					if (store.insertMigratedItem(item)) {
-						added.push({ prefix: item.prefix, hk: item.hk, bytes: item.est_row_bytes });
+						added.push({ routingHash: item.routingHash, hk: item.hk, bytes: item.est_row_bytes });
 					}
 					maxItemId = Math.max(maxItemId, item.item_id);
 				}
@@ -168,12 +168,12 @@ export class MaterializationMigrationHost implements MigrationHost {
 				if (!inSlice({ hashKey: item.hk, sortKey: item.sk })) {
 					invariant(false, () => `fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)}, outside the slice`);
 				}
-				// The row is stored under the prefix it carries, so a wrong prefix puts it outside the
-				// range of its own hash key, where a later read by prefix cannot find it.
+				// The row is stored under the routingHash it carries, so a wrong routingHash puts it outside the
+				// range of its own hash key, where a later read by routingHash cannot find it.
 				invariant(
-					compareRoutingHashes(item.prefix, this.deps.storagePrefix(item.hk)) === 0,
+					compareRoutingHashes(item.routingHash, this.deps.routingHashForKey(item.hk)) === 0,
 					() =>
-						`fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)} with a prefix that is not the storage prefix of the hash key`,
+						`fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)} with a routingHash that is not the routingHash of the hash key`,
 				);
 			}
 		}

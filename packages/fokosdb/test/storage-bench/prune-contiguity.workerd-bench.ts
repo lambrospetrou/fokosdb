@@ -15,7 +15,7 @@ import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import { prefixOf } from "../storage-prefix.js";
+import { routingHashFor } from "../routing-hash.js";
 
 const FILL_BYTES = 8 * 1024 * 1024;
 const DATA_BYTES = [100, 200, 500, 1_000, 1_500, 2_000];
@@ -37,7 +37,15 @@ it.each(DATA_BYTES)("a contiguous delete of %i-byte items frees a proportional p
 				for (let i = 0; i < ROWS_PER_TRANSACTION; i++) {
 					const hk = KeyCodec.encode(crypto.randomUUID());
 					const data = crypto.getRandomValues(new Uint8Array(dataBytes));
-					store.upsertItem({ prefix: prefixOf(hk), hk, sk: KeyCodec.encode("s"), data, kind: "bytes", ttlAt: null, txOrderTs: 1 });
+					store.upsertItem({
+						routingHash: routingHashFor(hk),
+						hk,
+						sk: KeyCodec.encode("s"),
+						data,
+						kind: "bytes",
+						ttlAt: null,
+						txOrderTs: 1,
+					});
 				}
 			});
 			rows += ROWS_PER_TRANSACTION;

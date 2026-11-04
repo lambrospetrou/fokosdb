@@ -275,8 +275,8 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 				if (plan.kind === "key_promotion" && slice?.kind === "promoted_routing_hash") {
 					const moved = slice.routingHash;
 					for (const { tenant_id } of sql.exec<{ tenant_id: string }>("SELECT DISTINCT tenant_id FROM docs").toArray()) {
-						const prefix = this.fokos.storagePrefix(KeyCodec.encode(tenant_id));
-						if (prefix.length === moved.length && prefix.every((b, i) => b === moved[i])) {
+						const routingHash = this.fokos.routingHashForKey(KeyCodec.encode(tenant_id));
+						if (routingHash.length === moved.length && routingHash.every((b, i) => b === moved[i])) {
 							sql.exec("DELETE FROM docs WHERE tenant_id = ?", tenant_id);
 						}
 					}

@@ -4,10 +4,10 @@ import { describe, expect, it } from "vitest";
 import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: Parameters<typeof prefixOf>[0]) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);
@@ -131,7 +131,7 @@ describe("MaterializationStore — change positions", () => {
 describe("MaterializationStore — row size estimate", () => {
 	it("counts the data, the keys two times, and the fixed part for a live image, and the keys three times for a tombstone", async () => {
 		await withStore((h) => {
-			// The keys and the 8-byte storage prefix.
+			// The keys and the 8-byte routingHash.
 			const keys = 8 + kb("x").byteLength + NO_SK.byteLength;
 			h.ingest("x", 1, []);
 			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe("v1".length + 2 * keys + 70);
@@ -216,7 +216,7 @@ describe("MaterializationStore — the item-id counter", () => {
 			h.store.transactionSync(() => {
 				h.store.insertMigratedItem({
 					item_id: 2,
-					prefix: P(kb("copied")),
+					routingHash: P(kb("copied")),
 					hk: kb("copied"),
 					sk: kb("s"),
 					revision: 1,
@@ -245,7 +245,7 @@ describe("MaterializationStore — the item-id counter", () => {
 			put(h.store, "local");
 			const copy = (hk: string) => ({
 				item_id: idOf(h, "local"),
-				prefix: P(kb(hk)),
+				routingHash: P(kb(hk)),
 				hk: kb(hk),
 				sk: kb("s"),
 				revision: 1,

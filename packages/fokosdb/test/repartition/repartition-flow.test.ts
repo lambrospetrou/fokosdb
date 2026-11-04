@@ -25,7 +25,7 @@ import {
 	type Node,
 	type NodeEnv,
 } from "./repartition-harness.js";
-import { ALL_ROWS } from "../storage-prefix.js";
+import { ALL_ROWS } from "../routing-hash.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { compositeInInterval } from "../../src/sharding/repartition-slice.js";
@@ -306,7 +306,7 @@ describe("Repartition — initialization and cutover", () => {
 			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
 			const participant = new TransactionParticipant({
 				store,
-				storagePrefix: P,
+				routingHashForKey: P,
 				maxClockSkewMs: () => 0,
 				staleTransactionMs: () => DEFAULT_STALE_TRANSACTION_MS,
 				// The range root owns every key of the promoted hash key.
@@ -383,7 +383,7 @@ describe("Repartition — the migration protocol", () => {
 		await root.enter(({ source, store }) => {
 			for (let i = 0; i < 1_500; i++) {
 				store.upsertItem({
-					prefix: P(kb(`k${i}`)),
+					routingHash: P(kb(`k${i}`)),
 					hk: kb(`k${i}`),
 					sk: KeyCodec.encodeOptional(undefined),
 					data: `d-${i}`,
@@ -579,7 +579,7 @@ describe("Repartition — the migration protocol", () => {
 			expect(target.importState()).toBe("imported");
 			// A user delete lands on the finished copy.
 			store.deleteItem({
-				prefix: P(kb(keyForChild(0, c.base.topology, "a"))),
+				routingHash: P(kb(keyForChild(0, c.base.topology, "a"))),
 				hk: kb(keyForChild(0, c.base.topology, "a")),
 				sk: kb("s1"),
 				txOrderTs: 99,
@@ -662,8 +662,8 @@ describe("Repartition — the migration protocol", () => {
 		const child = await firstChild(c, root);
 
 		for (const bad of [
-			{ prefix: P(kb("a")), hk: null, sk: kb("s1") },
-			{ prefix: P(kb("a")), hk: kb("a"), sk: undefined },
+			{ routingHash: P(kb("a")), hk: null, sk: kb("s1") },
+			{ routingHash: P(kb("a")), hk: kb("a"), sk: undefined },
 			{ hk: kb("a"), sk: kb("s1") },
 		]) {
 			c.nextPullPage(root.doName, {
@@ -1163,7 +1163,7 @@ describe("Repartition — range splits", () => {
 		const sks = ["s1", "s2", "s3", "s4", "s5", "s6"];
 		await rangeRoot.enter(({ source, store }) => {
 			store.upsertItem({
-				prefix: P(kb("alice")),
+				routingHash: P(kb("alice")),
 				hk: kb("alice"),
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "d",

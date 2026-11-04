@@ -14,10 +14,10 @@ import type { TargetImage } from "./materialization-store.js";
 import invariant from "../../shared/invariant.js";
 import type { ExpressionValue } from "../../shared/expression/types.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NO_SK = KeyCodec.encodeOptional(undefined);

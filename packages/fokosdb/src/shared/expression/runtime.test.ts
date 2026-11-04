@@ -12,10 +12,10 @@ import { materializeExpressionBindings } from "./bindings.js";
 import { evaluateConditionPlan } from "./runtime.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, type ExpressionSemanticItem } from "./test-fixtures.js";
 import type { ConditionExpression } from "./types.js";
-import { prefixOf } from "../../../test/storage-prefix.js";
+import { routingHashFor } from "../../../test/routing-hash.js";
 
-/** The storage prefix of a hash key, as the partition stores it. */
-const P = (hk: KeyBytes) => prefixOf(hk);
+/** The routingHash of a hash key, as the partition stores it. */
+const P = (hk: KeyBytes) => routingHashFor(hk);
 
 type StoredFixture = {
 	hashKey: string | Uint8Array;
@@ -39,7 +39,7 @@ async function evaluate(item: StoredFixture | null, condition: ConditionExpressi
 
 function putFixture(storage: DurableObjectStorage, hashKey: KeyBytes, sortKey: KeyBytes, item: StoredFixture): void {
 	new PartitionStore(storage).upsertItem({
-		prefix: P(hashKey),
+		routingHash: P(hashKey),
 		hk: hashKey,
 		sk: sortKey,
 		data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),

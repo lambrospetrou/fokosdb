@@ -441,7 +441,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			maxClockSkewMs: () => this.config().maxClockSkewMs,
 			staleTransactionMs: () => this.config().staleTransactionMs,
 			ownerCheck: () => this.fokos.ownerCheck(),
-			storagePrefix: (hashKey) => this.fokos.storagePrefix(hashKey),
+			routingHashForKey: (hashKey) => this.fokos.routingHashForKey(hashKey),
 		});
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
@@ -1152,7 +1152,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
 				captureChanges: () => this.#captureEnabled(),
 				selfId: () => this.ctx.id.toString(),
-				storagePrefix: (hashKey) => this.fokos.storagePrefix(hashKey),
+				routingHashForKey: (hashKey) => this.fokos.routingHashForKey(hashKey),
 			}),
 			// After the cutover the export claims skip the moved rows, so only the export calls from before
 			// the cutover can carry them. The raise commits with the cutover, so each of those calls has an
@@ -1274,8 +1274,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	// of its caller.
 
 	/** Refuses a non-transactional write to an item that an in-progress transaction holds. It does not wait for the lock. */
-	private assertNotLocked(prefix: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes): void {
-		const pendingRow = this.#store.pendingLockFor(prefix, hashKey, sortKey);
+	private assertNotLocked(routingHash: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes): void {
+		const pendingRow = this.#store.pendingLockFor(routingHash, hashKey, sortKey);
 		if (pendingRow) {
 			// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
 			// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
@@ -1284,11 +1284,11 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	private upsertNow(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		item: { hashKey: KeyBytes; sortKey: KeyBytes; data: string | Uint8Array; kind: DataKind; ttlAt?: number },
 	) {
 		return this.#store.upsertItem({
-			prefix,
+			routingHash,
 			hk: item.hashKey,
 			sk: item.sortKey,
 			data: item.data,
@@ -1299,8 +1299,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	/** The delete stamps the transaction order watermark, as a transactional delete does. */
-	private deleteNow(prefix: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes) {
-		return this.#store.deleteItem({ prefix, hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
+	private deleteNow(routingHash: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes) {
+		return this.#store.deleteItem({ routingHash, hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
 	}
 
 	/**
@@ -1309,7 +1309,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * exists. `putItem`, `deleteItem`, and each operation of a batch write share it.
 	 */
 	private conditionalWrite<W>(
-		prefix: RoutingHash,
+		routingHash: RoutingHash,
 		hashKey: KeyBytes,
 		sortKey: KeyBytes,
 		condition: ConditionExpression | undefined,
@@ -1317,11 +1317,11 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		write: () => W,
 	): ConditionalWriteResult<W> {
 		return this.#store.transactionSync((): ConditionalWriteResult<W> => {
-			this.assertNotLocked(prefix, hashKey, sortKey);
+			this.assertNotLocked(routingHash, hashKey, sortKey);
 
-			const conditionRes = condition ? this.#store.evaluateCondition(condition, prefix, hashKey, sortKey) : null;
+			const conditionRes = condition ? this.#store.evaluateCondition(condition, routingHash, hashKey, sortKey) : null;
 			if (conditionRes && !conditionRes.conditionOk) {
-				const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(prefix, hashKey, sortKey) : undefined;
+				const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(routingHash, hashKey, sortKey) : undefined;
 				return { outcome: "rejected", conditionRes, image };
 			}
 
@@ -1334,8 +1334,10 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	private putItemLocal(req: PutItemRpcRequest, call: FokosLocalCall): PutItemRpcResponse {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
-		const prefix = this.fokos.storagePrefix(hashKey);
-		const localRes = this.conditionalWrite(prefix, hashKey, sortKey, req.condition, wantsImage, () => this.upsertNow(prefix, req));
+		const routingHash = this.fokos.routingHashForKey(hashKey);
+		const localRes = this.conditionalWrite(routingHash, hashKey, sortKey, req.condition, wantsImage, () =>
+			this.upsertNow(routingHash, req),
+		);
 
 		if (localRes.outcome === "rejected") {
 			return {
@@ -1359,9 +1361,9 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	private deleteItemLocal(req: DeleteItemRpcRequest): DeleteItemRpcResponse {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
-		const prefix = this.fokos.storagePrefix(hashKey);
-		const localRes = this.conditionalWrite(prefix, hashKey, sortKey, req.condition, wantsImage, () =>
-			this.deleteNow(prefix, hashKey, sortKey),
+		const routingHash = this.fokos.routingHashForKey(hashKey);
+		const localRes = this.conditionalWrite(routingHash, hashKey, sortKey, req.condition, wantsImage, () =>
+			this.deleteNow(routingHash, hashKey, sortKey),
 		);
 
 		if (localRes.outcome === "rejected") {
@@ -1391,9 +1393,9 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * `estimateProjectedRowBytes` counts for it. `getItem` and the batch read share it.
 	 */
 	private readItem(hashKey: KeyBytes, sortKey: KeyBytes, projection: readonly ProjectionExpression[] | undefined): ItemRead {
-		const prefix = this.fokos.storagePrefix(hashKey);
+		const routingHash = this.fokos.routingHashForKey(hashKey);
 		if (projection !== undefined) {
-			const { row, rowsRead, rowsWritten } = this.#store.getItemProjected(projection, prefix, hashKey, sortKey);
+			const { row, rowsRead, rowsWritten } = this.#store.getItemProjected(projection, routingHash, hashKey, sortKey);
 			if (!row) {
 				return { rowsRead, rowsWritten };
 			}
@@ -1405,7 +1407,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			};
 			return { found: { item, bytes: estimateProjectedRowBytes(row.projected) }, rowsRead, rowsWritten };
 		}
-		const { row, rowsRead, rowsWritten } = this.#store.getItem(prefix, hashKey, sortKey);
+		const { row, rowsRead, rowsWritten } = this.#store.getItem(routingHash, hashKey, sortKey);
 		if (!row) {
 			return { rowsRead, rowsWritten };
 		}
@@ -1476,16 +1478,16 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			const { opIndex, hashKey, sortKey } = item;
 			let local: ConditionalWriteResult<ReturnType<FokosDBPartitionDO["upsertNow"]> | ReturnType<FokosDBPartitionDO["deleteNow"]>>;
 			try {
-				const prefix = this.fokos.storagePrefix(hashKey);
+				const routingHash = this.fokos.routingHashForKey(hashKey);
 				// TODO: This might be performance slowdown instead of doing a transaction for all the items.
 				//       The only reason we do this is to allow partial application of the batch, but might reconsider.
 				local = this.conditionalWrite(
-					prefix,
+					routingHash,
 					hashKey,
 					sortKey,
 					item.condition,
 					item.returnValuesOnConditionCheckFailure === "all_old",
-					() => (item.operation === "put" ? this.upsertNow(prefix, item) : this.deleteNow(prefix, hashKey, sortKey)),
+					() => (item.operation === "put" ? this.upsertNow(routingHash, item) : this.deleteNow(routingHash, hashKey, sortKey)),
 				);
 			} catch (e) {
 				out.failed.push({ ...classifyBatchFailure(e, { write: true, local: true }), opIndexes: [opIndex], partitionIndex: 0 });
@@ -1560,8 +1562,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					if (req.epoch > stored) {
 						this.#store.raiseProducerEpoch(req.producerId, req.epoch);
 					}
-					const prefix = this.fokos.storagePrefix(item.hashKey);
-					return item.op === "put" ? this.upsertNow(prefix, item) : this.deleteNow(prefix, item.hashKey, item.sortKey);
+					const routingHash = this.fokos.routingHashForKey(item.hashKey);
+					return item.op === "put" ? this.upsertNow(routingHash, item) : this.deleteNow(routingHash, item.hashKey, item.sortKey);
 				});
 				if (res === undefined) {
 					out.failed.push({
@@ -1618,7 +1620,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		});
 		const { rowsRead, rowsWritten } = this.#store.scanQueryPage(
 			{
-				prefix: this.fokos.storagePrefix(hk),
+				routingHash: this.fokos.routingHashForKey(hk),
 				hk,
 				lower,
 				lowerInclusive,
@@ -1853,7 +1855,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			if (!pending.op_list.every(([, operation]) => operation === "check")) {
 				return false;
 			}
-			const stamp = this.#store.getItemStamp(pending.prefix, pending.hk, pending.sk).row;
+			const stamp = this.#store.getItemStamp(pending.routingHash, pending.hk, pending.sk).row;
 			const recorded = stamp ? stamp.last_read_ts : (maxDeleteTxOrderTs ??= this.#store.getMaxDeleteTxOrderTs());
 			return recorded >= pending.transaction_ts;
 		});
