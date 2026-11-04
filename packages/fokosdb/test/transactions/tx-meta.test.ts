@@ -1,3 +1,4 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { isFokosDBError, type FokosDB } from "../../src/client/db.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
@@ -6,6 +7,7 @@ import type { ConditionExpression } from "../../src/shared/types.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { TestPartition } from "../partition-do/partition-harness.js";
 import {
+	acceptAnyClockSkew,
 	controlledCoordinator,
 	controlledPartition,
 	coordinatorRouter,
@@ -44,6 +46,7 @@ describe("transactions - meta on the coordinator path", () => {
 	it("names each participant and the coordinator on a commit, and a replay names no participant", async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "meta-commit");
+		await acceptAnyClockSkew(db, keys);
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `meta-commit-${crypto.randomUUID()}`;
 
@@ -61,6 +64,7 @@ describe("transactions - meta on the coordinator path", () => {
 	it("names the partition of each rejected operation of a cancelled transaction", async () => {
 		const db = makeDB({ controlled: true });
 		const [missing, other] = keysAcrossPartitions(db, 2, "meta-cancel");
+		await acceptAnyClockSkew(db, [missing, other]);
 		const token = `meta-cancel-${crypto.randomUUID()}`;
 
 		const err = await cancelOf(
@@ -96,6 +100,7 @@ describe("transactions - meta on the coordinator path", () => {
 	it("names the coordinator and the participants that answered on transaction_commit_pending", async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "meta-pending");
+		await acceptAnyClockSkew(db, keys);
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `meta-pending-${crypto.randomUUID()}`;
 		const coordinator = controlledCoordinator(db);
@@ -150,7 +155,7 @@ describe("transactions - meta on the fast path", () => {
 
 describe("transactions - meta of a participant that fans out", () => {
 	it("lists each owner below a split participant, with the index of each rejected operation and item", async () => {
-		const db = makeDB({ rootTreesN: 1, maxSizeMb: 1 });
+		const db = makeDB({ rootTreesN: 1, maxSizeMb: 1, controlled: true });
 		const { pCtx, stub } = owningPartition(db, { hashKey: "any", sortKey: "sk" });
 		const root = TestPartition.at(pCtx, stub);
 		await root.splitHash();
@@ -165,6 +170,10 @@ describe("transactions - meta of a participant that fans out", () => {
 				owners.push(owner);
 			}
 		}
+		// The skew check runs on the children that own the keys, not on the root that forwards.
+		await Promise.all(
+			owners.map((owner) => env.CONTROLLED_PARTITION_DO.getByName(owner).testConfig({ maxClockSkewMs: Number.MAX_SAFE_INTEGER })),
+		);
 		const token = `meta-fanout-${crypto.randomUUID()}`;
 		const childEntry = (i: number) => expect.objectContaining({ servedByActorName: owners[i], hashDepth: 1 });
 

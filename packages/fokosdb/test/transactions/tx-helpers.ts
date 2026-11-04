@@ -78,18 +78,20 @@ function withoutPartition(result: TransactWriteOperationResult): TransactWriteOp
 	return rest;
 }
 
-/** The total wait of `writeOutcomeWithClockRetry`. It must stay well below the test timeout of 5 s. */
+/** The total wait of `writeOutcomeWithClockRetry`. It must stay well below the test timeout. */
 const CLOCK_RETRY_BUDGET_MS = 3_000;
 
 /**
- * Sends a transaction write, and sends it again after a cancel with `timestamp_conflict`.
+ * Sends a transaction write, and sends it again after a cancel that a clock of the local runtime
+ * caused: `timestamp_conflict` or `clock_skew`.
  *
  * On the two-phase path, the coordinator stamps the transaction with its own clock. A partition
- * refuses a stamp that is not above the stamp of the item, or above the last delete of the partition.
- * A write of the same test, or of another test on a shared table, can have a stamp in the same
- * millisecond, and the clock can go back in local workerd/miniflare. Under the load of the full
- * suite, the clock of one Durable Object can be more than one second behind the clock of another.
- * A cancelled transaction applies nothing, thus a new attempt is safe.
+ * refuses a stamp that is not above the stamp of the item (`timestamp_conflict`), or a stamp that
+ * is more than `maxClockSkewMs` ahead of the partition clock (`clock_skew`). In local workerd the
+ * clock of a Durable Object moves only at its I/O, so under the load of the full suite the clock of
+ * one Durable Object can stay more than a second behind the clock of another, and a stamp that the
+ * same wall clock made in order can arrive out of order. A cancelled transaction applies nothing,
+ * thus a new attempt is safe.
  * A cancel for any other reason returns at once.
  *
  * The wait between attempts doubles from 2 ms to at most 250 ms, and the waits stop after
@@ -103,7 +105,7 @@ export async function writeOutcomeWithClockRetry(db: FokosDB, request: TransactW
 	let outcome = await writeOutcome(db.transactWriteItems(request));
 	let waitMs = 2;
 	let waitedMs = 0;
-	while (waitedMs < CLOCK_RETRY_BUDGET_MS && isTimestampConflict(outcome)) {
+	while (waitedMs < CLOCK_RETRY_BUDGET_MS && isClockCancel(outcome)) {
 		await new Promise((resolve) => setTimeout(resolve, waitMs));
 		waitedMs += waitMs;
 		waitMs = Math.min(waitMs * 2, 250);
@@ -112,9 +114,11 @@ export async function writeOutcomeWithClockRetry(db: FokosDB, request: TransactW
 	return outcome;
 }
 
-function isTimestampConflict(outcome: WriteOutcome): boolean {
+const CLOCK_CANCEL_CODES: ReadonlySet<string> = new Set(["timestamp_conflict", "clock_skew"]);
+
+function isClockCancel(outcome: WriteOutcome): boolean {
 	return (
-		outcome.outcome === "cancelled" && outcome.results.some((op) => op.outcome === "rejected" && op.reason.code === "timestamp_conflict")
+		outcome.outcome === "cancelled" && outcome.results.some((op) => op.outcome === "rejected" && CLOCK_CANCEL_CODES.has(op.reason.code))
 	);
 }
 
@@ -235,6 +239,22 @@ export function owningPartition(db: FokosDB, key: Key) {
 export function controlledPartition(db: FokosDB, key: Key): DurableObjectStub<ControlledPartitionDO> {
 	expect(db.options().table.ns, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_PARTITION_DO");
 	return env.CONTROLLED_PARTITION_DO.getByName(partitionNameOf(db, key));
+}
+
+/**
+ * Lets the partition that owns each of `keys` accept a transaction stamp of any distance ahead of
+ * its clock. In local workerd the clock of a Durable Object moves only at its I/O, so under load it
+ * can stay more than `maxClockSkewMs` behind the clock of a coordinator, and the prepare then
+ * answers `clock_skew`. A test that is not about the clock uses this, and a test with a
+ * `clientRequestToken` needs it: a cancelled token cannot be retried. The tests of the check give
+ * the participant their own clocks. The table must be `controlled`.
+ */
+export async function acceptAnyClockSkew(db: FokosDB, keys: Key[]): Promise<void> {
+	const partitions = new Map<string, DurableObjectStub<ControlledPartitionDO>>();
+	for (const key of keys) {
+		partitions.set(partitionNameOf(db, key), controlledPartition(db, key));
+	}
+	await Promise.all([...partitions.values()].map((partition) => partition.testConfig({ maxClockSkewMs: Number.MAX_SAFE_INTEGER })));
 }
 
 /**

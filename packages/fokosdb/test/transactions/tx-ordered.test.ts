@@ -7,10 +7,10 @@ import { describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
-import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { TransactWriteItem } from "../../src/shared/transaction-api-types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import {
+	acceptAnyClockSkew,
 	controlledCoordinator,
 	controlledPartition,
 	type Key,
@@ -19,6 +19,7 @@ import {
 	makeDB,
 	txCalls,
 	writeOutcome,
+	writeOutcomeWithClockRetry,
 } from "./tx-helpers.js";
 
 const TTL_AT = Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
@@ -166,7 +167,7 @@ async function expectSameOnBothPaths(build: (keys: Key[]) => TransactWriteItem[]
 	for (const [i, db] of tables.entries()) {
 		await seed(db, keys);
 		if (i < 2) {
-			await db.transactWriteItems({ items, ...ORDERED });
+			expect(await writeOutcomeWithClockRetry(db, { items, ...ORDERED })).toMatchObject({ outcome: "committed" });
 		} else {
 			for (const item of items) {
 				await db.transactWriteItems({ items: [item] });
@@ -217,17 +218,19 @@ describe("transactWriteItems - ordered_per_item cancellation", () => {
 		await db.putItem({ ...b, data: "b" });
 		const before = await readAll(db, [a, b]);
 
-		const error = await db.transactWriteItems({ items: [put(a, "a"), check(a, false), put(a, "a2"), del(b)], ...ORDERED }).then(
-			() => null,
-			(e: unknown) => e,
-		);
-		expect(error).toBeInstanceOf(FokosTransactionCancelledError);
-		expect((error as FokosTransactionCancelledError).results).toMatchObject([
-			{ outcome: "passed" },
-			{ outcome: "rejected", reason: { code: "condition_failed" } },
-			{ outcome: "not_evaluated" },
-			{ outcome: "passed" },
-		]);
+		const outcome = await writeOutcomeWithClockRetry(db, {
+			items: [put(a, "a"), check(a, false), put(a, "a2"), del(b)],
+			...ORDERED,
+		});
+		expect(outcome).toMatchObject({
+			outcome: "cancelled",
+			results: [
+				{ outcome: "passed" },
+				{ outcome: "rejected", reason: { code: "condition_failed" } },
+				{ outcome: "not_evaluated" },
+				{ outcome: "passed" },
+			],
+		});
 		expect(await readAll(db, [a, b])).toEqual(before);
 	});
 });
@@ -236,6 +239,7 @@ describe("transactWriteItems - ordered_per_item recovery", () => {
 	it("finishes the commit of an ordered transaction in the tx_recovery job, and a replay applies nothing", async () => {
 		const db = makeDB({ controlled: true });
 		const [a, b] = keysAcrossPartitions(db, 2, `ordered-recovery-${crypto.randomUUID()}`);
+		await acceptAnyClockSkew(db, [a, b]);
 		await db.putItem({ ...b, data: "b" });
 		const coordinator = controlledCoordinator(db);
 		await coordinator.testConfig({
