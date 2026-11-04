@@ -6,7 +6,8 @@ description: Capture CPU and heap (allocation) profiles of a deployed fokosdb ht
 # Profile a deployed fokosdb worker
 
 Produce pprof CPU and heap profiles of the deployed `examples/http-api` worker and of a Durable Object
-partition that serves the traffic.
+partition that serves the traffic. For a local `wrangler dev` worker use the `profile-worker-local`
+skill, which drives the CDP inspector instead of the Cloudflare API.
 
 ## Rules
 
