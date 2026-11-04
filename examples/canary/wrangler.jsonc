@@ -61,7 +61,10 @@
 		"DEMO_CRON_WORKLOADS": "crud,tx,query,batch,ttl",
 		// The default instance name of the cron run. External runners use their own instance names.
 		"DEMO_CRON_INSTANCE": "0",
-		// The HTTP API requires the `x-fokos-secret-token` header only when this is set.
-		"DEMO_API_TOKEN": "",
+	},
+	// The HTTP API requires the `x-fokos-secret-token` header when this is set. Deploy sets it with
+	// `wrangler secret put DEMO_API_TOKEN`; local dev sets it in .dev.vars (see .dev.vars.example).
+	"secrets": {
+		"required": ["DEMO_API_TOKEN"],
 	},
 }
