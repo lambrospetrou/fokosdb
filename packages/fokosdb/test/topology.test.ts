@@ -1,16 +1,19 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB, type FokosDBOptions } from "../src/client/db.js";
 import type { FokosDBAutoAdminDO } from "../src/server/do-auto-admin.js";
 import { KeyCodec } from "../src/sharding/key-codec.js";
 import { hashPrefixBucketOf } from "../src/sharding/hash-primitives.js";
-import { namespaceFingerprint, type DataNamespaceKey } from "../src/shared/do-stubs.js";
-import { topologyAdminName } from "../src/shared/partition-context.js";
-import { isPromotedHashPrefixBucket, parseHashBody } from "../src/sharding/topology-codec.js";
+import { namespaceFingerprint, type DataNamespaceKey, type TopologyAdminAddress } from "../src/shared/do-stubs.js";
+import { hashPrefixBucketTopologyAdminName, topologyAdminName } from "../src/shared/partition-context.js";
+import { topologyCacheFor } from "../src/shared/topology-hooks.js";
+import { topologyGetForRangePath, topologyGetPath } from "../src/sharding/topology-cache.js";
+import { isPromotedHashPrefixBucket, parseHashBody, parseRangeBody } from "../src/sharding/topology-codec.js";
 import { TOPOLOGY_BLOOM_MIN_CAPACITY } from "../src/sharding/topology-encode.js";
 import type { FokosTopologyRead } from "../src/sharding/topology-keeper.js";
 import { TARGET_WAIT } from "./partition-do/helpers.js";
+import { makeRangeRoot } from "./partition-do/partition-harness.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // maxSizeMb 0.25 is 262,144 bytes. The empty schema holds about 100 KB, so a few 50 KB items split a root.
@@ -258,5 +261,81 @@ describe("FokosDB — two tables with the same name on two ns namespaces", () =>
 				expect(items.map((item) => item.baseHashKey)).toEqual([baseHashKey]);
 			}, TARGET_WAIT);
 		}
+	});
+});
+
+describe("FokosDB — the admin of a promoted hashPrefixBucket", () => {
+	/** The kinds of the reports that the admin `name` holds for `shardGroup`. */
+	const reportKinds = async (name: string, shardGroup: string) =>
+		await runInDurableObject(env.FOKOS_ADMIN_DO.getByName(name), (_: FokosDBAutoAdminDO, state) =>
+			state.storage.sql
+				.exec<{ kind: string }>(`SELECT kind FROM fokos_topo_repartitions WHERE shard_group = ?1 ORDER BY kind`, shardGroup)
+				.toArray()
+				.map((r) => r.kind),
+		);
+	const groupRow = async (name: string, shardGroup: string) =>
+		await runInDurableObject(env.FOKOS_ADMIN_DO.getByName(name), (_: FokosDBAutoAdminDO, state) =>
+			state.storage.sql
+				.exec<{ epoch: number; reset_at: number }>(`SELECT epoch, reset_at FROM fokos_topo_groups WHERE shard_group = ?1`, shardGroup)
+				.one(),
+		);
+	type Entrypoint = (opts: { props: TopologyAdminAddress }) => Fetcher;
+	const entrypointRead = async (props: TopologyAdminAddress, path: string) => {
+		const error = console.error;
+		console.error = () => {};
+		try {
+			return await (exports as unknown as { FokosDBTopologyCache: Entrypoint })
+				.FokosDBTopologyCache({ props })
+				.fetch(`http://topology${path}`);
+		} finally {
+			console.error = error;
+		}
+	};
+
+	it("a promotion reaches both admins, a range split only the admin of its hashPrefixBucket, and destroy resets both", async () => {
+		const tableName = `topotest.${crypto.randomUUID().replaceAll("-", "")}`;
+		const shardGroup = `fokos.p.${tableName}`;
+		const { root, hashPartition } = await makeRangeRoot(2, {
+			tableName,
+			nsAdmin: "FOKOS_ADMIN_DO",
+			topologyEntrypoint: "FokosDBTopologyCache",
+		});
+		await root.splitRange("a");
+		const bucket = hashPartition.bucketOf("alice");
+		const fp = namespaceFingerprint(env, "PARTITION_DO", undefined);
+		const groupAdmin = topologyAdminName(shardGroup, fp);
+		const bucketAdmin = hashPrefixBucketTopologyAdminName(shardGroup, fp, bucket);
+
+		await vi.waitFor(async () => {
+			for (const partition of [hashPartition, root, ...(await root.children())]) {
+				await partition.runDueWork();
+			}
+			expect(await reportKinds(bucketAdmin, shardGroup)).toEqual(["key_promotion", "range_split"]);
+			expect(await reportKinds(groupAdmin, shardGroup)).toEqual(["key_promotion"]);
+		}, WAIT);
+
+		// A caller reads the range topology from the admin of the hashPrefixBucket, after its build.
+		await vi.waitFor(async () => {
+			const read = (await env.FOKOS_ADMIN_DO.getByName(bucketAdmin).getRangeTopology(shardGroup, bucket)) as FokosTopologyRead;
+			expect(parseRangeBody((read as { body: Uint8Array }).body).n).toBeGreaterThan(0);
+		}, WAIT);
+		const cache = topologyCacheFor(hashPartition.ctx, "PARTITION_DO", () => {});
+		const response = await cache!.fetch(topologyGetForRangePath(shardGroup, bucket), AbortSignal.timeout(5_000), bucket);
+		expect(response.status).toBe(200);
+		expect(parseRangeBody(new Uint8Array(await response.arrayBuffer())).n).toBeGreaterThan(0);
+		// The entrypoint answers a read only from the admin that holds it.
+		const groupProps = { nsAdmin: "FOKOS_ADMIN_DO" as const, name: groupAdmin };
+		const bucketProps = { nsAdmin: "FOKOS_ADMIN_DO" as const, name: bucketAdmin };
+		expect((await entrypointRead(groupProps, topologyGetForRangePath(shardGroup, bucket))).status).toBe(503);
+		expect((await entrypointRead(bucketProps, topologyGetPath(shardGroup))).status).toBe(503);
+
+		await new FokosDB(options(tableName)).destroy();
+		expect(await reportKinds(bucketAdmin, shardGroup)).toEqual([]);
+		expect(await reportKinds(groupAdmin, shardGroup)).toEqual([]);
+		const bucketReset = await groupRow(bucketAdmin, shardGroup);
+		const groupReset = await groupRow(groupAdmin, shardGroup);
+		expect([bucketReset.epoch, groupReset.epoch]).toEqual([1, 1]);
+		// The admin of the hashPrefixBucket is reset during the traversal, and the admin of the shard group after it.
+		expect(bucketReset.reset_at).toBeLessThanOrEqual(groupReset.reset_at);
 	});
 });

@@ -1066,8 +1066,11 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 // ─── the topology entrypoint ─────────────────────────────────────────────────
 
 export type FokosTopologyEntrypointOptions = {
-	/** Host code: the stub of the admin Durable Object that the host names for `shardGroup`. */
-	admin(this: void, shardGroup: string): FokosTopologyAdminRpc;
+	/**
+	 * Host code: the stub of the admin Durable Object that the host names for `shardGroup`. A range read
+	 * gives its `hashPrefixBucket`, so the host can keep each range topology in another object.
+	 */
+	admin(this: void, shardGroup: string, hashPrefixBucket?: HashPrefixBucket): FokosTopologyAdminRpc;
 	/** `max-age` of a topology answer. 0 makes every request revalidate against the admin Durable Object. */
 	maxAgeS: number;
 	/** `stale-while-revalidate` of a topology answer. */
@@ -1119,7 +1122,7 @@ export async function fokosTopologyEntrypointFetch(request: Request, opts: Fokos
 	const ifNoneMatch = request.headers.get("If-None-Match")?.replace(/^W\//, "") ?? undefined;
 	let read: FokosTopologyRead;
 	try {
-		const admin = opts.admin(shardGroup);
+		const admin = opts.admin(shardGroup, hashPrefixBucket);
 		read = hashPrefixBucket
 			? await admin.getRangeTopology(shardGroup, hashPrefixBucket, ifNoneMatch)
 			: await admin.getTopology(shardGroup, ifNoneMatch);

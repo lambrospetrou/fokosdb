@@ -140,6 +140,21 @@ describe("topology keeper — reports", () => {
 		});
 	});
 
+	it("ignores a report from before the first of two resets, as a destroy that resets again after a lost answer does", async () => {
+		await withKeeper(async (keeper, { sg }) => {
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [c("g")], 1_000), 1_000);
+			keeper.runDueBuilds(LATER);
+			keeper.resetShardGroup(sg, 2_000);
+			keeper.resetShardGroup(sg, 3_000);
+			for (const completedAt of [1_000, 1_500, 2_500]) {
+				await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [c("g")], completedAt), 3_100);
+			}
+			expect(keeper.nextBuildAt()).toBeNull();
+			expect(parseHashBody(body(keeper.getTopology(sg))).epoch).toBe(2);
+			expect(parseRangeBody(rangeBody(keeper, sg)).depths.length).toBe(0);
+		});
+	});
+
 	it("answers the older body until the next build, and 304 for the current ETag", async () => {
 		await withKeeper(async (keeper, { sg }) => {
 			await keeper.registerRepartition(hashSplitReport(sg, T, 0, []), 0);
@@ -373,6 +388,19 @@ describe("topology keeper — range build", () => {
 			// The fallback of a miss at [g, k) is its parent B.
 			const target = rangePointLookup(view, c("h"), none)!;
 			expect(rangeOf(view, rangePointLookup(view, c("h"), new Set([rangeCutKey(view, target)])))).toEqual(["g", "p", 1]);
+		});
+	});
+
+	it("serves the range body from range reports only, and a hash body with no hash node and only that hashPrefixBucket", async () => {
+		// The admin of one promoted hashPrefixBucket gets only its promotion and its range splits.
+		await withKeeper(async (keeper, { sg, storage }) => {
+			await keeper.registerRepartition(rangeSplitReport(sg, HK, null, null, [c("g")]));
+			keeper.runDueBuilds(LATER);
+			const view = parseRangeBody(rangeBody(keeper, sg));
+			expect(rangeOf(view, rangePointLookup(view, c("h"), new Set()))).toEqual(["g", null, 1]);
+			expect(storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_hash_nodes").one().n).toBe(0);
+			const hash = parseHashBody(body(keeper.getTopology(sg)));
+			expect([...promotedSectionBuckets(hash.promoted!)]).toEqual([hashPrefixBucketOf(HK, sg)]);
 		});
 	});
 

@@ -1,31 +1,17 @@
 /**
- * The hooks that connect a table to its topology: the admin outbox of a partition or a coordinator,
- * and the topology cache options of a client or a runtime. A table with no `nsAdmin` gets no outbox,
- * and a table with no `topologyEntrypoint` gets no topology cache.
+ * The hooks that connect a table to its topology cache: the topology cache options of a client or a
+ * runtime. A table with no `topologyEntrypoint` gets no topology cache. `server/admin-outbox.ts` has
+ * the admin outbox.
  */
 import { env, exports } from "cloudflare:workers";
-import type { FokosAdminOutbox } from "../sharding/runtime-types.js";
 import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
-import { topologyAdminAddress, topologyAdminStub, type DataNamespaceKey, type TopologyAdminAddress } from "./do-stubs.js";
+import { topologyAdminAddress, type DataNamespaceKey, type TopologyAdminAddress } from "./do-stubs.js";
 import type { FokosDBStubContext } from "./partition-context.js";
 
 /** The refresh settings of a topology cache. Absent values take the defaults of the cache. */
 export type TopologyRefreshSettings = { refreshMs?: number; refreshTimeoutMs?: number };
 
 type TopologyEntrypointFactory = (opts: { props: TopologyAdminAddress }) => Fetcher;
-
-/**
- * The admin outbox of a partition or a coordinator of `ctx`, or undefined when the table has no `nsAdmin`.
- * `binding` is the namespace that holds the shard group of `ctx`.
- */
-export function adminOutboxFor(ctx: FokosDBStubContext, binding: DataNamespaceKey): FokosAdminOutbox | undefined {
-	const address = topologyAdminAddress(env, ctx, binding);
-	if (address === undefined) {
-		return undefined;
-	}
-	// The outbox holds one event type now: the report of a completed repartition of this shard group.
-	return { send: async (entry) => await topologyAdminStub(env, address).registerRepartition(entry.event) };
-}
 
 /**
  * The topology cache options of the shard group of `ctx`, or undefined when the table has no
@@ -44,15 +30,18 @@ export function topologyCacheFor(
 		return undefined;
 	}
 	return {
-		fetch: async (path, signal) => {
+		fetch: async (path, signal, hashPrefixBucket) => {
 			const entrypoint = (exports as unknown as Record<string, TopologyEntrypointFactory | undefined>)[topologyEntrypoint];
 			if (entrypoint === undefined) {
 				throw new Error(`the Worker does not export the topology entrypoint ${topologyEntrypoint}`);
 			}
-			return await entrypoint({ props: address }).fetch(`http://fokos-topology${path}`, { signal });
+			// A range topology is in the admin of its hashPrefixBucket. `address` exists, so the table has `nsAdmin`.
+			const props = hashPrefixBucket === undefined ? address : topologyAdminAddress(env, ctx, binding, hashPrefixBucket)!;
+			return await entrypoint({ props }).fetch(`http://fokos-topology${path}`, { signal });
 		},
 		waitUntil,
-		// The entrypoint answers by the admin address, so the isolate cache keys by it too.
+		// The entrypoint answers by the admin address, so the isolate cache keys by it too. The key of a
+		// range entry also has its hashPrefixBucket, which gives the address of the admin of the bucket.
 		scope: JSON.stringify([address.nsAdmin, address.jurisdiction ?? null, address.name]),
 		...(settings.refreshMs === undefined ? {} : { refreshMs: settings.refreshMs }),
 		...(settings.refreshTimeoutMs === undefined ? {} : { refreshTimeoutMs: settings.refreshTimeoutMs }),

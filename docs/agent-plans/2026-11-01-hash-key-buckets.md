@@ -253,7 +253,7 @@ not carry over.
    links and the collision check. **DONE.**
 8. **M8 — Topology admin objects for each promoted hashPrefixBucket** (Section 4.2.11). A promotion registers with
    two admin objects. A range split registers only with the object of its hashPrefixBucket, and callers read the
-   range topology encoding from that object.
+   range topology encoding from that object. **DONE.**
 
 ## 4. Proposed solution
 
@@ -1369,7 +1369,7 @@ encoded topology RFC lists this as its follow-up 6.
   `hashPrefixBucketTopologyAdminName(shardGroup, fp, hashPrefixBucket)`:
 
   ```ts
-  topologyAdminName(shardGroup, fp) + ".b." + hex(hashPrefixBucket)
+  topologyAdminName(shardGroup, fp) + ".rh." + hex(hashPrefixBucket)
   ```
 
   The fingerprint alphabet has no `.`, so the name is injective.

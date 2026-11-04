@@ -5,7 +5,7 @@ import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
-import { hashPrefixBucketOf } from "./hash-primitives.js";
+import { hashPrefixBucketOf, type HashPrefixBucket } from "./hash-primitives.js";
 import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
 import { isRangePartition, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
@@ -413,8 +413,17 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * The fence comes first, so nothing adds a target after the traversal reads the last page. A
 	 * destroy that stops halfway can run again, because each parent that remains still knows its
 	 * children.
+	 *
+	 * `beforeDestroy` runs after the targets of a partition are gone and before its `fokosDestroy`,
+	 * with the hashPrefixBuckets of its promotions. When it throws, the traversal stops, and the
+	 * partition keeps its promotions for the next destroy.
 	 */
-	async destroy(opts: { onDestroyed?(ref: FokosPartitionRef): void } = {}): Promise<void> {
+	async destroy(
+		opts: {
+			onDestroyed?(ref: FokosPartitionRef): void;
+			beforeDestroy?(ref: FokosPartitionRef, promoted: HashPrefixBucket[]): Promise<void>;
+		} = {},
+	): Promise<void> {
 		const visited = new Set<string>();
 
 		const destroyPartition = async (ctx: FokosRouteContext<TPolicy>, rootContext?: FokosRouteContext<TPolicy>): Promise<void> => {
@@ -426,9 +435,14 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 			const stub = this.#rpc(ctx);
 			await stub.fokosPrepareDestroy({ rootContext });
 			const status = await stub.fokosStatus({ rootContext });
-			for await (const { target } of this.#targets(stub, status.split)) {
+			const promoted: HashPrefixBucket[] = [];
+			for await (const { repartition, target } of this.#targets(stub, status.split)) {
 				await destroyPartition(this.#targetContext(target.ref));
+				if (repartition.hashPrefixBucket !== null) {
+					promoted.push(repartition.hashPrefixBucket);
+				}
 			}
+			await opts.beforeDestroy?.(refOf(ctx), promoted);
 			try {
 				await stub.fokosDestroy();
 			} catch (e) {

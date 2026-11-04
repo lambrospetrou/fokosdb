@@ -54,7 +54,8 @@ import {
 	type TransactionPartitionsAnswer,
 } from "../shared/transaction-wire-types.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
-import { adminOutboxFor, TopologyCacheMemo, topologyCacheFor } from "../shared/topology-hooks.js";
+import { TopologyCacheMemo, topologyCacheFor } from "../shared/topology-hooks.js";
+import { adminOutboxFor } from "./admin-outbox.js";
 import {
 	FokosError,
 	FokosExpressionError,

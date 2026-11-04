@@ -97,7 +97,8 @@ import { materializationStubByName, partitionStubByName, tableFingerprint, txCoo
 import { FokosShardingClient } from "../sharding/client.js";
 import { MaterializationExporter, type ExportCall, type ExportItemOutcome } from "../shared/partition/materialization-export.js";
 import type { MaterializationOps } from "./materialization/do-materialization.js";
-import { adminOutboxFor, TopologyCacheMemo } from "../shared/topology-hooks.js";
+import { TopologyCacheMemo } from "../shared/topology-hooks.js";
+import { adminOutboxFor } from "./admin-outbox.js";
 import {
 	ADMISSION_MARGIN,
 	applyBatchImageCap,

@@ -23,8 +23,10 @@ export type FokosTopologyCacheOptions = {
 	/**
 	 * Host code. Fetches one encoded topology, for example through `ctx.exports.FokosDBTopologyCache.fetch`.
 	 * Give `signal` to the fetch, so the request stops when the refresh stops waiting for it.
+	 * `hashPrefixBucket` is the hashPrefixBucket of a range topology, and undefined for the hash topology,
+	 * so the host can read each one from a different source.
 	 */
-	fetch(this: void, path: string, signal: AbortSignal): Promise<Response>;
+	fetch(this: void, path: string, signal: AbortSignal, hashPrefixBucket?: HashPrefixBucket): Promise<Response>;
 	/** The `waitUntil` of the request (Worker) or of the `DurableObjectState` (Durable Object). */
 	waitUntil(this: void, promise: Promise<unknown>): void;
 	/**
@@ -137,7 +139,7 @@ export function cachedRangeTopology(
 	const key = `r|${scopeOf(opts)}|${shardGroup}|${hashPrefixBucket.toHex()}`;
 	const entry = cache.get(key) as TopologyEntry<RangeTopologyView> | undefined;
 	if (shouldRefresh(opts, key, entry)) {
-		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, hashPrefixBucket), parseRangeBody));
+		opts.waitUntil(refresh(opts, key, topologyGetForRangePath(shardGroup, hashPrefixBucket), parseRangeBody, hashPrefixBucket));
 	}
 	return entry;
 }
@@ -178,12 +180,13 @@ async function refresh(
 	key: string,
 	path: string,
 	parse: (body: Uint8Array) => HashTopologyView | RangeTopologyView,
+	hashPrefixBucket?: HashPrefixBucket,
 ): Promise<void> {
 	const startedAt = refreshStartedAt.get(key);
 	const signal = AbortSignal.timeout(opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS);
 	try {
 		const read = async () => {
-			const response = await opts.fetch(path, signal);
+			const response = await opts.fetch(path, signal, hashPrefixBucket);
 			if (response.status !== 200) {
 				await response.body?.cancel();
 				throw new Error(`the topology read answered ${response.status}`);

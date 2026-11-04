@@ -38,7 +38,8 @@ import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
 import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
 import { topologyCacheFor } from "../shared/topology-hooks.js";
-import { FOKOS_HASH_PARTITIONS_MAX, FokosTopology } from "../sharding/route-context.js";
+import { FOKOS_HASH_PARTITIONS_MAX, FokosTopology, type FokosPartitionRef } from "../sharding/route-context.js";
+import type { HashPrefixBucket } from "../sharding/hash-primitives.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
@@ -1676,17 +1677,35 @@ export class FokosDB {
 		// coordinator of a given idempotency token is not knowable from here.
 		//
 		// The client owns the traversal: the fence, the target order and the dedup.
-		await this.#coordinators.destroy({ onDestroyed: (ref) => console.warn(`Destroyed transaction coordinator ${ref.doName}`) });
+		const { topology, policy } = this.#table;
+		const fp = tableFingerprint(env, this.#table);
+		const adminOf = (shardGroup: string, binding: DataNamespaceKey, hashPrefixBucket?: HashPrefixBucket) =>
+			topologyAdminAddress(env, { topology: { ...topology, shardGroup }, policy }, binding, hashPrefixBucket);
+		// The admin of a promoted hashPrefixBucket is reset after its range tree is gone, while the fenced
+		// partition that promoted it still links it. A destroy that stops before the reset finds the link
+		// again.
+		const resetPromoted =
+			(shardGroup: string, binding: DataNamespaceKey) => async (_ref: FokosPartitionRef, promoted: HashPrefixBucket[]) => {
+				for (const hashPrefixBucket of promoted) {
+					const admin = adminOf(shardGroup, binding, hashPrefixBucket);
+					if (admin !== undefined) {
+						await topologyAdminStub(env, admin).resetShardGroup(shardGroup);
+					}
+				}
+			};
+		await this.#coordinators.destroy({
+			onDestroyed: (ref) => console.warn(`Destroyed transaction coordinator ${ref.doName}`),
+			beforeDestroy: resetPromoted(coordinatorShardGroup(topology, fp), policy.nsTx),
+		});
 		await this.#partitions.destroy({
 			onDestroyed: (ref) => console.warn(`Destroyed partition DO ${ref.doName} (partitionId=${ref.partitionId})`),
+			beforeDestroy: resetPromoted(topology.shardGroup, policy.ns),
 		});
 		// Each writer goes before its receiver: the base partitions export to the materialization
 		// partitions, and these write the GSI tables.
 		// The materialization partitions are fenced first, so that no GSI write follows the destroy of a
 		// GSI table, and they are deleted last, so that a destroy that stops halfway can read the GSI
 		// targets again.
-		const { topology, policy } = this.#table;
-		const fp = tableFingerprint(env, this.#table);
 		// Each shard group of the table, with the namespace that holds it.
 		const shardGroups: Array<[string, DataNamespaceKey]> = [
 			[topology.shardGroup, policy.ns],
@@ -1699,9 +1718,15 @@ export class FokosDB {
 			});
 			const indexNames = await this.#fenceMaterializations(materializations);
 			for (const indexName of indexNames) {
-				await this.#gsiClient(indexName).destroy({ onDestroyed: (ref) => console.warn(`Destroyed GSI partition DO ${ref.doName}`) });
+				await this.#gsiClient(indexName).destroy({
+					onDestroyed: (ref) => console.warn(`Destroyed GSI partition DO ${ref.doName}`),
+					beforeDestroy: resetPromoted(gsiShardGroup(topology, indexName), policy.ns),
+				});
 			}
-			await materializations.destroy({ onDestroyed: (ref) => console.warn(`Destroyed materialization DO ${ref.doName}`) });
+			await materializations.destroy({
+				onDestroyed: (ref) => console.warn(`Destroyed materialization DO ${ref.doName}`),
+				beforeDestroy: resetPromoted(materializationShardGroup(topology, fp), policy.nsMat),
+			});
 			shardGroups.push(
 				[materializationShardGroup(topology, fp), policy.nsMat],
 				...indexNames.map((indexName): [string, DataNamespaceKey] => [gsiShardGroup(topology, indexName), policy.ns]),
@@ -1711,7 +1736,7 @@ export class FokosDB {
 		// A report that completed before the reset is ignored. The reset does not clear the topology caches,
 		// so their old hints stay for a short time. `destroy()` tells the limitation.
 		for (const [shardGroup, binding] of shardGroups) {
-			const admin = topologyAdminAddress(env, { topology: { ...topology, shardGroup }, policy }, binding);
+			const admin = adminOf(shardGroup, binding);
 			if (admin !== undefined) {
 				await topologyAdminStub(env, admin).resetShardGroup(shardGroup);
 			}
