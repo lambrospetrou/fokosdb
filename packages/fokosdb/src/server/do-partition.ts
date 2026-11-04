@@ -393,6 +393,8 @@ const rowKeyOf = (row: { hk: KeyBytes; sk: KeyBytes }) => ({ hashKey: row.hk, so
 export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	/** The sharding runtime: identity, routing, repartitions, and the alarm. Every public method is one `dispatch`. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
+	/** The id of this instance as a string. The id never changes, so it is made one time. */
+	readonly #actorId: string;
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#ttl: TtlExpiry;
@@ -414,6 +416,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.#actorId = ctx.id.toString();
 		// The runtime is created after this store. The callbacks run only when a statement or a
 		// decision needs the answer.
 		this.#store = new PartitionStore(ctx.storage, {
@@ -735,7 +738,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const client = this.#materializationClient();
 		const outcomes: Array<ExportItemOutcome | undefined> = Array.from({ length: call.images.length });
 		const groups = client.resolveAll(call.images.map((image) => ({ hashKey: image.hashKey, sortKey: image.sortKey })));
-		const producerId = this.ctx.id.toString();
+		const producerId = this.#actorId;
 		await Promise.all(
 			groups.map(async ({ ctx, indexes }) => {
 				const items = indexes.map((i) => call.images[i]);
@@ -1151,7 +1154,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				store: this.#store,
 				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
 				captureChanges: () => this.#captureEnabled(),
-				selfId: () => this.ctx.id.toString(),
+				selfId: () => this.#actorId,
 				routingHashForKey: (hashKey) => this.fokos.routingHashForKey(hashKey),
 			}),
 			// After the cutover the export claims skip the moved rows, so only the export calls from before
@@ -1666,7 +1669,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	private selfPartition(): WirePartitionMeta {
 		const identity = this.fokos.identity();
 		const depth = identityDepth(identity);
-		return { actorId: this.ctx.id.toString(), ...(identity.kind === "hash" ? { hashDepth: depth } : { rangeDepth: depth }) };
+		return { actorId: this.#actorId, ...(identity.kind === "hash" ? { hashDepth: depth } : { rangeDepth: depth }) };
 	}
 
 	/** The answer of a local transaction handler, which lists this partition only. */
@@ -1869,7 +1872,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	private logParams() {
 		return {
 			...this.#_coloInfo,
-			actorId: this.ctx.id.toString(),
+			actorId: this.#actorId,
 			// Cloudflare Workers can truncate this to 1024 bytes. The runtime logs the full doName with its own lines.
 			actorName: this.ctx.id.name,
 			databaseSize: this.#store.databaseSize,

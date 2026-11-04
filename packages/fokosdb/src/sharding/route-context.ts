@@ -173,14 +173,21 @@ export function validatePolicyVersion(policyVersion: number): void {
  * error, so a new field cannot slip past the identity check.
  */
 export function topologiesEqual(a: FokosTopology, b: FokosTopology): boolean {
-	const compared = {
-		shardGroup: a.shardGroup === b.shardGroup,
-		rootTreesN: a.rootTreesN === b.rootTreesN,
-		hashSplitN: a.hashSplitN === b.hashSplitN,
-		jurisdiction: a.jurisdiction === b.jurisdiction,
-	} satisfies Record<keyof FokosTopology, boolean>;
-	return Object.values(compared).every(Boolean);
+	for (const key of TOPOLOGY_KEYS) {
+		if (a[key] !== b[key]) {
+			return false;
+		}
+	}
+	return true;
 }
+
+// Made one time, so a compare allocates nothing.
+const TOPOLOGY_KEYS = Object.keys({
+	shardGroup: true,
+	rootTreesN: true,
+	hashSplitN: true,
+	jurisdiction: true,
+} satisfies Record<keyof FokosTopology, true>) as ReadonlyArray<keyof FokosTopology>;
 
 /**
  * Structural equality over JSON-like values. A key whose value is `undefined` counts as absent, so
@@ -193,16 +200,41 @@ export function structurallyEqual(a: unknown, b: unknown): boolean {
 	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
 		return false;
 	}
-	if (Array.isArray(a) || Array.isArray(b)) {
-		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
-			return false;
-		}
-		return a.every((value, i) => structurallyEqual(value, b[i]));
-	}
-	const keysA = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
-	const keysB = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
-	if (keysA.length !== keysB.length) {
+	const isArray = Array.isArray(a);
+	if (isArray !== Array.isArray(b)) {
 		return false;
 	}
-	return keysA.every((k) => structurallyEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+	// Loops without arrays or closures: every request runs this compare.
+	if (isArray) {
+		const other = b as unknown[];
+		if (a.length !== other.length) {
+			return false;
+		}
+		for (let i = 0; i < a.length; i++) {
+			if (!structurallyEqual(a[i], other[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+	const ra = a as Record<string, unknown>;
+	const rb = b as Record<string, unknown>;
+	// Each defined key of `a` must be equal, and so defined, in `b`. Then the same count of defined
+	// keys means the same keys.
+	let defined = 0;
+	for (const k in ra) {
+		if (!Object.hasOwn(ra, k) || ra[k] === undefined) {
+			continue;
+		}
+		defined++;
+		if (!structurallyEqual(ra[k], rb[k])) {
+			return false;
+		}
+	}
+	for (const k in rb) {
+		if (Object.hasOwn(rb, k) && rb[k] !== undefined) {
+			defined--;
+		}
+	}
+	return defined === 0;
 }

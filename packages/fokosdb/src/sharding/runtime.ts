@@ -201,6 +201,8 @@ export type FokosRuntimeConstructorOptions<TPolicy, Ops extends FokosOperationSp
 
 export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> implements FokosShardingRpc {
 	readonly #ctx: DurableObjectState;
+	/** The id of this instance as a string. The id never changes, so it is made one time. */
+	readonly #actorId: string;
 	readonly #stub: FokosRuntimeOptions<TPolicy>["stub"];
 	readonly #hooks: FokosShardingHooks<TPolicy>;
 	readonly #ops: Record<string, AnyOperation>;
@@ -235,6 +237,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	constructor(opts: FokosRuntimeConstructorOptions<TPolicy, Ops>) {
 		this.#ctx = opts.ctx;
+		this.#actorId = opts.ctx.id.toString();
 		this.#stub = opts.stub;
 		this.#hooks = opts.hooks;
 		this.#ops = opts.operations as Record<string, AnyOperation>;
@@ -295,7 +298,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			} catch (error) {
 				this.#initError = error;
 				console.error({
-					actorId: this.#ctx.id.toString(),
+					actorId: this.#actorId,
 					actorName: this.#ctx.id.name,
 					message: "fokos/runtime: the initialization of the partition failed.",
 					error: String(error),
@@ -400,7 +403,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			this.#assertCanOwnRange(op, descriptor.range(req));
 		} else {
 			for (const key of this.#scopeRouteKeys(descriptor, req)) {
-				if (!this.#ownsByTopology(key)) {
+				if (!this.#ownsByTopology(key, this.#routingHash(key.hashKey))) {
 					throw misrouted(op, "key outside this partition");
 				}
 			}
@@ -1690,7 +1693,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const depth = identityDepth(identity);
 		return {
 			ref: identity.ref,
-			actorId: this.#ctx.id.toString(),
+			actorId: this.#actorId,
 			hashDepth: identity.kind === "hash" ? depth : 0,
 			rangeDepth: identity.kind === "range" ? depth : 0,
 			role,
@@ -1718,14 +1721,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/** The range form of the ownership check: the hash key, and the whole interval inside a range partition. */
 	#assertCanOwnRange(op: string, input: FokosRangeInput): void {
 		const identity = this.identity();
+		const routingHash = this.#routingHash(input.hashKey);
 		if (identity.kind === "hash") {
-			if (!this.#hashesHere(input.hashKey, identity)) {
+			if (!this.#hashesHere(routingHash, identity)) {
 				throw misrouted(op, "hash key outside this partition");
 			}
 			return;
 		}
 		const range = identity.range!;
-		if (compareRoutingHashes(this.#routingHash(input.hashKey), range.routingHash) !== 0) {
+		if (compareRoutingHashes(routingHash, range.routingHash) !== 0) {
 			throw misrouted(op, "hash key outside this range partition");
 		}
 		const segment = projectOnHashKey(input.hashKey, range.start, range.end);
@@ -1734,22 +1738,25 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 	}
 
-	/** Hash step 1 and range step 1: can this partition own the key at all, by its identity alone. */
-	#ownsByTopology(key: RouteKey): boolean {
+	/**
+	 * Hash step 1 and range step 1: can this partition own the key at all, by its identity alone.
+	 * `routingHash` is the routingHash of `key.hashKey`.
+	 */
+	#ownsByTopology(key: RouteKey, routingHash: RoutingHash): boolean {
 		const identity = this.identity();
 		if (identity.kind === "hash") {
-			return this.#hashesHere(key.hashKey, identity);
+			return this.#hashesHere(routingHash, identity);
 		}
 		const range = identity.range!;
 		return (
-			compareRoutingHashes(this.#routingHash(key.hashKey), range.routingHash) === 0 &&
+			compareRoutingHashes(routingHash, range.routingHash) === 0 &&
 			compositeInInterval({ hk: key.hashKey, sk: key.sortKey }, range.start, range.end)
 		);
 	}
 
-	#hashesHere(hashKey: KeyBytes, identity: FokosPartitionIdentity): boolean {
+	#hashesHere(routingHash: RoutingHash, identity: FokosPartitionIdentity): boolean {
 		const { start, end } = identity.hash!;
-		return inRoutingHashInterval(this.#routingHash(hashKey), start, end);
+		return inRoutingHashInterval(routingHash, start, end);
 	}
 
 	/** The routingHash of a hash key in the shard group of this partition. It is not kept after the call. */
@@ -1760,13 +1767,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/** `view` is read here when the caller does not give one. A hash key with a cut-over override does not need it. */
 	#resolve(key: RouteKey, opts: ResolveOptions, view?: RouterView): Resolution {
 		const identity = this.identity();
-		if (!this.#ownsByTopology(key)) {
+		// One hash of the key for each resolve: the ownership check, the override, the Bloom filter, and
+		// the topology use it.
+		const routingHash = this.#routingHash(key.hashKey);
+		if (!this.#ownsByTopology(key, routingHash)) {
 			return { kind: "out_of_range" };
 		}
 
 		if (identity.kind === "hash") {
-			// One hash of the key for each resolve: the override, the Bloom filter, and the topology use it.
-			const routingHash = this.#routingHash(key.hashKey);
 			const override = this.#store.routeOverrideFor(routingHash);
 			if (override && cutOver(override.state)) {
 				return this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "override", false, opts.learnedRange);
@@ -2418,7 +2426,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			rootTreesN: ctx.topology.rootTreesN,
 			hashSplitN: ctx.topology.hashSplitN,
 			source: plan.source,
-			actorId: this.#ctx.id.toString(),
+			actorId: this.#actorId,
 			// A stub is not an RPC: its ID comes from the name and the jurisdiction that the host applies.
 			targets: plan.targets.map((t) => ({ ref: t.ref, slice: t.slice, actorId: this.#stub(ctx, t.ref.doName).id.toString() })),
 			completedAt,
@@ -2580,7 +2588,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const identity = this.#identity;
 		const importSource = this.#target.importRecord()?.source;
 		return {
-			actorId: this.#ctx.id.toString(),
+			actorId: this.#actorId,
 			actorName: this.#ctx.id.name,
 			partitionId: identity?.ref.partitionId,
 			doName: identity?.ref.doName,
