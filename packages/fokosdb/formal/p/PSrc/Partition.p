@@ -784,7 +784,10 @@ machine Partition {
     durable.pendingTx -= (tx);
   }
 
-  // FokosMigrationHost.buildPage: one row of the slice at the cursor. The `items` stream hands over
+  // FokosMigrationHost.buildPage: one row of the slice at the cursor. The code reads the storage
+  // interval of the target in (routing_hash, hk, sk) order and continues after a key cursor. The
+  // filter by ChildIndexOf gives the same rows, and an index cursor is enough, because a router does
+  // not change its item rows or its lock copies before the cleanup. The `items` stream hands over
   // to the `pending_tx` stream. Each page of the `pending_tx` stream carries the deletion metadata, so
   // a slice with no lock receives it in one empty page.
   fun BuildPage(slice: int, cursor: tCursor): tMigrationPage {

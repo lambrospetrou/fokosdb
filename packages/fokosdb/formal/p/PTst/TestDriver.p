@@ -49,7 +49,7 @@ fun NoFaults(): tFaults {
 }
 
 // Root A holds hash keys a and c, and root B holds hash key b. A hash split of root A moves hash key
-// a to its child 0 and hash key c to its child 1. One coordinator, the Environment, which is also the
+// a to its child 0 and hash key c to its child 1 (ChildIndexOf in Topology.p). One coordinator, the Environment, which is also the
 // clock, and an Operator when the faults ask for one. Each client runs its own list of calls.
 fun StartSystem(bugs: tBugs, faults: tFaults, scripts: seq[seq[tClientOp]]) {
   var topology: tTopology;

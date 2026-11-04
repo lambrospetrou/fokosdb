@@ -198,15 +198,18 @@ and every other item and transaction operation answers `partition_migrating`.
 
 #### 1.3.7 Key promotion
 
-A key promotion moves one hash key, with all its sort keys and its locks, from a hash partition into a new range
-root. The source keeps a copy of each moved lock until the target acknowledges its import.
+A key promotion moves one routingHash (`docs/agent-plans/2026-11-01-routing-hash.md`) from a hash partition into a
+new range root: each hash key whose routingHash it is, with all its sort keys and its locks. Usually one routingHash
+holds one hash key, but two hash keys can have the same routingHash, and then both move. Below, `K` is the promoted
+routingHash, and a key of `K` is a key whose hash key has the routingHash `K`. The source keeps a copy of each moved
+lock until the target acknowledges its import.
 
 **Source states** (`packages/fokosdb/src/sharding/repartition-flow.ts`): `queued → planned → cutover → completed →
 cleaned`. **Target states**: `awaiting_data → importing → imported → active`.
 
 **Steps:**
 
-1. The source queues the promotion of hash key `K` and plans one target, the range root `R`.
+1. The source queues the promotion of the routingHash `K` and plans one target, the range root `R`.
 2. The source marks `R` `initializing`, then calls `fokosInit`. `R` writes its identity and an import record in
    `awaiting_data`. On success the source marks `R` `initialized`.
 3. When every target is `initialized`, the source writes `cutover` in one transaction. FokosDB does not implement
@@ -224,12 +227,12 @@ cleaned`. **Target states**: `awaiting_data → importing → imported → activ
 The promotion RFC differs from the code in two places. Its section 4.2.8 deletes the pending copies in the completion
 transaction, and its section 4.2.6 keeps `guarded_at` off a copy. The model follows the code and `AGENTS.md`.
 
-**Ownership.** On the source, `owns(K)` is false when the route override of `K` is in `cutover`, `completed`, or
-`cleaned`. `R` owns `K`. An importing `R` answers `partition_migrating` for every write and transaction operation,
+**Ownership.** On the source, `owns(k)` is false for a key of `K` when the route override of `K` is in `cutover`,
+`completed`, or `cleaned`. `R` owns every key of `K`. An importing `R` answers `partition_migrating` for every write and transaction operation,
 and reads through the source for `apiGetItem` and `apiQueryItems`.
 
-**Transactions.** The coordinator groups the keys by root partition, so the source is the participant for both `K`
-and its retained keys `U`. After cutover, `dispatch` divides each `group` request by owner: the local part runs in
+**Transactions.** The coordinator groups the keys by root partition, so the source is the participant for both the keys
+of `K` and its retained keys `U`. After cutover, `dispatch` divides each `group` request by owner: the local part runs in
 the same block, and the moved part goes to `R`. `txPrepare` is `fail_fast`. `txCommit` and `txCancel` are
 `attempt_all`: they run every part and throw `partition_fanout_failed` after the local part applied.
 
@@ -616,7 +619,7 @@ that each milestone builds.
 
 ### 3.7 M6 — Key promotion
 
-- **Scope.** One promotion of one hash key while 2 or 3 transactions run, with the faults of M2. The transfer copies,
+- **Scope.** One promotion of one routingHash while 2 or 3 transactions run, with the faults of M2. The transfer copies,
   the retention until the acknowledgement, the cleanup, the stale job that skips copies, and the repair.
 - **Test cases.** `tcPromotionHappy`, `tcPromotionFaults`, `tcPromotionStale`, `tcPromotionRepair`,
   `tcPromotionReads`, the test cases of P1 to P7.
@@ -734,7 +737,9 @@ packages/fokosdb/formal/p/
 #### 4.2.3 Abstractions
 
 - **Keys.** Each key is a pair of a hash key and a sort key, written `a1` for hash key `a` and sort key `1`. A
-  static map gives the root partition of each hash key. The model names each partition with its role: `A`, `B`,
+  static map gives the root partition of each hash key, and `ChildIndexOf` gives its child in a hash split. In the
+  code, both come from the digits of the routingHash of the hash key. The model needs only a fixed function of the
+  hash key, so it does not compute the routingHash. The model names each partition with its role: `A`, `B`,
   `A0`, `A1`, `R`.
 - **Values.** Each write writes a unique value id: the transaction id and the `opIndex`, or the id of the
   single-item write. A delete writes `absent`. Thus a monitor can tell which writer produced each value that a read
@@ -762,7 +767,7 @@ packages/fokosdb/formal/p/
 
 | Machine | From | Durable state | Memory state | Code |
 | --- | --- | --- | --- | --- |
-| `Partition` | M0 | identity, `items` (`v`, value, `last_read_ts`, `last_write_ts`), lock rows, `pending_tx_info` (`created_at` class, `guarded_at`), deletion metadata, repartition row and target rows (source side), route override of a promoted key, import record and cursor (target side) | continuations of point, single-owner, read-through, and group forwards, the stale job in progress | `PartitionDO`, `TransactionParticipant`, `PartitionStore`, `FokosShardingRuntime`, `RepartitionSource`, `RepartitionTarget`, `FokosMigrationHost` |
+| `Partition` | M0 | identity, `items` (`v`, value, `last_read_ts`, `last_write_ts`), lock rows, `pending_tx_info` (`created_at` class, `guarded_at`), deletion metadata, repartition row and target rows (source side), route override of a promoted routingHash, import record and cursor (target side) | continuations of point, single-owner, read-through, and group forwards, the stale job in progress | `PartitionDO`, `TransactionParticipant`, `PartitionStore`, `FokosShardingRuntime`, `RepartitionSource`, `RepartitionTarget`, `FokosMigrationHost` |
 | `Client` | M0 | — | the calls in progress and their retries | `FokosDB` |
 | `Coordinator` | M1 | `tc_state`, `tc_participants`, `tc_items` (participant and operation only) | the drives in progress | `TransactionCoordinatorDO` |
 | `RpcCall` | M1 | — | one request and its answer | Workers RPC, `FokosShardingClient` retries |
@@ -986,8 +991,8 @@ reports the lost write, and a probe found the lost write of S5.
 #### 4.2.13 Configurations and test cases
 
 Keys: `a1` on root `A`; `b1` and `b2` on root `B`. M5 adds `c1`: hash keys `a` and `c` are on `A`, and the split
-moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: the promotion moves hash key `a`
-(`a1`, `a2`) to `R`, and `c1` stays on `A`.
+moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: the promotion moves the routingHash of
+hash key `a` (`a1`, `a2`) to `R`, and `c1` stays on `A`.
 
 | Test case | Writers and readers | Faults | Expected |
 | --- | --- | --- | --- |
