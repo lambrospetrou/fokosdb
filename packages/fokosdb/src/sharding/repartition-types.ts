@@ -184,6 +184,12 @@ export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteL
  * `belongsToTarget`. The host must not compute the interval from the slice alone: a hash-child slice
  * has no root and no ancestor path.
  *
+ * To read only the interval, the host keeps its rows in the storage order `(routingHash, hk, sk)`:
+ * the first key column is `routingHashForKey(hk)`, then the encoded hash key, then the encoded sort
+ * key. An edge with no `hk` or `sk` has the empty key there, the minimum. The host then seeks to the
+ * start of the interval and stops at its end. A host that reads its whole table for each page gives
+ * correct pages, but it also reads the rows of every other target.
+ *
  * `validatePage` runs on the target before the page transaction, and a throw delays the import with
  * no write. `inSlice` is true for a key in the slice of the target. It does not read the route
  * overrides, so it accepts each key that `belongsToTarget` accepts, and some more.

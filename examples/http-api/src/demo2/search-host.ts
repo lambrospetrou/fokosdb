@@ -63,9 +63,16 @@ export type SearchStats = {
 };
 
 type DocRow = { tenant_id: string; sort_key: string; title: string; body: string };
+
+/** A migrated document carries its storage key: the routingHash, the hash key, and the sort key. */
+type MigratedDoc = DocRow & { routingHash: Uint8Array; hk: KeyBytes; sk: KeyBytes };
+type DocCursor = { routingHash: Uint8Array; hk: KeyBytes; sk: KeyBytes };
 type SearchReq = SearchOps["search"]["req"];
 
 const PAGE_ROWS = 20;
+
+/** The empty key: the minimum of the hash-key and sort-key columns. */
+const NO_KEY = KeyCodec.asKeyBytes(new Uint8Array());
 
 /** A sort-key edge as a string. Null and the empty key are the open edge. */
 function decodeEdge(k: KeyBytes | null): string | null {
@@ -90,6 +97,12 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		ctx.storage.sql.exec("CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(tenant_id UNINDEXED, sort_key UNINDEXED, title, body)");
+		// An FTS5 table has no ordered key. `doc_keys` gives each document its storage key, in the order
+		// (routingHash, hash key, sort key), and points to the `docs` row. A migration reads the interval
+		// of its target with one seek, and a promotion deletes the rows of one routingHash with one seek.
+		ctx.storage.sql.exec(
+			"CREATE TABLE IF NOT EXISTS doc_keys (routing_hash BLOB NOT NULL, hk BLOB NOT NULL, sk BLOB NOT NULL, doc_id INTEGER NOT NULL, PRIMARY KEY (routing_hash, hk, sk)) WITHOUT ROWID",
+		);
 		this.fokos = new FokosShardingRuntime<SearchPolicy, SearchOps>({
 			ctx,
 			stub: (_routeCtx, doName) => env.SEARCH_PARTITION_DO.get(env.SEARCH_PARTITION_DO.idFromName(doName)),
@@ -147,6 +160,13 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 		return this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM docs WHERE tenant_id = ?", tenant).one().n;
 	}
 
+	/** Writes one document and its storage key. The caller runs it inside a transaction. */
+	private insertDoc(doc: MigratedDoc): void {
+		const sql = this.ctx.storage.sql;
+		sql.exec("INSERT INTO docs (tenant_id, sort_key, title, body) VALUES (?, ?, ?, ?)", doc.tenant_id, doc.sort_key, doc.title, doc.body);
+		sql.exec("INSERT INTO doc_keys (routing_hash, hk, sk, doc_id) VALUES (?, ?, ?, last_insert_rowid())", doc.routingHash, doc.hk, doc.sk);
+	}
+
 	// ── Runtime wiring ────────────────────────────────────────────────────────
 
 	private operations(): FokosOperations<SearchOps> {
@@ -159,7 +179,18 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 				local: (req, call) => {
 					const tenant = KeyCodec.decode(req.hashKey) as string;
 					const sortKey = KeyCodec.decode(req.sortKey) as string;
-					sql.exec("INSERT INTO docs (tenant_id, sort_key, title, body) VALUES (?, ?, ?, ?)", tenant, sortKey, req.title, req.body);
+					const routingHash = this.fokos.routingHashForKey(req.hashKey);
+					this.ctx.storage.transactionSync(() =>
+						this.insertDoc({
+							routingHash,
+							hk: req.hashKey,
+							sk: req.sortKey,
+							tenant_id: tenant,
+							sort_key: sortKey,
+							title: req.title,
+							body: req.body,
+						}),
+					);
 					const tenantDocs = this.tenantDocCount(tenant);
 					// A hash partition gives a large tenant its own range tree. A range partition is already that tree.
 					if (this.fokos.identity().kind === "hash" && tenantDocs >= this.fokos.policy().promoteAtDocs) {
@@ -232,37 +263,81 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 			evaluateSplit: ({ identity, policy }) => (identity.kind === "range" && this.docCount() >= policy.rangeSplitAtDocs ? {} : false),
 			// The boundaries divide the documents of this partition into equal parts in (tenant, sort key)
 			// order. A range partition holds the tenants of one routingHash, normally one tenant.
-			computeRangeBoundaries: ({ childCount }) => {
-				const keys = sql
-					.exec<{ tenant_id: string; sort_key: string }>("SELECT tenant_id, sort_key FROM docs ORDER BY tenant_id, sort_key")
-					.toArray();
-				if (keys.length < childCount) return null;
-				return Array.from({ length: childCount - 1 }, (_, i): FokosCompositeKey => {
-					const key = keys[Math.floor(((i + 1) * keys.length) / childCount)];
-					return { hk: KeyCodec.encode(key.tenant_id), sk: KeyCodec.encode(key.sort_key) };
-				});
+			// It reads the keys of the partition interval from `doc_keys` in key order, so SQLite does
+			// not sort and does not read the FTS5 rows. It reads one row at a time and stops at the
+			// last boundary, so it keeps only the boundaries in memory.
+			computeRangeBoundaries: ({ routingHash, start, end, childCount }) => {
+				const params: unknown[] = [routingHash];
+				let where = "routing_hash = ?1";
+				if (start) {
+					where += ` AND (hk, sk) >= (?${params.length + 1}, ?${params.length + 2})`;
+					params.push(start.hk, start.sk);
+				}
+				if (end) {
+					where += ` AND (hk, sk) < (?${params.length + 1}, ?${params.length + 2})`;
+					params.push(end.hk, end.sk);
+				}
+				const count = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM doc_keys WHERE ${where}`, ...params).one().n;
+				if (count < childCount) return null;
+				// Boundary i is the key at position i * count / childCount. Positions are distinct and above 0,
+				// and keys are unique, so the boundaries increase and each child gets at least one document.
+				const boundaries: FokosCompositeKey[] = [];
+				let position = 0;
+				for (const row of sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(
+					`SELECT hk, sk FROM doc_keys WHERE ${where} ORDER BY hk, sk`,
+					...params,
+				)) {
+					if (position === Math.floor(((boundaries.length + 1) * count) / childCount)) {
+						boundaries.push({ hk: KeyCodec.asKeyBytes(new Uint8Array(row.hk)), sk: KeyCodec.asKeyBytes(new Uint8Array(row.sk)) });
+						if (boundaries.length === childCount - 1) break;
+					}
+					position++;
+				}
+				return boundaries;
 			},
 			migration: {
-				buildPage: (cursor, _slice, belongsToTarget) => {
-					const [tenant, sortKey] = (cursor as [string, string] | null) ?? ["", ""];
+				// The read seeks to `interval`, the storage interval of the target, and stops at its end.
+				// An absent `hk` or `sk` of an edge is the empty key, the minimum. `belongsToTarget` still
+				// filters each row: it removes the keys that a range tree owns.
+				buildPage: (cursor, _slice, belongsToTarget, _budget, interval) => {
+					const edge = (k: { routingHash: Uint8Array; hk?: KeyBytes; sk?: KeyBytes }) => [k.routingHash, k.hk ?? NO_KEY, k.sk ?? NO_KEY];
+					const after = cursor as DocCursor | null;
+					const params: unknown[] = [PAGE_ROWS];
+					let where = after ? "(k.routing_hash, k.hk, k.sk) > (?2, ?3, ?4)" : "(k.routing_hash, k.hk, k.sk) >= (?2, ?3, ?4)";
+					params.push(...(after ? [after.routingHash, after.hk, after.sk] : edge(interval.start)));
+					if (interval.end) {
+						where += " AND (k.routing_hash, k.hk, k.sk) < (?5, ?6, ?7)";
+						params.push(...edge(interval.end));
+					}
 					const rows = sql
-						.exec<DocRow>(
-							"SELECT tenant_id, sort_key, title, body FROM docs WHERE (tenant_id, sort_key) > (?, ?) ORDER BY tenant_id, sort_key LIMIT ?",
-							tenant,
-							sortKey,
-							PAGE_ROWS,
+						.exec<{ routing_hash: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer } & DocRow>(
+							`SELECT k.routing_hash, k.hk, k.sk, d.tenant_id, d.sort_key, d.title, d.body
+							   FROM doc_keys k JOIN docs d ON d.rowid = k.doc_id
+							  WHERE ${where} ORDER BY k.routing_hash, k.hk, k.sk LIMIT ?1`,
+							...params,
 						)
-						.toArray();
+						.toArray()
+						.map(
+							(r): MigratedDoc => ({
+								routingHash: new Uint8Array(r.routing_hash),
+								hk: KeyCodec.asKeyBytes(new Uint8Array(r.hk)),
+								sk: KeyCodec.asKeyBytes(new Uint8Array(r.sk)),
+								tenant_id: r.tenant_id,
+								sort_key: r.sort_key,
+								title: r.title,
+								body: r.body,
+							}),
+						);
 					const last = rows.at(-1);
 					return {
-						page: rows.filter((r) => belongsToTarget({ hashKey: KeyCodec.encode(r.tenant_id), sortKey: KeyCodec.encode(r.sort_key) })),
-						nextCursor: rows.length === PAGE_ROWS && last ? [last.tenant_id, last.sort_key] : null,
+						page: rows.filter((r) => belongsToTarget({ hashKey: r.hk, sortKey: r.sk })),
+						nextCursor:
+							rows.length === PAGE_ROWS && last ? ({ routingHash: last.routingHash, hk: last.hk, sk: last.sk } satisfies DocCursor) : null,
 					};
 				},
+				// It runs inside the page transaction of the runtime.
 				applyPage: (page) => {
-					for (const r of page as DocRow[]) {
-						sql.exec("INSERT INTO docs (tenant_id, sort_key, title, body) VALUES (?, ?, ?, ?)", r.tenant_id, r.sort_key, r.title, r.body);
-					}
+					for (const doc of page as MigratedDoc[]) this.insertDoc(doc);
 				},
 				validatePage: (_cursor, page) => {
 					if (!Array.isArray(page)) throw new Error("search migration page must be an array");
@@ -273,15 +348,11 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 			cleanupSourceStep: (plan) => {
 				const slice = plan.targets[0]?.slice;
 				if (plan.kind === "key_promotion" && slice?.kind === "promoted_routing_hash") {
-					const moved = slice.routingHash;
-					for (const { tenant_id } of sql.exec<{ tenant_id: string }>("SELECT DISTINCT tenant_id FROM docs").toArray()) {
-						const routingHash = this.fokos.routingHashForKey(KeyCodec.encode(tenant_id));
-						if (routingHash.length === moved.length && routingHash.every((b, i) => b === moved[i])) {
-							sql.exec("DELETE FROM docs WHERE tenant_id = ?", tenant_id);
-						}
-					}
+					sql.exec("DELETE FROM docs WHERE rowid IN (SELECT doc_id FROM doc_keys WHERE routing_hash = ?)", slice.routingHash);
+					sql.exec("DELETE FROM doc_keys WHERE routing_hash = ?", slice.routingHash);
 				} else {
 					sql.exec("DELETE FROM docs");
+					sql.exec("DELETE FROM doc_keys");
 				}
 				return true;
 			},

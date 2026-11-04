@@ -972,14 +972,28 @@ export class FokosShardingStore {
 		);
 	}
 
-	/** Pages the terminal overrides in `routing_hash` order, strictly after `cursor`. */
-	queryTerminalRouteOverridesPage(cursor: PromotedKeyCursor | null, limit: number): { routingHash: RoutingHash }[] {
-		const where = cursor ? `AND o.routing_hash > ?2` : ``;
-		const params: unknown[] = cursor ? [limit, cursor.routingHash] : [limit];
+	/**
+	 * Pages the terminal overrides in the routingHash interval `[start, end)`, in `routing_hash` order,
+	 * strictly after `cursor`. A null `end` has no upper bound. The primary key seeks to the first row
+	 * of the interval, so the overrides outside it cost no row read.
+	 */
+	queryTerminalRouteOverridesPage(
+		cursor: PromotedKeyCursor | null,
+		limit: number,
+		start: RoutingHash,
+		end: RoutingHash | null,
+	): { routingHash: RoutingHash }[] {
+		const params: unknown[] = [limit, cursor ? cursor.routingHash : start];
+		const lower = cursor ? `o.routing_hash > ?2` : `o.routing_hash >= ?2`;
+		let upper = ``;
+		if (end !== null) {
+			params.push(end);
+			upper = `AND o.routing_hash < ?3`;
+		}
 		return this.#storage.sql
 			.exec<{ routing_hash: ArrayBuffer }>(
 				`SELECT o.routing_hash FROM fokos_route_overrides o JOIN fokos_repartitions r ON r.id = o.repartition_id
-				  WHERE r.state IN ('completed', 'cleaned') ${where} ORDER BY o.routing_hash LIMIT ?1`,
+				  WHERE ${lower} ${upper} AND r.state IN ('completed', 'cleaned') ORDER BY o.routing_hash LIMIT ?1`,
 				...params,
 			)
 			.toArray()

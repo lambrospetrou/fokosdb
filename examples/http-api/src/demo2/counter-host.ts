@@ -39,6 +39,10 @@ export type CounterStats = {
 
 type CounterRow = { key: string; val: number };
 
+/** A migrated row and a migration cursor carry the routingHash, the first key column of `counters`. */
+type MigratedCounterRow = CounterRow & { routingHash: Uint8Array };
+type CounterCursor = { routingHash: Uint8Array; key: string };
+
 /** A hash-only host uses no sort key. */
 const NO_SORT_KEY = KeyCodec.asKeyBytes(new Uint8Array());
 
@@ -51,7 +55,11 @@ export class CounterPartitionDO extends ShardedDurableObject<CounterPolicy, Coun
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, val INTEGER NOT NULL)");
+		// The routingHash of the key is the first key column, so a migration reads the interval of its
+		// target with one seek and does not read the rows of other targets.
+		ctx.storage.sql.exec(
+			"CREATE TABLE IF NOT EXISTS counters (routing_hash BLOB NOT NULL, key TEXT NOT NULL, val INTEGER NOT NULL, PRIMARY KEY (routing_hash, key)) WITHOUT ROWID",
+		);
 		ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS counter_meta (key TEXT PRIMARY KEY, val INTEGER NOT NULL)");
 		this.requestCount = this.readMeta("requestCount");
 		this.fokos = new FokosShardingRuntime<CounterPolicy, CounterOps>({
@@ -121,9 +129,12 @@ export class CounterPartitionDO extends ShardedDurableObject<CounterPolicy, Coun
 				key: (req) => ({ hashKey: req.hashKey, sortKey: NO_SORT_KEY }),
 				local: (req, call) => {
 					const key = KeyCodec.decode(req.hashKey) as string;
-					const current = sql.exec<{ val: number }>("SELECT val FROM counters WHERE key = ?", key).toArray()[0]?.val ?? 0;
+					const routingHash = this.fokos.routingHashForKey(req.hashKey);
+					const current =
+						sql.exec<{ val: number }>("SELECT val FROM counters WHERE routing_hash = ? AND key = ?", routingHash, key).toArray()[0]?.val ??
+						0;
 					const val = current + req.amount;
-					sql.exec("INSERT OR REPLACE INTO counters (key, val) VALUES (?, ?)", key, val);
+					sql.exec("INSERT OR REPLACE INTO counters (routing_hash, key, val) VALUES (?, ?, ?)", routingHash, key, val);
 					this.requestCount += 1;
 					this.writeMeta("requestCount", this.requestCount);
 					call.signal({ evaluateSplit: true });
@@ -139,22 +150,45 @@ export class CounterPartitionDO extends ShardedDurableObject<CounterPolicy, Coun
 			// A hash split cannot divide one key, so a partition with one hot key does not split.
 			evaluateSplit: ({ policy }) => (this.requestCount >= policy.maxRequests && this.keyCount() > 1 ? {} : false),
 			migration: {
-				buildPage: (cursor, _slice, belongsToTarget) => {
+				// The read seeks to `interval`, the routingHash interval of the target, and stops at its end.
+				// `belongsToTarget` still filters each row: it removes the keys that a range tree owns.
+				buildPage: (cursor, _slice, belongsToTarget, _budget, interval) => {
+					// This host splits by hash only, so each edge of an interval is a whole routingHash.
+					if (interval.start.hk !== undefined || interval.end?.hk !== undefined) {
+						throw new Error("the counter host splits by hash only");
+					}
+					const after = cursor as CounterCursor | null;
+					const params: unknown[] = [PAGE_ROWS + 1];
+					let where: string;
+					if (after) {
+						where = "(routing_hash, key) > (?2, ?3)";
+						params.push(after.routingHash, after.key);
+					} else {
+						where = "routing_hash >= ?2";
+						params.push(interval.start.routingHash);
+					}
+					if (interval.end) {
+						where += ` AND routing_hash < ?${params.length + 1}`;
+						params.push(interval.end.routingHash);
+					}
 					const rows = sql
-						.exec<CounterRow>(
-							"SELECT key, val FROM counters WHERE key > ? ORDER BY key LIMIT ?",
-							(cursor as string | null) ?? "",
-							PAGE_ROWS + 1,
+						.exec<{ routing_hash: ArrayBuffer; key: string; val: number }>(
+							`SELECT routing_hash, key, val FROM counters WHERE ${where} ORDER BY routing_hash, key LIMIT ?1`,
+							...params,
 						)
-						.toArray();
+						.toArray()
+						.map((r): MigratedCounterRow => ({ routingHash: new Uint8Array(r.routing_hash), key: r.key, val: r.val }));
 					const page = rows.slice(0, PAGE_ROWS);
+					const last = page[PAGE_ROWS - 1];
 					return {
 						page: page.filter((r) => belongsToTarget({ hashKey: KeyCodec.encode(r.key), sortKey: NO_SORT_KEY })),
-						nextCursor: rows.length > PAGE_ROWS ? page[PAGE_ROWS - 1].key : null,
+						nextCursor: rows.length > PAGE_ROWS ? ({ routingHash: last.routingHash, key: last.key } satisfies CounterCursor) : null,
 					};
 				},
 				applyPage: (page) => {
-					for (const r of page as CounterRow[]) sql.exec("INSERT OR REPLACE INTO counters (key, val) VALUES (?, ?)", r.key, r.val);
+					for (const r of page as MigratedCounterRow[]) {
+						sql.exec("INSERT OR REPLACE INTO counters (routing_hash, key, val) VALUES (?, ?, ?)", r.routingHash, r.key, r.val);
+					}
 				},
 				validatePage: (_cursor, page) => {
 					if (!Array.isArray(page)) throw new Error("counter migration page must be an array");

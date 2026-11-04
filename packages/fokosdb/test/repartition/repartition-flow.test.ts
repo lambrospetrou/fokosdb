@@ -1150,6 +1150,31 @@ describe("Repartition — promotions", () => {
 			expect(sharding.hasRouteOverride(P(kb(sibling)))).toBe(false);
 		});
 	});
+
+	// The overrides of the sibling are more than the scan cap. A read of the whole table needs more
+	// than one pull to pass them. A read of the interval of the child does not see them.
+	it("reads only the overrides in the interval of the child, so other overrides cost no pull", async () => {
+		const c = makeCluster({ runtimeConfig: { migrationScanRows: 5 } });
+		const root = c.hashNode([0]);
+		const mine = keyForChild(0, c.base.topology, "m");
+		const siblings = Array.from({ length: 12 }, (_, i) => keyForChild(1, c.base.topology, `s${i}`));
+
+		await root.enter(({ source, sharding }) => {
+			[mine, ...siblings].forEach((key, i) => {
+				source.queue({ kind: "key_promotion", routingHash: P(kb(key)) });
+				sharding.setRepartitionState(`r${i + 1}`, "cleaned");
+			});
+			source.queue({ kind: "hash_split" });
+		});
+		await cutOver(root);
+		const child = await firstChild(c, root);
+
+		expect((await pullsByStream(child)).overrides).toBe(1);
+		await child.enter(({ sharding }) => {
+			expect(sharding.hasRouteOverride(P(kb(mine)))).toBe(true);
+			expect(siblings.some((key) => sharding.hasRouteOverride(P(kb(key))))).toBe(false);
+		});
+	});
 });
 
 describe("Repartition — range splits", () => {

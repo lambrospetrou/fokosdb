@@ -845,7 +845,7 @@ export class RepartitionSource {
 		const slice = this.materializeSlice(target.slice);
 		const cursor: FokosMigrationCursor = req.cursor ?? { phase: "overrides", inner: null };
 		if (cursor.phase === "overrides") {
-			return this.#buildOverridesPage(row, slice, cursor.inner);
+			return this.#buildOverridesPage(row, target.partitionId, cursor.inner);
 		}
 
 		const config = this.deps.config();
@@ -891,19 +891,19 @@ export class RepartitionSource {
 
 	/**
 	 * The route overrides inside the target's slice. Only a hash split has any to give: a range or
-	 * promoted-key slice is itself inside a range tree, which holds no overrides of its own.
+	 * promoted-key slice is itself inside a range tree, which holds no overrides of its own. The slice
+	 * of a hash child is its node interval, so the read seeks to that interval.
 	 */
-	#buildOverridesPage(row: RepartitionRow, slice: FokosSlice, inner: PromotedKeyCursor | null): FokosMigrationPage {
+	#buildOverridesPage(row: RepartitionRow, targetPartitionId: string, inner: PromotedKeyCursor | null): FokosMigrationPage {
 		if (row.kind !== "hash_split") {
 			return { phase: "overrides", overrides: [], nextCursor: { phase: "host", inner: null } };
 		}
 
-		const topology = this.deps.identity().ctx.topology;
+		const { start, end } = PartitionIdHelper.routingHashInterval(targetPartitionId, this.deps.identity().ctx.topology);
 		const config = this.deps.config();
 		const { rows, nextCursor } = collectBatch<{ routingHash: RoutingHash }, PromotedKeyCursor>({
-			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize),
+			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize, start, end),
 			advanceCursor: (r) => ({ routingHash: r.routingHash }),
-			include: (r) => sliceIncludesRoutingHash(slice, r.routingHash, topology),
 			estimateBytes: (r) => r.routingHash.byteLength + 64,
 			budgetBytes: config.migrationPageBytes,
 			maxItems: config.migrationPageRows,
