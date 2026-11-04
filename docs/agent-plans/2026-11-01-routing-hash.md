@@ -1114,8 +1114,7 @@ CREATE TABLE IF NOT EXISTS fokos_range_hierarchy (
 
 ##### The topology event and the keeper
 
-- `FokosTopologyEvent.targets[].slice` carries the routingHash and the composite boundaries. The `repartition_key`
-  of a `range_split` is the routingHash hex.
+- `FokosTopologyEvent.targets[].slice` carries the routingHash and the composite boundaries.
 - `fokos_topo_range_dirty` and `fokos_topo_bodies` use the routingHash in place of `hash_key`.
 - `fokos_topo_range_intervals` becomes
   `(shard_group, routing_hash, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)`, with the primary key

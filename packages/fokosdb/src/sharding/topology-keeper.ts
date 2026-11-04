@@ -106,10 +106,21 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   rows in fokos_topo_hash_nodes, so a build can size the bitmap before it reads the rows.
 		//
 		// fokos_topo_repartitions:
-		// - One row for each report, of every kind, for idempotency. `repartition_key` is the source
-		//   partition ID of a `hash_split` and a `key_promotion`, and the base64url hash key of a
-		//   `range_split`. `seq` is the `version` that the report gave its shard group.
-		// - `data` is the JSONB of the event. No build reads it.
+		// - One row for each report of a completed repartition, of every kind. The source partition
+		//   writes the report to its admin outbox in the completion transaction, and the outbox sends
+		//   it to this keeper until the keeper accepts it. The row makes a repeated report a no-op.
+		// - `id` is `<source DO name>/<repartition id>`. A repartition id is unique only inside its
+		//   source partition, so the source DO name makes it unique in the shard group. The primary key
+		//   `(shard_group, id)` is the idempotency check.
+		// - `kind` is `hash_split`, `range_split`, or `key_promotion`.
+		// - `seq` is the `version` of the shard group after the report: the new version when the report
+		//   wrote a new fact, or the current version when it wrote none.
+		// - `completed_at` is the clock of the source when it wrote `completed`. `received_at` is the
+		//   clock of this keeper when it accepted the report. The two clocks are different.
+		// - `actor_id` is the Durable Object ID of the source (`ctx.id.toString()`).
+		// - `data` is the JSONB of the full event: the source, the targets with their slices and
+		//   actor IDs, and the topology values. No build and no query reads it. It is there to examine
+		//   a report later.
 		//
 		// fokos_topo_hash_nodes:
 		// - One row for each split hash partition, and for each of its ancestors, also when the report
@@ -158,7 +169,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 completed_at    INTEGER NOT NULL,
                 received_at     INTEGER NOT NULL,
                 actor_id        TEXT    NOT NULL,
-                repartition_key TEXT    NOT NULL,
                 data            BLOB    NOT NULL,
                 PRIMARY KEY (shard_group, id)
             ) STRICT;
@@ -288,7 +298,7 @@ export class FokosTopologyKeeper {
 	async registerRepartition(wire: unknown, now = Date.now()): Promise<void> {
 		const event = topologyEventFromWire(wire);
 		validateTopology({ shardGroup: event.shardGroup, rootTreesN: event.rootTreesN, hashSplitN: event.hashSplitN });
-		const { source, repartitionKey } = this.#checkSource(event);
+		const source = this.#checkSource(event);
 		const sql = this.#storage.sql;
 		const dueAt = this.#storage.transactionSync((): number | null => {
 			const group = this.#group(event.shardGroup);
@@ -316,8 +326,8 @@ export class FokosTopologyKeeper {
 			const version = changed ? previous + 1 : previous;
 			sql.exec(
 				`INSERT INTO fokos_topo_repartitions
-				   (shard_group, id, kind, seq, completed_at, received_at, actor_id, repartition_key, data)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, jsonb(?9))`,
+				   (shard_group, id, kind, seq, completed_at, received_at, actor_id, data)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8))`,
 				event.shardGroup,
 				event.id,
 				event.kind,
@@ -325,7 +335,6 @@ export class FokosTopologyKeeper {
 				event.completedAt,
 				now,
 				event.actorId,
-				repartitionKey,
 				topologyEventToJson(event),
 			);
 			const buildDueAt = group?.build_due_at ?? (changed ? now + this.#buildDelayMs : null);
@@ -473,10 +482,10 @@ export class FokosTopologyKeeper {
 
 	/**
 	 * Checks the source and the targets of the report against its kind and its topology values, and
-	 * gives the decoded source ID and the `repartition_key` of the row. A hash ID with a root index or a
-	 * child index outside the topology would put a bit at the position of another partition.
+	 * gives the decoded source ID. A hash ID with a root index or a child index outside the topology
+	 * would put a bit at the position of another partition.
 	 */
-	#checkSource(event: FokosTopologyEvent): { source: DecodedId; repartitionKey: string } {
+	#checkSource(event: FokosTopologyEvent): DecodedId {
 		let source: DecodedId;
 		try {
 			source = decodePartitionId(event.source.partitionId);
@@ -495,7 +504,7 @@ export class FokosTopologyKeeper {
 			if (event.targets.some((t) => t.slice.kind === "range" && compareRoutingHashes(t.slice.routingHash, routingHash) !== 0)) {
 				throw invalidEvent("the targets of a range_split have the routingHash of the source", { id: event.id });
 			}
-			return { source, repartitionKey: routingHash.toHex() };
+			return source;
 		}
 		if (source.schema !== PartitionIdHelper.SCHEMA_HASH_V1) {
 			throw invalidEvent(`the source of a ${event.kind} is a hash partition`, { id: event.id });
@@ -511,7 +520,7 @@ export class FokosTopologyKeeper {
 		if (event.kind === "key_promotion" && event.targets.length !== 1) {
 			throw invalidEvent("a key_promotion has one target", { id: event.id });
 		}
-		return { source, repartitionKey: event.source.partitionId };
+		return source;
 	}
 
 	/**
