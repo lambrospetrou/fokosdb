@@ -168,13 +168,14 @@ describe.concurrent("FokosDBPartitionDO - putItem / getItem", () => {
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "data", kind: "text" as const });
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
+		// A point read reads one row and writes none.
 		expect(result).toMatchObject({
 			found: true,
 			meta: {
 				partitions: [
 					{
-						rowsRead: expect.any(Number),
-						rowsWritten: expect.any(Number),
+						rowsRead: 1,
+						rowsWritten: 0,
 						databaseSize: expect.any(Number),
 						servedByActorId: expect.any(String),
 						servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),

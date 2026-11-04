@@ -728,6 +728,9 @@ describe("Repartition — fokosInit and fokosStartImport", () => {
 		const req = await initRequestFor(root, child);
 
 		await expect(child.peer.fokosInit({ ...req, repartitionId: "r99" })).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
+		await expect(child.peer.fokosInit({ ...req, source: { ...req.source, doName: "impostor" } })).rejects.toThrow(
+			fokosErrorWith("partition_context_mismatch"),
+		);
 		await expect(child.peer.fokosInit({ ...req, slice: { kind: "hash_child", childIndex: 9, depth: 1 } })).rejects.toThrow(
 			fokosErrorWith("partition_context_mismatch"),
 		);

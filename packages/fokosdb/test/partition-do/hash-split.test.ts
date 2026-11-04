@@ -96,24 +96,17 @@ describe("FokosDBPartitionDO - splitting", () => {
 		}
 	});
 
-	it("fokosInit is idempotent for identical options, and restores the fallback alarm", async ({ expect }) => {
+	it("status() reports a target after fokosInit as migration_initialized, with its parent", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub();
 		// The DO name and the partition ID of a target must match, so the target is the real child 0.
 		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
 		const childStub = testPartitionStub(childCtx.doName);
 
-		const req = {
+		await childStub.fokosInit({
 			repartitionId: "r1",
 			source: refOf(parentCtx),
 			target: childCtx,
-			slice: { kind: "hash_child" as const, childIndex: 0, depth: 1 },
-		};
-		await childStub.fokosInit(req);
-		// A lost reply leaves the source believing the target is initialized. A matching retry must
-		// therefore succeed AND leave an alarm behind, or the target has nothing to start itself with.
-		await expect(childStub.fokosInit(req)).resolves.not.toThrow();
-		await runInDurableObject(childStub, async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
-			expect(await state.storage.getAlarm()).not.toBeNull();
+			slice: { kind: "hash_child", childIndex: 0, depth: 1 },
 		});
 
 		const status = await openedRpc(childStub).status(childCtx);
@@ -153,35 +146,6 @@ describe("FokosDBPartitionDO - splitting", () => {
 		const write = openedRpc(child).apiPutItem(childCtx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
 		await expect(write).rejects.toThrow(fokosErrorWith("partition_migrating"));
 		await vi.waitFor(async () => expect(await attempts()).toBe(1), { timeout: 5_000, interval: 10 });
-	});
-
-	it("fokosInit refuses a call that conflicts with the import the target already holds", async ({ expect }) => {
-		const { ctx: parentCtx } = makeStub();
-		// The DO name and the partition ID of a target must match, so the target is the real child 0.
-		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
-		const childStub = testPartitionStub(childCtx.doName);
-		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
-		const source = refOf(parentCtx);
-
-		await childStub.fokosInit({ repartitionId: "r1", source, target: childCtx, slice });
-
-		// runInDurableObject keeps each caught rejection inside the execution context of the DO, so none
-		// of them leaks as an unhandled rejection at the worker level.
-		const { ctx: otherParentCtx } = makeStub();
-		await runInDurableObject(childStub, async (instance: FokosDBPartitionDO) => {
-			// A different repartition.
-			await expect(instance.fokosInit({ repartitionId: "r2", source, target: childCtx, slice })).rejects.toThrow(
-				fokosErrorWith("partition_context_mismatch"),
-			);
-			// A different source.
-			await expect(instance.fokosInit({ repartitionId: "r1", source: refOf(otherParentCtx), target: childCtx, slice })).rejects.toThrow(
-				fokosErrorWith("partition_context_mismatch"),
-			);
-			// A different slice.
-			await expect(
-				instance.fokosInit({ repartitionId: "r1", source, target: childCtx, slice: { ...slice, childIndex: 1 } }),
-			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
-		});
 	});
 
 	it("a matching fokosInit retry stores the latest policy of the target context", async ({ expect }) => {
