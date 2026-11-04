@@ -366,7 +366,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Implement clustered rows with the key range intervals `docs/agent-plans/2026-11-01-hash-key-buckets.md`.
 - Implement the splits with the new Durable Object Snapshot API.
 - Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
 - Enable cached topology for the GSI writers and `db.gsi()` client.

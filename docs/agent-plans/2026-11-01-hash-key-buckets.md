@@ -1,6 +1,6 @@
 # RFC — hashPrefixBucket: route, promote, and store by a fixed-length hash of the hash key
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-11-01
 **Author:** Lambros Petrou
 
