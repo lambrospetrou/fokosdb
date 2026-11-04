@@ -10,8 +10,8 @@ const PACKAGE_DIR = join(import.meta.dirname, "../packages/fokosdb");
 // Files that still have a prototype spy. Each entry is work to do: move the spy to a test control on a
 // test-only subclass, then remove the entry. The check fails when an entry has no spy.
 const PROTOTYPE_SPY_EXCEPTIONS = {
-	//"test/partition-do/promotion.test.ts":
-	//	"PartialRangeTopology is private to the runtime, thus no subclass can reach it. The spy is in a sequential top-level describe.",
+	"src/client/db.test.ts":
+		"The spies replace one RPC of a DO, or one method of FokosShardingClient, which is not a DO. Each spy is in a sequential describe outside the concurrent blocks.",
 };
 
 const TIMER_MARKER = "guard: allow-timer";
@@ -25,7 +25,8 @@ const CHECKS = [
 	// A prototype spy reaches every instance in the isolate, and `vi.restoreAllMocks()` of a different
 	// test can remove it. Put a test control on `ControlledPartitionDO` (test/controlled-partition-do.ts).
 	function noPrototypeSpy(files) {
-		const pattern = /vi\.spyOn\([^,]*prototype/;
+		// `vi` can be on the line above, so the pattern starts at `.spyOn(`.
+		const pattern = /\.spyOn\([^,]*prototype/;
 		const errors = [];
 		for (const file of files) {
 			const hits = matches(file, pattern);
@@ -63,12 +64,19 @@ const CHECKS = [
 	},
 ];
 
-const files = readdirSync(join(PACKAGE_DIR, "test"), { recursive: true })
-	.filter((path) => path.endsWith(".ts"))
-	.map((path) => {
-		const name = `test/${path}`;
-		return { name, lines: readFileSync(join(PACKAGE_DIR, name), "utf8").split("\n") };
-	});
+// Every file under test/, and every test file under src/.
+const sources = [
+	["test", (path) => path.endsWith(".ts")],
+	["src", (path) => path.endsWith(".test.ts")],
+];
+const files = sources.flatMap(([dir, keep]) =>
+	readdirSync(join(PACKAGE_DIR, dir), { recursive: true })
+		.filter(keep)
+		.map((path) => {
+			const name = `${dir}/${path}`;
+			return { name, lines: readFileSync(join(PACKAGE_DIR, name), "utf8").split("\n") };
+		}),
+);
 
 const errors = CHECKS.flatMap((check) => check(files).map((error) => `${check.name}: ${error}`));
 if (errors.length > 0) {

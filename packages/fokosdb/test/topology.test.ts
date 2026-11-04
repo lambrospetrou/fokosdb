@@ -14,6 +14,7 @@ import { TOPOLOGY_BLOOM_MIN_CAPACITY } from "../src/sharding/topology-encode.js"
 import type { FokosTopologyRead } from "../src/sharding/topology-keeper.js";
 import { TARGET_WAIT } from "./partition-do/helpers.js";
 import { makeRangeRoot } from "./partition-do/partition-harness.js";
+import { untilAvailable } from "./property-based/harness.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // maxSizeMb 0.25 is 262,144 bytes. The empty schema holds about 100 KB, so a few 50 KB items split a root.
@@ -47,15 +48,9 @@ async function splitRoot(db: FokosDB): Promise<string[]> {
 	const doNames = new Set<string>();
 	for (let i = 0; i < 10; i++) {
 		const hashKey = `item-${i}`;
-		for (let attempt = 0; attempt < 20; attempt++) {
-			try {
-				const { meta } = await db.putItem({ hashKey, data: ITEM_DATA });
-				doNames.add(meta.partitions[0].servedByActorName!);
-				break;
-			} catch (e) {
-				expect(["partition_migrating", "partition_over_size"]).toContain((e as { code?: string }).code);
-			}
-		}
+		// A write fails for a short time while a split is in progress.
+		const { meta } = await untilAvailable(() => db.putItem({ hashKey, data: ITEM_DATA }));
+		doNames.add(meta.partitions[0].servedByActorName!);
 		keys.push(hashKey);
 	}
 	for (const doName of doNames) {

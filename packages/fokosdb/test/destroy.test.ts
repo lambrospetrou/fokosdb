@@ -1,6 +1,7 @@
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
+import { untilAvailable } from "./property-based/harness.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // 3 root partitions, each splits into 2 children.
@@ -27,16 +28,9 @@ describe("FokosDB.destroy()", () => {
 		const allKeys: string[] = [];
 		for (let i = 0; i < 10; i++) {
 			const hk = `item-${String(i).padStart(4, "0")}`;
-			// Writes transiently fail while a split migration is in progress.
-			for (let attempt = 0; attempt < 20; attempt++) {
-				try {
-					const { meta } = await db.putItem({ hashKey: hk, data: ITEM_DATA });
-					doNamesSet.add(meta.partitions[0].servedByActorName!);
-					break;
-				} catch (e: unknown) {
-					expect(["partition_migrating", "partition_over_size"]).toContain((e as { code?: string }).code);
-				}
-			}
+			// A write fails for a short time while a split is in progress.
+			const { meta } = await untilAvailable(() => db.putItem({ hashKey: hk, data: ITEM_DATA }));
+			doNamesSet.add(meta.partitions[0].servedByActorName!);
 			allKeys.push(hk);
 		}
 

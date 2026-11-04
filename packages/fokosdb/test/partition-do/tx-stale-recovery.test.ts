@@ -14,7 +14,7 @@ import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
-import { captureConsoleError, kb, makeStub } from "./helpers.js";
+import { captureConsoleError, insertLock, kb, makeStub } from "./helpers.js";
 import { partitionRoutingHashOf } from "../routing-hash.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
@@ -23,42 +23,6 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
-
-	function insertStalePendingLock(
-		state: DurableObjectState,
-		transactionId: string,
-		coordinator: FokosDBRouteContext,
-		options?: {
-			createdAt?: number;
-			hashKey?: string;
-			data?: string;
-			guardedAt?: number | null;
-			transactionTimestamp?: number;
-			operation?: "put" | "check";
-		},
-	): PartitionStore {
-		const createdAt = options?.createdAt ?? Date.now() - 10_000;
-		const operation = options?.operation ?? "put";
-		const store = new PartitionStore(state.storage);
-		const P = partitionRoutingHashOf(state);
-		store.insertPendingLock({
-			routingHash: P(kb(options?.hashKey ?? `stale-${transactionId}`)),
-			hk: kb(options?.hashKey ?? `stale-${transactionId}`),
-			sk: kb("sk"),
-			transaction_id: transactionId,
-			transaction_ts: options?.transactionTimestamp ?? createdAt,
-			operation,
-			op_list: [[0, operation]],
-			data: operation === "put" ? (options?.data ?? "value") : null,
-			kind: operation === "put" ? "text" : null,
-			ttl_epoch_utc_seconds: null,
-			coordinator_json: JSON.stringify({ v: 1, doName: coordinator.doName, idempotencyToken: `token-${transactionId}` }),
-			created_at: createdAt,
-			guarded_at: options?.guardedAt ?? null,
-			next_recovery_at: createdAt + DEFAULT_STALE_TRANSACTION_MS,
-		});
-		return store;
-	}
 
 	/** Releases every remaining row of one transaction, to leave the partition without an alarm. */
 	function releasePendingLock(store: PartitionStore, transactionId: string): void {
@@ -165,7 +129,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 					nextAttemptAt: now,
 				});
 			});
-			const store = insertStalePendingLock(state, transactionId, coordinator);
+			const store = insertLock(state, transactionId, { coordinatorDoName: coordinator.doName });
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
@@ -202,7 +166,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...record, state: importState });
 			// This test cannot reach the source, so the import step fails and logs. The case is about
 			// recovery staying away, and not about how far the import gets.
-			const store = insertStalePendingLock(state, transactionId, coordinator);
+			const store = insertLock(state, transactionId, { coordinatorDoName: coordinator.doName });
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
@@ -221,7 +185,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: Date.now() });
+			const store = insertLock(state, transactionId, { createdAt: Date.now() });
 			// The lock goes stale at the scheduled time of the alarm, and the handler starts before it.
 			const scheduledTime = Date.now() + 300;
 			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = ? WHERE transaction_id = ?`, scheduledTime, transactionId);
@@ -241,7 +205,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS });
+			const store = insertLock(state, transactionId, { createdAt: now - IDEMPOTENCY_WINDOW_MS });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.listPendingTxKeys(transactionId).length).toBe(0);
 		});
@@ -260,7 +224,8 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, coordinator, {
+			const store = insertLock(state, transactionId, {
+				coordinatorDoName: coordinator.doName,
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
 				hashKey,
 			});
@@ -338,7 +303,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+			const store = insertLock(state, transactionId, {
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
 				operation: "check",
 				transactionTimestamp: 5,
@@ -377,14 +342,14 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 				txOrderTs: 10,
 			});
 			const transactionTimestamp = withPut ? 10 : 11;
-			insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+			insertLock(state, transactionId, {
 				createdAt,
 				hashKey: `checked-${transactionId}`,
 				operation: "check",
 				transactionTimestamp,
 			});
 			if (withPut) {
-				insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt, transactionTimestamp });
+				insertLock(state, transactionId, { createdAt, transactionTimestamp });
 			}
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.listPendingTxKeys(transactionId)).toHaveLength(withPut ? 2 : 1);
@@ -407,7 +372,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
+			const store = insertLock(state, transactionId, { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.listPendingTxKeys(transactionId).length).toBe(1);
 			expect(store.listPendingTxItems(transactionId)[0].guarded_at).toBeNull();
@@ -436,7 +401,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - 10_000 });
+			const store = insertLock(state, transactionId, { createdAt: now - 10_000 });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			// The next pass, as the fast path of the scheduler runs it after a pass that ends with a due job.
 			await instance.fokos.runDueWork();
@@ -467,7 +432,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			} as unknown as DurableObjectStub<FokosDBTransactionCoordinatorDO>);
 			const store = new PartitionStore(state.storage);
 			for (const [index, transactionId] of transactionIds.entries()) {
-				insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+				insertLock(state, transactionId, {
 					createdAt: now - 10_000 - index,
 					hashKey: `budget-${index}`,
 				});
@@ -497,7 +462,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - 10_000 });
+			const store = insertLock(state, transactionId, { createdAt: now - 10_000 });
 			// A reference that a later version of the code wrote.
 			state.storage.sql.exec(
 				`UPDATE pending_tx_info SET coordinator_json = json_set(coordinator_json, '$.v', 2) WHERE transaction_id = ?`,
@@ -528,7 +493,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
+			const store = insertLock(state, transactionId, { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			// Every key of the lock now belongs to another partition, which holds the true lock. The
 			// rows here are copies, and the cleanup of the migration deletes them.
 			const ownerCheck = vi.spyOn(instance.fokos, "ownerCheck").mockReturnValue(() => false);
@@ -554,7 +519,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = new PartitionStore(state.storage);
 			for (const [index, transactionId] of transactionIds.entries()) {
-				insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+				insertLock(state, transactionId, {
 					createdAt: index < 10 ? now - IDEMPOTENCY_WINDOW_MS - 1 : now - 5_001,
 					hashKey: `starvation-${index}`,
 				});
@@ -584,7 +549,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 		const hashKey = `debug-${outcome}-${transactionId}`;
 		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+			const store = insertLock(state, transactionId, {
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
 				hashKey,
 				data: "resolved-value",

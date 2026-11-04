@@ -7,7 +7,9 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import invariant from "../../src/shared/invariant.js";
-import { testPartitionStub } from "../stub-helpers.js";
+import { testCoordinatorContext, testPartitionStub } from "../stub-helpers.js";
+import { partitionRoutingHashOf } from "../routing-hash.js";
+import { DEFAULT_STALE_TRANSACTION_MS } from "../../src/shared/transaction-limits.js";
 export { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import {
 	createTableConfig,
@@ -200,4 +202,50 @@ export async function latestImage(
 			.toArray()[0];
 		return row && { revision: row.revision, deleted: row.deleted_at_ms !== null, data: row.data };
 	});
+}
+
+/**
+ * Writes one lock row of `transactionId` directly into the storage of a partition, as a prepare that
+ * the coordinator never finished leaves it. The lock is unguarded unless `guardedAt` is given, and
+ * its first recovery is due `DEFAULT_STALE_TRANSACTION_MS` after `createdAt`.
+ */
+export function insertLock(
+	state: DurableObjectState,
+	transactionId: string,
+	options?: {
+		hashKey?: string;
+		sortKey?: string;
+		operation?: "put" | "check";
+		data?: string;
+		createdAt?: number;
+		transactionTimestamp?: number;
+		guardedAt?: number | null;
+		coordinatorDoName?: string;
+	},
+): PartitionStore {
+	const createdAt = options?.createdAt ?? Date.now() - 10_000;
+	const operation = options?.operation ?? "put";
+	const hashKey = kb(options?.hashKey ?? `lock-${transactionId}`);
+	const store = new PartitionStore(state.storage);
+	store.insertPendingLock({
+		routingHash: partitionRoutingHashOf(state)(hashKey),
+		hk: hashKey,
+		sk: kb(options?.sortKey ?? "sk"),
+		transaction_id: transactionId,
+		transaction_ts: options?.transactionTimestamp ?? createdAt,
+		operation,
+		op_list: [[0, operation]],
+		data: operation === "put" ? (options?.data ?? "value") : null,
+		kind: operation === "put" ? "text" : null,
+		ttl_epoch_utc_seconds: null,
+		coordinator_json: JSON.stringify({
+			v: 1,
+			doName: options?.coordinatorDoName ?? testCoordinatorContext().doName,
+			idempotencyToken: `token-${transactionId}`,
+		}),
+		created_at: createdAt,
+		guarded_at: options?.guardedAt ?? null,
+		next_recovery_at: createdAt + DEFAULT_STALE_TRANSACTION_MS,
+	});
+	return store;
 }

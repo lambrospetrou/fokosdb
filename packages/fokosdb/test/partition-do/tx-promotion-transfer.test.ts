@@ -16,8 +16,8 @@ import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testCoordinatorContext, testCoordinatorRef } from "../stub-helpers.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
-import { DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
-import { captureConsoleError, kb, lockKeys, makeStub, withOpIndex } from "./helpers.js";
+import { IDEMPOTENCY_WINDOW_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
+import { captureConsoleError, insertLock, kb, lockKeys, makeStub, withOpIndex } from "./helpers.js";
 import {
 	CONTROLLED_NS,
 	drainUntil,
@@ -54,38 +54,6 @@ function cutOverPromotion(state: DurableObjectState, hashKey: string | null): vo
 }
 
 /** Writes the lock row a prepare left before the cutover of its key. */
-function insertLock(
-	state: DurableObjectState,
-	transactionId: string,
-	hashKey: string,
-	options?: { sortKey?: string; createdAt?: number; data?: string; guardedAt?: number | null; coordinatorDoName?: string },
-): PartitionStore {
-	const createdAt = options?.createdAt ?? Date.now() - 10_000;
-	const store = new PartitionStore(state.storage);
-	const P = partitionRoutingHashOf(state);
-	store.insertPendingLock({
-		routingHash: P(kb(hashKey)),
-		hk: kb(hashKey),
-		sk: kb(options?.sortKey ?? "sk"),
-		transaction_id: transactionId,
-		transaction_ts: createdAt,
-		operation: "put",
-		op_list: [[0, "put"] as [number, "put"]],
-		data: options?.data ?? "moved-value",
-		kind: "text",
-		ttl_epoch_utc_seconds: null,
-		coordinator_json: JSON.stringify({
-			v: 1,
-			doName: options?.coordinatorDoName ?? testCoordinatorContext().doName,
-			idempotencyToken: `token-${transactionId}`,
-		}),
-		created_at: createdAt,
-		guarded_at: options?.guardedAt ?? null,
-		next_recovery_at: createdAt + DEFAULT_STALE_TRANSACTION_MS,
-	});
-	return store;
-}
-
 function prepareOf(transactionId: string, keys: { hashKey: string; sortKey: string }[], data = "v1") {
 	return {
 		transactionId,
@@ -117,7 +85,7 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		const prepare = prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }], "bob-v1");
 		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "alice");
+			insertLock(state, transactionId, { hashKey: "alice" });
 			cutOverPromotion(state, "alice");
 		});
 
@@ -140,7 +108,7 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "alice");
+			insertLock(state, transactionId, { hashKey: "alice" });
 			cutOverPromotion(state, "alice");
 		});
 
@@ -169,7 +137,7 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		);
 		expect(prepared).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "alice");
+			insertLock(state, transactionId, { hashKey: "alice" });
 			cutOverPromotion(state, "alice");
 		});
 
@@ -184,7 +152,7 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		const transactionId = crypto.randomUUID();
 		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "alice");
+			insertLock(state, transactionId, { hashKey: "alice" });
 			cutOverPromotion(state, "alice");
 		});
 
@@ -198,7 +166,7 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		const transactionId = crypto.randomUUID();
 		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "alice");
+			insertLock(state, transactionId, { hashKey: "alice" });
 			cutOverPromotion(state, "alice");
 		});
 
@@ -216,7 +184,7 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		const prepare = prepareOf(transactionId, keys, "many");
 		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "alice");
+			insertLock(state, transactionId, { hashKey: "alice" });
 			cutOverPromotion(state, "alice");
 		});
 
@@ -243,8 +211,8 @@ describe("FokosDBPartitionDO — emergency repair on a promotion source", () => 
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "bob", { guardedAt: now, data: "bob-v1" });
-			insertLock(state, transactionId, "alice", { guardedAt: now });
+			insertLock(state, transactionId, { hashKey: "bob", guardedAt: now, data: "bob-v1" });
+			insertLock(state, transactionId, { hashKey: "alice", guardedAt: now });
 			cutOverPromotion(state, "alice");
 		});
 		const consoleError = captureConsoleError();
@@ -271,7 +239,7 @@ describe("FokosDBPartitionDO — emergency repair on a promotion source", () => 
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			insertLock(state, transactionId, "bob", { guardedAt: Date.now() });
+			insertLock(state, transactionId, { hashKey: "bob", guardedAt: Date.now() });
 		});
 		const logged = vi.spyOn(console, "info").mockImplementation(() => {});
 
@@ -321,7 +289,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertLock(state, transactionId, "alice", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
+			const store = insertLock(state, transactionId, { hashKey: "alice", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			const dispatch = vi.spyOn(instance.fokos, "dispatch");
 
 			// The promotion of the key cuts over while the coordinator holds its answer.
@@ -336,7 +304,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 
 			// The row is a copy now. The new owner commits its own row after its import.
 			expect(dispatch).not.toHaveBeenCalled();
-			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null, data: "moved-value" });
+			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null, data: "value" });
 			expect(store.getItem(partitionRoutingHashOf(state)(kb("alice")), kb("alice"), kb("sk")).row).toBeUndefined();
 		});
 	});
@@ -348,14 +316,14 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertLock(state, transactionId, "alice", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
+			const store = insertLock(state, transactionId, { hashKey: "alice", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			cutOverPromotion(state, "alice");
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 
 			// The copy carries its payload to the target, which resolves it after its import.
 			expect(await coordinator().testRecoverCalls()).toBe(0);
-			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null, data: "moved-value" });
+			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null, data: "value" });
 			const alarm = await state.storage.getAlarm();
 			expect(alarm === null || alarm > now).toBe(true);
 		});
@@ -371,8 +339,8 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
-			const store = insertLock(state, transactionId, "bob", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
-			insertLock(state, transactionId, "alice", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
+			const store = insertLock(state, transactionId, { hashKey: "bob", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
+			insertLock(state, transactionId, { hashKey: "alice", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			cutOverPromotion(state, "alice");
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
