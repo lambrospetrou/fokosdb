@@ -32,12 +32,31 @@ the two bounds, so a slow region completes fewer iterations inside its budget.
 - `POST /sweep` — runs the same fan-out the cron does and returns the per-run results. The optional
   body `{placements?, workloads?, instance?}` narrows it: `POST /sweep {"workloads": ["crud"],
 "placements": ["weur"]}`.
-- Auth: when `DEMO_API_TOKEN` is set, requests need the `x-fokos-secret-token` header.
+- Auth: when `DEMO_API_TOKEN` is set, requests need the `x-fokos-secret-token` header. The token is
+  a required secret, never a var — see Deploy for how it is set.
 
 ## Cron
 
 `* * * * *` → for every placement in `DEMO_PLACEMENTS` and every workload in `DEMO_CRON_WORKLOADS`,
 calls `tick` on instance `DEMO_CRON_INSTANCE`. Runs are independent objects, so all run in parallel.
+
+## Deploy
+
+`DEMO_API_TOKEN` is a required secret, so the first deploy must upload it with the code — a plain
+`wrangler deploy` fails the required-secret check, and `wrangler secret put` needs a Worker that
+already exists.
+
+```bash
+# 1. Generate the secrets file (env format; .env* is gitignored)
+echo "DEMO_API_TOKEN=$(openssl rand -hex 32)" > .env.production
+
+# 2. First deploy: code and secrets go up together
+pnpm deploy:secrets
+```
+
+Later code deploys need only `pnpm deploy` — the secret carries over from the previous version.
+Rotate the token with `wrangler secret put DEMO_API_TOKEN`. For local dev, copy `.dev.vars.example`
+to `.dev.vars` instead — `wrangler dev` reads it, `wrangler deploy` does not.
 
 ## Workloads
 
@@ -114,4 +133,3 @@ The `outcome` blob reports the first non-ok outcome of the iteration (a FokosDB 
 - Table retention policy: scheduled `cleanup` or table name rotation.
 - Placements `fedramp`, `sam`, `afr`, `me` when the account allows them.
 - vitest suite for the worker, like `examples/http-api` has.
-- `DEMO_API_TOKEN` as a secret instead of a plain var before a real deployment.

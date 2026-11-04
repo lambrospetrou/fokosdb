@@ -7,6 +7,7 @@
 		"check": "tsc --noEmit",
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy",
+		"deploy:secrets": "wrangler deploy --secrets-file .env.production",
 		"cf-typegen": "wrangler types"
 	},
 	"dependencies": {

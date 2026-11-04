@@ -1,0 +1,3 @@
+# Local dev secret — copy to .dev.vars (gitignored) for `pnpm dev`.
+# Leave unset locally to run the HTTP API without the token check.
+DEMO_API_TOKEN=dev-token-local
