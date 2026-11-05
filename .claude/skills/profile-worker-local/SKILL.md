@@ -97,5 +97,9 @@ The outputs are **V8 formats, not pprof** — `go tool pprof` cannot read them.
 - Empty/sparse CPU profile — the load was not running during `--duration`, or the isolate restarted
   mid-capture. Check the k6 run covered the whole window.
 - `401` from the API — pass `-e FOKOS_API_TOKEN=dev-token-1` (or another token from `.dev.vars`).
+- Worker stops answering, `/json/list` times out, wrangler logs `Cannot assign requested address` —
+  workerd hit ephemeral-port/file-descriptor limits under load. Stay at or below ~150 it/s for a CDP
+  session; at ~250 it/s the inspector starves first and the server wedges. Kill `wrangler dev` and
+  every `workerd` child of that run, wait for the ports to free, and restart.
 - Many targets in `/json/list` — use `--target <substr>` to pick the one whose title or url matches;
   the script prints the list when it cannot pick.
