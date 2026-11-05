@@ -22,6 +22,7 @@ const P = (hk: KeyBytes) => routingHashFor(hk);
 const kb = (value: string) => KeyCodec.encode(value);
 const SOURCE_ID = "aa".repeat(32);
 const GRANDPARENT_ID = "cc".repeat(32);
+const OUT_OF_ORDER = expect.objectContaining({ attributes: { detail: expect.stringContaining("out of storage order") } });
 const BUDGET = { pageBytes: 1024 * 1024, pageRows: 2, scanRows: 100 };
 
 const targets: PushSinkTargetDefinition[] = ["t1", "t2"].map((targetId) => ({
@@ -205,6 +206,30 @@ describe("MaterializationMigrationHost", () => {
 		expect(child.bytes).toBe(source.routingHashBytes);
 		// The ingest raised the item-id mark above each copied id.
 		expect(child.hwm).toBe(Math.max(...moved.map((item) => item.item_id)) + 1);
+	});
+
+	it("refuses an items page with a row out of storage order, or at or below its cursor", async () => {
+		const slice: FokosSlice = { kind: "promoted_routing_hash", routingHash: P(kb("hot")) };
+		const inSlice = (key: RouteKey) => KeyCodec.compare(key.hashKey, kb("hot")) === 0;
+		await inPartition("mat-source", (store) => {
+			for (const sk of ["s1", "s2", "s3"]) {
+				store.putLatestImage(P(kb("hot")), image("hot", sk), 1_000, undefined, []);
+			}
+			store.storeCursorSnapshot(P(kb("hot")));
+			const host = new MaterializationMigrationHost({ store, selfId: () => SOURCE_ID, routingHashForKey: P });
+			const { page, nextCursor } = host.buildPage(null, slice, inSlice, { ...BUDGET, pageRows: 10 }, ALL_ROWS);
+			const items = (page as Extract<MaterializationHostPage, { stream: "items" }>).items;
+			expect(items.map((item) => KeyCodec.decode(item.sk))).toEqual(["s1", "s2", "s3"]);
+			host.validatePage(null, page, nextCursor, inSlice);
+
+			const swapped = { stream: "items", items: [items[0], items[2], items[1]] };
+			expect(() => host.validatePage(null, swapped, nextCursor, inSlice)).toThrow(OUT_OF_ORDER);
+			const repeated = { stream: "items", items: [items[0], items[0], items[2]] };
+			expect(() => host.validatePage(null, repeated, nextCursor, inSlice)).toThrow(OUT_OF_ORDER);
+			const first = items[0];
+			const atCursor = { stream: "items", cursor: { routingHash: first.routingHash, hk: first.hk, sk: first.sk } };
+			expect(() => host.validatePage(atCursor, page, nextCursor, inSlice)).toThrow(OUT_OF_ORDER);
+		});
 	});
 
 	it("gives no fence to a target that has no inherited work", async () => {

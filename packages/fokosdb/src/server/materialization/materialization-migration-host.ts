@@ -18,7 +18,13 @@
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../../shared/invariant.js";
 import { compareRoutingHashes, type RoutingHash } from "../../sharding/hash-primitives.js";
-import { collectStream, comparePositions, rowFilter, type StreamReader } from "../../shared/partition/fokos-migration-host.js";
+import {
+	assertItemFollows,
+	collectStream,
+	comparePositions,
+	rowFilter,
+	type StreamReader,
+} from "../../shared/partition/fokos-migration-host.js";
 import type { KeyRange, StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
@@ -162,8 +168,11 @@ export class MaterializationMigrationHost implements MigrationHost {
 				() => `fokos/mat-migration: the ${requested.stream} cursor of the page does not move forward`,
 			);
 		}
-		if (p.stream === "items") {
+		if (p.stream === "items" && requested.stream === "items") {
+			let previous = requested.cursor;
 			for (const item of p.items) {
+				assertItemFollows(previous, item, "fokos/mat-migration");
+				previous = item;
 				// The closure is made only on a failure, because a page can hold many rows.
 				if (!inSlice({ hashKey: item.hk, sortKey: item.sk })) {
 					invariant(false, () => `fokos/mat-migration: the items page holds ${KeyCodec.pairForLog(item.hk, item.sk)}, outside the slice`);

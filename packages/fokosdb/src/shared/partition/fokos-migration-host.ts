@@ -146,6 +146,14 @@ export class FokosMigrationHost implements MigrationHost {
 		if (p.stream === "producer_fences") {
 			return;
 		}
+		const requested = asHostCursor(cursor);
+		if (p.stream === "items" && requested.stream === "items") {
+			let previous = requested.cursor;
+			for (const item of p.items) {
+				assertItemFollows(previous, item, "fokos/migration-host");
+				previous = item;
+			}
+		}
 		for (const row of p.stream === "items" ? p.items : p.stream === "pending_tx" ? p.pendingTransactions : p.rows) {
 			// The closure is made only on a failure, because a page can hold many rows.
 			if (!inSlice({ hashKey: row.hk, sortKey: row.sk })) {
@@ -467,6 +475,20 @@ function movesForward(requested: FokosDBHostCursor, next: FokosDBHostCursor): bo
 }
 
 export type StreamPosition = NonNullable<KeyStreamCursor["cursor"]>;
+
+/**
+ * Throws when a row of an items page is not above `previous` in storage order. The caller gives the page
+ * cursor for the first row and the row before for each other row. The source reads the rows in storage
+ * order, so a row out of order shows a defect in the page, and the target stops before it imports it.
+ *
+ * TODO: The check compares the key bytes of each row. Remove it if a profile shows that it costs too much
+ * on large imports.
+ */
+export function assertItemFollows(previous: StorageCursor | null, row: StorageCursor, logPrefix: string): void {
+	if (previous !== null && comparePositions(row, previous) <= 0) {
+		invariant(false, () => `${logPrefix}: the items page holds ${KeyCodec.pairForLog(row.hk, row.sk)} out of storage order`);
+	}
+}
 
 /**
  * Compares two positions of one stream in its read order: `(routingHash, hk, sk)` for items, and
