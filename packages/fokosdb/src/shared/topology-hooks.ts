@@ -11,7 +11,7 @@ import type { FokosDBStubContext } from "./partition-context.js";
 /** The refresh settings of a topology cache. Absent values take the defaults of the cache. */
 export type TopologyRefreshSettings = { refreshMs?: number; refreshTimeoutMs?: number };
 
-type TopologyEntrypointFactory = (opts: { props: TopologyAdminAddress }) => Fetcher;
+export type TopologyEntrypointFactory = (opts: { props: TopologyAdminAddress }) => Fetcher;
 
 /**
  * The topology cache options of the shard group of `ctx`, or undefined when the table has no

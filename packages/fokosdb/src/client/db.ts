@@ -1,4 +1,4 @@
-import { env, waitUntil } from "cloudflare:workers";
+import { env, exports, waitUntil } from "cloudflare:workers";
 import {
 	AnsweredPartitionMeta,
 	DataKind,
@@ -37,8 +37,9 @@ import {
 import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
 import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
-import { topologyCacheFor } from "../shared/topology-hooks.js";
-import { FOKOS_HASH_PARTITIONS_MAX, FokosTopology, type FokosPartitionRef } from "../sharding/route-context.js";
+import type { TopologyEntrypointFactory } from "../shared/topology-hooks.js";
+import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
+import { FOKOS_HASH_PARTITIONS_MAX, type FokosPartitionRef } from "../sharding/route-context.js";
 import type { RoutingHash } from "../sharding/hash-primitives.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
@@ -158,6 +159,7 @@ import {
 	materializationShardGroup,
 	materializationTableConfig,
 	type FokosDBPolicy,
+	type FokosDBStubContext,
 	type FokosDBTableConfig,
 	type FokosTableIdentity,
 	type FokosTableOptions,
@@ -700,25 +702,13 @@ export class FokosDB {
 			shardGroup: coordinatorShardGroup(topology, tableFingerprint(env, this.#table)),
 			rootTreesN: coordinatorRootsN,
 		};
-		// Each client reads the topology of its own shard group from its own admin Durable Object. The
-		// imported `waitUntil` extends the request that runs the refresh, in a Worker and in a Durable Object.
-		const withTopologyCache = (ctx: { topology: FokosTopology; policy: FokosDBPolicy }, binding: DataNamespaceKey) => {
-			const topologyCache =
-				options.useTopologyCache === false
-					? undefined
-					: topologyCacheFor(ctx, binding, waitUntil, {
-							refreshMs: options.topologyRefreshMs,
-							refreshTimeoutMs: options.topologyRefreshTimeoutMs,
-						});
-			return topologyCache === undefined ? {} : { topologyCache };
-		};
 		this.#partitions = new FokosShardingClient({
 			topology,
 			rangeConfig,
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
-			...withTopologyCache({ topology, policy }, policy.ns),
+			...this.#topologyCache({ topology, policy }, policy.ns),
 		});
 		this.#coordinators = new FokosShardingClient({
 			topology: coordinatorTopology,
@@ -726,8 +716,53 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
-			...withTopologyCache({ topology: coordinatorTopology, policy }, policy.nsTx),
+			...this.#topologyCache({ topology: coordinatorTopology, policy }, policy.nsTx),
 		});
+	}
+
+	/**
+	 * The topology cache options of the shard group of `ctx`, or an empty object when the table does
+	 * not use the cache. `binding` is the namespace that holds the shard group. Each client reads the
+	 * topology of its own shard group from its own admin Durable Object. The imported `waitUntil`
+	 * extends the request that runs a refresh, in a Worker and in a Durable Object.
+	 */
+	#topologyCache(ctx: FokosDBStubContext, binding: DataNamespaceKey): { topologyCache?: FokosTopologyCacheOptions } {
+		const { topologyEntrypoint, nsAdmin } = ctx.policy;
+		if (this.#options.useTopologyCache === false || topologyEntrypoint === undefined || nsAdmin === undefined) {
+			return {};
+		}
+		return {
+			topologyCache: {
+				fetch: (path, signal, routingHash) => this.#topologyFetch(ctx, binding, path, signal, routingHash),
+				waitUntil,
+				// The scope isolates the entries of each admin. The binding and the shard group name it
+				// without the fingerprint work of the address.
+				scope: JSON.stringify([nsAdmin, ctx.topology.jurisdiction ?? null, binding, ctx.topology.shardGroup]),
+				...(this.#options.topologyRefreshMs === undefined ? {} : { refreshMs: this.#options.topologyRefreshMs }),
+				...(this.#options.topologyRefreshTimeoutMs === undefined ? {} : { refreshTimeoutMs: this.#options.topologyRefreshTimeoutMs }),
+			},
+		};
+	}
+
+	/**
+	 * Fetches the encoded topology at `path` through the topology entrypoint of the table. The admin
+	 * address is computed on the call, which runs on a refresh, not on the construction of the client.
+	 */
+	async #topologyFetch(
+		ctx: FokosDBStubContext,
+		binding: DataNamespaceKey,
+		path: string,
+		signal: AbortSignal,
+		routingHash?: RoutingHash,
+	): Promise<Response> {
+		const { topologyEntrypoint } = ctx.policy;
+		const entrypoint = (exports as unknown as Record<string, TopologyEntrypointFactory | undefined>)[topologyEntrypoint!];
+		if (entrypoint === undefined) {
+			throw new Error(`the Worker does not export the topology entrypoint ${topologyEntrypoint}`);
+		}
+		const props = topologyAdminAddress(env, ctx, binding, routingHash);
+		invariant(props !== undefined, "fokos/client: a table with a topology entrypoint has an nsAdmin");
+		return await entrypoint({ props }).fetch(`http://fokos-topology${path}`, { signal });
 	}
 
 	/**

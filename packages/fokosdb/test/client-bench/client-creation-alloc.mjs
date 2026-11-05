@@ -33,7 +33,14 @@ const { outputFiles } = await build({
 			name: "cloudflare-workers",
 			setup(b) {
 				b.onResolve({ filter: /^cloudflare:workers$/ }, () => ({ path: "env", namespace: "cf" }));
-				b.onLoad({ filter: /.*/, namespace: "cf" }, () => ({ contents: "export const env = {};" }));
+				b.onLoad({ filter: /.*/, namespace: "cf" }, () => ({
+					contents: [
+						'const ns = { idFromName: () => ({ toString: () => "ab".repeat(32) }) };',
+						"export const env = { CUSTOM_PARTITION_DO: ns, TRANSACTION_COORDINATOR_DO: ns, FOKOS_ADMIN_DO: ns };",
+						"export const waitUntil = () => {};",
+						"export const exports = {};",
+					].join("\n"),
+				}));
 			},
 		},
 	],
