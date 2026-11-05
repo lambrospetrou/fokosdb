@@ -17,13 +17,13 @@
 - [7. References](#7-references)
 - [Appendix A. Measurements](#appendix-a-measurements)
 - [Appendix B. Walkthrough: the two planner defects](#appendix-b-walkthrough-the-two-planner-defects)
-- [Appendix C. Walkthrough: the promotion walk][appendix-c]
+- [Appendix C. Walkthrough: the promotion lookup][appendix-c]
 - [Appendix D. Walkthrough: why the bucket size counts items](#appendix-d-walkthrough-why-the-bucket-size-counts-items)
 - [Appendix E. Walkthrough: the cost bound of the planner](#appendix-e-walkthrough-the-cost-bound-of-the-planner)
 - [Appendix F. Walkthrough: the choice of K](#appendix-f-walkthrough-the-choice-of-k)
 - [Appendix G. Walkthrough: buckets in storage order](#appendix-g-walkthrough-buckets-in-storage-order)
 
-[appendix-c]: #appendix-c-walkthrough-the-promotion-walk
+[appendix-c]: #appendix-c-walkthrough-the-promotion-lookup
 
 ## 1. Overview and context
 
@@ -162,8 +162,9 @@ and the deployment uses new namespaces.
 3. The size summaries must stay exact: after each commit, they must match the committed items. A write must not fail
    because of a summary defect. The partition must detect the defect, log it, and repair it in the same transaction.
 4. The storage model must be able to change after the release, for new constants, columns, indexes, and tables. A
-   change of a constant must apply to each estimate at once, with no rewrite of a stored row. Only a new kind of fact
-   can need a backfill.
+   change of a constant must apply at once to item validity, the byte budgets, and the range planner, with no rewrite
+   of a stored row. The stored estimate of the promotion lookup can keep the old constant until the next write or
+   import of its bucket (section 4.2.8). Only a new kind of fact can need a backfill.
 5. The promotion decision must find each routingHash whose estimate is at or above the promotion threshold, up to
    five, largest first, each with a hash key that has items. The check after a write and the decision must agree.
 6. A range split must succeed whenever the slice holds at least one item for each child. Each child must hold at least
@@ -225,14 +226,14 @@ the lower bound of the next bucket, in composite-key order.
 **Storage model.** The estimate of an item or a bucket is the storage bytes that the storage model calculates from its
 facts. The model multiplies each fact by a coefficient, a constant in the code that is measured for each table. It
 counts each key copy in each index, the index entry of a TTL or a tombstone, and the overflow pages of large rows. A
-new coefficient changes every estimate at once, with no row rewrite.
+new coefficient changes every estimate that the planner calculates at once, with no row rewrite.
 
 The facts feed two decisions:
 
-- **Promotion.** Each bucket also stores `rank_bytes`, a sum of its facts with fixed integer weights. A partial index
-  on `rank_bytes` holds the first bucket of each routingHash. The lookup walks this index from the largest value. It
-  calculates the estimate of each row with the current coefficients, and it stops at a bound that holds for any
-  weights.
+- **Promotion.** Each bucket also stores `est_x4`, 4 times its estimate. Each statement that writes facts calculates
+  it again from the new facts. A partial index on `est_x4` holds the first bucket of each routingHash. The lookup reads
+  at most 5 rows of this index from the largest value. After a coefficient change, a bucket gets the new value at its
+  next write or import.
 - **Range split.** The planner reads the bucket rows of the slice in key order and calculates the byte target of each
   boundary. It then scans only the bucket that holds each target, and it selects the exact gap between two items.
 
@@ -245,7 +246,7 @@ items.item_bytes (exact) ───────────────► item l
         ▼
 item_stats buckets (exact facts), key (routing_hash, lower_hk, lower_sk)
         │
-        ├── hash leaf: one bucket per routingHash ──► walk on rank_bytes ──► storage model ──► promotion
+        ├── hash leaf: one bucket per routingHash ──► est_x4 ──► top 5 on item_stats_promotion ──► promotion
         │
         └── range leaf: K..2K items per bucket ──► storage model ──► planner:
                                                                      bucket rows + one scan per target bucket
@@ -260,12 +261,12 @@ sql.databaseSize ─────────────────────
 1. The old-facts read gets the old `item_bytes` and the indexed state of the item, or finds no row (section 4.2.2).
 2. The item write calculates the new `item_bytes` in SQLite and returns it.
 3. The bucket helper adds the new facts minus the old facts to the first bucket of the routingHash, and it sets
-   `rank_bytes` in the same statement (section 4.2.5). The statement returns the new facts of the bucket.
-4. After the commit, the write-path check prices the returned facts. It reports a promotion candidate when the
-   estimate is at or above the promotion threshold. The write then signals the split decision.
+   `est_x4` from the new facts in the same statement (section 4.2.5). The statement returns the new `est_x4`.
+4. After the commit, the write-path check compares the returned `est_x4` with the promotion threshold. It reports a
+   promotion candidate when the estimate is at or above the threshold. The write then signals the split decision.
 
-**A hash leaf over its cap.** The split decision runs after the write. It walks `item_stats_promotion` from the largest
-`rank_bytes`, and it returns up to five routingHashes at or above the promotion threshold (section 4.2.8). The
+**A hash leaf over its cap.** The split decision runs after the write. It reads at most 5 rows of `item_stats_promotion`
+from the largest `est_x4`, and it returns up to five routingHashes at or above the promotion threshold (section 4.2.8). The
 runtime requests a promotion for each one. When no routingHash is at or above the threshold, the leaf queues a hash
 split.
 
@@ -394,8 +395,7 @@ estimate = item_bytes + key_index_factor * key_bytes + base_overhead * item_coun
   A negative error is an estimate that is too high, so a routingHash of such rows is promoted earlier. A line in the
   key bytes cannot be closer, because a page holds a whole number of rows (section 2.2).
 - `shared/partition/item-size.ts` defines the `item_bytes` expression, the model type, the two coefficient sets, the
-  two rank-weight sets, the SQL fragment that sets `rank_bytes`, and both forms of `overflow_bytes`. No other module
-  holds a coefficient or a rank weight.
+  SQL fragment that sets `est_x4`, and both forms of `overflow_bytes`. No other module holds a coefficient.
 
 **Overflow pages.** A `WITHOUT ROWID` table keeps its rows in an index B-tree. On a 4 KiB page, SQLite keeps a row
 payload of at most 1,002 bytes on the tree page. For a larger payload, it keeps 489 bytes or more on the tree page and
@@ -446,11 +446,11 @@ CREATE TABLE item_stats (
   indexed_item_count INTEGER NOT NULL,
   indexed_key_bytes  INTEGER NOT NULL,
   overflow_bytes     INTEGER NOT NULL,
-  rank_bytes         INTEGER NOT NULL,   -- the rank formula over the facts of this row (section 4.2.8)
+  est_x4             INTEGER NOT NULL,   -- 4 times the estimate of the facts of this row (section 4.2.8)
   PRIMARY KEY (routing_hash, lower_hk, lower_sk)
 ) WITHOUT ROWID, STRICT;
 
-CREATE INDEX item_stats_promotion ON item_stats (rank_bytes) WHERE lower_hk = x'' AND lower_sk = x'';
+CREATE INDEX item_stats_promotion ON item_stats (est_x4) WHERE lower_hk = x'' AND lower_sk = x'';
 ```
 
 - **Bucket rule.** The bucket of an item is the row of its `routing_hash` with the greatest
@@ -462,8 +462,8 @@ CREATE INDEX item_stats_promotion ON item_stats (rank_bytes) WHERE lower_hk = x'
 - **Range leaf.** The one routingHash has buckets that cover its slice. The import builds them, and each write keeps
   them inside the band of section 4.2.6. The bounds are composite, so a bucket can hold the end of one hash key and
   the start of the next. Appendix G gives an example.
-- **`rank_bytes`** is an ordinary column. Each statement that writes facts also sets it (section 4.2.5). It is not a
-  generated column (section 5.23). Only the promotion walk reads it. A range leaf also stores it, because both leaf
+- **`est_x4`** is an ordinary column. Each statement that writes facts also sets it (section 4.2.5). It is not a
+  generated column (section 5.23). Only the promotion checks read it. A range leaf also stores it, because both leaf
   kinds use one schema. It costs about 6 bytes in each bucket row and no row written.
 - **The promotion index** holds only first buckets. A range leaf never reads it. The query must repeat both terms of
   the index condition.
@@ -472,7 +472,7 @@ CREATE INDEX item_stats_promotion ON item_stats (rank_bytes) WHERE lower_hk = x'
 - One class, `ItemStats` in `shared/partition/item-stats.ts`, owns the table, its migrations under its own KV key,
   and the split, merge, and recount statements. It replaces `KeySizeStats`. The host gives it the item table, the key
   column names, the indexed-item condition (`ttl_epoch_utc_seconds IS NOT NULL` or `deleted_at_ms IS NOT NULL`),
-  the leaf kind, the coefficient set, and the rank weights. These are fixed SQL fragments from the code, never user
+  the leaf kind, and the coefficient set. These are fixed SQL fragments from the code, never user
   input. The host gives each routingHash as opaque bytes, as it does to `KeySizeStats` today.
 
 #### 4.2.5 Fact updates
@@ -501,16 +501,21 @@ The facts of an item include its `overflow_bytes`. An overwrite or an update tha
 `overflow_bytes` and subtracts the old one, which the function gives from the old `item_bytes`.
 
 **Statements that write `item_stats`.** Only `ItemStats` writes the table. Each statement that writes a fact column
-must set `rank_bytes` in the same statement, from the new facts of that row. `item-size.ts` gives one function,
-`rankSql(itemBytes, keyBytes, itemCount, overflowBytes)`. It takes four SQL expressions for the new facts and returns
-the rank formula over them, with the rank weights of the code. In an SQLite `UPDATE`, each `SET` expression reads the
-old values of the row, so an update passes the old value plus its delta:
+must set `est_x4` in the same statement, from the new facts of that row. `item-size.ts` gives one function,
+`estSql(itemCount, itemBytes, keyBytes, indexedItemCount, indexedKeyBytes, overflowBytes)`. It takes six SQL
+expressions for the new facts and returns 4 times the estimate over them, with the coefficients of the code. In an
+SQLite `UPDATE`, each `SET` expression reads the old values of the row, so an update passes the old value plus its
+delta:
 
 ```sql
-rank_bytes = rankSql(item_bytes + ?db, key_bytes + ?dk, item_count + ?dc, overflow_bytes + ?do)
+est_x4 = estSql(item_count + ?dc, item_bytes + ?db, key_bytes + ?dk, …, overflow_bytes + ?do)
 ```
 
-| Statement | Facts that it writes | Arguments of `rankSql` |
+A statement must never set `est_x4` from the old `est_x4` plus a delta. A recalculation from the facts gives each
+written row the coefficients of the code, so a coefficient change reaches each bucket at its next write (section
+4.2.8).
+
+| Statement | Facts that it writes | Arguments of `estSql` |
 | --- | --- | --- |
 | Hash-leaf upsert, insert branch (first write of a routingHash) | The new facts | The bound new facts |
 | Hash-leaf upsert, `ON CONFLICT DO UPDATE` branch | Old facts plus the delta | Each old column plus its delta |
@@ -523,7 +528,7 @@ rank_bytes = rankSql(item_bytes + ?db, key_bytes + ?dk, item_count + ?dc, overfl
 | Import: insert of a new bucket | The page sums of the bucket | The bound sums |
 | TTL sweep: update of one bucket | Old facts minus the group sums | Each old column minus its group sum |
 | Recount of the drift repair | The counted facts | The bound counted facts |
-| Rank-weight job (section 4.2.8) | No fact | The columns of the row |
+| Coefficient backfill, optional (section 4.2.8) | No fact | The columns of the row |
 | Deletes: empty bucket, merge upper row, `beforeComplete`, cleanup guard | The row goes | Nothing |
 
 - No second statement is necessary. The column adds no row write: the statement already writes the bucket row and its
@@ -534,7 +539,7 @@ rank_bytes = rankSql(item_bytes + ?db, key_bytes + ?dk, item_count + ?dc, overfl
 the bucket with one seek:
 
 ```sql
-UPDATE item_stats SET item_count = item_count + ?dc, item_bytes = item_bytes + ?db, …, rank_bytes = <fragment>
+UPDATE item_stats SET item_count = item_count + ?dc, item_bytes = item_bytes + ?db, …, est_x4 = <fragment>
  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = (
        SELECT lower_hk, lower_sk FROM item_stats
         WHERE routing_hash = ?1 AND (lower_hk, lower_sk) <= (?2, ?3)
@@ -638,7 +643,7 @@ In the same storage transaction:
 
 1. Log the defect one time, with the routingHash, the bucket, the stored facts, and the delta.
 2. After the item change, count the facts of the bucket again from its key range of the primary key.
-3. Write the counted facts and their `rank_bytes` with one statement, or delete the bucket under the rule for empty
+3. Write the counted facts and their `est_x4` with one statement, or delete the bucket under the rule for empty
    buckets of section 4.2.5.
 
 On a range leaf, the recount reads at most `2K` items. On a hash leaf, the bucket is the whole routingHash:
@@ -647,137 +652,95 @@ On a range leaf, the recount reads at most `2K` items. On a hash leaf, the bucke
 #### 4.2.8 Promotion
 
 `T` is the promotion threshold: the cap of the leaf in bytes times `promotionFraction`, 0.25 by default. Both checks
-below use one estimate function over the facts of the first bucket of the routingHash, and the same `T`.
+below compare the `est_x4` of the first bucket of the routingHash with `ceil(4 * T)`. `est_x4` is an integer, so
+`est_x4 >= ceil(4 * T)` is the same test as `estimate >= T`.
 
-**Write-path check.** The bucket helper returns the facts of the bucket with `RETURNING`. On a hash leaf, the host
-calculates the estimate of the routingHash from them. It reports the changed hash key as a candidate when the estimate
-is at or above `T`. The runtime maps the hash key to its routingHash, as today.
-
-**Lookup of the split decision.** It replaces `largestAtLeast`. An index can order rows only by a column, and the
-estimate depends on the coefficients of the current code. Thus the lookup walks the index on `rank_bytes`, and it
-calculates the estimate of each row that it reads.
-
-**`rank_bytes`.**
+**`est_x4`.**
 
 ```text
-rank_bytes = item_bytes + RANK_KEY * key_bytes + RANK_ITEM * item_count + RANK_OVERFLOW * overflow_bytes
+est_x4 = 4 * estimate(facts of the row, coefficients of the code that last wrote the row)
 ```
 
-- `RANK_KEY`, `RANK_ITEM`, and `RANK_OVERFLOW` are positive integer constants for each table, in `item-size.ts`.
-- The estimate never uses them. They only order the walk.
-- The indexed facts are not in `rank_bytes`, so a TTL change does not change it. The ratio `r` below covers them.
+- Each coefficient is a multiple of 1/4 (section 4.2.3), so `est_x4` is an exact integer.
+- It includes each fact of section 4.2.3, also the indexed facts. Thus a TTL change, or a change from a live row to a
+  tombstone, changes it. That statement already writes the bucket row and its index entry, so this adds no row written.
+- Each statement that writes facts calculates it again from the new facts (section 4.2.5).
+- The range planner does not read it. The planner prices the facts with the live coefficients (section 4.2.9).
 
-**How to select the rank weights.** Select them one time, with the bench of appendix A.1, after each measurement of
-the coefficients. They are the positive integers that make the largest `r * rank_bytes / estimate` smallest, over the
-measured row shapes: keys of 16 to 408 bytes, data of 0 to 1,000 bytes, and no item, one item in three, or each item
-indexed. The walk length grows with this value. `RANK_OVERFLOW` is 1, because `overflow_coefficient` is 1.
+**Write-path check.** The bucket helper returns the `est_x4` of the bucket with `RETURNING`. On a hash leaf, the host
+reports the changed hash key as a candidate when `est_x4 >= ceil(4 * T)`. The runtime maps the hash key to its
+routingHash, as today.
 
-**The ratio `r`.** The lookup calculates `r` at each run, from the live coefficients and the rank weights:
-
-```text
-r = max( 1,
-         (key_index_factor + indexed_key_factor) / RANK_KEY,
-         (base_overhead + indexed_overhead)      / RANK_ITEM,
-         overflow_coefficient                    / RANK_OVERFLOW )
-```
-
-For each routingHash, `estimate <= r * rank_bytes` (appendix C). This holds for each item size, also for a routingHash
-of 1-byte items, because `item_count` has its own term in `rank_bytes`.
-
-The rank weights for the coefficients of section 4.2.3:
-
-| Rank weight | `items` | Term of `r` | `latest_items` | Term of `r` |
-| --- | --- | --- | --- | --- |
-| `RANK_KEY` | 2 | (1.25 + 1.25) / 2 = 1.25 | 2 | (1.25 + 1.25) / 2 = 1.25 |
-| `RANK_ITEM` | 81 | (76 + 25) / 81 = 1.25 | 74 | (67.25 + 24.75) / 74 = 1.24 |
-| `RANK_OVERFLOW` | 1 | 1 / 1 = 1 | 1 | 1 / 1 = 1 |
-| | | `r` = **1.25** | | `r` = **1.25** |
-| Largest `r * rank_bytes / estimate` | | **1.64** | | **1.65** |
-
-`r` is above 1 because the bound assumes that each item is indexed.
-
-**The walk.**
+**Lookup of the split decision.** It replaces `largestAtLeast`.
 
 ```sql
-SELECT routing_hash, item_count, item_bytes, key_bytes, indexed_item_count, indexed_key_bytes, overflow_bytes,
-       rank_bytes
+SELECT routing_hash, est_x4
   FROM item_stats
- WHERE lower_hk = x'' AND lower_sk = x'' AND rank_bytes >= ?1
- ORDER BY rank_bytes DESC
+ WHERE lower_hk = x'' AND lower_sk = x'' AND est_x4 >= ?1
+ ORDER BY est_x4 DESC
+ LIMIT 5
 ```
 
-1. Bind `?1` to `T / r`. A routingHash with `estimate >= T` has `rank_bytes >= T / r`, so the walk reads each
-   candidate.
-2. Calculate the estimate of each row. Keep the largest `PROMOTION_CANDIDATES_MAX` (5) at or above `T`.
-3. When the walk holds 5 candidates, and `r * rank_bytes` of the current row is below the fifth estimate, stop. Each
-   later row has a smaller `rank_bytes`, so it cannot enter the top five.
-4. For each kept routingHash, read one hash key with one primary-key seek:
+1. Bind `?1` to `ceil(4 * T)`. The `LIMIT` is `PROMOTION_CANDIDATES_MAX` (5).
+2. SQLite seeks to the largest entry of `item_stats_promotion` and reads the index backwards. It stops after 5 rows, or
+   at the first row below `?1`.
+3. For each row, read one hash key with one primary-key seek:
    `SELECT hk FROM items WHERE routing_hash = ? ORDER BY hk, sk LIMIT 1`. The host promotes by hash key, and the
    runtime maps it back to the routingHash.
-5. Return at most `PROMOTION_CANDIDATES_MAX` hash keys, largest estimate first.
+4. Return at most 5 hash keys, largest estimate first.
 
-- When the seek of step 4 finds no row, the bucket has no items. Log the defect one time and skip that routingHash.
-- The walk reads at most `r * sum(rank_bytes) / T` rows, and never more than the first-bucket count of the leaf. With
-  the rank weights above, `r * sum(rank_bytes)` is at most about 1.65 times the estimate of the leaf. Then a hash leaf
-  at 1.1 times its cap with `promotionFraction = 0.25` reads at most about 1.1 / 0.25 * 1.65, that is about 7 rows. A
-  walk of 6 rows takes about 0.15 ms locally, and a walk of 560 rows about 1.5 ms (appendix A.4).
-- The walk runs only while the leaf is over its cap. It runs after the write commits, so it reads committed facts.
-- The walk keeps no result between two decisions, and it writes no row. Each decision walks again.
+- When the seek of step 3 finds no row, the bucket has no items. Log the defect one time and skip that routingHash. Do
+  not read more index rows to replace it. The lookup then returns fewer candidates, and its bound stays.
+- **Bound.** The lookup reads at most 6 index entries (5 rows, and the row that stops the read) and makes at most 5
+  primary-key seeks. The bound does not depend on the leaf size, the number of routingHashes, or the cap. Thus a cap
+  reduction does not make the lookup longer. A read of 6 index rows takes about 0.15 ms locally (appendix A.4).
+- The query must repeat both terms of the index condition. Otherwise SQLite can scan the table with no error. A test
+  asserts the plan with `EXPLAIN QUERY PLAN` (section 4.2.16).
+- The lookup runs only while the leaf is over its cap. It runs after the write commits, so it reads committed facts.
+- The lookup keeps no result between two decisions, and it writes no row. Each decision reads again.
 
-**Cost after a cap reduction.** The walk reads at most about `4 * X * 1.65` rows, where `X` is the estimate of the leaf
-divided by its cap. A cap reduction makes `X` larger. The walk runs for each split decision while the leaf is over its
-cap and no split is queued: about one time for each successful write. `partition-context.ts` accepts each `maxSizeMb`
-above 0. The design accepts this cost, and it adds no cap minimum and no cache. Example with about 2.6 µs for each
-row read (appendix A.4):
+**Coefficient change.** A release can change a coefficient. A bucket row then keeps the `est_x4` of the old
+coefficients until a statement writes it again. Correctness does not need a job or a version, because these paths give
+each row the new value:
 
-| Cap change | `X` | Rows read, at most | Time, about |
-| --- | --- | --- | --- |
-| 1 GB to 100 MB | about 10 | about 66 | 0.17 ms |
-| 10 GB to 100 MB | about 100 | about 660 | 1.7 ms |
-| 10 GB to 1 MB | about 10,000 | about 66,000 | 0.17 s |
+- Each write of a routingHash calculates `est_x4` again from the facts. A routingHash that grows gets the new value at
+  its next write.
+- Each split, merge, and recount of a bucket does the same.
+- Each import builds its buckets with the coefficients of the code. Thus each hash child, each range child, and each new
+  range root starts with the new values. The source becomes a router and does not read its `item_stats` again.
 
-**Why inexact rank weights are correct.** The lookup calculates `r` from the live coefficients and the same weights, so
-`estimate <= r * rank_bytes` holds for any positive rank weights (invariant I9). A rank weight changes only the length
-of the walk:
+Only the first bucket of a routingHash with no write since the deployment, on a leaf that did not split, keeps the old
+value. The effects:
 
-- A weight below its coefficient makes `r` larger, so the walk stops lower.
-- A weight above its coefficient makes `rank_bytes` larger, so more rows are above `T / r`.
+| Coefficient change | Effect on such a routingHash | Cost |
+| --- | --- | --- |
+| Larger | The lookup can miss it when its new estimate is at or above `T`. The leaf then makes a hash split. The import of the child gives it the new value, and the write-path check or the next decision of the child promotes it | One more copy of the routingHash |
+| Smaller | The lookup can return it when its new estimate is below `T` | An early promotion |
+| Either | The order in the top five can change | None |
 
-Neither error can hide a candidate. Example: a later release adds an index that holds the key to `items`, and the
-measured `key_index_factor` goes from 1.25 to 2.5.
+- Item validity, the byte budgets, the facts, and the range boundaries do not read `est_x4`. A stale value cannot
+  change them.
+- Such a routingHash gets no writes, so it does not make the leaf grow.
+- Each Durable Object uses the coefficients of its code version. A rollout needs no coordination between Durable
+  Objects.
 
-1. The release changes the coefficient. The estimates are correct at once, and no row is rewritten.
-2. `RANK_KEY` stays 2. The term of `r` becomes (2.5 + 1.25) / 2 = 1.875, so `r` is 1.875 in place of 1.25.
-3. For items of 24 key bytes and 20 bytes of data, `r * rank_bytes / estimate` goes from 1.44 to 1.80, so the walk
-   reads about 25% more rows. It still finds each candidate.
+**Optional backfill.** Neither milestone builds it. When a coefficient change must reach each bucket before the next
+writes and imports:
 
-**Rank-weight change.** Correctness never needs this change. Change the weights only when the largest `r * rank_bytes /
-estimate` of the bench grows far above its value, for example above 3. Before the release, edit the constants. After the
-release, use the job below. Neither milestone builds it.
+1. `ItemStats` stores the version of the coefficients under its KV key. A new `item_stats` table stores the version of
+   the code.
+2. When the class starts and the stored version is older than the code version, a background job sets `est_x4` from
+   the facts of each bucket row, in primary-key order, in bounded batches in the alarm, for example 500 rows. A first
+   bucket writes the row and its index entry. Another bucket writes the row only.
+3. When the job has updated each row, it stores the code version in KV.
 
-1. Each weight set has a version. The code keeps each weight set that it ever used: three integers for each version.
-2. `ItemStats` stores, under its KV key, the oldest weight version that a bucket row can still use. A new
-   `item_stats` table stores the version of the code when it creates the table.
-3. When the class starts and the stored version is older than the code version, the weight change is in progress:
-   - Each statement that writes facts sets `rank_bytes` with the weights of the code version.
-   - A background job sets `rank_bytes` with the weights of the code version in each bucket row, in primary-key
-     order, in bounded batches in the alarm, for example 500 rows. A first bucket writes the row and its index entry.
-     Another bucket writes the row only.
-   - The walk calculates `r` with the smallest weight of each term over the versions from the stored version to the
-     code version. Each row uses one of those weight sets, so `estimate <= r * rank_bytes` holds for each row, and the
-     walk misses no candidate.
-4. The job stores the code version in KV when it has updated each row. The change is then complete, and the walk
-   uses only the weights of the code version.
+The lookup does not change during the job.
 
-The job writes about 2 rows for each routingHash of a hash leaf, and about 1 row for each bucket of a range leaf, at
-the rate that the batch size and the alarm interval set. A second weight change can start before the first job ends:
-the job then continues with the newest weights, and the walk keeps the smallest weights of all versions in the range.
-
-**Promotions in progress.** An in-flight promotion keeps its ranked place and answers `already_promoted`. The runtime
+**Promotions in progress.** An in-flight promotion keeps its place in the top five and answers `already_promoted`. The runtime
 tries each other candidate of the returned set independently. An unfinished promotion must not prevent the discovery
 of the other top-five routingHashes. When `beforeComplete` removes its buckets, the next decision finds the next ones.
 
-**Retry after a write.** The write-path signal can fail before it queues a promotion. Each decision walks the committed
+**Retry after a write.** The write-path signal can fail before it queues a promotion. Each decision reads the committed
 facts again, so a later decision finds the eligible routingHash again. Each decision retries its returned candidates,
 also after an earlier promotion request failed.
 
@@ -791,7 +754,7 @@ The planner keeps one `transactionSync`. Its inputs are the routingHash, the own
 `routing_hash = ? AND (hk, sk) >= start AND (hk, sk) < end` of the primary key, or a part of it.
 
 The planner reads all bucket rows of the slice in storage order and prices them with the live coefficients. It does
-not read the buckets in size order, so it uses no `rank_bytes` and no `r`.
+not read the buckets in size order, so it does not read `est_x4`.
 
 **Bucket path (M2).**
 
@@ -886,7 +849,7 @@ These changes move some page and batch boundaries.
 `MaterializationStore` uses the same machinery as `PartitionStore`:
 
 - `item_bytes` and the primary-key reads of section 4.2.2.
-- `ItemStats` with the `latest_items` coefficients and rank weights.
+- `ItemStats` with the `latest_items` coefficients.
 - The same fact updates, split, merge, import, promotion lookup, and planner.
 
 Its routingHash comes from its own runtime, with the seed of the materialization shard group. Its indexed items are
@@ -901,14 +864,14 @@ Each invariant must hold after each commit. The verification of section 4.2.16 c
 | --- | --- | --- |
 | I1 | The facts of each bucket equal the sums over the items in its key range | Each write changes the item and its facts in one storage transaction (section 4.2.5). The drift repair corrects a defect in the same transaction (section 4.2.7) |
 | I2 | The facts that a write adds for an item equal the facts that a later update or delete of that item subtracts | The old-facts read returns `item_bytes`, and `overflow_bytes` is a function of `item_bytes` only. Its JavaScript and SQL forms give the same value (sections 4.2.2 and 4.2.3) |
-| I3 | The `rank_bytes` of each bucket equals `rankSql` over its facts, with the weights of the code. During a rank-weight change, it can use the weights of an older version | Each statement that writes facts sets `rank_bytes` in the same statement (section 4.2.5) |
+| I3 | The `est_x4` of each bucket equals `estSql` over its facts, with the coefficients of the code that last wrote the row. After a coefficient change, a row with no write since the deployment can keep the older value | Each statement that writes facts sets `est_x4` from the new facts in the same statement, never from the old `est_x4` (section 4.2.5) |
 | I4 | A hash leaf holds exactly one bucket for each routingHash that has items: its first bucket `(x'', x'')` | The helper upserts the first bucket and deletes it with the last item (section 4.2.5). A hash leaf never splits a bucket |
 | I5 | On a range leaf, each bucket holds at most `2K` items, and each two neighbour buckets hold at least `K` items together. The first bucket stays while the routingHash has an item | The split and the merge run in the transaction of the write (section 4.2.6). The import makes buckets of `K` items. A merge deletes the upper row |
 | I6 | The buckets of a routingHash are one key range of `item_stats`, and the items of a bucket are one key range of the primary key of the item table | Both tables lead with `routing_hash` and are in storage order (section 4.2.4). Thus a promotion cleanup is one range delete |
 | I7 | The rows of an imported items page are strictly increasing in storage order above the page cursor | `assertItemFollows` in `validatePage` of both migration hosts (section 4.2.6) |
 | I8 | A retried migration page adds facts only for the items that it inserts | The import adds the facts of a row only when its insert reports a new row (section 4.2.6) |
-| I9 | For each routingHash, `estimate <= r * rank_bytes`. Thus the promotion lookup gives the same result for any positive rank weights. A rank weight changes only the number of rows that the walk reads | The lookup calculates `r` from the live coefficients and the rank weights (section 4.2.8, appendix C) |
-| I10 | The check after a write and the promotion lookup use the same estimate and the same `T` | One estimate function over the facts of the first bucket (section 4.2.8) |
+| I9 | The promotion lookup reads at most 6 index entries and makes at most 5 primary-key seeks, for each leaf size and each cap | The partial index `item_stats_promotion`, `LIMIT 5`, and a query that repeats the index condition (section 4.2.8) |
+| I10 | The check after a write and the promotion lookup use the same estimate and the same `T` | Both compare the stored `est_x4` of the first bucket with `ceil(4 * T)` (section 4.2.8) |
 | I11 | When a slice holds at least `N` items, the planner returns `N - 1` boundaries in increasing order. Each child holds at least one item, and each boundary is the shortest key that separates two adjacent items | One `transactionSync` for all reads, gaps only between items, and `KeyCodec.shortestCompositeSeparator` (section 4.2.9) |
 | I12 | A read of sizes, counts, or facts reads no item data | `item_bytes` and the TTL columns are before `data`, and no size read selects `data` (sections 4.2.2 and 4.2.9) |
 | I13 | The split decision of a range leaf reads at most `N` items | The count check with `LIMIT N` (section 4.2.10) |
@@ -927,7 +890,7 @@ deployed Durable Object (section 4.3.1).
 | Split | 1.45 to 1.65 ms, 6,150 rows read, 2 rows written, at most once for each `K` inserts into a bucket |
 | Merge | 2 more seeks for each delete while the bucket holds fewer than `K` items; 2 row writes for a merge |
 | Import | No item read for the buckets; one bucket write for each `K` imported items, and one for each page |
-| Promotion lookup | At most `r * sum(rank_bytes) / T` index rows, about 7 at 1.1 times the cap, plus at most 5 primary-key seeks. About 0.15 ms for 6 rows. No row written. It runs for each split decision of a hash leaf over its cap |
+| Promotion lookup | At most 6 index rows and 5 primary-key seeks, at each cap. About 0.15 ms for 6 rows. No row written. It runs for each split decision of a hash leaf over its cap |
 | Split decision of a range leaf | At most `N` items |
 | Planner, `N = 4`, caps of 500 MiB to 2 GiB | About 30 to 50 ms. Measured: 12 ms for a slice of 300,000 items |
 | Planner, `N = 4`, each cap up to 10 GB | At most about 150 ms |
@@ -954,7 +917,7 @@ fewer bucket rows. Thus small items give the worst case.
   backfill and no rollback procedure.
 - Key encoding, the routingHash, DO names, and committed item contents stay the same.
 - After the release, a coefficient change is an edit of the constants. It must not change item validity or commit
-  eligibility. A rank-weight change uses the background job of section 4.2.8.
+  eligibility. The stored `est_x4` follows at the next write or import, or with the optional backfill of section 4.2.8.
 - Update `AGENTS.md` for the range floor, the promotion lookup, and the bucket rules.
 
 #### 4.2.16 Verification
@@ -1010,15 +973,16 @@ Tests must check definitions, not only the agreement between two uses of the sam
 - Check a routingHash with many small items and long keys that ranks below a routingHash with large items by
   `item_bytes`, but above it by estimate. The lookup must return it.
 - Check a routingHash of 1-byte items with no data. The lookup must return it when its estimate is at or above `T`.
-- Change the coefficients in a test build and keep the rank weights, for example `base_overhead` times 2. The lookup
-  must give the same result as the reference.
-- Check that `rank_bytes` equals its formula after inserts, updates, deletes, splits, merges, imports, and recounts.
-- Change the rank weights in a test build. Check that the lookup gives the same result as the reference before, during,
-  and after the background job, with rows of both weight sets.
+- Check that `est_x4` equals 4 times the estimate of its facts after inserts, updates, deletes, TTL changes,
+  tombstone changes, splits, merges, imports, and recounts.
+- Write a bucket with an old `est_x4` directly with SQL in the test, as after a coefficient change. Check that the
+  next write of that routingHash sets `est_x4` from the facts, and that an import of the routingHash gives the new
+  value.
+- Check `T` values for which `4 * T` is not an integer.
 - Check that the write-path estimate equals the lookup estimate for a routingHash with long sort keys and TTLs.
 - Check that two hash keys with one routingHash give one candidate, with a hash key that has items.
 - Lower the cap below the size of a leaf with many routingHashes. The lookup must give the same result as the
-  reference.
+  reference, and `rowsRead` must stay within the bound of invariant I9.
 - While one promotion is unfinished, check that the decision still returns the other eligible top-five routingHashes.
 - Seed six routingHashes with estimates `[100, 90, 80, 70, 60, 50]` KiB at `T = 10 KiB`. Reduce the first five to
   11 KiB through deletes or TTL expiry before cutover. The next decision must return the sixth first.
@@ -1072,11 +1036,20 @@ rows keep their old price.
 A scan then reads a ready weight. A coefficient change then needs a rewrite of each item, or leaves mixed model
 versions. Exact facts avoid this.
 
-### 5.3 A stored estimate in each bucket with a plain index
+### 5.3 A rank column with fixed weights and a ratio bound
 
-The promotion lookup then reads at most 5 rows. Each write path must calculate the estimate in its upsert, and a
-coefficient change must rewrite each bucket row. A stale estimate can hide a candidate until the rewrite ends.
-`rank_bytes` needs no rewrite for a coefficient change, and its walk has a bound. Rejected.
+Each bucket stores `rank_bytes = item_bytes + RANK_KEY * key_bytes + RANK_ITEM * item_count + RANK_OVERFLOW *
+overflow_bytes`, with integer weights that are not the coefficients. The lookup walks the index on `rank_bytes` from
+`T / r`, where `r` bounds `estimate / rank_bytes` from the live coefficients and the weights. It calculates the estimate
+of each row that it reads, and it stops when `r * rank_bytes` is below the fifth estimate. Thus it misses no candidate
+after a coefficient change, with no row rewrite.
+
+Not chosen. It needs the bound `r` and its proof, a bench step that selects the weights, and a versioned job for a
+weight change. The walk reads about 7 rows at 1.1 times the cap, but about `4 * X * 1.65` rows when the leaf is `X`
+times its cap, for example about 66,000 rows after a cap change from 10 GB to 1 MB. Its guarantee is exact against a
+heuristic threshold: the model can be up to 18% below the measured storage (section 4.2.3). The stored estimate of
+section 4.2.8 can miss a routingHash only after a coefficient change, and only until its next write or import. The cost
+of such a miss is one more copy of that routingHash.
 
 ### 5.4 An expression index on the estimate
 
@@ -1156,7 +1129,7 @@ chosen, unless the measurements of section 4.3.1 show that the primary-key scans
 
 `KeySizeStats` stores one hash key in each row today. It costs the bytes of a hash key in each first bucket, and the
 key can outlive its own items. The primary-key seek of section 4.2.8 gives a hash key with items, for at most five
-seeks for each walk. Rejected.
+seeks for each lookup. Rejected.
 
 ### 5.18 Two facts for the items above a size limit
 
@@ -1171,10 +1144,11 @@ function of `item_bytes` gives the same value again at the delete, so the column
 
 ### 5.20 A promotion index on `item_bytes`
 
-The walk then needs a bound on `estimate / item_bytes`. The 1-byte item sets that bound, because the fixed bytes of
+A walk on this index then needs a bound on `estimate / item_bytes`, as in section 5.3. The 1-byte item sets that bound, because the fixed bytes of
 each item divide by its size: `r = 1 + key_index_factor + indexed_key_factor + base_overhead + indexed_overhead`,
 about 105 with the coefficients of `items`. A typical routingHash has a ratio of about 2. The walk then reads about
-`4.4 * 105`, or 460, rows at 1.1 times the cap. Most of them cannot be candidates. Rejected.
+`4.4 * 105`, or 460, rows at 1.1 times the cap. Most of them cannot be candidates. The stored estimate of section
+4.2.8 orders the rows exactly. Rejected.
 
 ### 5.21 A minimum `item_bytes` for each partition
 
@@ -1184,28 +1158,28 @@ or an import resets the minimum. An average or a maximum cannot bound the ratio.
 
 ### 5.22 An in-memory cache of the top five
 
-The leaf keeps the result of the last walk until a fact or a pricing input changes. Each write to `item_stats`, each
-rollback, and each eviction must clear it. The walk on `rank_bytes` reads about 7 rows at 1.1 times the cap, so the
-cache saves little. A cap reduction makes the walk longer, and section 4.2.8 accepts that cost. Rejected.
+The leaf keeps the result of the last lookup until a fact or a pricing input changes. Each write to `item_stats`, each
+rollback, and each eviction must clear it. The lookup reads at most 6 index rows, so the cache saves almost nothing.
+Rejected.
 
-### 5.23 `rank_bytes` as a virtual generated column
+### 5.23 `est_x4` as a virtual generated column
 
-`rank_bytes INTEGER GENERATED ALWAYS AS (<rank formula>) VIRTUAL`, with the same partial index. SQLite calculates the
+`est_x4 INTEGER GENERATED ALWAYS AS (<estimate formula>) VIRTUAL`, with the same partial index. SQLite calculates the
 value from the facts of the row. No statement sets it, it cannot drift from the facts, and the table row does not store
-it. The index stores it. Durable Object SQLite accepts it in a `STRICT, WITHOUT ROWID` table, and the walk uses the
+it. The index stores it. Durable Object SQLite accepts it in a `STRICT, WITHOUT ROWID` table, and the lookup uses the
 index. Rejected, because each later change of the formula is a schema change:
 
-- A change of a rank weight must drop the index, drop the column, add it with the new formula, and create the index
+- A change of a coefficient must drop the index, drop the column, add it with the new formula, and create the index
   again. `CREATE INDEX` writes one row for each routingHash in one statement, so the rate cannot be bounded.
 - SQLite refuses to drop a column that the formula uses. A later release that removes such a fact must change the
   formula first.
 - `SELECT *` returns the column, but no statement can write it. A table copy, for example in a table rebuild, must
   name its columns.
-- The migration writes the weights into the schema, and the walk reads them from the code. A code change with no
-  schema change makes `r` wrong, and the walk can then miss a candidate.
+- The migration writes the coefficients into the schema, and the planner reads them from the code. A code change with
+  no schema change gives two models in one partition.
 
-The ordinary column costs about 6 bytes in each bucket row and one SQL fragment in the fact statements. A weight
-change then runs as a bounded background job.
+The ordinary column costs about 6 bytes in each bucket row and one SQL fragment in the fact statements. A coefficient
+change then reaches the rows at their next write, or with a bounded backfill.
 
 ## 6. Frequently asked questions
 
@@ -1218,12 +1192,12 @@ continues to control the cap.
 ### How does a change of the schema reach the model?
 
 - **A new column, index, or key copy for each item.** Measure again, and change the coefficients. Rows and buckets
-  store exact facts only, so the new coefficient applies to each estimate at once, with no migration. The rank weights
-  can stay (section 4.2.8).
+  store exact facts only, so the new coefficient applies to each estimate of the planner at once, with no migration.
+  The stored `est_x4` of a bucket gets the new coefficient at its next write or import (section 4.2.8).
 - **A new table with its own storage shape.** The feature adds the facts that its shape needs: a count for a variable
   number of rows, a byte sum for variable data, or a sum over the items that hold a conditional row. It updates them
   with its rows in the same transaction, and its migration and delete paths move or remove them with the item. A new
-  fact needs a schema migration, a bounded backfill, and a rank weight.
+  fact needs a schema migration, a bounded backfill, and a term in `estSql`.
 
 ### Can `K` change after the release?
 
@@ -1320,7 +1294,6 @@ bench prints each measured value and its model value. It calculates:
    fixed bytes dominate.
 2. `overflow_row_overhead`: the integer that makes the largest relative error smallest for the rows with overflow
    pages.
-3. The rank weights of section 4.2.8.
 
 | Result | `items` | `latest_items` |
 | --- | --- | --- |
@@ -1329,7 +1302,6 @@ bench prints each measured value and its model value. It calculates:
 | Measured payload overhead | 37 to 39 bytes, 41 with a TTL | 28 bytes |
 | `row_payload_overhead` of the model | 40 | 29 |
 | `overflow_row_overhead` | 61 | 69 |
-| Rank weights, `r`, largest bound | 2 / 81 / 1, 1.25, 1.64 | 2 / 74 / 1, 1.25, 1.65 |
 
 Error of the model, as (measured − model) / measured, smallest to largest:
 
@@ -1428,17 +1400,17 @@ On 100,000 first buckets of hash leaves:
 
 | Operation | Time | Rows read | Rows written |
 | --- | --- | --- | --- |
-| Promotion walk that reads 6 rows | 0.14 to 0.16 ms | 7 | 0 |
-| Promotion walk that reads 56 rows | 0.3 to 1.0 ms | 57 | 0 |
-| Promotion walk that reads 560 rows | 1.4 to 1.5 ms | 561 | 0 |
+| Promotion index read of 6 rows | 0.14 to 0.16 ms | 7 | 0 |
 | First-bucket upsert, one hot routingHash | 24 to 29 µs | 1 | 2 |
 | First-bucket upsert, spread over all routingHashes | 52 to 74 µs | 1 | 2 |
 
 - The split is the `OFFSET` seek, the two aggregates with `overflow_bytes`, and the two bucket writes of section 4.2.6.
-- The time ranges come from two runs. The walk times vary between runs more than the other values.
+- The time ranges come from two runs. The index-read times vary between runs more than the other values.
 - `EXPLAIN QUERY PLAN` shows a primary-key search for the range scan, the count, the split seek, the old-facts read, the
-  seek of the last item before a bound, and the `item_stats` cleanup. The walk is
+  seek of the last item before a bound, and the `item_stats` cleanup. The promotion read is
   `SEARCH m_item_stats USING INDEX m_item_stats_promotion (rank_bytes>?)`.
+- The bench measured the index read on an earlier column, `rank_bytes`, with the same partial index and the same plan
+  shape. TODO: measure the read on `est_x4` with `LIMIT 5`.
 
 The current layout reads its sizes from the covering index `idx_items_scan`. On 2026-10-30, a JavaScript iteration of
 that index cost 1.17 µs for each row with a 16-byte sort key, and 1.30 µs with a 100-byte sort key.
@@ -1508,48 +1480,41 @@ Correct: gaps at 111 and 5222. The nearest gap to 1777 is 111 (1666 away; 5222 i
 222. Both targets select the gap 222, so the forward pass gives one boundary. The repair takes the gaps of the buffer,
 latest first, and gives `[111]`, `[111]`, `[5111]`.
 
-## Appendix C. Walkthrough: the promotion walk
+## Appendix C. Walkthrough: the promotion lookup
 
-The examples use the coefficients and the rank weights of `items` (sections 4.2.3 and 4.2.8): `key_index_factor`
-1.25, `base_overhead` 76, `RANK_KEY` 2, `RANK_ITEM` 81, `RANK_OVERFLOW` 1, and `r = 1.25`. The routingHashes have no
-TTL. Only X has overflow pages, and they add about 0.4% to it.
+The examples use the coefficients of `items` (section 4.2.3): `key_index_factor` 1.25 and `base_overhead` 76. The
+routingHashes have no TTL. Only X has overflow pages, and they add about 0.4% to it. The cap is 1 GB, so `T` is 250 MB.
 
-**The order by `rank_bytes` follows the estimate.**
+**The order by `est_x4` is the estimate order.**
 
 ```text
 routingHash X: 100 items of 1 MB
-  item_bytes 100 MB, estimate about 100 MB,                                 rank_bytes about 100 MB
+  item_bytes 100 MB, estimate about 100 MB,                          est_x4 about 400 M
 routingHash Y: 500,000 items, 100-byte keys and 20 bytes of data
-  item_bytes  60 MB, estimate 60 + 1.25 * 50 + 76 * 0.5 = 160.5 MB,         rank_bytes 60 + 2 * 50 + 81 * 0.5 = 200.5 MB
+  item_bytes  60 MB, estimate 60 + 1.25 * 50 + 76 * 0.5 = 160.5 MB,  est_x4 642 M
 routingHash Z: 1,000,000 items of 1-byte keys and no data
-  item_bytes   1 MB, estimate  1 + 1.25 * 1 + 76 * 1 = 78.25 MB,            rank_bytes  1 + 2 * 1 + 81 * 1 = 84 MB
+  item_bytes   1 MB, estimate  1 + 1.25 * 1 + 76 * 1 = 78.25 MB,     est_x4 313 M
 ```
 
-By `item_bytes`, Z is 100 times smaller than X. By `rank_bytes`, Z is close to its estimate. The walk reads Y, then X,
-then Z: the estimate order.
+By `item_bytes`, Z is 100 times smaller than X. By `est_x4`, Z is in its estimate place: the read order is Y, X, Z.
+The fixed bytes of each item and the overflow pages are terms of the estimate, so small items and large items get the
+same treatment. None of the three is at or above `T`, so the lookup reads one index row and returns no candidate.
 
-**Bound on the ratio.** For any routingHash, `indexed_key_bytes <= key_bytes` and `indexed_item_count <= item_count`.
-Each coefficient is 0 or more. So:
+**A coefficient change.** A later release changes `base_overhead` from 76 to 152.
 
 ```text
-estimate = item_bytes + key_index_factor * key_bytes + base_overhead * item_count
-         + indexed_key_factor * indexed_key_bytes + indexed_overhead * indexed_item_count
-         + overflow_coefficient * overflow_bytes
-        <= item_bytes
-         + (key_index_factor + indexed_key_factor) * key_bytes
-         + (base_overhead + indexed_overhead) * item_count
-         + overflow_coefficient * overflow_bytes
-        <= r * (item_bytes + RANK_KEY * key_bytes + RANK_ITEM * item_count + RANK_OVERFLOW * overflow_bytes)
-         = r * rank_bytes
+Z after the release, with no write:     est_x4 313 M  (old coefficients)
+Z new estimate:                          1 + 1.25 + 152 = 154.25 MB, est_x4 617 M
 ```
 
-The last step holds because `r` is at least 1, and at least each coefficient sum divided by its rank weight. A
-routingHash with `estimate >= T` therefore has `rank_bytes >= T / r`, and the walk reads it.
+Both values are below `4 * T` = 1,000 M, so the result is the same. Suppose instead that Z has 2,000,000 items. Its
+old value is 626 M and its new estimate is 308.5 MB, at or above `T`. Then:
 
-**Bound on the rows.** The number of first buckets with `rank_bytes >= T / r` is at most `sum(rank_bytes) * r / T`. With
-the rank weights of section 4.2.8, `r * rank_bytes` is at most about 1.65 times the estimate for each measured row
-shape. In a hash leaf at 1.1 times its cap with `T = 0.25 * cap`, that is `1.1 * 1.65 / 0.25`, or about 7 rows. Most
-leaves have few routingHashes above `T / r`, so a walk usually reads fewer.
+1. If Z gets a write, the statement sets `est_x4` to 1,234 M. The write-path check reports Z, and the lookup returns
+   it.
+2. If Z gets no write and the leaf goes over its cap, the lookup does not return Z. The leaf makes a hash split. The
+   import of the child that owns Z writes `est_x4` 1,234 M. The write-path check of a later write, or the next decision
+   of the child over its cap, promotes Z. Z is copied one more time.
 
 ## Appendix D. Walkthrough: why the bucket size counts items
 
