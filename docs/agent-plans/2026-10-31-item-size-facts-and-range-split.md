@@ -1,7 +1,7 @@
 # RFC — Exact item-size facts, item statistics in buckets, and correct range splits
 
 **State:** Draft
-**Date:** 2026-10-31
+**Date:** 2026-10-31, updated 2026-11-05
 
 ## Table of contents
 
@@ -17,37 +17,53 @@
 - [7. References](#7-references)
 - [Appendix A. Measurements](#appendix-a-measurements)
 - [Appendix B. Walkthrough: the two planner defects](#appendix-b-walkthrough-the-two-planner-defects)
-- [Appendix C. Walkthrough: the stop rule of the promotion lookup][appendix-c]
+- [Appendix C. Walkthrough: the promotion walk][appendix-c]
 - [Appendix D. Walkthrough: why the bucket size counts items](#appendix-d-walkthrough-why-the-bucket-size-counts-items)
 - [Appendix E. Walkthrough: the cost bound of the planner](#appendix-e-walkthrough-the-cost-bound-of-the-planner)
 - [Appendix F. Walkthrough: the choice of K](#appendix-f-walkthrough-the-choice-of-k)
+- [Appendix G. Walkthrough: buckets in storage order](#appendix-g-walkthrough-buckets-in-storage-order)
 
-[appendix-c]: #appendix-c-walkthrough-the-stop-rule-of-the-promotion-lookup
+[appendix-c]: #appendix-c-walkthrough-the-promotion-walk
 
 ## 1. Overview and context
 
 ### 1.1 Glossary
 
+The terms of the current system that this document uses. Section 4 defines the terms of the solution where it first
+uses them.
+
 | Term | Meaning in this document |
 | --- | --- |
-| item | One committed row of `items` (partition) or `latest_items` (materialization) |
-| key bytes | `octet_length(hk) + octet_length(sk)` of one item |
-| `item_bytes` | The exact encoded size of one item: stored data plus key bytes |
-| estimate | The storage bytes of one item or of a group of items, from the storage model |
-| coefficient | One of the four constants of the storage model (section 4.2.3) |
-| facts | The exact sums of a group of items: count, item bytes, key bytes, and the TTL parts |
-| bucket | One row of `item_stats`: the facts of the items of one hash key in one sort-key range |
-| hash leaf, range leaf | A partition that owns hash keys, or one slice `[start, end)` of one promoted hash key |
-| `K` | The target item count of a bucket. The value is 2,048 |
-| `C`, `N`, `B` | The item count of a slice, the child count of a range split, the estimate of a slice |
+| item | One committed row of `items` (partition DO) or `latest_items` (materialization DO) |
+| composite key | The pair `(hk, sk)` of an item, compared by `hk` first and then by `sk` |
+| routingHash | The 8-byte hash of the hash key (`docs/agent-plans/2026-11-01-routing-hash.md`). Two hash keys can have one routingHash |
+| storage order | The primary-key order `(routing_hash, hk, sk)` of `items`, and `(routing_hash, base_hk, base_sk)` of `latest_items` |
+| hash leaf | A partition that owns an interval of routingHashes |
+| range leaf | A partition that owns one composite-key slice `[start, end)` of one promoted routingHash |
+| cap | The `maxSizeMb` of the split policy of a leaf. A leaf above its cap splits or promotes |
+| promotion | The move of one large routingHash from a hash leaf to its own range tree. The threshold is a fraction of the cap |
+| hash split, range split | The split of a leaf into children. A range split makes `rangeSplitN` children, 4 by default |
 
 ### 1.2 Current size accounting
 
-`shared/partition/item-size.ts` defines one formula, and `items.est_row_bytes` stores its result:
+**Storage.** `items` is a `WITHOUT ROWID` table with `PRIMARY KEY (routing_hash, hk, sk)`. Its rows are in storage
+order. It has three secondary indexes:
+
+- `idx_items_item_id (item_id)`, unique. Each entry also holds the primary key.
+- `idx_items_scan (routing_hash, hk, sk, est_row_bytes)`, for the covering size scans and count queries.
+- `idx_items_ttl (ttl_epoch_utc_seconds, routing_hash, hk, sk)`, partial, for the items with a TTL.
+
+Thus an insert writes 3 rows, or 4 with a TTL. Each item stores its routingHash and its key 3 times, or 4 times with a
+TTL.
+
+**Formula.** `shared/partition/item-size.ts` defines one formula, and `items.est_row_bytes` stores its result:
 
 ```text
-est_row_bytes = octet_length(stored data) + octet_length(hk) + octet_length(sk) + 108
+est_row_bytes = octet_length(stored data) + octet_length(hk) + octet_length(sk) + 150
 ```
+
+The constant 150 (`EST_ROW_BYTES_K`) covers the routingHash, the integer columns, the record header, and the entries
+of `idx_items_scan` and `idx_items_item_id`.
 
 Five consumers use this one value:
 
@@ -56,25 +72,29 @@ Five consumers use this one value:
 | Item limit: put, update, prepare | `PartitionStore.upsertItem`, `expression/plan.ts`, `measureItemBytes` |
 | The evaluated-byte budget of `queryItems` | `query/query-collector.ts` |
 | The byte budget of an export call | `partition/materialization-export.ts` |
-| The per-key total for promotion | `KeySizeStats`, `signalGrowth`, `largestAtLeast` |
-| The weights of range boundaries | `split-planner.ts` `planRangeBoundaries`, `PartitionStore.sortKeySizes` |
+| The total of each routingHash for promotion | `KeySizeStats`, `signalGrowth`, `largestAtLeast` |
+| The weights of range boundaries | `split-planner.ts` `planRangeBoundaries`, `PartitionStore.compositeKeySizes` |
 
-`latest_items` of the materialization DO uses a second formula, `data + 2 · key bytes + 60`, and the same
-`SplitPlanner`.
-`key_size_estimates(hk, est_bytes)` holds one total for each hash key, with an index on `est_bytes`.
+`latest_items` of the materialization DO is also `WITHOUT ROWID`, on `(routing_hash, base_hk, base_sk)`, with
+`UNIQUE (item_id)`. Its formula is `data + 2 · (routingHash + key bytes) + 70` for a live row. For a tombstone it is
+`3 · (routingHash + key bytes) + 70`, because the tombstone index holds a third copy. It uses the same `SplitPlanner`.
+
+`key_size_estimates (routing_hash PRIMARY KEY, hk, est_bytes)` holds one total for each routingHash, with an index on
+`est_bytes`. `hk` is a representative hash key of the routingHash, for the hash-key promotion API of the host.
 
 ### 1.3 Problems
 
-1. **One value has five meanings.** A change of the constant 108 changes which items are valid. An item that
+1. **One value has five meanings.** A change of the constant 150 changes which items are valid. An item that
    prepare accepted can then fail at commit, and a commit must not fail. Query pages and export batches also change.
-2. **The estimate is too low for long keys.** SQLite stores each key in the table, in the UNIQUE index, and in
-   `idx_items_scan`, and in the TTL index when the item has a TTL. The formula counts the key one time.
-   For a 408-byte key and 100 bytes of data, the formula gives 616 bytes, and the file grows by 1,610 bytes
-   (appendix A.1). GSI rows have long physical sort keys and little data, so they get this error the most.
+2. **The estimate is too low for long keys.** SQLite stores each key in the table row, in `idx_items_item_id`, in
+   `idx_items_scan`, and in `idx_items_ttl` when the item has a TTL. The formula counts the key one time.
+   On the earlier rowid layout, which also stored 3 key copies, a 408-byte key with 100 bytes of data gave 616 bytes,
+   and the file grew by 1,610 bytes (appendix A.2). GSI rows have long physical sort keys and little data, so they
+   get this error the most.
 3. **Each row stores the constant.** A change of the constant leaves old rows at the old value.
-4. **`latest_items` has a different formula**, and its range scan reads table rows, because no index covers it.
+4. **`latest_items` has a different formula** and a different constant.
 5. **The planner has two defects** (appendix B). It counts the bytes of the crossing item in the lower child.
-   It also reports a false `skewed_bytes` floor, for example for weights `[111, 5111, 111]` and `N = 3`.
+   It also reports a false `skewed_bytes` floor, for example for item sizes `[111, 5111, 111]` and 3 children.
    At that floor, the leaf refuses each write until an operator acts, although a valid split exists.
 6. **The split decision scans the slice on the request path.** `signalGrowth` signals `evaluateSplit` after each
    applied write, and admission requests it for each refused write. On a range leaf above its cap,
@@ -84,81 +104,96 @@ Five consumers use this one value:
    of a Durable Object holds about 70M small rows. The scan then takes more than the 30 s CPU limit, and each try of
    the plan fails (appendix E.3).
 8. **The summary hides drift.** `KeySizeStats` clamps with `MAX(0, …)`. It deletes the row when the bytes reach 0,
-   because it has no item count. A transactional delete of an absent item also writes the summary row with no change.
-9. **Promotion comes late.** The threshold is absolute, and the estimate is too low. A large key then stays through
-   more hash splits, and each split copies the key again.
+   because it has no item count. A transactional delete of an absent item with `bumpTxOrderTsAlways` calls
+   `subtract` with 0 bytes, which writes the summary row with no change. The representative `hk` can outlive its own
+   items.
+9. **Promotion comes late.** The threshold is absolute, and the estimate is too low. A large routingHash then stays
+   through more hash splits, and each split copies it again.
 10. **Change capture depends on the size.** `#captureWrite(…, oldEst === 0)` reads "the old size is 0" as
-    "the write created the row".
+    "the write created the row". The item-id assignment of `upsertItem` uses the same test.
+11. **`idx_items_scan` repeats the table order.** The primary-key B-tree is already in storage order, and its record
+    holds each column before `data`. The index adds one row written for each insert and one more key copy for each
+    item. Its only gain is narrower entries for the size scans.
 
 ### 1.4 Why now
 
-The first release is close. After the release, a change of `idx_items_scan` rebuilds an index over each item of each
-partition, and a change of the primary key of the summary table rewrites each summary row. On a leaf of 9 GB, such a
-rebuild blocks every request of the partition. Before the release, the change edits the schema migrations in place,
+The first release is close. After the release, a drop or a change of `idx_items_scan` changes an index over each item
+of each partition. A change of the primary key of the summary table rewrites each summary row. On a leaf of 9 GB, such
+a change blocks every request of the partition. Before the release, the change edits the schema migrations in place,
 and the deployment uses new namespaces.
 
 ## 2. Goals and requirements
 
 ### 2.1 In scope
 
-- Separate the exact item size from the storage estimate and from the RPC response estimate.
-- Store exact facts for each item and for each bucket. Store no coefficient.
-- Price items and buckets with one storage model, with measured coefficients for each table.
-- Keep the facts of a range leaf in buckets of `K` to `2K` items, with an inline split and merge.
-- Find promotion candidates with an index that does not depend on a coefficient.
-- Correct the planner, and bound its work with the buckets.
-- Remove the scan from the split decision of a range leaf.
-- Apply the same design to `latest_items`.
-- Optimize the costs for range leaves of 500 MB to 2 GB. Keep leaves up to the 10 GB limit of a Durable Object within
-  the costs of section 4.2.13.
+- One exact size for each item, for the item limit and the byte budgets.
+- A storage estimate for each group of items that follows the real storage: each key copy in each index, the index
+  entry of an item with a TTL or of a tombstone, and the overflow pages of large rows.
+- Promotion and range splits that use this estimate.
+- The same behaviour in the partition DO and in the materialization DO.
+- Costs optimized for range leaves of 500 MB to 2 GB.
 
 ### 2.2 Out of scope
 
-- An exact page attribution for each item. The model does not include the page waste of items of 1 KB to 1.5 KB
-  (appendix A.1).
-- The storage of `item_stats` rows in the estimate of a key. One summary row adds 50 to 264 bytes to a key, which is
-  less than 0.001% of a key at the promotion threshold (appendix A.3).
+- An exact page attribution for each item. A page holds a whole number of rows, and the model does not count the
+  space that this wastes. Rows with 400 to 700 bytes of data are up to 18% too low for that reason (appendix A.1). A
+  range split compares the sizes of one slice with each other, so an error that is the same for each item moves no
+  boundary.
+- The exact payload size of each row. The model estimates the overflow pages from a fixed payload estimate.
+- The overflow pages of index entries. Only keys of more than about 990 bytes give such entries.
+- The storage of the size summaries themselves. One summary row uses about 66 bytes. At a cap of 32 MB or more, that
+  is less than 0.001% of a routingHash at the promotion threshold (appendix A.3).
 - A storage model for `pending_transactions`, the outbox, or the coordinator.
 - A generic cost plug-in framework, and placeholder tables for unspecified features.
-- A public configuration of the coefficients or of `K`.
-- An upper limit on `rangeSplitConditions.maxSizeMb`. The buckets bound the planner at each cap (appendix E).
-- Changes to routing names, key encoding, ownership rules, or the repartition protocol.
+- A public configuration of the storage model.
+- An upper limit on `rangeSplitConditions.maxSizeMb`. The solution bounds the planner at each cap (appendix E).
+- Changes to the routingHash, the clustered primary keys, `idx_items_item_id`, `idx_items_ttl`, routing names, key
+  encoding, ownership rules, or the repartition protocol.
 - The deletion of the item rows that a split source keeps.
 
 ### 2.3 Requirements
 
-1. The item limit must compare `item_bytes` with `MAX_ITEM_BYTES`. No coefficient can change that result.
-2. Prepare and commit must apply the same item-validity rule.
-3. The query evaluated-byte budget and the export byte budgets must use `item_bytes`. Response budgets keep their
-   RPC estimates.
-4. After each commit, the facts of each bucket must equal the SQL sums over the items of its sort-key range.
-   The one exception is a defect, which the repair of section 4.2.7 corrects.
-5. Each path that changes an item must change its facts in the same storage transaction.
-6. A migration retry must add facts only for the rows that it inserts.
-7. A change of a coefficient must reprice each item and each bucket with no rewrite of a row.
-8. Size scans, count checks, bucket splits, and recounts must read only covering indexes. They must not read item data.
-9. A hash leaf must keep exactly one bucket for each hash key that has items.
-10. After each commit on a range leaf: each bucket must hold at most `2K` items, each two neighbour buckets of a key
-    must hold at least `K` items together, and the first bucket of a key must have `lower_sk = x''`.
-11. The promotion lookup must return every key whose estimate is at or above the threshold, up to
-    `PROMOTION_CANDIDATES_MAX` (5) keys, largest first.
-12. The write-path promotion check and the promotion lookup must compare the same estimate with the same threshold.
-13. With at least `N` items, the planner must return `N - 1` strictly increasing boundaries and `N` non-empty children.
-14. Each boundary must be `KeyCodec.shortestSeparator` of two adjacent keys in canonical byte order.
-15. The planner must read its bucket rows and its scanned rows in one `transactionSync`.
-16. The split decision of a range leaf must read at most `N` index entries.
-17. The physical split trigger and the admission guard must continue to use `sql.databaseSize`.
-18. No test can need a new production hook.
+**Functional**
+
+1. The validity of an item must depend only on its encoded size and the item limit of 400 KB. Prepare and commit must
+   apply the same rule, so an item that prepare accepted cannot fail at commit.
+2. The byte budgets of query pages and of export batches must count the encoded size of each item. The budgets of RPC
+   responses keep their own estimates.
+3. The size summaries must stay exact: after each commit, they must match the committed items. A write must not fail
+   because of a summary defect. The partition must detect the defect, log it, and repair it in the same transaction.
+4. The storage model must be able to change after the release, for new constants, columns, indexes, and tables. A
+   change of a constant must apply to each estimate at once, with no rewrite of a stored row. Only a new kind of fact
+   can need a backfill.
+5. The promotion decision must find each routingHash whose estimate is at or above the promotion threshold, up to
+   five, largest first, each with a hash key that has items. The check after a write and the decision must agree.
+6. A range split must succeed whenever the slice holds at least one item for each child. Each child must hold at least
+   one item, and each boundary must be the shortest key that separates two adjacent items. The children must be close
+   to equal in estimated size.
+7. Migration retries and promotion cleanups must leave the size summaries exact.
+8. The physical size of the database must continue to control the split trigger and the admission of writes.
+
+**Non-functional**
+
+9. **Rows written.** Each row written is billed. An item write must write fewer rows than today. An import or a TTL
+   sweep must not write one summary row for each item.
+10. **Request path.** The size accounting of one write must read and write a fixed number of rows. The split decision
+    on the request path must read a number of rows that does not grow with the leaf size.
+11. **Planner.** The range split planner must not read each item of the slice. The rows that it reads must be a small,
+    bounded fraction of the item count, so that it stays far below the 30 s CPU limit at each cap, up to the 10 GB
+    limit of a Durable Object.
+12. **Large writes.** Work that changes many rows must run in bounded steps. One large write blocks each request of
+    the partition until the write is durable.
+13. **Tests.** No test can need a new production hook.
 
 ## 3. Milestones
 
 The change ships as two milestones. Both milestones must ship before the first release. No delivery dates are set.
 
-1. **M1 — Exact facts, storage model, promotion, and the corrected planner.** Sections 4.2.1 to 4.2.5 and
-   4.2.7 to 4.2.12. Each leaf keeps one bucket for each key. The planner uses the streaming scan of section 4.2.9.
-   The planner change and the split decision of section 4.2.10 ship together.
-   M1 alone must not be released: its planner scan has no bound, and `maxSizeMb` has no upper limit.
-2. **M2 — Buckets on range leaves.** Section 4.2.6, the bucket groups of the import and of the TTL sweep, and the
+1. **M1 — Exact item sizes, the storage model, promotion, and the corrected planner.** Sections 4.2.1 to 4.2.5 and
+   4.2.7 to 4.2.12. M1 drops `idx_items_scan`. Each leaf keeps one bucket for each routingHash. The planner scans the
+   slice (the streaming path of section 4.2.9). The planner change and the split decision of section 4.2.10 ship
+   together. M1 alone must not be released: its planner scan has no bound, and `maxSizeMb` has no upper limit.
+2. **M2 — Buckets on range leaves.** Section 4.2.6, the import buckets, the bucket groups of the TTL sweep, and the
    bucket path of the planner. M2 changes no schema. No range leaf from M1 reaches a release, so M2 converts no data.
    A development namespace from M1 must be destroyed: the first split of its one large bucket reads the whole slice.
 
@@ -166,36 +201,51 @@ The change ships as two milestones. Both milestones must ship before the first r
 
 ### 4.1 High-level overview
 
-Each item stores one exact fact: `item_bytes`, the stored data plus the key bytes. The item limit, the query budget,
-and the export budgets use only this fact.
+**Exact item size.** Each item stores one exact value: `item_bytes`, the stored data plus the key bytes. The item
+limit, the query budget, and the export budgets use only this value.
 
-A new table `item_stats` holds the facts of groups of items: the item count, the item bytes, the key bytes, and the
-same two values for the items with a TTL. A row of `item_stats` is a bucket: the items of one hash key from its
-`lower_sk` up to the `lower_sk` of the next bucket.
+**Facts and buckets.** The facts of a group of items are exact sums: the item count, the item bytes, the key bytes, the
+same two sums for the items with an index entry (a TTL or a tombstone), and the overflow bytes. A new table
+`item_stats` holds the facts in buckets. A bucket is one row: the items of one routingHash from its lower bound up to
+the lower bound of the next bucket, in composite-key order.
 
-- On a hash leaf, each key has one bucket. That bucket is the summary of the key.
-- On a range leaf, the one key has many buckets of `K` to `2K` items. The write that adds an item splits a bucket
-  above `2K` items in its own transaction, and a delete merges two small neighbours.
+- On a hash leaf, each routingHash has one bucket. That bucket is the summary of the routingHash, and it includes
+  each hash key that has that routingHash.
+- On a range leaf, the one routingHash has many buckets of `K` to `2K` items, with `K = 2,048`. The write that adds an
+  item splits a bucket above `2K` items in its own transaction, and a delete merges two small neighbours.
 
-One storage model prices a row or a bucket from its facts. It counts each key copy in each index and the cost of a TTL.
-The coefficients are constants in the code, so a new coefficient reprices every row and bucket at once.
+**Storage order.** `items` and `item_stats` are both in storage order. Thus:
+
+- The items of a bucket are one key range of the primary key. A bucket split, a recount, and a planner scan read
+  that range and no other row.
+- The facts of a routingHash are one key range of `item_stats`. A promotion cleanup deletes one key range.
+- The import receives its items in storage order, so it builds its buckets with no item read.
+- The table already holds the size columns in key order, so `idx_items_scan` goes.
+
+**Storage model.** The estimate of an item or a bucket is the storage bytes that the storage model calculates from its
+facts. The model multiplies each fact by a coefficient, a constant in the code that is measured for each table. It
+counts each key copy in each index, the index entry of a TTL or a tombstone, and the overflow pages of large rows. A
+new coefficient changes every estimate at once, with no row rewrite.
 
 The facts feed two decisions:
 
-- **Promotion.** The lookup walks an index on the exact `item_bytes` of each hash-leaf bucket, from the largest.
-  It prices each key with the model, and it stops at a proven bound.
-- **Range split.** The planner reads the bucket rows of the slice and calculates the byte target of each boundary.
-  It then scans only the bucket that holds each target, and it selects the exact gap between two items.
+- **Promotion.** Each bucket also stores `rank_bytes`, a sum of its facts with fixed integer weights. A partial index
+  on `rank_bytes` holds the first bucket of each routingHash. The lookup walks this index from the largest value. It
+  calculates the estimate of each row with the current coefficients, and it stops at a bound that holds for any
+  weights.
+- **Range split.** The planner reads the bucket rows of the slice in key order and calculates the byte target of each
+  boundary. It then scans only the bucket that holds each target, and it selects the exact gap between two items.
 
-The split decision of a range leaf counts at most `N` items. Only the planner, in the alarm, reads more.
+The split decision of a range leaf counts at most `N` items, where `N` is `rangeSplitN`. Only the planner, in the
+alarm, reads more.
 
 ```text
 items.item_bytes (exact) ───────────────► item limit, query evaluated bytes, export budgets
         │ same transaction as the write
         ▼
-item_stats buckets (exact facts)
+item_stats buckets (exact facts), key (routing_hash, lower_hk, lower_sk)
         │
-        ├── hash leaf: one bucket per key ──► storage model ──► promotion lookup and write-path check
+        ├── hash leaf: one bucket per routingHash ──► walk on rank_bytes ──► storage model ──► promotion
         │
         └── range leaf: K..2K items per bucket ──► storage model ──► planner:
                                                                      bucket rows + one scan per target bucket
@@ -203,107 +253,227 @@ item_stats buckets (exact facts)
 sql.databaseSize ───────────────────────► split trigger and admission (unchanged)
 ```
 
+#### 4.1.1 End-to-end flows
+
+**A write on a hash leaf** (put, update, delete, or commit apply), in one storage transaction:
+
+1. The old-facts read gets the old `item_bytes` and the indexed state of the item, or finds no row (section 4.2.2).
+2. The item write calculates the new `item_bytes` in SQLite and returns it.
+3. The bucket helper adds the new facts minus the old facts to the first bucket of the routingHash, and it sets
+   `rank_bytes` in the same statement (section 4.2.5). The statement returns the new facts of the bucket.
+4. After the commit, the write-path check prices the returned facts. It reports a promotion candidate when the
+   estimate is at or above the promotion threshold. The write then signals the split decision.
+
+**A hash leaf over its cap.** The split decision runs after the write. It walks `item_stats_promotion` from the largest
+`rank_bytes`, and it returns up to five routingHashes at or above the promotion threshold (section 4.2.8). The
+runtime requests a promotion for each one. When no routingHash is at or above the threshold, the leaf queues a hash
+split.
+
+**A promotion.** The new range root imports the items of the routingHash in storage order, and it builds its buckets
+with no item read (section 4.2.6). At `beforeComplete`, the source deletes the buckets of the routingHash. The source
+cleanup then deletes the item copies in steps. Those deletes change no facts, because the routingHash has no bucket.
+
+**A hash split.** Each hash child imports its routingHashes, and it adds the facts of each run of one routingHash to
+the first bucket of that routingHash. The source becomes a router and does not read its `item_stats` again.
+
+**A write on a range leaf.** The same steps as on a hash leaf, but the bucket helper finds the bucket of the
+composite key with one seek. After an insert, the bucket splits when it holds more than `2K` items. After a delete, it
+merges with a neighbour when the pair holds fewer than `K` items (section 4.2.6). A range leaf has no promotion.
+
+**A range leaf over its cap.** The split decision counts at most `N` items of the slice (section 4.2.10). In the
+alarm, the planner reads the bucket rows, scans the buckets that hold the targets, and returns `N - 1` boundaries
+(section 4.2.9). Each range child imports its slice and builds its buckets. The source becomes a router.
+
+**A TTL sweep.** It deletes a chunk of expired items, groups their facts by bucket, and writes each changed bucket
+one time (section 4.2.5).
+
 ### 4.2 Technical details
 
 #### 4.2.1 Size definitions
 
 | Value | Definition | Consumers |
 | --- | --- | --- |
+| key bytes | The encoded bytes of the hash key plus the encoded bytes of the sort key | `item_bytes`, the key facts |
 | `item_bytes` | `octet_length(stored data) + key bytes` | Item limit, query evaluated bytes, export budgets |
 | estimate | The facts priced by the storage model of the table | Promotion, range boundaries |
 | response estimate | `estimateItemBytes()` and `estimateProjectedRowBytes()` | Response and migration page budgets |
 
-`item_bytes` keeps the current measurements: UTF-8 bytes for text, BLOB bytes for binary data, JSONB bytes for JSON,
-and the one-byte tag of a binary key. An absent sort key has zero bytes. `MAX_ITEM_BYTES` stays 400 KB. The fixed
-overhead of 108 bytes leaves the item limit, so an item can hold 108 more bytes than today.
+- `item_bytes` keeps the current measurements: UTF-8 bytes for text, BLOB bytes for binary data, JSONB bytes for JSON,
+  and the one-byte tag of a binary key. JSONB bytes measure the stored representation, so no separate JSON text
+  measurement is necessary.
+- An absent sort key has zero bytes. The routingHash is not in `item_bytes`, because it is not part of the item.
+- `MAX_ITEM_BYTES` stays 400 KB. The fixed overhead of 150 bytes leaves the item limit, so an item can hold 150 more
+  bytes than today.
+- The rule does not match the DynamoDB item size exactly.
+- The response estimators must not supply row weights or facts.
 
-This rule is the encoded-item rule of FokosDB. It does not claim exact DynamoDB size compatibility.
-The response estimators must not supply row weights or facts.
-
-#### 4.2.2 Item schema and covering indexes
+#### 4.2.2 Item schema
 
 **`items`** (the partition):
 
-- Replace `est_row_bytes` with an ordinary `item_bytes INTEGER NOT NULL` column. Each writer calculates it in SQLite,
-  over the same expression that produces the stored data.
-- Replace `idx_items_scan` with `(hk, sk, item_bytes, ttl_epoch_utc_seconds)`.
-  `ttl_epoch_utc_seconds` is a plain column and the last column. Do not index `ttl_epoch_utc_seconds IS NOT NULL`:
-  an indexed expression can stop SQLite from using the index as a covering index.
-- Keep the rowid table, `item_id`, the UNIQUE key constraint, and the partial TTL index.
-- Do not use a generated column for `item_bytes`. SQLite does not use an index with a generated column as a covering
-  index.
+- Replace `est_row_bytes` with an ordinary `item_bytes INTEGER NOT NULL` column. Keep it before `data`, so `data`
+  stays the last column. Each writer calculates it in SQLite, over the same expression that produces the stored data.
+- Drop `idx_items_scan`. The primary-key B-tree is in storage order. Its record stores `routing_hash`, `hk`, and `sk`
+  first, then the other columns in declared order. A read of `item_bytes` and `ttl_epoch_utc_seconds` stops before
+  `data`, so it reads no overflow page.
+- Keep `WITHOUT ROWID`, the primary key, `idx_items_item_id`, `idx_items_ttl`, and `item_id_counter`.
+- Do not use a generated column for `item_bytes` (section 5.13).
 
 **`latest_items`** (the materialization DO):
 
-- Replace `est_row_bytes` with `item_bytes`, with the same definition. A tombstone has no data, so its `item_bytes`
-  is its key bytes.
-- Add the covering index `(base_hk, base_sk, item_bytes, ttl_at)`.
+- Replace `est_row_bytes` with `item_bytes`, with the same definition, before `data`. A tombstone has no data, so its
+  `item_bytes` is its key bytes.
+- Add no index. The table is in storage order, and `item_bytes`, `deleted_at_ms`, and `ttl_at` are before `data`.
 
-**The old-facts read.** A write reads the old facts of its item with one covering seek:
-`SELECT item_bytes, ttl_epoch_utc_seconds FROM items INDEXED BY idx_items_scan WHERE hk = ? AND sk = ?`.
-The presence of the row is the "created" signal of `#captureWrite`, in place of `oldEst === 0`.
+**The old-facts read.** A write reads the old facts of its item with one primary-key seek:
+`SELECT item_bytes, ttl_epoch_utc_seconds FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`.
+On `latest_items`, the seek reads `item_bytes` and `deleted_at_ms` on `(routing_hash, base_hk, base_sk)`.
+
+- It replaces `#storedEstRowBytes` and its `INDEXED BY idx_items_scan` pin.
+- The seek reads the leaf page of the row, which can hold the inline part of `data`, but no overflow page.
+- The presence of the row is the "created" signal of `#captureWrite` and of the item-id assignment, in place of
+  `oldEst === 0`.
+- The key bytes of an item come from its key. The old and the new `overflow_bytes` come from the old and the new
+  `item_bytes` (section 4.2.3).
+
+**The new facts.** Each statement that writes an item returns the `item_bytes` that SQLite calculated, with
+`RETURNING`, as the writes return `est_row_bytes` today. This covers the put, the update, the compiled update, the
+commit apply, and the migration insert. A delete that already returns its row with `RETURNING`, such as the TTL sweep
+and the tombstone collection, returns `item_bytes` and the full key. The tombstone collection of `latest_items`
+deletes by `item_id`, so it must also return `base_sk` for the bucket lookup of a range leaf.
+
+**Rows written.** An insert into `items` writes 2 rows (the row and its `idx_items_item_id` entry), or 3 with a TTL.
+Today it writes 3, or 4.
 
 #### 4.2.3 Storage model
 
-The estimate of one item is:
+An indexed item is an item with an entry in the partial index of its table: an item with a TTL in `items`, and a
+tombstone in `latest_items`. The estimate of one item is:
 
 ```text
 estimate = item_bytes
          + key_index_factor * key_bytes
          + base_overhead
-         + (TTL set ? ttl_key_factor * key_bytes + ttl_overhead : 0)
+         + (indexed item ? indexed_key_factor * key_bytes + indexed_overhead : 0)
+         + overflow_coefficient * overflow_bytes(item_bytes)
 ```
 
 The estimate of a group of items uses the facts of the group. It equals the sum of the item estimates:
 
 ```text
 estimate = item_bytes + key_index_factor * key_bytes + base_overhead * item_count
-         + ttl_key_factor * ttl_key_bytes + ttl_overhead * ttl_item_count
+         + indexed_key_factor * indexed_key_bytes + indexed_overhead * indexed_item_count
+         + overflow_coefficient * overflow_bytes
 ```
 
 | Coefficient | `items` | `latest_items` | What it covers |
 | --- | --- | --- | --- |
-| `key_index_factor` | 2.5 | 2.5 | The key copies in the UNIQUE index and in the covering index |
-| `base_overhead` | 50 | 40 | The integer columns, record headers, rowid, and index entry headers |
-| `ttl_key_factor` | 1.25 | 0 | The key copy in the partial TTL index |
-| `ttl_overhead` | 20 | 4 | The fixed part of the TTL index entry, or of the `ttl_at` value |
+| `key_index_factor` | 1.25 | 1.25 | The key copy in `idx_items_item_id` or `UNIQUE (item_id)`, and the part-full pages of the table |
+| `base_overhead` | 76 | 67.25 | The two routingHash copies, the item id, the integer columns, the record and cell headers |
+| `indexed_key_factor` | 1.25 | 1.25 | The key copy in `idx_items_ttl` or in `idx_latest_items_deleted_gc` |
+| `indexed_overhead` | 25 | 24.75 | The routingHash copy and the fixed columns of that index entry |
+| `overflow_coefficient` | 1 | 1 | The overflow pages. A measured constant error of `overflow_bytes` changes this value, not the stored sums |
 
-- Each coefficient is a multiple of 1/4. Thus a double holds each sum of integer facts exactly, up to 2^51.
-- Each index stores 2 copies of a key, but its pages are not full, so `key_index_factor` is 2.5 and not 2.
-- The model is within 5% of the measured file growth for data up to 100 bytes, with or without a TTL (appendix A.1).
-- For data of about 1,000 bytes, the model is 5% to 23% too low, because such rows fill a 4 KB page badly.
-  A boundary uses the weights of one slice relative to each other, so a constant error moves no boundary.
-- `shared/partition/item-size.ts` defines the `item_bytes` expression, the model type, and the two coefficient sets.
-  No other module holds a coefficient.
+- The partial index of `items` is `idx_items_ttl`: its entry is `(ttl_epoch_utc_seconds, routing_hash, hk, sk)`.
+  The partial index of `latest_items` is `idx_latest_items_deleted_gc`: its entry is
+  `(deleted_at_ms, item_id, routing_hash, base_hk, base_sk)`. The `ttl_at` column of `latest_items` has no index, and
+  the model does not count its few bytes.
+- Each coefficient is 0 or more, and a multiple of 1/4. Thus a double holds each sum of integer facts exactly, up to
+  2^51.
+- The coefficients are the multiples of 1/4 that make the largest relative error of the model smallest, for rows with
+  20 to 200 bytes of data, with and without an indexed item (appendix A.1). The fit prefers rows with some data to rows
+  with no data. The errors, as (measured − model) / measured:
+
+  | Rows | `items` | `latest_items` |
+  | --- | --- | --- |
+  | 20 to 200 bytes of data | −7.4% to +7.5% | −8.4% to +8.5% |
+  | No data | −10.5% to +3.8% | −13.5% to +3.7% |
+  | 400 to 700 bytes of data | 0% to +18% | −0.2% to +13.7% |
+  | Rows with overflow pages | −0.4% to +0.4% | −0.2% to +0.2% |
+
+  A negative error is an estimate that is too high, so a routingHash of such rows is promoted earlier. A line in the
+  key bytes cannot be closer, because a page holds a whole number of rows (section 2.2).
+- `shared/partition/item-size.ts` defines the `item_bytes` expression, the model type, the two coefficient sets, the
+  two rank-weight sets, the SQL fragment that sets `rank_bytes`, and both forms of `overflow_bytes`. No other module
+  holds a coefficient or a rank weight.
+
+**Overflow pages.** A `WITHOUT ROWID` table keeps its rows in an index B-tree. On a 4 KiB page, SQLite keeps a row
+payload of at most 1,002 bytes on the tree page. For a larger payload, it keeps 489 bytes or more on the tree page and
+puts the remainder on overflow pages. Each overflow page holds 4,092 bytes of one row only, and its unused space stays
+empty. Thus a row of 1,100 bytes uses about 4,600 bytes, and a row of 2,000 bytes also uses about 4,600 bytes. The
+other terms count each payload byte one time, so `overflow_bytes` adds the remainder of the overflow pages:
+
+```text
+P = item_bytes + row_payload_overhead
+if P <= 1002:          overflow_bytes = 0
+local = 489 + (P - 489) mod 4092
+if local > 1002:       local = 489
+moved = P - local
+overflow_bytes = ceil(moved / 4092) * 4096 - moved + overflow_row_overhead
+```
+
+- `row_payload_overhead` is a constant for each table: the payload bytes of the columns that are not in `item_bytes`
+  (the routingHash, the item id, the integer columns, and the record header). It is 40 for `items` and 29 for
+  `latest_items`. The measured payload overhead of `items` is 37 to 39 bytes with no TTL, by the size of the item id,
+  and 4 bytes more with a TTL. On `latest_items` it is 28 bytes for small item ids, and up to 2 bytes more for a 4-byte
+  item id. Thus the constant is within 3 bytes of each row, and only a row whose payload is within 3 bytes of 1,002 can
+  get the wrong overflow estimate (appendix A.5).
+- `overflow_row_overhead` is a constant for each table: the bytes that a row with overflow pages uses on the tree page
+  more than the other terms count. It is 61 for `items` and 69 for `latest_items`, from the rows with overflow pages of
+  appendix A.1. It is a fixed value for each such row, not a multiple of the unused overflow space, so it is in the
+  function and not in `overflow_coefficient`.
+- 1,002, 489, 4,092, and 4,096 are the SQLite values for a 4 KiB page, a usable size of 4,096, and an index B-tree.
+- The function reads only `item_bytes`. The old-facts read returns `item_bytes`, so a delete or an update subtracts
+  the same value that the write of the old item added (invariant I2). The real payload can differ from `P` by a few
+  bytes, because an integer column has a variable size. Such a difference changes the estimate, never the symmetry.
+- `row_payload_overhead`, `overflow_row_overhead`, and the page constants are not coefficients. They decide which items
+  have overflow pages and what each bucket stores in `overflow_bytes`. Thus a change of one of these constants needs a
+  recount of each bucket (section 4.2.7). A change of `overflow_coefficient` needs no recount, like each other
+  coefficient.
+- `item-size.ts` gives the function in JavaScript, for the write paths and the import, and as an SQL expression over
+  `item_bytes`, for the split aggregates and the recount. Both forms must give the same value for each `item_bytes`.
 
 #### 4.2.4 The `item_stats` table
 
 ```sql
 CREATE TABLE item_stats (
-  hk             BLOB    NOT NULL,
-  lower_sk       BLOB    NOT NULL,   -- inclusive lower bound of the bucket; x'' for the first bucket
-  item_count     INTEGER NOT NULL,
-  item_bytes     INTEGER NOT NULL,
-  key_bytes      INTEGER NOT NULL,
-  ttl_item_count INTEGER NOT NULL,
-  ttl_key_bytes  INTEGER NOT NULL,
-  PRIMARY KEY (hk, lower_sk)
+  routing_hash       BLOB    NOT NULL,
+  lower_hk           BLOB    NOT NULL,   -- inclusive lower bound (lower_hk, lower_sk) of the bucket;
+  lower_sk           BLOB    NOT NULL,   -- (x'', x'') for the first bucket
+  item_count         INTEGER NOT NULL,
+  item_bytes         INTEGER NOT NULL,
+  key_bytes          INTEGER NOT NULL,
+  indexed_item_count INTEGER NOT NULL,
+  indexed_key_bytes  INTEGER NOT NULL,
+  overflow_bytes     INTEGER NOT NULL,
+  rank_bytes         INTEGER NOT NULL,   -- the rank formula over the facts of this row (section 4.2.8)
+  PRIMARY KEY (routing_hash, lower_hk, lower_sk)
 ) WITHOUT ROWID, STRICT;
 
-CREATE INDEX item_stats_promotion ON item_stats (item_bytes) WHERE lower_sk = x'';
+CREATE INDEX item_stats_promotion ON item_stats (rank_bytes) WHERE lower_hk = x'' AND lower_sk = x'';
 ```
 
-- **Bucket rule.** The bucket of an item is the row of its `hk` with the greatest `lower_sk <= sk`.
-- **First bucket.** The first bucket of a key has `lower_sk = x''`, the smallest encoded sort key. It stays while the
-  key has an item. A merge never deletes it, because a merge deletes the upper row.
-- **Hash leaf.** Each key has only its first bucket. A hash leaf never splits a bucket.
-- **Range leaf.** The one key has buckets that cover its slice. The import builds them, and each write keeps them
-  inside the band of section 4.2.6.
-- **The promotion index** holds only first buckets. A range leaf never reads it.
+- **Bucket rule.** The bucket of an item is the row of its `routing_hash` with the greatest
+  `(lower_hk, lower_sk) <= (hk, sk)`.
+- **First bucket.** The first bucket of a routingHash has the bound `(x'', x'')`, the smallest composite key. It stays
+  while the routingHash has an item. A merge never deletes it, because a merge deletes the upper row.
+- **Hash leaf.** Each routingHash has only its first bucket. Two hash keys with one routingHash share it, and their
+  combined estimate decides the promotion. A hash leaf never splits a bucket.
+- **Range leaf.** The one routingHash has buckets that cover its slice. The import builds them, and each write keeps
+  them inside the band of section 4.2.6. The bounds are composite, so a bucket can hold the end of one hash key and
+  the start of the next. Appendix G gives an example.
+- **`rank_bytes`** is an ordinary column. Each statement that writes facts also sets it (section 4.2.5). It is not a
+  generated column (section 5.23). Only the promotion walk reads it. A range leaf also stores it, because both leaf
+  kinds use one schema. It costs about 6 bytes in each bucket row and no row written.
+- **The promotion index** holds only first buckets. A range leaf never reads it. The query must repeat both terms of
+  the index condition.
+- **Storage order.** The table leads with `routing_hash`, like `items`. Thus the buckets of one routingHash are one
+  key range, and the buckets of a hash child are one key range of the parent (I6 of the routingHash RFC).
 - One class, `ItemStats` in `shared/partition/item-stats.ts`, owns the table, its migrations under its own KV key,
-  and the split, merge, and recount statements. It replaces `KeySizeStats`. The host gives it the item table, the
-  covering index, the key and TTL column names, the leaf kind, and the coefficient set. These are fixed SQL fragments
-  from the code, never user input.
+  and the split, merge, and recount statements. It replaces `KeySizeStats`. The host gives it the item table, the key
+  column names, the indexed-item condition (`ttl_epoch_utc_seconds IS NOT NULL` or `deleted_at_ms IS NOT NULL`),
+  the leaf kind, the coefficient set, and the rank weights. These are fixed SQL fragments from the code, never user
+  input. The host gives each routingHash as opaque bytes, as it does to `KeySizeStats` today.
 
 #### 4.2.5 Fact updates
 
@@ -315,59 +485,117 @@ Each write path changes the facts with the bucket helper of `ItemStats`, in the 
 | Overwrite or update | Add the new facts minus the old facts. `item_count` stays |
 | Present-item delete | Subtract the old facts and 1 from `item_count`; then merge on a range leaf |
 | Delete of an absent item | No statement |
-| TTL sweep | Subtract the facts of each deleted row from its bucket. On a range leaf, then apply the merge check |
-| Migration insert | Add inserted-row facts once per bucket and page; then split on a range leaf |
+| TTL sweep | Subtract the facts of the deleted rows from their buckets, one statement for each bucket. On a range leaf, then apply the merge check |
+| Migration insert | Add inserted-row facts once for each bucket and page (section 4.2.6) |
 | Migration retry | Nothing for a row that is already present |
-| Promotion `beforeComplete` | Delete the `item_stats` rows of the promoted key |
-| Source copy cleanup | No change. The copies have no bucket after `beforeComplete` |
+| Promotion `beforeComplete` | `DELETE FROM item_stats WHERE routing_hash = ?`, one contiguous delete |
+| Source copy cleanup | No fact change: the copies have no bucket after `beforeComplete`. After its last item delete, the cleanup runs `DELETE FROM item_stats WHERE routing_hash = ?` again, as a guard, as it does today |
 | Prepare and cancel | No change. Pending rows are not committed items |
 | Commit apply | The same as the insert, overwrite, update, or delete that it applies |
-| TTL change from null to a value | Add the item to `ttl_item_count` and `ttl_key_bytes`. The reverse subtracts it |
+| TTL change from null to a value | Add the item to `indexed_item_count` and `indexed_key_bytes`. The reverse subtracts it |
+| `latest_items` live row to tombstone | Add the item to the indexed facts, and change `item_bytes` to the key bytes. The reverse subtracts it |
+| Tombstone collection of `latest_items` | A delete of a present item |
 | Read-stamp change (`check`) | No change |
 
-**Bucket lookup.** On a hash leaf, the helper writes the row `(hk, x'')`. On a range leaf, it updates the bucket with
-one seek:
+The facts of an item include its `overflow_bytes`. An overwrite or an update that changes `item_bytes` adds the new
+`overflow_bytes` and subtracts the old one, which the function gives from the old `item_bytes`.
+
+**Statements that write `item_stats`.** Only `ItemStats` writes the table. Each statement that writes a fact column
+must set `rank_bytes` in the same statement, from the new facts of that row. `item-size.ts` gives one function,
+`rankSql(itemBytes, keyBytes, itemCount, overflowBytes)`. It takes four SQL expressions for the new facts and returns
+the rank formula over them, with the rank weights of the code. In an SQLite `UPDATE`, each `SET` expression reads the
+old values of the row, so an update passes the old value plus its delta:
 
 ```sql
-UPDATE item_stats SET item_count = item_count + ?, item_bytes = item_bytes + ?, …
- WHERE hk = ?1 AND lower_sk = (SELECT MAX(lower_sk) FROM item_stats WHERE hk = ?1 AND lower_sk <= ?2)
+rank_bytes = rankSql(item_bytes + ?db, key_bytes + ?dk, item_count + ?dc, overflow_bytes + ?do)
+```
+
+| Statement | Facts that it writes | Arguments of `rankSql` |
+| --- | --- | --- |
+| Hash-leaf upsert, insert branch (first write of a routingHash) | The new facts | The bound new facts |
+| Hash-leaf upsert, `ON CONFLICT DO UPDATE` branch | Old facts plus the delta | Each old column plus its delta |
+| Range-leaf bucket seek update | Old facts plus the delta | Each old column plus its delta |
+| Range-leaf insert of the first bucket, when the routingHash has none | The new facts | The bound new facts |
+| Split: update of the lower row | The counted lower facts | The bound counted facts |
+| Split: insert of the upper row | The counted upper facts | The bound counted facts |
+| Merge: update of the lower row | Lower facts plus upper facts | Each old column plus the upper fact |
+| Import: update of the last bucket, and the hash-child upsert | Old facts plus the page sums | Each old column plus its page sum |
+| Import: insert of a new bucket | The page sums of the bucket | The bound sums |
+| TTL sweep: update of one bucket | Old facts minus the group sums | Each old column minus its group sum |
+| Recount of the drift repair | The counted facts | The bound counted facts |
+| Rank-weight job (section 4.2.8) | No fact | The columns of the row |
+| Deletes: empty bucket, merge upper row, `beforeComplete`, cleanup guard | The row goes | Nothing |
+
+- No second statement is necessary. The column adds no row write: the statement already writes the bucket row and its
+  index entry.
+- A new statement that writes `item_stats` must add a row to this table.
+
+**Bucket lookup.** On a hash leaf, the helper upserts the row `(routing_hash, x'', x'')`. On a range leaf, it updates
+the bucket with one seek:
+
+```sql
+UPDATE item_stats SET item_count = item_count + ?dc, item_bytes = item_bytes + ?db, …, rank_bytes = <fragment>
+ WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = (
+       SELECT lower_hk, lower_sk FROM item_stats
+        WHERE routing_hash = ?1 AND (lower_hk, lower_sk) <= (?2, ?3)
+        ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1)
  RETURNING …
 ```
 
-When no bucket exists for the key, the helper inserts the first bucket. When the facts of a write do not change, the
-helper writes no row. An update writes the row and its index entry, also when the values stay the same.
+When no bucket exists for the routingHash, the helper inserts the first bucket. When the facts of a write do not
+change, the helper writes no row. An update writes the row and its index entry, also when the values stay the same.
 
-**Delete of an unrepresented row.** When a delete removes a row whose key has no bucket, the delete changes no facts.
-The bucket did not represent the row, so a subtraction makes the facts wrong.
+**Delete of an unrepresented row.** When a delete removes a row whose routingHash has no bucket, the delete changes no
+facts. The bucket did not represent the row, so a subtraction makes the facts wrong.
 
 **Empty buckets.** A bucket that reaches 0 items is below `K`, so on a range leaf the merge check of section 4.2.6
-runs on it before its row is removed. When no merge applies — each pair with the empty bucket already holds at least
-`K` items — the helper deletes the row if it is not the first bucket. Each neighbour then holds at least `K` items on
-its own, so the pair that the removal makes adjacent also holds at least `K` together. When the empty bucket is the
-only bucket of the key, the helper deletes it: the key then has no items. An empty first bucket that is not alone
-stays, and the merge check applies to it like to every other bucket.
+runs on it before the helper removes its row.
 
-**Migration.** The import keeps its page grouping. It must not write one bucket update for each imported item.
-Do not replace the bulk paths with item-table triggers: a trigger adds one row write for each row of those paths.
+- When no merge applies, each pair with the empty bucket already holds at least `K` items. The helper then deletes the
+  row if it is not the first bucket. Each neighbour holds at least `K` items on its own, so the pair that the removal
+  makes adjacent also holds at least `K` together.
+- When the empty bucket is the only bucket of the routingHash, the helper deletes it: the routingHash then has no
+  items.
+- An empty first bucket that is not alone stays, and the merge check applies to it like to every other bucket.
 
-#### 4.2.6 Bucket split and merge (range leaf only)
+**TTL sweep.** The sweep deletes a chunk of expired items in TTL order, and each delete returns the facts and the key
+of its row. The sweep groups the deleted rows by bucket in JavaScript:
+
+- On a hash leaf, the group is the routingHash.
+- On a range leaf, the bucket of a row comes from the select part of the bucket seek. The rows of a chunk are in TTL
+  order, not in key order, so the sweep looks up the bucket of each row (M2).
+
+The sweep then writes one update for each changed bucket, and applies the empty-bucket rule and the merge check to it.
+
+**Migration.** The import keeps its page grouping: one bucket write for each page, not for each item. Do not replace
+the bulk paths with item-table triggers: a trigger adds one row write for each row of those paths.
+
+#### 4.2.6 Bucket split, merge, and import (range leaf only)
 
 The split and the merge run in the transaction of the write that makes them necessary. No job and no signal exist.
 
 **Split.** After an insert, while a bucket holds more than `2K` items:
 
-1. Find the first sort key of the upper half with one covering seek, `ORDER BY sk LIMIT 1 OFFSET floor(count / 2)`.
-2. Calculate the facts of the lower half and of the upper half with two aggregates over the covering index.
-3. Write the lower facts to the old row. Insert a row at `lower_sk = <first sort key of the upper half>`.
+1. Find the first item of the upper half with one seek in the primary key:
 
-- The new `lower_sk` is a real sort key, not a shortest separator. A bucket bound is not a DO name.
+   ```sql
+   SELECT hk, sk FROM items
+    WHERE routing_hash = ?1 AND (hk, sk) >= (?2, ?3) AND (hk, sk) < (?4, ?5)
+    ORDER BY hk, sk LIMIT 1 OFFSET ?6
+   ```
+
+   `(?2, ?3)` is the bound of the bucket, `(?4, ?5)` is the bound of the next bucket, and `?6` is
+   `floor(count / 2)`. The last bucket has no upper term.
+2. Calculate the facts of the lower half and of the upper half with two aggregates over the same key ranges.
+3. Write the lower facts to the old row. Insert a row at the composite key of the first item of the upper half.
+
+- The new bound is a real composite key, not a shortest separator. A bucket bound is not a DO name.
 - Step 2 counts both halves from the items. Thus each split also repairs drift in that bucket.
-- A split reads about `3K` index entries in SQLite and reads no row into JavaScript. At `K = 2,048` it takes 0.70 to
-  0.86 ms (appendix A.4). A bucket splits at most once for each `K` inserts into it.
-- An import page can add more than `K` items to one bucket, so the split repeats while a half holds more than `2K`.
+- A split reads about `3K` items in SQLite and reads no row into JavaScript. It selects no `data`. A bucket splits
+  at most once for each `K` inserts into it. On the primary key, it costs 1.45 to 1.65 ms locally (appendix A.4).
+- `OFFSET` steps over the rows. The primary key has no order-statistic tree, so a seek to the middle costs `K` steps.
 
-**Merge.** After a delete, while the changed bucket holds fewer than `K` items — also at 0 items, before the
-empty-bucket rule of section 4.2.5 removes the row:
+**Merge.** After a delete, while the changed bucket holds fewer than `K` items, also at 0 items:
 
 1. Read the previous and the next bucket rows with one seek each.
 2. When the bucket and one neighbour hold fewer than `K` items together, add the upper facts to the lower row,
@@ -377,131 +605,245 @@ empty-bucket rule of section 4.2.5 removes the row:
 A merge reads no item. The band prevents thrash: a split gives two halves of about `K` items each, so the pair holds
 about `2K`. A merged bucket holds fewer than `K` items, so it needs more than `K` inserts before it splits again.
 
-**Failure mode.** The split and the merge only read and write small rows, so they add no failure cause to a write.
-A commit apply can still get `SQLITE_FULL`, as it can today.
+**Import.** A target takes no local write while it imports: the runtime answers `partition_migrating`. Its pages arrive
+in storage order after the cursor. Thus each item that a page inserts is above each item that the target already
+holds. `FokosMigrationHost.validatePage` and `MaterializationMigrationHost.validatePage` refuse an items page whose
+rows are not strictly increasing in storage order above the page cursor (`assertItemFollows`). The check costs one key
+comparison for each row. The import uses this order and builds the buckets with no item read:
+
+1. Read the last bucket of the routingHash with one seek, or start the first bucket `(x'', x'')`.
+2. Add each inserted item to the last bucket in JavaScript.
+3. When the last bucket holds `K` items, the next inserted item starts a new bucket at its own composite key.
+4. Write each changed or new bucket one time for the page, in the page transaction.
+
+- Each import bucket holds `K` items, except the last, which holds 1 to `K`. Thus invariant I5 holds.
+- A retried page inserts no row, so it changes no bucket.
+- A hash child is a hash leaf. Its import adds the facts of each run of one routingHash to the first bucket, as
+  `KeySizeStats.addRows` does today.
+- After the import, the writes use the split and merge rules.
+
+**Failure mode.** The split and the merge read only keys and small columns, and they write small rows. Thus they add
+no failure cause to a write. A commit apply can still get `SQLITE_FULL`, as it can today.
 
 #### 4.2.7 Drift repair
 
-When a write would make a fact of a bucket negative, the facts and the items disagree. The write path must not throw:
-a throw rolls back a commit apply, the coordinator in `COMMITTING` then retries forever, and the lock stays. The write
-path must not clamp with `MAX(0, …)`, because a clamp keeps the wrong facts. In the same storage transaction:
+When a write would make a fact of a bucket negative, the facts and the items disagree. The bucket helper finds this
+from the facts that its statement returns with `RETURNING`.
 
-1. Log the defect one time, with the key, the bucket, the stored facts, and the delta.
-2. After the item change, count the facts of the bucket again from the covering index.
-3. Write the counted facts, or delete the bucket under the rule for empty buckets of section 4.2.5.
+- The write path must not throw. A throw rolls back a commit apply, the coordinator in `COMMITTING` then retries
+  forever, and the lock stays.
+- The write path must not clamp with `MAX(0, …)`, because a clamp keeps the wrong facts.
 
-On a range leaf, the recount reads at most `2K` entries. On a hash leaf, the bucket is the whole key. The recount runs
-only after a defect.
+In the same storage transaction:
+
+1. Log the defect one time, with the routingHash, the bucket, the stored facts, and the delta.
+2. After the item change, count the facts of the bucket again from its key range of the primary key.
+3. Write the counted facts and their `rank_bytes` with one statement, or delete the bucket under the rule for empty
+   buckets of section 4.2.5.
+
+On a range leaf, the recount reads at most `2K` items. On a hash leaf, the bucket is the whole routingHash:
+`WHERE routing_hash = ?`. The recount runs only after a defect.
 
 #### 4.2.8 Promotion
 
-The threshold is `T = maxSizeBytes * promotionFraction` of the hash split policy. Both checks below use one shared
-estimate function over the facts of the first bucket of the key.
+`T` is the promotion threshold: the cap of the leaf in bytes times `promotionFraction`, 0.25 by default. Both checks
+below use one estimate function over the facts of the first bucket of the routingHash, and the same `T`.
 
 **Write-path check.** The bucket helper returns the facts of the bucket with `RETURNING`. On a hash leaf, the host
-calculates the estimate of the key from them and reports a candidate when the estimate is at or above `T`.
+calculates the estimate of the routingHash from them. It reports the changed hash key as a candidate when the estimate
+is at or above `T`. The runtime maps the hash key to its routingHash, as today.
 
-**Lookup of the split decision.** It replaces `largestAtLeast`:
+**Lookup of the split decision.** It replaces `largestAtLeast`. An index can order rows only by a column, and the
+estimate depends on the coefficients of the current code. Thus the lookup walks the index on `rank_bytes`, and it
+calculates the estimate of each row that it reads.
 
-```sql
-SELECT hk, item_count, item_bytes, key_bytes, ttl_item_count, ttl_key_bytes
-  FROM item_stats WHERE lower_sk = x'' AND item_bytes >= ?1 ORDER BY item_bytes DESC
+**`rank_bytes`.**
+
+```text
+rank_bytes = item_bytes + RANK_KEY * key_bytes + RANK_ITEM * item_count + RANK_OVERFLOW * overflow_bytes
 ```
 
-1. Bind `?1` to `T / r`, where `r` is the largest possible ratio of estimate to `item_bytes`:
-   `r = 1 + key_index_factor + ttl_key_factor + (base_overhead + ttl_overhead) / 1`.
-   The smallest item has 1 byte, because a key cannot be empty. `r` is 74.75 for `items` and 47.5 for `latest_items`.
-2. Calculate the estimate of each returned key. Keep only the largest `PROMOTION_CANDIDATES_MAX` keys at or above `T`.
-3. Return at most `PROMOTION_CANDIDATES_MAX` keys, largest estimate first.
+- `RANK_KEY`, `RANK_ITEM`, and `RANK_OVERFLOW` are positive integer constants for each table, in `item-size.ts`.
+- The estimate never uses them. They only order the walk.
+- The indexed facts are not in `rank_bytes`, so a TTL change does not change it. The ratio `r` below covers them.
 
-- Each key at or above `T` has `item_bytes >= T / r`, so the walk finds each candidate (appendix C).
-- Once the walk holds `PROMOTION_CANDIDATES_MAX` keys at or above `T`, it can stop before `T / r`: a key that is not
-  read yet has `item_bytes` below the cursor, and when `r` times that value is below the fifth estimate, the key
-  cannot enter the top five.
-- The walk reads at most `r * (sum of item_bytes) / T` entries, and never more than the first-bucket count of the
-  leaf. In a hash leaf at 1.1 times its cap with `promotionFraction = 0.25`, that is at most about 330 entries for
-  `items` and 209 for `latest_items`. 285 entries took 0.585 ms (appendix A.4).
-- A cap reduction can make `T / r` smaller than the `item_bytes` of every summary. One pass then reads each first
-  bucket of the leaf. Section 4.3.3 covers the cost of that pass.
-- The walk runs only while the leaf is over its cap.
-- The index is on an exact fact, so a coefficient change rewrites nothing.
+**How to select the rank weights.** Select them one time, with the bench of appendix A.1, after each measurement of
+the coefficients. They are the positive integers that make the largest `r * rank_bytes / estimate` smallest, over the
+measured row shapes: keys of 16 to 408 bytes, data of 0 to 1,000 bytes, and no item, one item in three, or each item
+indexed. The walk length grows with this value. `RANK_OVERFLOW` is 1, because `overflow_coefficient` is 1.
 
-**Cache.** `ItemStats` owns one in-memory cache for a hash leaf. The pass and the cache each retain at most
-`PROMOTION_CANDIDATES_MAX` keys and their estimates. They must not collect all qualifying keys.
+**The ratio `r`.** The lookup calculates `r` at each run, from the live coefficients and the rank weights:
 
-- The cache identifies its threshold, policy, and coefficient values. It contains the current top five, in estimate
-  order, or a valid empty result.
-- Before each SQL write to `item_stats`, `ItemStats` must invalidate the cache. This covers inserts, overwrites,
-  deletes, TTL expiry, tombstone GC, imports, recounts, and the removal at promotion completion.
-- A rollback leaves the cache invalid. The next decision can repeat the pass, but must not reuse facts from the
-  rolled-back write. The lookup must build and publish the cache from committed facts, outside item-write transactions.
-- A change of the threshold, policy, or coefficient values, or the end of a local import, also invalidates the cache.
-  Eviction loses the cache and requires a new pass.
-- With a valid cache, the decision returns its ranked keys with no summary read. A valid empty result stays valid.
-  After invalidation, the next decision over the cap runs a new pass. No cache state needs a SQLite or KV write.
+```text
+r = max( 1,
+         (key_index_factor + indexed_key_factor) / RANK_KEY,
+         (base_overhead + indexed_overhead)      / RANK_ITEM,
+         overflow_coefficient                    / RANK_OVERFLOW )
+```
 
-An in-flight promotion keeps its ranked place and answers `already_promoted`. The runtime tries each other key of
-the returned set independently. An unfinished promotion alone must not suppress discovery of the other top-five keys.
-When `beforeComplete` removes its bucket, that write invalidates the cache and permits discovery of the next keys.
+For each routingHash, `estimate <= r * rank_bytes` (appendix C). This holds for each item size, also for a routingHash
+of 1-byte items, because `item_count` has its own term in `rank_bytes`.
 
-**Retry after a write.** The write-path signal can fail before it queues a promotion. Cache reuse must not depend on
-that signal succeeding. The committed fact change already invalidates the cache, so a later decision discovers the
-eligible key again. Each decision retries its returned candidates, including after an earlier promotion request failed.
+The rank weights for the coefficients of section 4.2.3:
 
-The rest of the decision stays: a hash leaf with one key promotes that key whatever its estimate, and a leaf with two
-or more keys promotes its candidates before it splits.
+| Rank weight | `items` | Term of `r` | `latest_items` | Term of `r` |
+| --- | --- | --- | --- | --- |
+| `RANK_KEY` | 2 | (1.25 + 1.25) / 2 = 1.25 | 2 | (1.25 + 1.25) / 2 = 1.25 |
+| `RANK_ITEM` | 81 | (76 + 25) / 81 = 1.25 | 74 | (67.25 + 24.75) / 74 = 1.24 |
+| `RANK_OVERFLOW` | 1 | 1 / 1 = 1 | 1 | 1 / 1 = 1 |
+| | | `r` = **1.25** | | `r` = **1.25** |
+| Largest `r * rank_bytes / estimate` | | **1.64** | | **1.65** |
+
+`r` is above 1 because the bound assumes that each item is indexed.
+
+**The walk.**
+
+```sql
+SELECT routing_hash, item_count, item_bytes, key_bytes, indexed_item_count, indexed_key_bytes, overflow_bytes,
+       rank_bytes
+  FROM item_stats
+ WHERE lower_hk = x'' AND lower_sk = x'' AND rank_bytes >= ?1
+ ORDER BY rank_bytes DESC
+```
+
+1. Bind `?1` to `T / r`. A routingHash with `estimate >= T` has `rank_bytes >= T / r`, so the walk reads each
+   candidate.
+2. Calculate the estimate of each row. Keep the largest `PROMOTION_CANDIDATES_MAX` (5) at or above `T`.
+3. When the walk holds 5 candidates, and `r * rank_bytes` of the current row is below the fifth estimate, stop. Each
+   later row has a smaller `rank_bytes`, so it cannot enter the top five.
+4. For each kept routingHash, read one hash key with one primary-key seek:
+   `SELECT hk FROM items WHERE routing_hash = ? ORDER BY hk, sk LIMIT 1`. The host promotes by hash key, and the
+   runtime maps it back to the routingHash.
+5. Return at most `PROMOTION_CANDIDATES_MAX` hash keys, largest estimate first.
+
+- When the seek of step 4 finds no row, the bucket has no items. Log the defect one time and skip that routingHash.
+- The walk reads at most `r * sum(rank_bytes) / T` rows, and never more than the first-bucket count of the leaf. With
+  the rank weights above, `r * sum(rank_bytes)` is at most about 1.65 times the estimate of the leaf. Then a hash leaf
+  at 1.1 times its cap with `promotionFraction = 0.25` reads at most about 1.1 / 0.25 * 1.65, that is about 7 rows. A
+  walk of 6 rows takes about 0.15 ms locally, and a walk of 560 rows about 1.5 ms (appendix A.4).
+- The walk runs only while the leaf is over its cap. It runs after the write commits, so it reads committed facts.
+- The walk keeps no result between two decisions, and it writes no row. Each decision walks again.
+
+**Cost after a cap reduction.** The walk reads at most about `4 * X * 1.65` rows, where `X` is the estimate of the leaf
+divided by its cap. A cap reduction makes `X` larger. The walk runs for each split decision while the leaf is over its
+cap and no split is queued: about one time for each successful write. `partition-context.ts` accepts each `maxSizeMb`
+above 0. The design accepts this cost, and it adds no cap minimum and no cache. Example with about 2.6 µs for each
+row read (appendix A.4):
+
+| Cap change | `X` | Rows read, at most | Time, about |
+| --- | --- | --- | --- |
+| 1 GB to 100 MB | about 10 | about 66 | 0.17 ms |
+| 10 GB to 100 MB | about 100 | about 660 | 1.7 ms |
+| 10 GB to 1 MB | about 10,000 | about 66,000 | 0.17 s |
+
+**Why inexact rank weights are correct.** The lookup calculates `r` from the live coefficients and the same weights, so
+`estimate <= r * rank_bytes` holds for any positive rank weights (invariant I9). A rank weight changes only the length
+of the walk:
+
+- A weight below its coefficient makes `r` larger, so the walk stops lower.
+- A weight above its coefficient makes `rank_bytes` larger, so more rows are above `T / r`.
+
+Neither error can hide a candidate. Example: a later release adds an index that holds the key to `items`, and the
+measured `key_index_factor` goes from 1.25 to 2.5.
+
+1. The release changes the coefficient. The estimates are correct at once, and no row is rewritten.
+2. `RANK_KEY` stays 2. The term of `r` becomes (2.5 + 1.25) / 2 = 1.875, so `r` is 1.875 in place of 1.25.
+3. For items of 24 key bytes and 20 bytes of data, `r * rank_bytes / estimate` goes from 1.44 to 1.80, so the walk
+   reads about 25% more rows. It still finds each candidate.
+
+**Rank-weight change.** Correctness never needs this change. Change the weights only when the largest `r * rank_bytes /
+estimate` of the bench grows far above its value, for example above 3. Before the release, edit the constants. After the
+release, use the job below. Neither milestone builds it.
+
+1. Each weight set has a version. The code keeps each weight set that it ever used: three integers for each version.
+2. `ItemStats` stores, under its KV key, the oldest weight version that a bucket row can still use. A new
+   `item_stats` table stores the version of the code when it creates the table.
+3. When the class starts and the stored version is older than the code version, the weight change is in progress:
+   - Each statement that writes facts sets `rank_bytes` with the weights of the code version.
+   - A background job sets `rank_bytes` with the weights of the code version in each bucket row, in primary-key
+     order, in bounded batches in the alarm, for example 500 rows. A first bucket writes the row and its index entry.
+     Another bucket writes the row only.
+   - The walk calculates `r` with the smallest weight of each term over the versions from the stored version to the
+     code version. Each row uses one of those weight sets, so `estimate <= r * rank_bytes` holds for each row, and the
+     walk misses no candidate.
+4. The job stores the code version in KV when it has updated each row. The change is then complete, and the walk
+   uses only the weights of the code version.
+
+The job writes about 2 rows for each routingHash of a hash leaf, and about 1 row for each bucket of a range leaf, at
+the rate that the batch size and the alarm interval set. A second weight change can start before the first job ends:
+the job then continues with the newest weights, and the walk keeps the smallest weights of all versions in the range.
+
+**Promotions in progress.** An in-flight promotion keeps its ranked place and answers `already_promoted`. The runtime
+tries each other candidate of the returned set independently. An unfinished promotion must not prevent the discovery
+of the other top-five routingHashes. When `beforeComplete` removes its buckets, the next decision finds the next ones.
+
+**Retry after a write.** The write-path signal can fail before it queues a promotion. Each decision walks the committed
+facts again, so a later decision finds the eligible routingHash again. Each decision retries its returned candidates,
+also after an earlier promotion request failed.
+
+The rest of the decision stays: a hash leaf with one routingHash promotes it whatever its estimate, and a leaf with
+two or more routingHashes promotes its candidates before it splits. `probeRoutingHashes` does not change.
 
 #### 4.2.9 Range planner
 
-The planner keeps one `transactionSync`. Its inputs are the hash key, the owned slice `[start, end)`, and `N`.
-On a range leaf, the buckets of the key cover exactly that slice.
+The planner keeps one `transactionSync`. Its inputs are the routingHash, the owned composite slice `[start, end)`, and
+`N`. On a range leaf, the buckets of the routingHash cover exactly that slice. All reads use the key range
+`routing_hash = ? AND (hk, sk) >= start AND (hk, sk) < end` of the primary key, or a part of it.
+
+The planner reads all bucket rows of the slice in storage order and prices them with the live coefficients. It does
+not read the buckets in size order, so it uses no `rank_bytes` and no `r`.
 
 **Bucket path (M2).**
 
 1. Apply the count check of section 4.2.10. Return `fewer_items` when the slice holds fewer than `N` items.
-2. Read the bucket rows in sort-key order. Price each bucket with the model, and keep the running total before each
+2. Read the bucket rows in storage order. Price each bucket with the model, and keep the running total before each
    bucket. The total is `B`.
 3. Calculate the targets `i * B / N` for `i = 1 … N - 1`, and find the bucket that holds each target.
-4. Scan each of those buckets one time, in sort-key order, through the covering index. Start from the running total
-   before the bucket, add each item estimate, and select the gap nearest each target. The candidate gaps are the gaps
-   inside the bucket, the start of the bucket, and the start of the next bucket. When two gaps have the same distance,
-   select the earlier gap.
+4. Scan each of those buckets one time, in storage order. Start from the running total before the bucket, add each
+   item estimate, and select the gap nearest each target. The candidate gaps are the gaps inside the bucket, the start
+   of the bucket, and the start of the next bucket. When two gaps have the same distance, select the earlier gap.
 5. Assign the boundaries in target order, with the same rule as the streaming path: the gap nearest the target after
-   the previous boundary. When the gap that step 4 selected for a target is after the previous boundary, it is the
-   boundary. Otherwise the boundary is the first gap after the previous boundary, and the planner reads the item
-   that ends it: one row for each such step. This collision occurs only when one item weighs at least `B / N`.
+   the previous boundary.
+   - When the gap that step 4 selected for a target is after the previous boundary, it is the boundary.
+   - Otherwise the boundary is the first gap after the previous boundary, and the planner reads the item that ends
+     it: one row for each such step. This collision occurs only when one item weighs at least `B / N`.
 6. When a boundary is the last gap and later targets have no boundary, apply the repair of the streaming path: read
    the last `N` items of the slice in reverse order, keep the boundaries before their first gap, and fill the missing
    boundaries from their gaps, latest gap first.
-7. Make each boundary with `KeyCodec.shortestSeparator` of the two items at its gap. At the start of a bucket, one seek
-   reads the item before `lower_sk`.
+7. Make each boundary with `KeyCodec.shortestCompositeSeparator` of the two items at its gap. At the start of a
+   bucket, one seek reads the item before the bucket bound: `ORDER BY hk DESC, sk DESC LIMIT 1`.
 
-The planner reads at most `2C / K + 1` bucket rows. Its scans read at most `min(N - 1, buckets) * 2K` rows for the
-buckets of the targets, at most `N - 1` rows for the collision steps, and at most `N` rows for the repair:
-at most `min(N - 1, buckets) * 2K + 2N` rows in total (appendix E).
+`C` is the item count of the slice. The planner reads at most `2C / K + 1` bucket rows. Its scans read at most
+`min(N - 1, buckets) * 2K` rows for the buckets of the targets, at most `N - 1` rows for the collision steps, and at
+most `N` rows for the repair: at most `min(N - 1, buckets) * 2K + 2N` rows in total (appendix E).
 
 **Streaming path (M1).**
 
 1. Apply the count check.
-2. Read the rows of the slice through a streaming covering-index cursor, and price each row with the model.
+2. Read the items of the slice in storage order through a streaming cursor, and price each item with the model.
 3. For each target in order, select the gap nearest the target after the previous boundary. Ties select the earlier gap.
-4. Keep the last `N` rows of the scan in a buffer. These rows have `N - 1` gaps.
+4. Keep the last `N` items of the scan in a buffer. These items have `N - 1` gaps.
 5. Stop the scan when it has `N - 1` boundaries.
 6. When the cursor ends with fewer boundaries, repair: keep the boundaries before the first gap of the buffer, and fill
    the missing boundaries from the gaps of the buffer, latest gap first.
-7. Make each boundary with `KeyCodec.shortestSeparator`.
+7. Make each boundary with `KeyCodec.shortestCompositeSeparator`.
 
 **Both paths.**
 
 - For a cut after `k` items, the lower prefix holds only those `k` items.
 - A gap is the position between two adjacent items. No gap exists before the first item or after the last item, so each
   child holds at least one item.
+- A gap can be between two hash keys of one routingHash. The separator is then `(s, x'')`, as
+  `shortestCompositeSeparator` defines.
 - `B` and the facts control only the balance. Wrong facts give a worse balance, but the boundaries stay valid.
-- The planner must preserve canonical byte order, strict boundary order, and the slice bounds. It must not use repeated
-  `OFFSET` walks in JavaScript or materialize the slice.
+- The planner must preserve storage order, strict boundary order, and the slice bounds. It must not use repeated
+  `OFFSET` walks in JavaScript or materialize the slice. It selects `hk`, `sk`, `item_bytes`, and
+  `ttl_epoch_utc_seconds`, never `data`.
 - Remove `skewed_bytes`. `RangeSplitPlan` keeps only `fewer_items` as a floor. `SplitPlanner.rangeBoundaries`, the
   `computeRangeBoundaries` hook, returns the boundaries, or `null` for that floor.
-- This planner does not give the optimal balance. A child that is still over its cap splits again.
+- `SplitSource.compositeKeySizes` gives the facts of each item in place of one size.
+- This planner does not give the optimal balance. An item cannot cross a boundary, so a dominant item makes equal
+  children impossible. A child that is still over its cap splits again.
 
 This section replaces the threshold loop of `range-split-boundary-byte-seek.md` and the range-floor rule of
 `2026-09-27-over-size-split-trigger.md`.
@@ -511,16 +853,19 @@ This section replaces the threshold loop of `range-split-boundary-byte-seek.md` 
 With the planner of section 4.2.9, `fewer_items` is the only range floor. For a range leaf over its cap,
 `SplitPlanner.evaluateSplit`:
 
-1. Counts the items of the slice through the covering index with `LIMIT N`. The planner uses the same function.
+1. Counts the items of the slice in its primary-key range with `LIMIT N`. The planner uses the same function.
 2. Answers a split when the count is `N` or more, and returns the `fewer_items` floor when it is less.
 3. Does not call the planner.
+
+The decision needs one fact: is a split possible. The item count gives that fact. The decision runs before a refused
+write gets its error, so a scan there blocks the partition for each write.
 
 Only `#plan` reads more, one time for each queued split, in the alarm. When deletes reduce the count below `N` after
 the decision, the planner returns `null`, and `#plan` waits with backoff, as it does today. The in-memory cache of the
 floor result of `2026-09-27-over-size-split-trigger.md` is not necessary.
 
 The planner change and this decision ship together. With the current planner, weights `[111, 5111, 111]` and `N = 3`
-pass the count check, and `#plan` returns `null` at each try. The split then never happens.
+pass the count check, but `#plan` returns `null` at each try, so the split never happens.
 
 #### 4.2.11 Item limit, query budget, and export budgets
 
@@ -530,70 +875,106 @@ pass the count check, and `#plan` returns `null` at each try. The split then nev
 - The early client check `validateItemDataSize` stays a lower bound on the data only.
 - The query scan gives `item_bytes` to its candidate consumer. The collector charges it for each evaluated item,
   also for an item that the filter rejects. The cursor stays a key position.
+- The count selection of `queryScanStatement` reads `sk` and `item_bytes` from the primary key, with no `INDEXED BY`
+  pin.
 - `MaterializationExportConfig.maxBytes` and `TargetRunnerConfig.maxBytesPerStep` count `item_bytes`.
 
 These changes move some page and batch boundaries.
 
 #### 4.2.12 Materialization DO
 
-`MaterializationStore` uses the same machinery as `PartitionStore`: `item_bytes`, the covering index of section 4.2.2,
-`ItemStats` with the `latest_items` coefficients, the same fact updates, the same split and merge, the same promotion
-lookup, and the same planner. The tombstone GC delete is a delete of a present item.
+`MaterializationStore` uses the same machinery as `PartitionStore`:
 
-#### 4.2.13 Performance
+- `item_bytes` and the primary-key reads of section 4.2.2.
+- `ItemStats` with the `latest_items` coefficients and rank weights.
+- The same fact updates, split, merge, import, promotion lookup, and planner.
 
-All values are from local workerd on an AMD Ryzen 9 7940HS (appendix A.4), with `K = 2,048` and small items of about
-150 bytes. Production CPUs can be slower.
+Its routingHash comes from its own runtime, with the seed of the materialization shard group. Its indexed items are
+its tombstones. The tombstone GC delete is a delete of a present item, and it returns `base_sk` (section 4.2.2). Its
+`beforeComplete` and its cleanup guard delete the buckets of the promoted routingHash, as in the partition.
+
+#### 4.2.13 Invariants
+
+Each invariant must hold after each commit. The verification of section 4.2.16 checks each one.
+
+| # | Invariant | Mechanism |
+| --- | --- | --- |
+| I1 | The facts of each bucket equal the sums over the items in its key range | Each write changes the item and its facts in one storage transaction (section 4.2.5). The drift repair corrects a defect in the same transaction (section 4.2.7) |
+| I2 | The facts that a write adds for an item equal the facts that a later update or delete of that item subtracts | The old-facts read returns `item_bytes`, and `overflow_bytes` is a function of `item_bytes` only. Its JavaScript and SQL forms give the same value (sections 4.2.2 and 4.2.3) |
+| I3 | The `rank_bytes` of each bucket equals `rankSql` over its facts, with the weights of the code. During a rank-weight change, it can use the weights of an older version | Each statement that writes facts sets `rank_bytes` in the same statement (section 4.2.5) |
+| I4 | A hash leaf holds exactly one bucket for each routingHash that has items: its first bucket `(x'', x'')` | The helper upserts the first bucket and deletes it with the last item (section 4.2.5). A hash leaf never splits a bucket |
+| I5 | On a range leaf, each bucket holds at most `2K` items, and each two neighbour buckets hold at least `K` items together. The first bucket stays while the routingHash has an item | The split and the merge run in the transaction of the write (section 4.2.6). The import makes buckets of `K` items. A merge deletes the upper row |
+| I6 | The buckets of a routingHash are one key range of `item_stats`, and the items of a bucket are one key range of the primary key of the item table | Both tables lead with `routing_hash` and are in storage order (section 4.2.4). Thus a promotion cleanup is one range delete |
+| I7 | The rows of an imported items page are strictly increasing in storage order above the page cursor | `assertItemFollows` in `validatePage` of both migration hosts (section 4.2.6) |
+| I8 | A retried migration page adds facts only for the items that it inserts | The import adds the facts of a row only when its insert reports a new row (section 4.2.6) |
+| I9 | For each routingHash, `estimate <= r * rank_bytes`. Thus the promotion lookup gives the same result for any positive rank weights. A rank weight changes only the number of rows that the walk reads | The lookup calculates `r` from the live coefficients and the rank weights (section 4.2.8, appendix C) |
+| I10 | The check after a write and the promotion lookup use the same estimate and the same `T` | One estimate function over the facts of the first bucket (section 4.2.8) |
+| I11 | When a slice holds at least `N` items, the planner returns `N - 1` boundaries in increasing order. Each child holds at least one item, and each boundary is the shortest key that separates two adjacent items | One `transactionSync` for all reads, gaps only between items, and `KeyCodec.shortestCompositeSeparator` (section 4.2.9) |
+| I12 | A read of sizes, counts, or facts reads no item data | `item_bytes` and the TTL columns are before `data`, and no size read selects `data` (sections 4.2.2 and 4.2.9) |
+| I13 | The split decision of a range leaf reads at most `N` items | The count check with `LIMIT N` (section 4.2.10) |
+
+#### 4.2.14 Performance
+
+The costs below come from local workerd on an AMD Ryzen 9 7940HS, on the clustered layout of section 4.2.2
+(appendix A.4), with `K = 2,048` and small items of about 150 bytes. Production CPUs can be slower. TODO: measure on a
+deployed Durable Object (section 4.3.1).
 
 | Path | Cost |
 | --- | --- |
-| Write on a hash leaf | Bucket update: 5.3 µs, 2 rows read, 2 rows written (the row and its promotion index entry) |
-| Write on a range leaf | One bucket seek update: 8.7 to 9.0 µs, 3 rows read, 1 row written (2 for the first bucket) |
-| Split | 0.70 to 0.86 ms and about 6,150 rows read, at most once for each `K` inserts into a bucket |
+| Old-facts read | 11 to 15 µs, 1 row read |
+| Write on a hash leaf | First-bucket upsert: 24 µs on one hot routingHash, 52 to 74 µs spread over 100,000 routingHashes. 1 row read, 2 rows written (the row and its promotion index entry). With the item row and its `idx_items_item_id` entry, an insert writes 4 rows. Today it writes 5: `items`, `idx_items_scan`, `idx_items_item_id`, and the `key_size_estimates` row and its index entry |
+| Write on a range leaf | One bucket seek update: 8 to 13 µs, 3 rows read, 1 row written (2 for the first bucket) |
+| Split | 1.45 to 1.65 ms, 6,150 rows read, 2 rows written, at most once for each `K` inserts into a bucket |
 | Merge | 2 more seeks for each delete while the bucket holds fewer than `K` items; 2 row writes for a merge |
-| Promotion lookup | One pass after cache invalidation; no summary read while the cache stays valid |
-| Split decision of a range leaf | At most `N` index entries |
-| Planner, `N = 4`, caps of 500 MiB to 2 GiB | About 20 to 33 ms |
-| Planner, `N = 4`, each cap up to 10 GB | At most about 100 ms |
-| Planner, `N = 255`, each cap up to 10 GB | At most about 1.4 s |
-| Bucket table of a leaf at 2 GiB | At most about 14,000 rows, 1 MB to 2 MB |
-| Storage of a bucket row | 11 to 16 bytes more than a `key_size_estimates` row today, plus the bytes of `lower_sk` |
+| Import | No item read for the buckets; one bucket write for each `K` imported items, and one for each page |
+| Promotion lookup | At most `r * sum(rank_bytes) / T` index rows, about 7 at 1.1 times the cap, plus at most 5 primary-key seeks. About 0.15 ms for 6 rows. No row written. It runs for each split decision of a hash leaf over its cap |
+| Split decision of a range leaf | At most `N` items |
+| Planner, `N = 4`, caps of 500 MiB to 2 GiB | About 30 to 50 ms. Measured: 12 ms for a slice of 300,000 items |
+| Planner, `N = 4`, each cap up to 10 GB | At most about 150 ms |
+| Planner, `N = 255`, each cap up to 10 GB | At most about 2 s |
+| Bucket table of a leaf at 2 GiB | At most about 14,000 rows, about 1 MB |
+| Storage of a bucket row | About 66 bytes for a first bucket, 69 bytes for a range bucket (appendix A.3) |
 
-The write that splits a bucket blocks the partition for less than 1 ms. The planner blocks the partition for its
+The write that splits a bucket blocks the partition for about 1.5 ms. The planner blocks the partition for its
 duration, one time for each split.
 
-At 1.1 times the cap and the default promotion fraction, a promotion pass reads at most about 330 entries in about
-0.7 ms. A cap reduction can make it read each first bucket of the leaf. The cache retains at most five candidates.
-Repeated decisions reuse the result only while the facts and the pricing inputs stay unchanged. Each statistics
-write invalidates the cache, so a delete, TTL sweep, or promotion completion can require another pass.
+The timings use sort keys of 16 and 100 bytes. From 16 to 100 bytes, a JavaScript row read and a split at `K = 2,048`
+each cost about 7% more. A longer key also makes each item larger, so a leaf holds fewer items, and the planner reads
+fewer bucket rows. Thus small items give the worst case.
 
-The timings use sort keys of 16 and 100 bytes. A longer key makes each row slower to read: from 16 to 100 bytes, a
-JavaScript row read costs 11% more, and the split costs 23% more. A longer key also makes each item larger, so a leaf
-holds fewer items, and the planner reads fewer bucket rows. Thus small items give the worst case.
-
-#### 4.2.14 Deployment and migration
+#### 4.2.15 Deployment and migration
 
 - Edit the existing schema migrations of `PartitionStore` and `MaterializationStore` in place. Do not add migration
   entries.
-- Remove `key_size_estimates`, its index, and the KV key `__fokosdb/key_sizes/sql_schema_version`.
+- In the `items` migration, drop `idx_items_scan`, replace `est_row_bytes` with `item_bytes`, and update the schema
+  comment: the size reads use the primary key, and `EST_ROW_BYTES_K` goes.
+- Remove `key_size_estimates`, its index, `KeySizeStats`, and the KV key `__fokosdb/key_sizes/sql_schema_version`.
   `ItemStats` tracks its migrations under `__fokosdb/item_stats/sql_schema_version`.
 - A deployment must use new namespaces. Existing Durable Objects are destroyed, not migrated, so the change needs no
   backfill and no rollback procedure.
-- Key encoding, DO names, and committed item contents stay the same.
+- Key encoding, the routingHash, DO names, and committed item contents stay the same.
 - After the release, a coefficient change is an edit of the constants. It must not change item validity or commit
-  eligibility.
+  eligibility. A rank-weight change uses the background job of section 4.2.8.
 - Update `AGENTS.md` for the range floor, the promotion lookup, and the bucket rules.
 
-#### 4.2.15 Verification
+#### 4.2.16 Verification
 
 Tests must check definitions, not only the agreement between two uses of the same value.
 
 **Exact facts**
 
 - Check multibyte text, binary data, JSONB, binary key tags, and an absent sort key.
-- Check inserts, overwrites, compiled updates, deletes, and absent deletes, and the "created" signal of the capture.
+- Check inserts, overwrites, compiled updates, deletes, and absent deletes, and the "created" signal of the capture
+  and of the item-id assignment.
 - Check null-to-TTL, TTL-to-null, and non-null TTL changes, TTL expiry, and the subtraction from the bucket.
-- Check migration retries, page grouping, restart, and source copy cleanup.
+- Check live-to-tombstone, tombstone-to-live, and tombstone collection in `latest_items`.
+- Check `overflow_bytes` at `P` of 1,002, 1,003, 5,094, 5,095, and `MAX_ITEM_BYTES`. Check that the JavaScript and the
+  SQL forms give the same value. Insert, update across the limit, and delete items of these sizes, and check that the
+  bucket returns to 0.
+- Check migration retries, page grouping, restart, and source copy cleanup, with its guard delete.
+- On a range leaf, check a TTL sweep chunk whose rows are in several buckets, and a tombstone collection of
+  `latest_items`. Each bucket must equal the SQL sums of its range after the operation.
+- Check that the page validation refuses an items page with a row out of storage order, or at or below its cursor.
 - Check that prepare and cancel add no facts.
 - After `beforeComplete` of a promotion, check that a delete of a copy creates no bucket and changes no other bucket.
 - Write a wrong bucket directly with SQL in the test. Then commit a delete in that bucket. Check that the commit
@@ -604,9 +985,12 @@ Tests must check definitions, not only the agreement between two uses of the sam
 
 - Run random sequences of inserts, overwrites, deletes, TTL expiries, and import pages. After each operation, check:
   - The buckets cover the slice with no gap and no overlap.
-  - Each bucket equals the SQL sums of its range.
-  - The band rules of requirement 10 hold, and a hash leaf has one bucket for each key.
+  - Each bucket equals the SQL sums of its composite range.
+  - Invariants I4 and I5 hold.
+- Include two hash keys with one routingHash (`collidingHashKeys` in `test/hash-digits.ts`). On a hash leaf, both share
+  one bucket. On a range leaf, a bucket can hold items of both, and a boundary between them is valid.
 - Check an append-only sort-key sequence and a "delete most items" sequence.
+- Check that an import gives buckets of `K` items, except the last, and reads no item for them.
 - A bulk TTL expiry that empties a bucket between two small neighbours must merge the neighbours before the
   transaction commits.
 - After a decrease of `K`, check deletes that leave ten buckets of 1,024 items at `K = 2,048`, from `K = 4,096`.
@@ -622,20 +1006,24 @@ Tests must check definitions, not only the agreement between two uses of the sam
 
 **Promotion**
 
-- Check a key with many small items and long keys that ranks below a key with large items by `item_bytes`, but above
-  it by estimate. The lookup must return it.
-- Check that the write-path estimate equals the lookup estimate for a key with long sort keys and TTLs.
-- Lower the cap below the size of a leaf with many keys. Compare each pass with the current top-five SQL result.
-  With unchanged facts and pricing inputs, repeated decisions must reuse the cache, including a valid empty result.
-- While one promotion is unfinished, check that the decision still returns the other eligible top-five keys.
-- Seed six keys with estimates `[100, 90, 80, 70, 60, 50]` KiB at `T = 10 KiB`, then build the cache. Reduce the
-  first five to 11 KiB through deletes or TTL expiry before cutover. The next decision must include the sixth key first.
-- Check invalidation after each statistics mutation of section 4.2.8, and after each pricing-input change and eviction.
-  A rolled-back write can invalidate the cache, but a later pass must use committed facts only.
-- Make an uncached key cross `T` and enter the top five through a committed write. Fail its promotion request before
-  the queue write. A later refused write must discover the key again and retry while another promotion is unfinished.
-- With more than five eligible keys, check that the pass and the cache each retain at most five candidates.
-  Completion must invalidate the cache so that the next pass discovers the remaining eligible keys.
+- Compare each lookup result with a reference: a full scan of the first buckets that calculates each estimate.
+- Check a routingHash with many small items and long keys that ranks below a routingHash with large items by
+  `item_bytes`, but above it by estimate. The lookup must return it.
+- Check a routingHash of 1-byte items with no data. The lookup must return it when its estimate is at or above `T`.
+- Change the coefficients in a test build and keep the rank weights, for example `base_overhead` times 2. The lookup
+  must give the same result as the reference.
+- Check that `rank_bytes` equals its formula after inserts, updates, deletes, splits, merges, imports, and recounts.
+- Change the rank weights in a test build. Check that the lookup gives the same result as the reference before, during,
+  and after the background job, with rows of both weight sets.
+- Check that the write-path estimate equals the lookup estimate for a routingHash with long sort keys and TTLs.
+- Check that two hash keys with one routingHash give one candidate, with a hash key that has items.
+- Lower the cap below the size of a leaf with many routingHashes. The lookup must give the same result as the
+  reference.
+- While one promotion is unfinished, check that the decision still returns the other eligible top-five routingHashes.
+- Seed six routingHashes with estimates `[100, 90, 80, 70, 60, 50]` KiB at `T = 10 KiB`. Reduce the first five to
+  11 KiB through deletes or TTL expiry before cutover. The next decision must return the sixth first.
+- Make a routingHash cross `T` through a committed write. Fail its promotion request before the queue write. A later
+  decision must find it again and retry while another promotion is unfinished.
 
 **Planner and decision**
 
@@ -643,7 +1031,8 @@ Tests must check definitions, not only the agreement between two uses of the sam
 - `[111, 5111, 111]` and `N = 3` give three non-empty children. `[111, 111, 5111]` and `N = 3` use the repair and give
   `[111]`, `[111]`, `[5111]`. Check dominant items at the start, the middle, and the end.
 - Check exactly `N` items, fewer than `N`, an empty slice, variable sort-key lengths, TTL costs, variable data sizes,
-  explicit slice bounds, shortest separators, string and binary keys, and children that cover the slice.
+  explicit composite slice bounds, shortest composite separators, string and binary keys, and children that cover the
+  slice.
 - Check that the bucket path and the streaming path give the same boundaries on the same items, also when adjacent
   items above `B / N` force a collision and the end repair.
 - Check that the scans of the bucket path stay inside the bound of appendix E when collisions occur.
@@ -654,49 +1043,22 @@ Tests must check definitions, not only the agreement between two uses of the sam
 
 **Query plans and flows**
 
-- Use `EXPLAIN QUERY PLAN` to assert covering scans for the size scans, the count checks, the split statements, the
-  recount, and the old-facts read. Assert that the promotion lookup uses `item_stats_promotion`.
+- Use `EXPLAIN QUERY PLAN` to assert a primary-key search on a key range for the size scans, the count checks, the
+  split statements, the recount, the planner scans, and the old-facts read. Assert that the promotion lookup uses
+  `item_stats_promotion`, and that the promotion cleanup of `item_stats` is a primary-key range delete.
 - Check range split, migration, promotion, and transaction flows in the Workers runtime with the existing partition
   harness. Add no production test hook.
 
 ### 4.3 Open questions
 
-#### 4.3.1 Costs on a deployed Durable Object
+#### 4.3.1 Costs on the clustered layout and on a deployed Durable Object
 
-All measurements of appendix A come from local workerd. The split statements, the bucket seek, and the refine scan
-must be measured again on a deployed Durable Object before the release. If the split costs much more than 1 ms, the
-answer can change `K`.
+The local costs on the clustered tables are measured (appendix A.4). A JavaScript row read of the primary key costs
+about 1.8 µs, against 1.2 µs over `idx_items_scan`, and a split at `K = 2,048` costs about 1.5 ms, against 0.8 ms.
+The planner stays within the bounds of section 4.2.14, so the fallback of section 5.16 is not necessary locally.
 
-#### 4.3.2 Tombstones of `latest_items`
-
-A tombstone also has an entry in `idx_latest_items_deleted_gc`. The `latest_items` model does not include that entry.
-TODO: measure the cost of a tombstone row, and decide if the model needs a term for it.
-
-#### 4.3.3 First-pass cost after a cap reduction
-
-This question concerns the promotion-candidate cache of section 4.2.8, not the range-planner buckets or their `K`.
-The cache lives in the memory of one hash-leaf Durable Object. It holds at most five candidate keys and their
-estimates. It holds no item data and writes no SQLite or KV row.
-
-The lookup must find those candidates before it can cache them. Its index orders keys by `item_bytes`, but promotion
-orders them by the storage estimate. These orders can differ, so the lookup cannot always stop after five entries.
-
-When an operator lowers the cap sharply:
-
-1. The leaf keeps the same data, but its promotion threshold `T` falls.
-2. More keys pass the index cutoff `T / r`.
-3. The lookup can read every first bucket before it can select the top five.
-
-For example, a leaf with 100,000 hash keys can require a pass over all 100,000 summaries. This is one summary per hash
-key, not one read per item. The pass runs synchronously and blocks the Durable Object while it runs.
-
-Repeated refused writes change no facts, so they can reuse the cached result. Statistics writes invalidate it;
-a delete, TTL expiry, or promotion completion can require another pass. Eviction also loses the cache.
-The cache bounds retained memory and avoids repeated work with unchanged facts. It does not bound one pass's CPU time.
-
-TODO: measure this pass at the largest supported key count. The open question is whether it fits the CPU and latency
-budgets after a large cap reduction. Decide later whether to accept that latency exception or divide the lookup across
-invocations if it exceeds the CPU budget.
+TODO: measure the same statements on a deployed Durable Object before the release. If the split costs much more than
+1.5 ms there, the answer can change `K` (appendix F).
 
 ## 5. Alternative options
 
@@ -713,8 +1075,8 @@ versions. Exact facts avoid this.
 ### 5.3 A stored estimate in each bucket with a plain index
 
 The promotion lookup then reads at most 5 rows. Each write path must calculate the estimate in its upsert, and a
-coefficient change must rewrite each bucket row. A stale estimate can hide a candidate until the rewrite ends. The index
-on `item_bytes` of section 4.2.8 has no derived state, and its walk has a bound.
+coefficient change must rewrite each bucket row. A stale estimate can hide a candidate until the rewrite ends.
+`rank_bytes` needs no rewrite for a coefficient change, and its walk has a bound. Rejected.
 
 ### 5.4 An expression index on the estimate
 
@@ -723,30 +1085,30 @@ a coefficient change rebuilds the index. Rejected.
 
 ### 5.5 No index for the promotion lookup
 
-The lookup then reads every key on each write while the leaf is over its cap. A scan of 1M index entries takes about
-0.05 s. Rejected.
+The lookup then reads every routingHash on each write while the leaf is over its cap. A scan of 1M index entries takes
+about 0.05 s. Rejected.
 
 ### 5.6 Promotion by the share of the leaf, or calibration with `sql.databaseSize`
 
-Both compare the estimate of a key with the total of the leaf. A maintained total costs one more row write on each
-write, and a summed total costs a scan of each key. Copies that wait for cleanup also change the total. The measured
-model is within 5% for most rows, so the absolute threshold is sufficient.
+Both compare the estimate of a routingHash with the total of the leaf. A maintained total costs one more row write on
+each write, and a summed total costs a scan of each routingHash. Copies that wait for cleanup also change the total.
+The measured model is accurate for most rows, so the absolute threshold is sufficient. Rejected.
 
 ### 5.7 A byte target for the bucket size
 
-A byte rule, for example `S = cap / 256`, does not bound the work. A 16 MiB bucket holds about 115,000 small items or
-40 large items, and the scan cost depends on the item count (appendix D). Rejected.
+A byte rule, for example `S = cap / 256`, does not bound the work, because the scan cost depends on the item count
+(appendix D). Rejected.
 
 ### 5.8 A background job for bucket splits
 
 A job keeps the band only when it keeps up with the writes. Until it runs, a bucket can grow past `2K`, and the planner
-bound fails. The job also needs a signal, an alarm, and a time budget. The inline split costs less than 1 ms once for
+bound fails. The job also needs a signal, an alarm, and a time budget. The inline split costs about 1.5 ms once for
 each `K` inserts. Rejected.
 
 ### 5.9 A cheaper split with one aggregate
 
 The split can count only the lower half and calculate the upper half as the total minus the lower half. It then reads
-about `K` entries in place of `3K`. It loses the drift repair of each split. Not chosen.
+about `K` items in place of `3K`. It loses the drift repair of each split. Not chosen.
 
 ### 5.10 The scan in chunks over some alarm steps
 
@@ -755,20 +1117,23 @@ bound the total work. Not chosen.
 
 ### 5.11 An upper limit on `rangeSplitConditions.maxSizeMb`
 
-A limit of about 2 GiB keeps the streaming scan of M1 below about 13 s at `N = 4`. With buckets, the planner cost does
-not grow with the cap, so no limit is necessary. Not chosen.
+A limit of about 2 GiB keeps the streaming scan of M1 below about 19 s at `N = 4`. With buckets, the planner reads
+about `2C / K` bucket rows plus a bounded scan, at most about 0.15 s at `N = 4` up to 10 GB (appendix F). Thus no
+limit is necessary. Not chosen.
 
 ### 5.12 Skip the refine scan for a large `N`
 
 Without the refine scan, a boundary can move by one bucket. The error of a boundary is then at most the estimate of
 that bucket: at most `N * largest_bucket_estimate / B` of a child. Only with items of equal weight is that
-`2K * N / C` — 1.5% for `N = 255` and 70M items. A bucket of `2K` near-maximum items next to buckets of small items
-can hold several child targets at once. This would remove most of the 1.4 s worst case at `N = 255`. Not chosen,
+`2K * N / C`: 1.5% for `N = 255` and 70M items. A bucket of `2K` near-maximum items next to buckets of small items
+can hold several child targets at once. This option removes most of the 2 s worst case at `N = 255`. Not chosen,
 because the default `N` is 4, and one rule for every `N` is simpler.
 
 ### 5.13 A generated item-size column
 
-A generated column removes some write expressions. SQLite then does not use the index as a covering index. Rejected.
+With no covering index, a `STORED` generated column works for the reads of the primary key. Not chosen: the item
+limit check runs before the write, in the prepare check and in the compiled update probe, so it needs the same SQL
+expression anyway. A change of the expression of a generated column also needs a table rebuild.
 
 ### 5.14 RPC estimates as storage weights
 
@@ -780,105 +1145,148 @@ They also do not represent SQLite indexes. Rejected.
 Materialization breaks the streaming memory rule. An order-statistics structure adds work to each mutation. Buckets
 give bounded planner work with one row update for each write. Rejected.
 
+### 5.16 Keep a covering index for the size reads
+
+An index `(routing_hash, hk, sk, item_bytes, ttl_epoch_utc_seconds)` gives the size reads narrower entries than the
+primary key. It costs one more row written for each insert and one more key copy for each item, on each partition.
+The buckets bound each size read to at most `2K` items for each target, so the narrower entries save little. Not
+chosen, unless the measurements of section 4.3.1 show that the primary-key scans break the planner bounds.
+
+### 5.17 A representative hash key in each bucket
+
+`KeySizeStats` stores one hash key in each row today. It costs the bytes of a hash key in each first bucket, and the
+key can outlive its own items. The primary-key seek of section 4.2.8 gives a hash key with items, for at most five
+seeks for each walk. Rejected.
+
+### 5.18 Two facts for the items above a size limit
+
+Each bucket counts the items above a fixed size and their `item_bytes`, and the model gives them their own
+coefficients. The overflow cost of a row is not linear in its size: a row of 1,100 bytes and a row of 2,000 bytes both
+use about 4,600 bytes. Such sums cannot give that cost. `overflow_bytes` gives it for each item. Rejected.
+
+### 5.19 An overflow column in each item row
+
+Each row stores its own `overflow_bytes`, and a delete subtracts the stored value. This adds bytes to each row. The
+function of `item_bytes` gives the same value again at the delete, so the column adds nothing. Rejected.
+
+### 5.20 A promotion index on `item_bytes`
+
+The walk then needs a bound on `estimate / item_bytes`. The 1-byte item sets that bound, because the fixed bytes of
+each item divide by its size: `r = 1 + key_index_factor + indexed_key_factor + base_overhead + indexed_overhead`,
+about 105 with the coefficients of `items`. A typical routingHash has a ratio of about 2. The walk then reads about
+`4.4 * 105`, or 460, rows at 1.1 times the cap. Most of them cannot be candidates. Rejected.
+
+### 5.21 A minimum `item_bytes` for each partition
+
+The term `(base_overhead + indexed_overhead) / 1` of section 5.20 then divides by the minimum. An insert can lower the
+minimum with no read, but a delete cannot raise it without a scan. One small item thus keeps `r` high until a split
+or an import resets the minimum. An average or a maximum cannot bound the ratio. Rejected.
+
+### 5.22 An in-memory cache of the top five
+
+The leaf keeps the result of the last walk until a fact or a pricing input changes. Each write to `item_stats`, each
+rollback, and each eviction must clear it. The walk on `rank_bytes` reads about 7 rows at 1.1 times the cap, so the
+cache saves little. A cap reduction makes the walk longer, and section 4.2.8 accepts that cost. Rejected.
+
+### 5.23 `rank_bytes` as a virtual generated column
+
+`rank_bytes INTEGER GENERATED ALWAYS AS (<rank formula>) VIRTUAL`, with the same partial index. SQLite calculates the
+value from the facts of the row. No statement sets it, it cannot drift from the facts, and the table row does not store
+it. The index stores it. Durable Object SQLite accepts it in a `STRICT, WITHOUT ROWID` table, and the walk uses the
+index. Rejected, because each later change of the formula is a schema change:
+
+- A change of a rank weight must drop the index, drop the column, add it with the new formula, and create the index
+  again. `CREATE INDEX` writes one row for each routingHash in one statement, so the rate cannot be bounded.
+- SQLite refuses to drop a column that the formula uses. A later release that removes such a fact must change the
+  formula first.
+- `SELECT *` returns the column, but no statement can write it. A table copy, for example in a table rebuild, must
+  name its columns.
+- The migration writes the weights into the schema, and the walk reads them from the code. A code change with no
+  schema change makes `r` wrong, and the walk can then miss a candidate.
+
+The ordinary column costs about 6 bytes in each bucket row and one SQL fragment in the fact statements. A weight
+change then runs as a bounded background job.
+
 ## 6. Frequently asked questions
 
 ### Does the estimate equal `sql.databaseSize`?
 
-No. It estimates the storage of committed items from exact facts. Pages, shared partition state, `item_stats`, and
-transaction storage stay outside that equality. The physical size continues to control the cap.
+No. It estimates the storage of committed items from exact facts. Part-full pages, the overflow pages of index
+entries, shared partition state, `item_stats`, and transaction storage stay outside that equality. The physical size
+continues to control the cap.
 
-### Does a coefficient change need a schema migration?
+### How does a change of the schema reach the model?
 
-No. Rows and buckets store exact facts only. The new coefficient applies to each estimate at once. A new fact for a new
-table can need a migration and a bounded backfill.
-
-### How does a future table add its storage to the model?
-
-The feature adds the facts that its storage shape needs: a count for a variable number of rows, a byte sum for variable
-data, or a sum over the items that hold a conditional row. It updates them with its rows in the same transaction, and
-its migration and delete paths move or remove them with the item. A new fact can need a schema migration and a bounded
-backfill. A change of a coefficient never needs a backfill.
-
-### Why are the buckets bounded by item count and not by bytes?
-
-Each cost of a bucket grows with its item count: the split, the refine scan, the recount, and the number of bucket rows.
-The bytes of a bucket affect only the precision of a boundary, and the refine scan makes each boundary exact to one
-item. Appendix D has the details.
-
-### Why does the write split the bucket, and not a job?
-
-The rule "at most `2K` items" then holds after each commit, and the planner bound needs that rule. The split costs less
-than 1 ms once for each `K` inserts into a bucket. A job needs a signal and an alarm, and it can fall behind.
+- **A new column, index, or key copy for each item.** Measure again, and change the coefficients. Rows and buckets
+  store exact facts only, so the new coefficient applies to each estimate at once, with no migration. The rank weights
+  can stay (section 4.2.8).
+- **A new table with its own storage shape.** The feature adds the facts that its shape needs: a count for a variable
+  number of rows, a byte sum for variable data, or a sum over the items that hold a conditional row. It updates them
+  with its rows in the same transaction, and its migration and delete paths move or remove them with the item. A new
+  fact needs a schema migration, a bounded backfill, and a rank weight.
 
 ### Can `K` change after the release?
 
-Yes. Correctness does not depend on `K`: each bucket layout gives valid boundaries. For one change from a layout in
-the old band, use two separate bounds until the layout reaches the new band:
+Yes. Each bucket layout gives valid boundaries, so correctness does not depend on `K`. Until the layout reaches the new
+band, two bounds apply:
 
 - Bucket rows: at most `2C / min(old K, new K) + 1`.
 - Bucket occupancy: at most `2 * max(old K, new K)` items.
 
-- **A larger `K`.** Each existing bucket is already below the new `2K`, but two neighbours can hold fewer than the
-  new `K` together. The bucket-row bound then stays at `2C / K + 1` rows of the old `K` until deletes merge the
-  small pairs, while a bucket that keeps growing already reaches the new `2K` items. A mixed layout can thus cost
-  the old bucket-row bound and the new refine-scan bound at the same time. A one-time job can merge the pairs
-  earlier. A merge reads bucket rows only, no item.
-- **A smaller `K`.** The old pair rule holds at deployment, but later deletes can leave pairs below the old `K`.
-  The new merge rule permits those pairs, so the bucket-row bound uses the new `K`. An unchanged bucket can still
-  hold up to the old `2K` items. Its next insert splits it in the write. Until then, its refine scan can read the
-  old `2K` rows. A mixed layout can cost the new bucket-row bound and the old refine-scan bound together.
-  A one-time job is necessary only for oversized buckets that get no inserts.
+**A larger `K`.** Each existing bucket is already below the new `2K`, but two neighbours can hold fewer than the new
+`K` together. The bucket-row bound then stays at `2C / K + 1` rows of the old `K` until deletes merge the small pairs.
+A bucket that keeps growing already reaches the new `2K` items. A mixed layout can thus cost the old bucket-row bound
+and the new refine-scan bound at the same time. A one-time job can merge the pairs earlier. A merge reads bucket rows
+only, no item.
 
-Each Durable Object uses the `K` of its code version, and each child builds its buckets during its import. Thus a
-rollout needs no coordination between Durable Objects.
+**A smaller `K`.** The old pair rule holds at deployment, but later deletes can leave pairs below the old `K`. The new
+merge rule permits those pairs, so the bucket-row bound uses the new `K`. An unchanged bucket can still hold up to the
+old `2K` items. Its next insert splits it in the write. Until then, its refine scan can read the old `2K` rows. A mixed
+layout can cost the new bucket-row bound and the old refine-scan bound together. A one-time job is necessary only for
+oversized buckets that get no inserts.
 
-### Does a hash leaf ever have more than one bucket for a key?
-
-No. The promotion lookup and the write-path check read one row for each key. A large key gets promoted, and the range
-root builds its buckets during its import.
+Each Durable Object uses the `K` of its code version, and each child builds its buckets during its import. A rollout
+needs no coordination between Durable Objects.
 
 ### What happens with sort keys that only increase?
 
-Each insert goes to the last bucket. It splits after about `K` inserts, so the cost is about 3 index entries read for
-each insert. The planner is not affected.
-
-### Can a split stay unequal, or a child stay over its cap?
-
-Yes. An item cannot cross a boundary, so a dominant item makes equal children impossible. With at least `N` items, the
-planner still gives `N` non-empty children. A child that is still over its cap splits again.
-
-### Why does the split decision not calculate the boundaries?
-
-The decision needs one fact: is a split possible. With the planner of section 4.2.9, the item count gives that fact.
-The decision runs before a refused write gets its error, so a scan there blocks the partition for each write.
-
-### Why use JSONB bytes for the exact item size?
-
-It keeps the existing measurement of the stored representation, and it needs no separate JSON text measurement. The
-rule stays separate from the RPC response estimate and from exact DynamoDB compatibility.
+Each insert goes to the last bucket. It splits after about `K` inserts, so the cost is about 3 item reads for each
+insert. The planner is not affected.
 
 ## 7. References
 
 Code paths are relative to `packages/fokosdb/src`:
 
 - `shared/partition/item-size.ts` — the stored-size expression and the data expression.
-- `shared/partition/key-size-stats.ts` — the current per-key summary, which `ItemStats` replaces.
-- `shared/partition/split-planner.ts` — `SplitPlanner` and `planRangeBoundaries`.
-- `shared/partition/partition-store.ts` — the schema, the mutations, the query scans, and `sortKeySizes`.
-- `shared/partition/fokos-migration-host.ts` — the per-page migration accounting.
+- `shared/partition/key-size-stats.ts` — the current summary for each routingHash, which `ItemStats` replaces.
+- `shared/partition/split-planner.ts` — `SplitPlanner`, `SplitSource`, and `planRangeBoundaries`.
+- `shared/partition/partition-store.ts` — the schema, the mutations, the query scans, `#storedEstRowBytes`,
+  `probeRoutingHashes`, and `compositeKeySizes`.
+- `shared/partition/fokos-migration-host.ts` — the per-page migration accounting, the page validation, and
+  `assertItemFollows`.
 - `shared/partition/transaction-participant.ts` — the prepare checks and the committed mutations.
 - `shared/partition/materialization-export.ts` — the export byte budget.
+- `shared/partition-context.ts` — the validation of `maxSizeMb`.
 - `shared/expression/plan.ts` and `shared/expression/runtime.ts` — the compiled update statement and its size probe.
 - `shared/query/query-collector.ts` — the evaluated-byte and response-byte charges.
 - `server/do-partition.ts` — admission, `signalGrowth`, the split hooks, and `beforeComplete`.
-- `server/materialization/materialization-store.ts` and `server/materialization/target-runner.ts` — `latest_items`
-  and its batch budget.
+- `server/materialization/materialization-store.ts`, `materialization-migration-host.ts`, and `target-runner.ts` —
+  `latest_items`, its migration accounting, and its batch budget.
+- `sharding/key-codec.ts` — `compareComposite` and `shortestCompositeSeparator`.
 - `sharding/runtime.ts` — `#admit`, `requestSplitEvaluation`, and `#evaluateSplit`.
 - `sharding/repartition-flow.ts` — `#plan` and its backoff.
+
+Tests and benches, relative to `packages/fokosdb`:
+
+- `test/storage-bench/item-size-model.workerd-bench.ts` — the coefficients, `row_payload_overhead`, the overflow
+  pages, the `item_stats` rows, and the statement costs of appendix A.
+- `test/hash-digits.ts` — `collidingHashKeys`, two hash keys with one routingHash.
 
 Repository documents:
 
 - `AGENTS.md` — invariants, test harnesses, and verification commands.
+- `docs/agent-plans/2026-11-01-routing-hash.md` — the routingHash, the clustered layout, promotions by routingHash,
+  and composite keys.
 - `docs/agent-plans/range-split-boundary-byte-seek.md` — the streaming boundary scan that section 4.2.9 replaces.
 - `docs/agent-plans/2026-09-27-over-size-split-trigger.md` — the physical cap, promotion decisions, and range floors.
 - `docs/agent-plans/2026-10-17-coalesced-materialization-and-gsis.md` — `latest_items` and the GSI physical sort key.
@@ -888,18 +1296,74 @@ Repository documents:
 Platform references:
 
 - [SQLite file format: SQL indexes](https://www.sqlite.org/fileformat2.html#representation_of_sql_indices)
+- [SQLite: clustered indexes and the WITHOUT ROWID optimization](https://www.sqlite.org/withoutrowid.html)
+- [SQLite: generated columns](https://www.sqlite.org/gencol.html)
 - [Durable Object SQLite storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)
 - [Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/) — 10 GB of storage for
   each Durable Object, and 30 s of CPU for each invocation by default, up to 5 minutes with `limits.cpu_ms`.
 
 ## Appendix A. Measurements
 
-### A.1 `items` under the proposed schema
+### A.1 Coefficients on the clustered layout
 
-Date: 2026-10-30. Each case inserts 20,000 rows of one 8-byte hash key, in sort-key order, into a new Durable Object.
-The value is the increase of `sql.databaseSize` divided by the row count. The runtime is local workerd under
-`@cloudflare/vitest-plugin`, and the page size is 4,096 bytes. The schema is the one of section 4.2.2. `key` is the key
-bytes. The model column uses the `items` coefficients of section 4.2.3.
+Date: 2026-11-05. Local workerd under `@cloudflare/vitest-plugin`, AMD Ryzen 9 7940HS, page size 4,096 bytes.
+`test/storage-bench/item-size-model.workerd-bench.ts` creates the tables of section 4.2.2 in a new Durable Object for
+each case: `items` with `item_bytes` and no `idx_items_scan`, and `latest_items` with `item_bytes`. Each case inserts
+20,000 rows of one 8-byte hash key in sort-key order. The value is the increase of `sql.databaseSize` divided by the
+row count. An indexed `items` row has a TTL. An indexed `latest_items` row is a tombstone, which has no data.
+
+The cases are keys of 16, 58, 108, 208, and 408 bytes, and data of 0, 20, 50, 100, 200, 400, 700, and 1,000 bytes. The
+bench prints each measured value and its model value. It calculates:
+
+1. The coefficients: the multiples of 1/4 that make the largest relative error smallest, for rows with 20 to 200
+   bytes of data and no overflow pages. A least-squares fit gives up to 12% error for the smallest rows, because their
+   fixed bytes dominate.
+2. `overflow_row_overhead`: the integer that makes the largest relative error smallest for the rows with overflow
+   pages.
+3. The rank weights of section 4.2.8.
+
+| Result | `items` | `latest_items` |
+| --- | --- | --- |
+| Model, not indexed | `1.25 * key + 76` | `1.25 * key + 67.25` |
+| Model, indexed, more | `1.25 * key + 25` | `1.25 * key + 24.75` |
+| Measured payload overhead | 37 to 39 bytes, 41 with a TTL | 28 bytes |
+| `row_payload_overhead` of the model | 40 | 29 |
+| `overflow_row_overhead` | 61 | 69 |
+| Rank weights, `r`, largest bound | 2 / 81 / 1, 1.25, 1.64 | 2 / 74 / 1, 1.25, 1.65 |
+
+Error of the model, as (measured − model) / measured, smallest to largest:
+
+| data | `items` | `items`, indexed | `latest_items` | `latest_items`, tombstone |
+| --- | --- | --- | --- | --- |
+| 0 | −10.5% to +3.8% | −6.9% to +1.1% | −13.5% to +3.7% | −2.2% to +2.2% |
+| 20 | −7.4% to +7.5% | −4.3% to +3.7% | −8.4% to +8.3% | |
+| 50 | −3.7% to +4.8% | −1.9% to +1.8% | −4.2% to +5.6% | |
+| 100 | +0.3% to +5.7% | −1.2% to +3.8% | +1.1% to +6.9% | |
+| 200 | +0.1% to +6.6% | −1.3% to +4.3% | +0.8% to +8.5% | |
+| 400 | +1.3% to +18.0% | −0.1% to +16.3% | +2.2% to +11.1% | |
+| 700 | 0% to +13.0% | −0.8% to +10.5% | −0.2% to +13.7% | |
+| 1,000 | 0% to +0.4% | −0.4% to +0.3% | −0.2% to +0.2% | |
+
+- A row with 1,000 bytes of data has overflow pages at each key. A row with 700 bytes of data has them only with a
+  key of 408 bytes.
+- The item id has 2 bytes for ids up to 2,000. The measured payload overhead of `items` is 38 bytes for ids from 40,000
+  and 39 bytes for ids from 10,000,000.
+- Random insert order: key 58 with 100 bytes of data gave 319 to 322 bytes (sorted 315), and key 208 gave 705 to 710
+  (sorted 683): at most 3.9% more.
+- The measured values of two runs were the same.
+- Rows written for one insert, from the `rowsWritten` of SQLite: `items` 2, or 3 with a TTL; with a scan index 3, or 4.
+  `latest_items` 2 for a live row and 3 for a tombstone.
+
+### A.2 The rowid layout
+
+Date: 2026-10-30. These values come from the earlier rowid layout: a rowid `items` table, the UNIQUE key index, and a
+covering index `(hk, sk, item_bytes, ttl_epoch_utc_seconds)`. That layout stored the key 3 times, like the current
+layout. The values show the size of the key-copy error. They do not give the coefficients of section 4.2.3.
+
+Each case inserts 20,000 rows of one 8-byte hash key, in sort-key order, into a new Durable Object. The value is the
+increase of `sql.databaseSize` divided by the row count. The runtime is local workerd under
+`@cloudflare/vitest-plugin`, and the page size is 4,096 bytes. `key` is the key bytes. The model column uses the
+coefficients that were fitted for that layout: `2.5 * key + 50`, and `1.25 * key + 20` more with a TTL.
 
 | key | data | Measured, no TTL | Model, no TTL | Measured, TTL | Model, TTL |
 | --- | --- | --- | --- | --- | --- |
@@ -919,65 +1383,68 @@ bytes. The model column uses the `items` coefficients of section 4.2.3.
 | 408 | 100 | 1,610 | 1,578 | 2,122 | 2,108 |
 | 408 | 1,000 | 3,076 | 2,478 | 3,588 | 3,008 |
 
-- Least-squares fits of `measured - item_bytes` against `key`, with no TTL: `2.50 * key + 48` for no data,
-  `2.57 * key + 51` for 100 bytes of data, and `3.20 * key + 242` for 1,000 bytes of data.
-- The TTL adds `1.19 * key + 17` to `1.20 * key + 21`.
-- Random insert order changes the result by at most 1.7% (353 in place of 355, and 1,162 in place of 1,143).
+- Random insert order changed the result by at most 1.7%.
 - Rows of 1 KB to 1.5 KB fill a 4,096-byte page badly, so the model is too low for them.
-
-The measurement of the current schema (2026-10-04) gave about the same file growth. The current formula `item + 108`
-gives 616 bytes for `key = 408, data = 100`, where the file grows by 1,610 bytes.
-
-### A.2 `latest_items` with the covering index
-
-The same method, with the schema of section 4.2.2 and no TTL. The model uses the `latest_items` coefficients.
-
-| key | data | Measured | Model |
-| --- | --- | --- | --- |
-| 16 | 0 / 100 / 1,000 | 96 / 202 / 1,430 | 96 / 196 / 1,096 |
-| 58 | 0 / 100 / 1,000 | 234 / 345 / 1,526 | 243 / 343 / 1,243 |
-| 108 | 0 / 100 / 1,000 | 411 / 520 / 1,646 | 418 / 518 / 1,418 |
-| 208 | 0 / 100 / 1,000 | 754 / 855 / 1,881 | 768 / 868 / 1,768 |
-| 408 | 0 / 100 / 1,000 | 1,480 / 1,610 / 3,076 | 1,468 / 1,568 / 2,468 |
-
-A `ttl_at` value adds 4 bytes (524 in place of 520 for `key = 108, data = 100`).
+- The formula of that time, `item + 108`, gave 616 bytes for `key = 408, data = 100`, where the file grew by 1,610
+  bytes.
 
 ### A.3 `item_stats` rows
 
-The same method, with one first bucket for each of 20,000 hash keys.
+Date: 2026-11-05, with the method of appendix A.1, on the schema of section 4.2.4, 20,000 rows for each case.
 
-| Hash key | `item_stats` row | `key_size_estimates` row today |
+| Row kind | Bounds | Bytes for each row |
 | --- | --- | --- |
-| 8 bytes | 50 | 39 |
-| 50 bytes | 145 | 134 |
-| 100 bytes | 264 | 248 |
+| First bucket, with its promotion index entry | `(x'', x'')`, 20,000 routingHashes | 65.7 |
+| Range bucket, not in the promotion index | an 8-byte hash key and a 16-byte sort key, one routingHash | 69.4 |
+
+A first bucket stores an 8-byte routingHash and two empty bounds, so its size does not depend on the hash key.
 
 ### A.4 Statement costs
 
-Date: 2026-10-30. Local workerd, AMD Ryzen 9 7940HS. One range-leaf slice of 300,000 items: an 8-byte hash key, a
-16-byte or a 100-byte sort key, 20 bytes of data, and a TTL on one item in three. Each value is the wall time of a
-`runInDurableObject` call minus an empty call (about 2 ms), the median of 3 calls, divided by the repetitions in the
-call. The clock of a Worker does not advance during synchronous code, so the test side measures the time.
+Date: 2026-11-05. Local workerd, AMD Ryzen 9 7940HS, `test/storage-bench/item-size-model.workerd-bench.ts`. The
+clustered tables of section 4.2.2. One range-leaf slice of 300,000 items: an 8-byte hash key, a 16-byte or a 100-byte
+sort key, 20 bytes of data, and a TTL on one item in three. Its buckets hold `K = 2,048` items each, as an import
+builds them: 147 buckets.
 
-| Operation | sk 16 bytes | sk 100 bytes |
-| --- | --- | --- |
-| JavaScript iteration of covering-index rows, with the weight | 1.17 µs / row | 1.30 µs / row |
-| SQL `COUNT(*)` over the covering index | 0.043 µs / entry | 0.080 µs / entry |
-| Split, `K = 2,048` (6,147 rows read) | 0.70 ms | 0.86 ms |
-| Split, `K = 4,096` (12,291 rows read) | 1.32 ms | 1.90 ms |
-| Split, `K = 8,192` (24,579 rows read) | 2.52 ms | 3.66 ms |
-| Split, `K = 16,384` (49,155 rows read) | 5.06 ms | 7.34 ms |
-| Refine (`2K` rows), `K = 2,048 / 4,096 / 8,192 / 16,384` | 5.0 / 9.5 / 19.0 / 36.8 ms | 5.3 / 10.5 / 21.1 / 42.0 ms |
-| Bucket update of the first bucket (2 rows read, 2 written) | 5.30 µs | 5.35 µs |
-| Bucket seek update, 1,000 buckets (3 rows read, 1 written) | 8.70 µs | 8.95 µs |
+Each value is the wall time of a `runInDurableObject` call minus an empty call, the median of 3 calls, divided by the
+repetitions in the call. The clock of a Worker does not advance during synchronous code, so the test side measures
+the time. The rows read and written come from `rowsRead` and `rowsWritten` of SQLite. A JavaScript row read includes
+the estimate of the item, with `overflow_bytes`.
 
-- The split is the `OFFSET` seek, the two aggregates, and the two bucket writes of section 4.2.6.
-- The promotion lookup over 100,000 first buckets read 285 entries in 0.585 ms.
-- `EXPLAIN QUERY PLAN` shows a covering-index search for the seek and for the aggregates, a primary-key search for the
-  bucket seek update, and a search of the partial promotion index for the lookup.
+| Operation | sk 16 bytes | sk 100 bytes | Rows read | Rows written |
+| --- | --- | --- | --- | --- |
+| JavaScript iteration of primary-key rows | 1.77 µs / row | 1.89 µs / row | 1 / row | 0 |
+| SQL `COUNT(*)` over the primary key | 0.14 µs / entry | 0.19 µs / entry | 1 / entry | 0 |
+| Split, `K = 2,048` | 1.45 ms | 1.55 ms | 6,150 | 2 |
+| Split, `K = 4,096` | 2.75 ms | 3.40 ms | 12,294 | 2 |
+| Split, `K = 8,192` | 5.50 ms | 7.00 ms | 24,582 | 2 |
+| Split, `K = 16,384` | 10.4 ms | 18.4 ms | 49,158 | 2 |
+| Refine scan of `2K` rows, `K = 2,048 / 4,096 / 8,192 / 16,384` | 7.45 / 14.7 / 32.4 / 59.5 ms | 7.0 / 15.1 / 28.6 / 57.0 ms | `2K + 2` | 0 |
+| Bucket seek update, 147 buckets | 8.2 µs | 13.4 µs | 3 | 1 |
+| Old-facts read | 11.2 µs | 14.8 µs | 1 | 0 |
+| Planner bucket path, `N = 4`, 147 buckets | 12 ms | 12 ms | 6,297 | 0 |
 
-Measurement of the current `planRangeSplit` (2026-10-04, same machine, 8-byte hash key, 16-byte sort key, 20 bytes of
-data, 146 MB of database for 1M rows):
+On 100,000 first buckets of hash leaves:
+
+| Operation | Time | Rows read | Rows written |
+| --- | --- | --- | --- |
+| Promotion walk that reads 6 rows | 0.14 to 0.16 ms | 7 | 0 |
+| Promotion walk that reads 56 rows | 0.3 to 1.0 ms | 57 | 0 |
+| Promotion walk that reads 560 rows | 1.4 to 1.5 ms | 561 | 0 |
+| First-bucket upsert, one hot routingHash | 24 to 29 µs | 1 | 2 |
+| First-bucket upsert, spread over all routingHashes | 52 to 74 µs | 1 | 2 |
+
+- The split is the `OFFSET` seek, the two aggregates with `overflow_bytes`, and the two bucket writes of section 4.2.6.
+- The time ranges come from two runs. The walk times vary between runs more than the other values.
+- `EXPLAIN QUERY PLAN` shows a primary-key search for the range scan, the count, the split seek, the old-facts read, the
+  seek of the last item before a bound, and the `item_stats` cleanup. The walk is
+  `SEARCH m_item_stats USING INDEX m_item_stats_promotion (rank_bytes>?)`.
+
+The current layout reads its sizes from the covering index `idx_items_scan`. On 2026-10-30, a JavaScript iteration of
+that index cost 1.17 µs for each row with a 16-byte sort key, and 1.30 µs with a 100-byte sort key.
+
+Measurement of the `planRangeSplit` of that time (2026-10-04, same machine, 8-byte hash key, 16-byte sort key, 20 bytes
+of data, 146 MB of database for 1M rows):
 
 | Rows | N | Planner time | Full JavaScript iteration | Full `COUNT(*)` in SQL |
 | --- | --- | --- | --- | --- |
@@ -987,6 +1454,34 @@ data, 146 MB of database for 1M rows):
 | 2M | 2 | 0.96 s | 1.78 s | 0.07 s |
 | 2M | 4 | 1.43 s | | |
 | 2M | 16 | 1.80 s | | |
+
+### A.5 Overflow pages
+
+Date: 2026-11-05, with the method of appendix A.1, on `items`, an 8-byte hash key and a 16-byte sort key (24 key
+bytes), no TTL, 2,000 rows for each case. The column `overflow pages` is `overflow_bytes` with
+`row_payload_overhead = 37`, the value measured for this case, and with no `overflow_row_overhead`.
+
+| data | `item_bytes` | Measured | overflow pages | Measured − `item_bytes` − overflow pages |
+| --- | --- | --- | --- | --- |
+| 800 | 824 | 1,077 | 0 | 253 |
+| 900 | 924 | 1,077 | 0 | 153 |
+| 950 | 974 | 4,727 | 3,574 | 179 |
+| 1,000 | 1,024 | 4,727 | 3,524 | 179 |
+| 1,500 | 1,524 | 4,727 | 3,024 | 179 |
+| 2,000 | 2,024 | 4,727 | 2,524 | 179 |
+| 3,000 | 3,024 | 4,727 | 1,524 | 179 |
+| 4,100 | 4,124 | 4,727 | 424 | 179 |
+| 4,600 | 4,624 | 4,731 | 4 | 103 |
+| 5,000 | 5,024 | 5,173 | 4 | 145 |
+| 8,000 | 8,024 | 8,823 | 620 | 179 |
+
+- The largest data with no overflow page is 941 bytes: a payload of 941 + 24 + 37 = 1,002 bytes.
+- From 950 to 8,000 bytes, the last column is 179 bytes at each size, so the unused overflow space of the function is
+  exact. The other terms of the model give 1.25 * 24 + 76 = 106 bytes for this row. The 73 bytes more are space on the
+  tree page. Over all the keys of appendix A.1, the best fixed value is 61 for `items`.
+- Rows of 800 to 900 bytes fit 3 to a page, so they waste page space that the model does not count (section 2.2).
+- At 4,600 and 5,000 bytes, the part on the tree page is 569 and 969 bytes, so fewer rows fit on a tree page. The
+  model does not count that space.
 
 ## Appendix B. Walkthrough: the two planner defects
 
@@ -1013,46 +1508,62 @@ Correct: gaps at 111 and 5222. The nearest gap to 1777 is 111 (1666 away; 5222 i
 222. Both targets select the gap 222, so the forward pass gives one boundary. The repair takes the gaps of the buffer,
 latest first, and gives `[111]`, `[111]`, `[5111]`.
 
-## Appendix C. Walkthrough: the stop rule of the promotion lookup
+## Appendix C. Walkthrough: the promotion walk
 
-The index orders keys by `item_bytes`, and the decision needs the order by estimate. The two orders can differ:
+The examples use the coefficients and the rank weights of `items` (sections 4.2.3 and 4.2.8): `key_index_factor`
+1.25, `base_overhead` 76, `RANK_KEY` 2, `RANK_ITEM` 81, `RANK_OVERFLOW` 1, and `r = 1.25`. The routingHashes have no
+TTL. Only X has overflow pages, and they add about 0.4% to it.
 
-```text
-Key X: 100 items of 1 MB         -> item_bytes 100 MB, estimate about 100 MB
-Key Y: 500,000 items, 100-byte keys and 20 bytes of data
-                                 -> item_bytes  60 MB, estimate 60 + 2.5 * 50 + 50 * 0.5 = 210 MB
-```
-
-X comes first in the index, and Y is larger. Thus the walk cannot stop after 5 rows.
-
-**Bound on the ratio.** For any key, `key_bytes <= item_bytes`, `ttl_key_bytes <= key_bytes`,
-`ttl_item_count <= item_count`, and `item_count <= item_bytes / 1`, because each item has at least one byte. So:
+**The order by `rank_bytes` follows the estimate.**
 
 ```text
-estimate <= item_bytes * (1 + key_index_factor + ttl_key_factor + base_overhead + ttl_overhead) = r * item_bytes
+routingHash X: 100 items of 1 MB
+  item_bytes 100 MB, estimate about 100 MB,                                 rank_bytes about 100 MB
+routingHash Y: 500,000 items, 100-byte keys and 20 bytes of data
+  item_bytes  60 MB, estimate 60 + 1.25 * 50 + 76 * 0.5 = 160.5 MB,         rank_bytes 60 + 2 * 50 + 81 * 0.5 = 200.5 MB
+routingHash Z: 1,000,000 items of 1-byte keys and no data
+  item_bytes   1 MB, estimate  1 + 1.25 * 1 + 76 * 1 = 78.25 MB,            rank_bytes  1 + 2 * 1 + 81 * 1 = 84 MB
 ```
 
-A key with `estimate >= T` therefore has `item_bytes >= T / r`. The walk that reads each key with
-`item_bytes >= T / r` finds every candidate.
+By `item_bytes`, Z is 100 times smaller than X. By `rank_bytes`, Z is close to its estimate. The walk reads Y, then X,
+then Z: the estimate order.
 
-**Bound on the rows.** The number of keys with `item_bytes >= T / r` is at most `sum(item_bytes) * r / T`. For
-`items`, `r = 74.75`. In a hash leaf at 1.1 times its cap with `T = 0.25 * cap`, that is
-`1.1 * 74.75 / 0.25`, about 330 keys. Most leaves have few keys above `T / r`, which is about 1.7 MB at the default
-500 MB cap, so a walk usually reads a few rows.
+**Bound on the ratio.** For any routingHash, `indexed_key_bytes <= key_bytes` and `indexed_item_count <= item_count`.
+Each coefficient is 0 or more. So:
+
+```text
+estimate = item_bytes + key_index_factor * key_bytes + base_overhead * item_count
+         + indexed_key_factor * indexed_key_bytes + indexed_overhead * indexed_item_count
+         + overflow_coefficient * overflow_bytes
+        <= item_bytes
+         + (key_index_factor + indexed_key_factor) * key_bytes
+         + (base_overhead + indexed_overhead) * item_count
+         + overflow_coefficient * overflow_bytes
+        <= r * (item_bytes + RANK_KEY * key_bytes + RANK_ITEM * item_count + RANK_OVERFLOW * overflow_bytes)
+         = r * rank_bytes
+```
+
+The last step holds because `r` is at least 1, and at least each coefficient sum divided by its rank weight. A
+routingHash with `estimate >= T` therefore has `rank_bytes >= T / r`, and the walk reads it.
+
+**Bound on the rows.** The number of first buckets with `rank_bytes >= T / r` is at most `sum(rank_bytes) * r / T`. With
+the rank weights of section 4.2.8, `r * rank_bytes` is at most about 1.65 times the estimate for each measured row
+shape. In a hash leaf at 1.1 times its cap with `T = 0.25 * cap`, that is `1.1 * 1.65 / 0.25`, or about 7 rows. Most
+leaves have few routingHashes above `T / r`, so a walk usually reads fewer.
 
 ## Appendix D. Walkthrough: why the bucket size counts items
 
 | What a bucket affects | Grows with | Reason |
 | --- | --- | --- |
-| The split | items | It reads index entries. The covering index does not read item data |
-| The refine scan | items | JavaScript reads each row, at about 1.2 µs for each row |
+| The split | items | It reads keys and small columns. It does not select item data |
+| The refine scan | items | JavaScript reads each row, at about 1.8 µs for each row |
 | The recount after a defect | items | The same scan as the split |
 | The number of bucket rows | items | It is the item count of the slice divided by the bucket size |
 | The precision of a boundary | bytes, only without a refine scan | The refine scan selects the exact gap |
 
 A byte target does not bound these costs. A 16 MiB bucket holds about 115,000 items of 146 bytes, a refine scan of
-about 140 ms, or 40 items of 400 KB, a scan of less than 1 ms. A long key makes each index entry larger, but it changes
-the cost of a row by less than 2 times (1.17 µs and 1.30 µs in appendix A.4).
+about 0.2 s, or 40 items of 400 KB, a scan of less than 1 ms. A long key makes each entry larger, but it changes
+the cost of a row by less than 2 times (1.77 µs and 1.89 µs in appendix A.4).
 
 With a count rule, `K` does not depend on the cap or on the policy. A change of `maxSizeMb` or `rangeSplitN` changes no
 bucket.
@@ -1087,55 +1598,83 @@ targets:            ^ B/4         ^ 2B/4          ^ 3B/4
 - The end repair reads the last `N` items one time: at most `N` rows.
 
 Example, `K = 2,048`, `C = 1,000,000`, `N = 4`: at most 977 bucket rows, and at most 3 * 4,096 + 8 = 12,296 scanned
-rows. That is about 17 ms. The streaming scan reads about 750,000 rows, about 0.9 s.
+rows. That is about 24 ms. The streaming scan reads about 750,000 rows, about 1.3 s.
 
 Example, `K = 2,048`, `C = 300,000`, `N = 255`: at most 293 buckets, and 254 * 4,096 + 510 is more than `C`. Thus the
 scan reads at most all 300,000 rows plus at most `2N` repair rows. The slice is small, so the planner reads it all,
-in about 0.36 s.
+in about 0.53 s.
 
 ### E.3 The planner at each cap
 
-Small items of about 150 bytes, 1.2 µs for each row read, and 5.3 ms for each refine scan at `K = 2,048`.
+Small items of about 150 bytes, 1.77 µs for each row read, and 7.45 ms for each refine scan at `K = 2,048`. These
+costs come from appendix A.4, with a 16-byte sort key.
 
 | Cap | Items | Streaming scan, `N = 4` | Streaming scan, `N = 255` | Buckets, `N = 4` | Buckets, `N = 255` |
 | --- | --- | --- | --- | --- | --- |
-| 500 MiB | 3.5M | 2.6M rows, 3.1 s | 3.5M rows, 4.2 s | 3,400 + 12,300 rows, 20 ms | 1.04M rows, 1.35 s |
-| 2 GiB | 14.3M | 10.7M rows, 12.9 s | 14.3M rows, 17.2 s | 14,000 + 12,300 rows, 33 ms | 1.05M rows, 1.37 s |
-| 5 GiB | 35.8M | 26.8M rows, 32.2 s | 35.8M rows, 43.0 s | 35,000 + 12,300 rows, 58 ms | 1.08M rows, 1.39 s |
-| 8 GiB | 57.3M | 43.0M rows, 51.6 s | 57.3M rows, 68.7 s | 56,000 + 12,300 rows, 83 ms | 1.10M rows, 1.42 s |
+| 500 MiB | 3.5M | 2.6M rows, 4.6 s | 3.5M rows, 6.2 s | 3,400 + 12,300 rows, 28 ms | 1.04M rows, 1.90 s |
+| 2 GiB | 14.3M | 10.7M rows, 19.0 s | 14.3M rows, 25.3 s | 14,000 + 12,300 rows, 47 ms | 1.05M rows, 1.92 s |
+| 5 GiB | 35.8M | 26.8M rows, 47.5 s | 35.8M rows, 63.4 s | 35,000 + 12,300 rows, 84 ms | 1.08M rows, 1.95 s |
+| 8 GiB | 57.3M | 42.9M rows, 76.0 s | 57.3M rows, 101 s | 56,000 + 12,300 rows, 121 ms | 1.10M rows, 1.99 s |
 
-The streaming scan passes the 30 s CPU limit at about 4.7 GiB at `N = 4`. With buckets, the planner cost does not grow
-with the cap. The collision repair of section 4.2.9 adds at most `2N` rows, below the precision of the table.
+The streaming scan passes the 30 s CPU limit at about 3.2 GiB at `N = 4`. With buckets, only the bucket rows grow
+with the cap, at one row for each `K` to `2K` items. The collision repair of section 4.2.9 adds at most `2N` rows,
+below the precision of the table.
 
 ## Appendix F. Walkthrough: the choice of K
 
-The worst case is a leaf at the 10 GB limit with about 70M small items. The refine scans use the measured costs of
-appendix A.4 for a 100-byte sort key.
+The worst case is a leaf at the 10 GB limit with about 70M small items. The values use the measured costs of
+appendix A.4 for a 100-byte sort key: 1.89 µs for each row read.
 
 | K | Split | Rows / split | Refine | Buckets at 10 GB | Planner, `N = 4` | Planner, `N = 255` | Splits / 1M inserts |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **2,048** | 0.70–0.86 ms | 6,147 | 5.3 ms | ≤ 68,000 (82 ms) | about 98 ms | about 1.4 s | 488 |
-| 4,096 | 1.32–1.90 ms | 12,291 | 10.5 ms | ≤ 34,000 (41 ms) | about 73 ms | about 2.7 s | 244 |
-| 8,192 | 2.52–3.66 ms | 24,579 | 21.1 ms | ≤ 17,000 (21 ms) | about 84 ms | about 5.4 s | 122 |
-| 16,384 | 5.06–7.34 ms | 49,155 | 42.0 ms | ≤ 8,500 (10 ms) | about 136 ms | about 10.7 s | 61 |
+| **2,048** | 1.45–1.55 ms | 6,150 | 7.0 ms | ≤ 68,000 (129 ms) | about 150 ms | about 1.9 s | 488 |
+| 4,096 | 2.75–3.40 ms | 12,294 | 15.1 ms | ≤ 34,000 (65 ms) | about 110 ms | about 3.9 s | 244 |
+| 8,192 | 5.50–7.00 ms | 24,582 | 28.6 ms | ≤ 17,000 (32 ms) | about 118 ms | about 7.3 s | 122 |
+| 16,384 | 10.4–18.4 ms | 49,158 | 57.0 ms | ≤ 8,500 (16 ms) | about 187 ms | about 14.5 s | 61 |
 
 The target range of leaves is 500 MB to 2 GB (section 2.1). The two closest values at each cap:
 
 | Cap | `K = 2,048`, `N = 4` | `K = 4,096`, `N = 4` | `K = 2,048`, `N = 255` | `K = 4,096`, `N = 255` |
 | --- | --- | --- | --- | --- |
-| 500 MiB | **about 20 ms** | about 34 ms | **about 1.35 s** | about 2.7 s |
-| 2 GiB | **about 33 ms** | about 40 ms | **about 1.37 s** | about 2.7 s |
-| 5 GiB | about 58 ms | **about 52 ms** | **about 1.39 s** | about 2.7 s |
-| 10 GB | about 98 ms | **about 73 ms** | **about 1.43 s** | about 2.7 s |
+| 500 MiB | **about 27 ms** | about 49 ms | **about 1.78 s** | about 3.84 s |
+| 2 GiB | **about 47 ms** | about 59 ms | **about 1.80 s** | about 3.85 s |
+| 5 GiB | about 87 ms | **about 78 ms** | **about 1.84 s** | about 3.87 s |
+| 10 GB | about 150 ms | **about 110 ms** | **about 1.91 s** | about 3.90 s |
 
-- The planner reads all bucket rows and up to `2K` rows for each target. Below about 3.4 GiB, the shorter refine scans
+- The planner reads all bucket rows and up to `2K` rows for each target. Below about 3.7 GiB, the shorter refine scans
   of `K = 2,048` save more than its extra bucket rows cost. Above it, `K = 4,096` is faster at `N = 4` by at most
-  about 25 ms.
-- The total split work is about 3 index entries read for each insert, for each `K`. A smaller `K` gives more, shorter
+  about 40 ms.
+- The total split work is about 3 item reads for each insert, for each `K`. A smaller `K` gives more, shorter
   splits.
-- At `K = 2,048`, each split blocks the partition for less than 1 ms, and the planner stays below 0.1 s at `N = 4` at
-  each cap. The bucket table of a 2 GiB leaf holds at most about 14,000 rows (1 MB to 2 MB), and the bucket table of a
-  10 GB leaf at most about 68,000 rows (4.5 MB to 10 MB), for sort keys of 16 to 100 bytes.
-- `K = 1,024` is not measured. A linear extrapolation gives about 42 ms at 2 GiB and about 170 ms at 10 GB at `N = 4`,
+- At `K = 2,048`, each split blocks the partition for about 1.5 ms, and the planner stays below about 0.15 s at
+  `N = 4` at each cap. The bucket table of a 10 GB leaf holds at most about 68,000 rows, about 4.7 MB.
+- `K = 1,024` is not measured. A linear extrapolation gives about 63 ms at 2 GiB and about 270 ms at 10 GB at `N = 4`,
   both worse than `K = 2,048`.
-- Larger items make every value in this appendix smaller, because a leaf then holds fewer items (section 4.2.13).
+- An import builds its buckets with no item read, so `K` does not change the import cost.
+- Larger items make every value in this appendix smaller, because a leaf then holds fewer items (section 4.2.14).
+
+## Appendix G. Walkthrough: buckets in storage order
+
+A range leaf owns the slice `[(A, x''), null)` of the routingHash `b7`. Two hash keys, `A` and `B`, have the
+routingHash `b7`, and `A < B`. Use `K = 2` for the example, so a bucket splits above 4 items.
+
+**Import.** The pages arrive in storage order: `(A, 1) (A, 2) (A, 3) (B, 1) (B, 2)`.
+
+```text
+item_stats (routing_hash, lower_hk, lower_sk)      items in the primary key
+(b7, x'', x'')  item_count 2  ───────────────────► (b7, A, 1) (b7, A, 2)
+(b7, A,   3)    item_count 2  ───────────────────► (b7, A, 3) (b7, B, 1)
+(b7, B,   2)    item_count 1  ───────────────────► (b7, B, 2)
+```
+
+The import reads no item. When a bucket holds `K = 2` items, the next item starts a new bucket at its own key. The
+bucket `(b7, A, 3)` holds items of both hash keys.
+
+**Insert.** A write inserts `(B, 0)`. The bucket rule selects the greatest bound at or below `(B, 0)`: that is
+`(b7, A, 3)`. Its count becomes 3. It is not above `2K = 4`, so no split happens.
+
+**Delete.** A write deletes `(B, 2)`. The last bucket reaches 0 items. Its pair with `(b7, A, 3)` holds 3 items, which
+is not fewer than `K`, so no merge happens. The helper deletes the empty row, which is not the first bucket.
+
+**Promotion cleanup.** On the hash leaf that held `b7` before the promotion, `b7` had one bucket `(b7, x'', x'')`. The
+cleanup deletes it with `DELETE FROM item_stats WHERE routing_hash = b7`, one key range.
