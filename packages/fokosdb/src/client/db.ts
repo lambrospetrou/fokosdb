@@ -296,11 +296,7 @@ function withAnswerMeta<T>(meta: FokosMeta, fn: () => T): T {
 
 /** The `meta` of a method that one partition ran, from the entry of its answer. */
 function singleMeta(partitions: ItemRpcPartitions, routing: FokosPublicRouting): SinglePartitionMeta {
-	const {
-		forwardCount,
-		partitions: [entry],
-	} = answerMeta(partitions, routing);
-	return { forwardCount, partitions: [entry] };
+	return answerMeta(partitions, routing);
 }
 
 /** The meta of no answer. */

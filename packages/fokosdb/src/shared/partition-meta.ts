@@ -13,17 +13,37 @@ import type { FokosPublicRoute, FokosPublicRouting } from "../sharding/runtime-t
  * envelope. An entry gets its name when the routing still has the node of the same actor.
  */
 export function answerMeta<E extends WirePartitionMeta>(
+	partitions: readonly [E],
+	routing: FokosPublicRouting,
+): { forwardCount: number; partitions: [Omit<E, "actorId"> & PartitionMeta] };
+export function answerMeta<E extends WirePartitionMeta>(
+	partitions: readonly E[],
+	routing: FokosPublicRouting,
+): { forwardCount: number; partitions: Array<Omit<E, "actorId"> & PartitionMeta> };
+export function answerMeta<E extends WirePartitionMeta>(
 	partitions: readonly E[],
 	routing: FokosPublicRouting,
 ): { forwardCount: number; partitions: Array<Omit<E, "actorId"> & PartitionMeta> } {
-	const names = new Map(routing.servedBy.map((node) => [node.actorId, node.ref.doName]));
-	return {
-		forwardCount: routing.forwardCount,
-		partitions: partitions.map(({ actorId, ...rest }) => {
-			const name = names.get(actorId);
-			return { servedByActorId: actorId, ...(name === undefined ? {} : { servedByActorName: name }), ...rest };
-		}),
-	};
+	if (partitions.length === 1) {
+		return { forwardCount: routing.forwardCount, partitions: [entryMeta(partitions[0], routing.servedBy)] };
+	}
+	return { forwardCount: routing.forwardCount, partitions: partitions.map((entry) => entryMeta(entry, routing.servedBy)) };
+}
+
+/**
+ * One `partitions` entry of `answerMeta`: the wire entry without `actorId`, plus `servedByActorId`
+ * and the name when a node of `servedBy` names it. `servedBy` is short, so a scan costs less than a
+ * lookup structure.
+ */
+function entryMeta<E extends WirePartitionMeta>({ actorId, ...rest }: E, servedBy: FokosPublicRoute[]): Omit<E, "actorId"> & PartitionMeta {
+	const entry: Omit<E, "actorId"> & PartitionMeta = { servedByActorId: actorId, ...rest };
+	for (const node of servedBy) {
+		if (node.actorId === actorId) {
+			entry.servedByActorName = node.ref.doName;
+			break;
+		}
+	}
+	return entry;
 }
 
 /**
