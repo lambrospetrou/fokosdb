@@ -6,10 +6,10 @@ import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind } from "../types.js";
-import { compileConditionExpression } from "./compiler.js";
+import { compileConditionExpression, compileProjectionExpression, compileUpdateExpression } from "./compiler.js";
 import { composeConditionStatement } from "./plan.js";
 import { materializeExpressionBindings } from "./bindings.js";
-import { evaluateConditionPlan } from "./runtime.js";
+import { evaluateConditionPlan, probeUpdatePlan, readProjectedItem } from "./runtime.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, type ExpressionSemanticItem } from "./test-fixtures.js";
 import type { ConditionExpression } from "./types.js";
 import { routingHashFor } from "../../../test/routing-hash.js";
@@ -235,6 +235,65 @@ describe("compiled condition runtime", () => {
 			expect(error?.name).toBe("ExpressionError");
 			expect(error?.message).toMatch(/could not evaluate/);
 			expect(error?.cause).toBeInstanceOf(Error);
+		});
+	});
+
+	it("passes a storage fault through and keeps an evaluation failure wrapped", async () => {
+		const stub = testPartitionStub(`expression-runtime.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, _state: DurableObjectState) => {
+			const hashKey = KeyCodec.encode("item");
+			const sortKey = KeyCodec.encodeOptional(undefined);
+			const routingHash = P(hashKey);
+			// `exec` is the only storage member each plan runner calls, so a stubbed throw reaches its catch.
+			const failing = (failure: Error): DurableObjectStorage =>
+				({
+					sql: {
+						exec: () => {
+							throw failure;
+						},
+					},
+				}) as unknown as DurableObjectStorage;
+			const runs: ((storage: DurableObjectStorage) => unknown)[] = [
+				(storage) =>
+					evaluateConditionPlan(
+						storage,
+						compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }),
+						hashKey,
+						sortKey,
+						routingHash,
+					),
+				(storage) => readProjectedItem(storage, compileProjectionExpression([{ expr: { ref: "data" } }]), hashKey, sortKey, routingHash),
+				(storage) =>
+					probeUpdatePlan(
+						storage,
+						compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]),
+						hashKey,
+						sortKey,
+						routingHash,
+					),
+			];
+			const run = (fn: (storage: DurableObjectStorage) => unknown, failure: Error): Error | undefined => {
+				try {
+					fn(failing(failure));
+					return undefined;
+				} catch (caught) {
+					return caught as Error;
+				}
+			};
+			for (const failure of [new Error("database is locked: SQLITE_BUSY"), new Error("disk I/O error: SQLITE_IOERR")]) {
+				for (const fn of runs) {
+					expect(run(fn, failure), failure.message).toBe(failure);
+				}
+			}
+			for (const message of ["no such function: missing_fn: SQLITE_ERROR", "string or blob too big: SQLITE_TOOBIG"]) {
+				const failure = new Error(message);
+				for (const fn of runs) {
+					const wrapped = run(fn, failure);
+					expect(wrapped?.name, message).toBe("ExpressionError");
+					expect(wrapped?.message, message).toMatch(/could not evaluate/);
+					expect(wrapped?.cause, message).toBe(failure);
+				}
+			}
 		});
 	});
 
