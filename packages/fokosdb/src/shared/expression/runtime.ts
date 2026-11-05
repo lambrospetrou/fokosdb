@@ -39,6 +39,26 @@ export type UpdateProbeResult = {
 	rowsWritten: number;
 };
 
+/**
+ * The SQLite result codes a statement raises only for its own content: SQLITE_ERROR for an
+ * evaluation failure, SQLITE_TOOBIG for a value above the string or BLOB limit. Each one fails the
+ * same statement again on the same data, so it is `runtime_capability`. Every other code is a
+ * storage condition the expression did not cause; it rethrows as itself, so a transient fault such
+ * as SQLITE_BUSY keeps its own classification and never becomes an expression error.
+ * See all SQLITE_xyz errors: https://www.sqlite.org/rescode.html
+ */
+const SQLITE_EVALUATION_FAILURE = /: SQLITE_(ERROR|TOOBIG)$/;
+
+function asEvaluationFailure(error: unknown): never {
+	if (error instanceof ExpressionError) {
+		throw error;
+	}
+	if (error instanceof Error && SQLITE_EVALUATION_FAILURE.test(error.message)) {
+		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
+	}
+	throw error;
+}
+
 export function evaluateConditionPlan(
 	storage: DurableObjectStorage,
 	plan: CompiledConditionPlan,
@@ -64,10 +84,7 @@ export function evaluateConditionPlan(
 			rowsWritten: cursor.rowsWritten,
 		};
 	} catch (error) {
-		if (error instanceof ExpressionError) {
-			throw error;
-		}
-		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
+		asEvaluationFailure(error);
 	}
 }
 
@@ -106,10 +123,7 @@ export function readProjectedItem(
 			rowsWritten: cursor.rowsWritten,
 		};
 	} catch (error) {
-		if (error instanceof ExpressionError) {
-			throw error;
-		}
-		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
+		asEvaluationFailure(error);
 	}
 }
 
@@ -141,9 +155,6 @@ export function probeUpdatePlan(
 			rowsWritten: cursor.rowsWritten,
 		};
 	} catch (error) {
-		if (error instanceof ExpressionError) {
-			throw error;
-		}
-		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
+		asEvaluationFailure(error);
 	}
 }
