@@ -95,24 +95,15 @@ export function topologyGetForRangePath(shardGroup: string, routingHash: Routing
 
 /** The scope part of a cache key. A JSON string ends at its closing quote, so no two scopes give the same prefix. */
 function scopeOf(opts: FokosTopologyCacheOptions): string {
-	return JSON.stringify(opts.scope ?? "");
+	return opts.scope ? JSON.stringify(opts.scope) : '""';
 }
-
-/** The scope and the cache key of the hash entry of each topology object. A client keeps one topology object. */
-const hashKeys = new WeakMap<FokosTopology, { scope: string | undefined; key: string }>();
 
 /**
  * The hash entry of a shard group, or undefined. It starts a refresh when the entry is absent or old.
- * A body whose `rootTreesN` or `hashSplitN` differs from `topology` is dropped. A fresh entry costs
- * two map reads and no allocation.
+ * A body whose `rootTreesN` or `hashSplitN` differs from `topology` is dropped.
  */
 export function cachedHashTopology(opts: FokosTopologyCacheOptions, topology: FokosTopology): TopologyEntry<HashTopologyView> | undefined {
-	let memo = hashKeys.get(topology);
-	if (memo === undefined || memo.scope !== opts.scope) {
-		memo = { scope: opts.scope, key: `h|${scopeOf(opts)}|${topology.shardGroup}|${topology.rootTreesN}|${topology.hashSplitN}` };
-		hashKeys.set(topology, memo);
-	}
-	const key = memo.key;
+	const key = `h|${scopeOf(opts)}|${topology.shardGroup}|${topology.rootTreesN}|${topology.hashSplitN}`;
 	const entry = cache.get(key) as TopologyEntry<HashTopologyView> | undefined;
 	if (shouldRefresh(opts, key, entry)) {
 		opts.waitUntil(

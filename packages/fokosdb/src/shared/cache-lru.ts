@@ -23,6 +23,8 @@ export class LRUCache<K, V> {
 	private readonly weight: LRUCacheWeightOptions<V> | undefined;
 	private readonly weights = new Map<K, number>();
 	private totalWeight = 0;
+	/** The key at the end of the order. A `get` on it keeps the order, so it does not reorder. */
+	private lastKey: K | undefined;
 
 	constructor(capacity: number, weight?: LRUCacheWeightOptions<V>) {
 		invariant(capacity >= 1, "LRUCache capacity must be >= 1");
@@ -44,9 +46,13 @@ export class LRUCache<K, V> {
 		if (value === undefined) {
 			return undefined;
 		}
-		// Move the accessed key to the end to mark it as recently used.
-		this.map.delete(key);
-		this.map.set(key, value);
+		// Move the accessed key to the end to mark it as recently used. A key that is already at the
+		// end keeps the order, so a repeated `get` of it writes nothing.
+		if (key !== this.lastKey) {
+			this.map.delete(key);
+			this.map.set(key, value);
+			this.lastKey = key;
+		}
 		return value;
 	}
 
@@ -58,6 +64,7 @@ export class LRUCache<K, V> {
 		// Delete a key that already exists, so that the re-insert puts it at the end.
 		this.delete(key);
 		this.map.set(key, value);
+		this.lastKey = key;
 		if (this.weight) {
 			const w = this.weight.weightOf(value);
 			this.weights.set(key, w);
@@ -78,6 +85,9 @@ export class LRUCache<K, V> {
 	delete(key: K): boolean {
 		this.totalWeight -= this.weights.get(key) ?? 0;
 		this.weights.delete(key);
+		if (key === this.lastKey) {
+			this.lastKey = undefined;
+		}
 		return this.map.delete(key);
 	}
 
@@ -85,5 +95,6 @@ export class LRUCache<K, V> {
 		this.map.clear();
 		this.weights.clear();
 		this.totalWeight = 0;
+		this.lastKey = undefined;
 	}
 }
