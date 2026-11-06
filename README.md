@@ -370,16 +370,16 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Implement the splits with the new Durable Object Snapshot API.
+- Revamp the item size statistics for better boundary calculations and choosing keys to promote (`docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md`).
+- Implement the splits with the new Durable Object Snapshot API (needs mocking locally or using the existing approach).
 - Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
 - Enable cached topology for the GSI writers and `db.gsi()` client.
 - Extend the topology caching in clients from responses.
-- Revamp the item size statistics for better boundary calculations and choosing keys to promote (`docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md`).
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Optimize the transactions RTTs by having the Worker send the Transaction Coordinator (TC) request in parallel to the partitions prepare() and handing off the driving to the TC. Partitions reply to the TC directly, not the Worker. It has some nuances if partitions RPC the TC before the initial call arrives, but with some wait timeout it might worth it.
 - Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting.
-- Optimize the range partition splitting to go straight to N partitions vs copying to root range.
+- Optimize the range partition splitting to go straight to N partitions vs copying to root range. Easy with the Snapshot API.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s. Optionally use the Workers Rate limit binding for colo-level accuracy.
 - Extend the split/migration flow to also allow writes while migration in-progress (probably will need some kind of logical replication of writes after the migration started `_fokos_replication_log`). Not needed once we use DO Snapshot API.
 
@@ -388,14 +388,13 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Allow online configuration (adding/removing/changing) global eventual indexes (DynamoDB GSIs) and push targets.
 - Add operation hooks that run during request forwarding and on the final serving partition (before, after, etc).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.
-- Allow custom split conditions in user-provided function of the FokosDB partition DO class.
-- Better support for binary blobs in GSI/push target projections for "data", or at least propagating the entire item.
 - Allow custom FokosDB partition classes to add their own migration hooks in addition to the FokosDB items, so that custom data also moves to child partitions.
+- Think about backups and export in a consistent fashion using Durable Object bookmarks.
+- Allow custom split conditions in user-provided function of the FokosDB partition DO class.
 - Add custom jobs to run on alarms, with their own best-effort interval.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions.
 - Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
-- Think about backups and export in a consistent fashion using Durable Object bookmarks.
 - Add automatic hashing of the item and signature comparison, similar to the managed "v".
 - Add external version in each write operation, to complement the partition driven "v" version.
 - User provided code running inside the DO for N+1 operations.
