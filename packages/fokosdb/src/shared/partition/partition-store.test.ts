@@ -24,8 +24,8 @@ import {
 	type StoredItem,
 } from "./partition-store.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
-import { EST_ROW_BYTES_K } from "./item-size.js";
 import { planRangeBoundaries } from "./split-planner.js";
+import { estimate, ITEMS_MODEL } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
@@ -60,12 +60,12 @@ const keyLabel = (key: KeyBytes): string => {
 const linkId = (n: number) => n as ItemLinkId;
 const ownsAll = () => true;
 
-// Mirrors items.est_row_bytes: octet_length(data)+octet_length(hk)+octet_length(sk)+K. octet_length is
-// UTF-8 bytes for text and byteLength for blobs; keys are already canonical bytes. est_row_bytes is a
-// plain column written by two statements, so these tests are what keeps the formula from drifting.
+// Mirrors items.item_bytes: octet_length(data)+octet_length(hk)+octet_length(sk). octet_length is
+// UTF-8 bytes for text and byteLength for blobs; keys are already canonical bytes. item_bytes is a
+// plain column written by several statements, so these tests are what keeps the formula from drifting.
 function expectedRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes): number {
 	const dataBytes = typeof data === "string" ? new TextEncoder().encode(data).length : data.byteLength;
-	return dataBytes + hk.byteLength + sk.byteLength + EST_ROW_BYTES_K;
+	return dataBytes + hk.byteLength + sk.byteLength;
 }
 
 // Runs `fn` against a PartitionStore over REAL Durable Object storage (vitest-pool-workers).
@@ -80,7 +80,7 @@ async function withStore(fn: (store: PartitionStore, state: DurableObjectState) 
 
 // One candidate of a scan as the consumer received it, with its payload decoded when the selection
 // materializes one.
-type ScanRow = { sk: KeyBytes; estRowBytes: number; matched: boolean; payload: StoredItem | ProjectedWireRow | null };
+type ScanRow = { sk: KeyBytes; itemBytes: number; matched: boolean; payload: StoredItem | ProjectedWireRow | null };
 
 // Runs a query scan and records every candidate; `take` bounds how many candidates the consumer
 // accepts before it stops the scan. Returns the rows and the metrics the scan reported.
@@ -90,16 +90,46 @@ function scanRows(
 	take = Number.POSITIVE_INFINITY,
 ): { rows: ScanRow[]; metrics: SqlMetrics } {
 	const rows: ScanRow[] = [];
-	const metrics = store.scanQueryPage(opts, (sk, estRowBytes, matched, decodePayload) => {
-		rows.push({ sk, estRowBytes, matched, payload: matched && opts.select === "projection" ? decodePayload() : null });
+	const metrics = store.scanQueryPage(opts, (sk, itemBytes, matched, decodePayload) => {
+		rows.push({ sk, itemBytes, matched, payload: matched && opts.select === "projection" ? decodePayload() : null });
 		return rows.length < take;
 	});
 	return { rows, metrics };
 }
 
-function kseBytes(state: DurableObjectState, hk: string): number | undefined {
-	return state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb(hk)).toArray()[0]
-		?.est_bytes;
+type BucketRow = { item_count: number; item_bytes: number; key_bytes: number; indexed_item_count: number; indexed_key_bytes: number; overflow_bytes: number };
+
+/** The facts of the bucket of the routingHash of `hk`, or undefined when it has none. */
+function bucketRow(state: DurableObjectState, hk: string): BucketRow | undefined {
+	return state.storage.sql
+		.exec<BucketRow>(
+			`SELECT item_count, item_bytes, key_bytes, indexed_item_count, indexed_key_bytes, overflow_bytes FROM item_stats WHERE routing_hash = ?`,
+			P(kb(hk)),
+		)
+		.toArray()[0];
+}
+
+/** The sum of the `item_bytes` of the bucket of `hk`. */
+function bucketBytes(state: DurableObjectState, hk: string): number | undefined {
+	return bucketRow(state, hk)?.item_bytes;
+}
+
+/** The estimate of the bucket of `hk` with the `items` coefficients, rounded up as the write path reports it. */
+function bucketEst(state: DurableObjectState, hk: string): number | undefined {
+	const row = bucketRow(state, hk);
+	return (
+		row &&
+		Math.ceil(
+			estimate(ITEMS_MODEL, {
+				itemCount: row.item_count,
+				itemBytes: row.item_bytes,
+				keyBytes: row.key_bytes,
+				indexedItemCount: row.indexed_item_count,
+				indexedKeyBytes: row.indexed_key_bytes,
+				overflowBytes: row.overflow_bytes,
+			}),
+		)
+	);
 }
 
 describe("PartitionStore - items", () => {
@@ -206,13 +236,13 @@ describe("PartitionStore - items", () => {
 			const value = JSON.stringify({ a: 1 });
 			const absent = store.measureItemBytesWithStamp({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
 			expect(absent).toMatchObject({ itemPresent: false, lastReadTs: null, lastWriteTs: null });
-			expect(absent.estRowBytes).toBe(store.measureItemBytes({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" }));
+			expect(absent.itemBytes).toBe(store.measureItemBytes({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" }));
 			expect(absent.rowsRead).toBeLessThanOrEqual(1);
 
 			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: "old", kind: "text", ttlAt: null, txOrderTs: 42 });
 			store.bumpItemReadTs(P(kb("hk")), kb("hk"), kb("s"), 50);
 			const present = store.measureItemBytesWithStamp({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
-			expect(present).toMatchObject({ estRowBytes: absent.estRowBytes, itemPresent: true, lastReadTs: 50, lastWriteTs: 42 });
+			expect(present).toMatchObject({ itemBytes: absent.itemBytes, itemPresent: true, lastReadTs: 50, lastWriteTs: 42 });
 			expect(present.rowsRead).toBe(1);
 		});
 	});
@@ -304,7 +334,7 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	it("maintains key_size_estimates across put, overwrite, and delete", async () => {
+	it("maintains the bucket facts across put, overwrite, and delete", async () => {
 		await withStore((store, state) => {
 			const est1 = expectedRowBytes("aaaa", kb("hk"), kb("s1"));
 			const r1 = store.upsertItem({
@@ -316,8 +346,8 @@ describe("PartitionStore - items", () => {
 				ttlAt: null,
 				txOrderTs: 1,
 			});
-			expect(r1.keyEstBytes).toBe(est1);
-			expect(kseBytes(state, "hk")).toBe(est1);
+			expect(bucketBytes(state, "hk")).toBe(est1);
+			expect(r1.keyEstBytes).toBe(bucketEst(state, "hk"));
 
 			// Second sort key accumulates on the same hash key.
 			const est2 = expectedRowBytes("bb", kb("hk"), kb("s2"));
@@ -330,7 +360,9 @@ describe("PartitionStore - items", () => {
 				ttlAt: null,
 				txOrderTs: 2,
 			});
-			expect(r2.keyEstBytes).toBe(est1 + est2);
+			expect(bucketBytes(state, "hk")).toBe(est1 + est2);
+			expect(bucketRow(state, "hk")?.item_count).toBe(2);
+			expect(r2.keyEstBytes).toBe(bucketEst(state, "hk"));
 
 			// Overwrite replaces the old row's contribution, not adds to it.
 			const est1b = expectedRowBytes("aaaaaaaa", kb("hk"), kb("s1"));
@@ -343,16 +375,18 @@ describe("PartitionStore - items", () => {
 				ttlAt: null,
 				txOrderTs: 3,
 			});
-			expect(r3.keyEstBytes).toBe(est1b + est2);
+			expect(bucketBytes(state, "hk")).toBe(est1b + est2);
+			expect(bucketRow(state, "hk")?.item_count).toBe(2);
+			expect(r3.keyEstBytes).toBe(bucketEst(state, "hk"));
 
 			// Delete removes its contribution.
 			const del = store.deleteItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("s1"), txOrderTs: 10 });
 			expect(del.deleted).toBe(true);
-			expect(kseBytes(state, "hk")).toBe(est2);
+			expect(bucketBytes(state, "hk")).toBe(est2);
 
 			// Deleting the last item of the key deletes its estimate row.
 			store.deleteItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("s2"), txOrderTs: 11 });
-			expect(kseBytes(state, "hk")).toBeUndefined();
+			expect(bucketBytes(state, "hk")).toBeUndefined();
 
 			// A new write of the key starts a new estimate.
 			const r4 = store.upsertItem({
@@ -364,14 +398,14 @@ describe("PartitionStore - items", () => {
 				ttlAt: null,
 				txOrderTs: 12,
 			});
-			expect(r4.keyEstBytes).toBe(expectedRowBytes("c", kb("hk"), kb("s3")));
-			expect(kseBytes(state, "hk")).toBe(r4.keyEstBytes);
+			expect(bucketBytes(state, "hk")).toBe(expectedRowBytes("c", kb("hk"), kb("s3")));
+			expect(r4.keyEstBytes).toBe(bucketEst(state, "hk"));
 		});
 	});
 
-	it("keeps no estimate row for a key that has no items", async () => {
+	it("keeps no bucket for a routingHash that has no items", async () => {
 		await withStore((store, state) => {
-			const estimateRows = () => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM key_size_estimates`).one().n;
+			const estimateRows = () => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM item_stats`).one().n;
 			for (let i = 0; i < 20; i++) {
 				store.upsertItem({ routingHash: P(kb(`k${i}`)), hk: kb(`k${i}`), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
@@ -468,16 +502,15 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	it("est_row_bytes equals octet_length(data)+octet_length(hk)+octet_length(sk)+K per kind", async () => {
+	it("item_bytes equals octet_length(data)+octet_length(hk)+octet_length(sk) per kind", async () => {
 		await withStore((store, state) => {
 			const readEst = (sk: string) =>
-				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb(sk)).toArray()[0]
+				state.storage.sql.exec<{ e: number }>(`SELECT item_bytes AS e FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb(sk)).toArray()[0]
 					?.e;
 			const octetLen = (sk: string, data: string | Uint8Array) =>
 				(typeof data === "string" ? new TextEncoder().encode(data).length : data.byteLength) +
 				kb("hk").byteLength +
-				kb(sk).byteLength +
-				EST_ROW_BYTES_K;
+				kb(sk).byteLength;
 
 			const multibyte = "héllo—✓"; // multi-byte UTF-8: octet_length > .length
 			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("t"), data: multibyte, kind: "text", ttlAt: null, txOrderTs: 1 });
@@ -488,20 +521,20 @@ describe("PartitionStore - items", () => {
 			expect(readEst("b")).toBe(octetLen("b", bytes));
 
 			// For json, the stored JSONB blob size is what octet_length(data) measures — read it from SQL
-			// rather than the input text (the two differ), then confirm the constant folds in.
+			// rather than the input text (the two differ).
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
 			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 			const jsonBlobLen = state.storage.sql
 				.exec<{ n: number }>(`SELECT octet_length(data) AS n FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb("j"))
 				.toArray()[0].n;
-			expect(readEst("j")).toBe(jsonBlobLen + kb("hk").byteLength + kb("j").byteLength + EST_ROW_BYTES_K);
+			expect(readEst("j")).toBe(jsonBlobLen + kb("hk").byteLength + kb("j").byteLength);
 		});
 	});
 
-	it("insertItemIfAbsent writes the same est_row_bytes as upsertItem", async () => {
+	it("insertItemIfAbsent writes the same item_bytes as upsertItem", async () => {
 		await withStore((store, state) => {
 			const readEst = (sk: string) =>
-				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb(sk)).toArray()[0]
+				state.storage.sql.exec<{ e: number }>(`SELECT item_bytes AS e FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb(sk)).toArray()[0]
 					?.e;
 
 			// The migration writer carries the formula independently of upsertItem — both must agree.
@@ -525,14 +558,13 @@ describe("PartitionStore - items", () => {
 				last_read_ts: 1,
 				last_write_ts: 1,
 			});
-			expect(readEst("b")).toBe(bytes.byteLength + kb("hk").byteLength + kb("b").byteLength + EST_ROW_BYTES_K);
+			expect(readEst("b")).toBe(bytes.byteLength + kb("hk").byteLength + kb("b").byteLength);
 		});
 	});
 
-	// idx_items_scan is what keeps `compositeKeySizes` off the wide
-	// item rows. A generated est_row_bytes column, or a narrower index, silently loses "COVERING" and
-	// costs ~20x more page reads without failing any other test.
-	it("the est_row_bytes scans stay index-only", async () => {
+	// The size reads use the primary key, which is in storage order and holds each column before
+	// `data`. No covering index exists, so a plan that leaves the primary key reads the table twice.
+	it("the size reads, the count, and the old-facts read search the primary key", async () => {
 		await withStore((_store, state) => {
 			const plan = (sql: string, ...params: unknown[]) =>
 				state.storage.sql
@@ -540,36 +572,29 @@ describe("PartitionStore - items", () => {
 					.toArray()
 					.map((r) => r.detail)
 					.join(" | ");
+			const rh = P(kb("hk"));
 
-			expect(plan(`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? ORDER BY sk`, kb("hk"), kb("a"))).toContain(
-				"COVERING INDEX",
-			);
-			expect(plan(`SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk`)).toContain("COVERING INDEX");
+			expect(
+				plan(`SELECT item_bytes, ttl_epoch_utc_seconds FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`, rh, kb("hk"), kb("sk")),
+			).toBe("SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=? AND sk=?)");
+			expect(
+				plan(
+					`SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds IS NOT NULL AS indexed FROM items
+					  WHERE routing_hash = ? AND (hk, sk) >= (?, ?) AND (hk, sk) < (?, ?) ORDER BY hk, sk`,
+					rh,
+					kb("a"),
+					kb("a"),
+					kb("z"),
+					kb("z"),
+				),
+			).toBe("SEARCH items USING PRIMARY KEY (routing_hash=? AND (hk,sk)>(?,?) AND (hk,sk)<(?,?))");
+			expect(
+				plan(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE routing_hash = ? AND (hk, sk) >= (?, ?) LIMIT ?)`, rh, kb("a"), kb("a"), 4),
+			).toContain("SEARCH items USING PRIMARY KEY (routing_hash=? AND (hk,sk)>(?,?))");
 		});
 	});
 
-	// The old-estimate lookup of the two upsert statements. Without INDEXED BY, SQLite picks
-	// sqlite_autoindex_items_1 and fetches the table row for est_row_bytes — correct, but one row
-	// fetch per put. Both halves are asserted: that the hint still works, and that it
-	// is still needed, so the pin can be dropped if SQLite ever starts choosing the covering index.
-	it("the old-estimate lookup stays index-only, and needs the INDEXED BY hint to do so", async () => {
-		await withStore((_store, state) => {
-			const plan = (sql: string) =>
-				state.storage.sql
-					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, P(kb("hk")), kb("hk"), kb("sk"))
-					.toArray()
-					.map((r) => r.detail)
-					.join(" | ");
-			const where = "WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1";
-
-			expect(plan(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan ${where}`)).toContain(
-				"COVERING INDEX idx_items_scan (routing_hash=? AND hk=? AND sk=?)",
-			);
-			expect(plan(`SELECT est_row_bytes FROM items ${where}`)).toContain("USING PRIMARY KEY");
-		});
-	});
-
-	it("scanQueryPage count rows carry the stored est_row_bytes and no item", async () => {
+	it("scanQueryPage count rows carry the stored item_bytes and no item", async () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const jsonText = JSON.stringify({ a: 1 });
@@ -578,7 +603,7 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ routingHash: P(hk), hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const storedEst = (sk: string) =>
-				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, hk, kb(sk)).toArray()[0]!.e;
+				state.storage.sql.exec<{ e: number }>(`SELECT item_bytes AS e FROM items WHERE hk = ? AND sk = ?`, hk, kb(sk)).toArray()[0]!.e;
 
 			const { rows } = scanRows(store, {
 				routingHash: P(hk),
@@ -597,14 +622,14 @@ describe("PartitionStore - items", () => {
 			for (const r of rows) {
 				expect(r.payload).toBeNull();
 				expect(r.matched).toBe(true);
-				expect(r.estRowBytes).toBe(storedEst(KeyCodec.decode(r.sk) as string));
+				expect(r.itemBytes).toBe(storedEst(KeyCodec.decode(r.sk) as string));
 			}
-			expect(rows[0].estRowBytes).toBe(expectedRowBytes(new Uint8Array([1, 2, 3]), hk, kb("b")));
-			expect(rows[2].estRowBytes).toBe(expectedRowBytes("hello", hk, kb("t")));
+			expect(rows[0].itemBytes).toBe(expectedRowBytes(new Uint8Array([1, 2, 3]), hk, kb("b")));
+			expect(rows[2].itemBytes).toBe(expectedRowBytes("hello", hk, kb("t")));
 		});
 	});
 
-	it("scanQueryPage projection rows carry the item and the same est_row_bytes", async () => {
+	it("scanQueryPage projection rows carry the item and the same item_bytes", async () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			const jsonText = JSON.stringify({ a: 1 });
@@ -629,7 +654,7 @@ describe("PartitionStore - items", () => {
 			const countRows = scan("count");
 			const projRows = scan("projection");
 
-			expect(projRows.map((r) => r.estRowBytes)).toEqual(countRows.map((r) => r.estRowBytes));
+			expect(projRows.map((r) => r.itemBytes)).toEqual(countRows.map((r) => r.itemBytes));
 			const items = new Map(projRows.map((r) => [KeyCodec.decode(r.sk) as string, r.payload as StoredItem]));
 			expect(items.get("t")).toMatchObject({ data: "hello", kind: "text" });
 			expect(items.get("b")?.data).toEqual(new Uint8Array([1, 2, 3]));
@@ -731,7 +756,7 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	it("the count scan is index-only on idx_items_scan, and the projection scan is not", async () => {
+	it("the count scan and the projection scan search the primary key in its order", async () => {
 		await withStore((_store, state) => {
 			const plan = (sql: string, ...params: unknown[]) =>
 				state.storage.sql
@@ -752,13 +777,15 @@ describe("PartitionStore - items", () => {
 			for (const direction of ["asc", "desc"] as const) {
 				for (const cursor of [null, { hk: kb("hk"), sk: kb("m") }]) {
 					const { sql, params } = queryScanStatement({ ...bounds, direction, cursor, limit: 10, select: "count" });
-					expect(plan(sql, ...params)).toContain("COVERING INDEX idx_items_scan");
+					const countPlan = plan(sql, ...params);
+					expect(countPlan).toContain("SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=?");
+					expect(countPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
 				}
 			}
 
 			const proj = queryScanStatement({ ...bounds, direction: "asc", cursor: null, limit: 10, select: "projection" });
 			const projPlan = plan(proj.sql, ...proj.params);
-			expect(projPlan).not.toContain("COVERING INDEX");
+			expect(projPlan).toContain("SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=?");
 			expect(projPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
 		});
 	});
@@ -819,12 +846,12 @@ describe("PartitionStore - items", () => {
 			expect(created).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: null, last_read_ts: 5, last_write_ts: 5 });
 			expect(JSON.parse(created?.data as string)).toEqual({ x: 1 });
 			// The created row is measured and accounted for exactly as an upsert of the same document is.
-			expect(kseBytes(state, "created-hk")).toBe(first.keyEstBytes);
+			expect(bucketEst(state, "created-hk")).toBe(first.keyEstBytes);
 
 			// The second call finds the row it created and takes the conflict branch.
 			const second = store.updateItemSingleShot({ routingHash: P(hk), hk, sk, plan, txOrderTs: 6 });
 			expect(second.version).toBe(2);
-			expect(kseBytes(state, "created-hk")).toBe(second.keyEstBytes);
+			expect(bucketEst(state, "created-hk")).toBe(second.keyEstBytes);
 		});
 	});
 
@@ -986,12 +1013,12 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	it("updateItemSingleShot keeps est_row_bytes and key_size_estimates in step with the stored document", async () => {
+	it("updateItemSingleShot keeps item_bytes and the bucket facts in step with the stored document", async () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const sk = kb("s1");
 			store.upsertItem({ routingHash: P(hk), hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, txOrderTs: 1 });
-			const before = kseBytes(state, "hk");
+			const before = bucketBytes(state, "hk");
 
 			const plan = updateTree([
 				{ action: "set", target: { ref: "data", path: "$.note" }, value: { val: "a considerably longer note than the first one" } },
@@ -1002,11 +1029,11 @@ describe("PartitionStore - items", () => {
 			// estimate carries exactly that row. An update grows an item without carrying its bytes, so
 			// this accounting is what keeps promotion and split decisions correct.
 			const row = state.storage.sql
-				.exec<{ e: number; d: number }>(`SELECT est_row_bytes AS e, octet_length(data) AS d FROM items WHERE hk = ? AND sk = ?`, hk, sk)
+				.exec<{ e: number; d: number }>(`SELECT item_bytes AS e, octet_length(data) AS d FROM items WHERE hk = ? AND sk = ?`, hk, sk)
 				.one();
-			expect(row.e).toBe(row.d + hk.byteLength + sk.byteLength + EST_ROW_BYTES_K);
-			expect(res.keyEstBytes).toBe(row.e);
-			expect(kseBytes(state, "hk")).toBe(row.e);
+			expect(row.e).toBe(row.d + hk.byteLength + sk.byteLength);
+			expect(bucketBytes(state, "hk")).toBe(row.e);
+			expect(res.keyEstBytes).toBe(bucketEst(state, "hk"));
 			expect(row.e).toBeGreaterThan(before!);
 		});
 	});
@@ -1156,7 +1183,7 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(
 				explain(
 					`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?
-					 RETURNING est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
+					 RETURNING item_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 					P(kb("a")),
 					kb("a"),
 					kb("s"),
@@ -1197,9 +1224,9 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getItem(P(kb("a")), kb("a"), kb("old")).row).toBeUndefined();
 			expect(store.getItem(P(kb("b")), kb("b"), kb("s")).row).toBeUndefined();
 			expect(store.getItem(P(kb("a")), kb("a"), kb("next")).row).toBeDefined();
-			expect(kseBytes(state, "a")).toBe(nextBytes + nullBytes + futureBytes);
+			expect(bucketBytes(state, "a")).toBe(nextBytes + nullBytes + futureBytes);
 			// The sweep removed the last item of "b", so its estimate row is gone.
-			expect(kseBytes(state, "b")).toBeUndefined();
+			expect(bucketBytes(state, "b")).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(20 * 1000 * TX_ORDER_TS_UNITS_PER_MS);
 			// The sweep advances the transaction order watermark to the largest expiry it reclaimed, and
 			// max_deleted_v to the largest delete revision (v + 1) it removed.
@@ -1210,12 +1237,12 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(second).toMatchObject({ deletedRows: 2, deletedBytes: nextBytes + exactBytes });
 			expect(store.getItem(P(kb("a")), kb("a"), kb("next")).row).toBeUndefined();
 			expect(store.getItem(P(kb("c")), kb("c"), kb("exact")).row).toBeUndefined();
-			expect(kseBytes(state, "a")).toBe(nullBytes + futureBytes);
-			expect(kseBytes(state, "c")).toBeUndefined();
+			expect(bucketBytes(state, "a")).toBe(nullBytes + futureBytes);
+			expect(bucketBytes(state, "c")).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 
 			expect(store.getItem(P(kb("locked")), kb("locked"), kb("s")).row).toBeDefined();
-			expect(kseBytes(state, "locked")).toBe(lockedBytes);
+			expect(bucketBytes(state, "locked")).toBe(lockedBytes);
 			expect(store.getItem(P(kb("a")), kb("a"), kb("null")).row).toBeDefined();
 			expect(store.getItem(P(kb("a")), kb("a"), kb("future")).row).toBeDefined();
 			expect(store.deleteExpiredItems(100, 2, ownsAll)).toEqual({ deletedRows: 0, deletedBytes: 0, resumeAfter: null });
@@ -1335,7 +1362,7 @@ describe("PartitionStore - deletion watermark", () => {
 
 			// The cleanup a promotion runs over the routingHash it is moving.
 			store.deleteItemsBatchForRoutingHash(P(kb("alice")), 1000);
-			store.keySizes.remove(P(kb("alice")));
+			store.itemStats.remove(P(kb("alice")));
 
 			expect(store.hasItemsForRoutingHash(P(kb("alice")))).toBe(false);
 			expect(store.getDeletionMetadata()).toEqual(before);
@@ -1391,7 +1418,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			expiring("copy", "s1");
 			expiring("copy", "s2");
 			const ownedVersion = expiring("owned", "s");
-			const copyBytes = kseBytes(state, "copy");
+			const copyBytes = bucketBytes(state, "copy");
 			const ownsByKey = (row: { hk: KeyBytes }) => keyLabel(row.hk) !== "copy";
 
 			// The chunk holds the 2 copies and the owned row. Only the owned row is deleted and counted.
@@ -1399,7 +1426,7 @@ describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", 
 			expect(store.getItem(P(kb("owned")), kb("owned"), kb("s")).row).toBeUndefined();
 			expect(store.getItem(P(kb("copy")), kb("copy"), kb("s1")).row).toBeDefined();
 			expect(store.getItem(P(kb("copy")), kb("copy"), kb("s2")).row).toBeDefined();
-			expect(kseBytes(state, "copy")).toBe(copyBytes);
+			expect(bucketBytes(state, "copy")).toBe(copyBytes);
 			expect(store.getDeletionMetadata().maxDeletedV).toBe(ownedVersion + 1);
 
 			// A chunk of copies only deletes nothing and writes no deletion metadata.
@@ -1857,8 +1884,9 @@ describe("PartitionStore - pending transactions", () => {
 
 describe("PartitionStore - range split boundaries", () => {
 	/**
-	 * The sort keys of the boundaries that the split planner computes from the rows of
-	 * `compositeKeySizes`, or null. The partition holds one hash key, so each boundary has it.
+	 * The sort keys of the boundaries that the split planner computes from the items of
+	 * `compositeKeyFacts` and the facts of the bucket, or null. The partition holds one hash key, so each
+	 * boundary has it.
 	 */
 	function computeBoundaries(
 		store: PartitionStore,
@@ -1868,12 +1896,14 @@ describe("PartitionStore - range split boundaries", () => {
 		N: number,
 	): KeyBytes[] | null {
 		const edge = (sk: KeyBytes | null) => (sk === null ? null : { hk, sk });
-		const plan = planRangeBoundaries(store.keySizes.bytesOf(P(hk)), N, edge(start), store.compositeKeySizes(P(hk), edge(start), edge(end)));
-		if (!("boundaries" in plan)) {
+		const model = store.itemStats.model;
+		const total = estimate(model, store.itemStats.factsOf(P(hk)));
+		const boundaries = planRangeBoundaries(model, total, N, edge(start), store.compositeKeyFacts(P(hk), edge(start), edge(end)));
+		if (boundaries === null) {
 			return null;
 		}
-		expect(plan.boundaries.every((b) => KeyCodec.compare(b.hk, hk) === 0)).toBe(true);
-		return plan.boundaries.map((b) => b.sk);
+		expect(boundaries.every((b) => KeyCodec.compare(b.hk, hk) === 0)).toBe(true);
+		return boundaries.map((b) => b.sk);
 	}
 
 	function put(store: PartitionStore, hk: string, ...sks: string[]) {
@@ -1895,14 +1925,13 @@ describe("PartitionStore - range split boundaries", () => {
 		});
 	});
 
-	it("N=2: emits a boundary at the byte midpoint (crossing row goes to the upper child)", async () => {
+	it("N=2: cuts at the gap nearest the byte midpoint, and the lower child gets only the items before it", async () => {
 		await withStore((store) => {
-			// 4 equal-size items; total bytes B, step = B/2. Accumulating est_row_bytes: after "apple"
-			// acc ≈ B/4 (< step); "cherry" tips acc over B/2, so the boundary lands between "apple" and
-			// "cherry" (the crossing row "cherry" falls into the upper child).
-			// shortestSeparator("apple","cherry"): 'a'!='c' at i=0 → "c".
+			// 4 items of almost the same estimate; the target is B/2. The gap after "cherry" holds about
+			// B/2 before it, so the boundary lands between "cherry" and "mango".
+			// shortestSeparator("cherry","mango"): 'c'!='m' at i=0 → "m".
 			put(store, "hk", "apple", "cherry", "mango", "peach");
-			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toEqual([kb("c")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 2)).toEqual([kb("m")]);
 		});
 	});
 
@@ -1934,19 +1963,20 @@ describe("PartitionStore - range split boundaries", () => {
 
 	it("N=3: produces two strictly-increasing shortened byte-quantile boundaries", async () => {
 		await withStore((store) => {
-			// 6 roughly-equal items; step = B/3. sorted: "aardvark","cherry","mango","strawberry","vanilla","zebra"
-			// b1: "cherry" tips acc over B/3 → shortestSeparator("aardvark","cherry") → "c"
-			// b2: "strawberry" tips acc over 2·B/3 → shortestSeparator("mango","strawberry") → "s"
+			// 6 roughly-equal items; the targets are B/3 and 2·B/3. sorted: "aardvark","cherry","mango","strawberry","vanilla","zebra"
+			// b1: the gap after "cherry" is nearest B/3 → shortestSeparator("cherry","mango") → "m"
+			// b2: the gap after "strawberry" is nearest 2·B/3 → shortestSeparator("strawberry","vanilla") → "v"
 			put(store, "hk", "aardvark", "cherry", "mango", "strawberry", "vanilla", "zebra");
-			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toEqual([kb("c"), kb("s")]);
+			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toEqual([kb("m"), kb("v")]);
 		});
 	});
 
 	it("honors explicit start/end range bounds on the scan", async () => {
 		await withStore((store) => {
 			// A splitting range parent owns exactly its [start, end) slice, so its items == the slice and
-			// est_bytes[hk] is the slice's byte total. Here the DO holds "banana","cherry","mango" and splits
-			// [banana, peach). N=2: "cherry" tips acc over B/2 → shortestSeparator("banana","cherry") → "c".
+			// the bucket holds the facts of the slice. Here the DO holds "banana","cherry","mango" and splits
+			// [banana, peach). N=2: "mango" is the smallest item, so the gap after "banana" is nearest B/2
+			// → shortestSeparator("banana","cherry") → "c".
 			put(store, "hk", "banana", "cherry", "mango");
 			expect(computeBoundaries(store, kb("hk"), kb("banana"), kb("peach"), 2)).toEqual([kb("c")]);
 		});
@@ -2038,8 +2068,8 @@ describe("PartitionStore - range split boundaries", () => {
 	it("one heavy row: the heavy row is isolated into its own child", async () => {
 		await withStore((store) => {
 			// 10 light rows plus one heavy row (data far larger than the light rows' combined bytes),
-			// keyed to sort last. With N=2, step = B/2 < heavy weight, so the light rows all fall below
-			// the threshold and the heavy row alone tips it over → boundary lands between them.
+			// keyed to sort last. With N=2, the target B/2 is below the heavy weight, so the gap before
+			// the heavy row is nearest it → boundary lands between them.
 			for (let i = 0; i < 10; i++) {
 				store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb(`k${i}`), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
@@ -2061,11 +2091,10 @@ describe("PartitionStore - range split boundaries", () => {
 		});
 	});
 
-	it("skewed data that cannot form N-1 boundaries returns null (retry contract)", async () => {
+	it("a dominant row between two light rows gets a child of its own", async () => {
 		await withStore((store) => {
-			// A single dominant row between two light rows. With N=3 the heavy row crosses the first
-			// threshold and the relative bump pushes the next threshold past the remaining bytes, so only
-			// one boundary is emitted (< N-1) → null, and the split retries on a later cycle.
+			// With N=3 the targets are B/3 and 2·B/3. The gap after "a" is nearest B/3, and the only gap
+			// left for 2·B/3 is the gap after "m". Each child holds one row.
 			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("a"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			store.upsertItem({
 				routingHash: P(kb("hk")),
@@ -2077,7 +2106,7 @@ describe("PartitionStore - range split boundaries", () => {
 				txOrderTs: 1,
 			});
 			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
-			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toBeNull();
+			expect(computeBoundaries(store, kb("hk"), null, null, 3)).toEqual([kb("m"), kb("z")]);
 		});
 	});
 });
@@ -2501,13 +2530,13 @@ describe("PartitionStore - the item-id counter", () => {
 		});
 	});
 
-	// One row for the table and one for each of `idx_items_scan` and `idx_items_item_id`, and one more for
-	// `idx_items_ttl` when the row has a TTL. The reservation of a block is a statement of its own.
-	it("an insert writes 3 rows without a TTL and 4 with a TTL", async () => {
+	// One row for the table and one for `idx_items_item_id`, and one more for `idx_items_ttl` when the
+	// row has a TTL. The reservation of a block is a statement of its own.
+	it("an insert writes 2 rows without a TTL and 3 with a TTL", async () => {
 		await withStore((store) => {
 			put(store, "reserves-the-block");
-			expect(put(store, "a").rowsWritten).toBe(3);
-			expect(put(store, "b", "s", 2_000_000_000).rowsWritten).toBe(4);
+			expect(put(store, "a").rowsWritten).toBe(2);
+			expect(put(store, "b", "s", 2_000_000_000).rowsWritten).toBe(3);
 		});
 	});
 });
@@ -2520,20 +2549,9 @@ describe("PartitionStore - plans of the storage order", () => {
 			.map((r) => r.detail)
 			.join(" | ");
 
-	it("the range split scan reads only idx_items_scan, and the promotion delete uses the primary key", async () => {
+	it("the promotion delete uses the primary key", async () => {
 		await withStore((_store, state) => {
 			const hk = kb("hk");
-			expect(
-				plan(
-					state,
-					`SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan
-					  WHERE routing_hash = ? AND hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
-					P(hk),
-					hk,
-					kb("a"),
-					kb("z"),
-				),
-			).toBe("SEARCH items USING COVERING INDEX idx_items_scan (routing_hash=? AND hk=? AND sk>? AND sk<?)");
 			const deletePlan = plan(
 				state,
 				`DELETE FROM items WHERE routing_hash = ?1 AND hk = ?2

@@ -53,11 +53,11 @@ it.each(DATA_BYTES)("a contiguous delete of %i-byte items frees a proportional p
 		const full = store.databaseSize;
 		// Keep [0, 2^63): delete each row from the middle of the space to its end.
 		sql.exec(`DELETE FROM items WHERE routing_hash >= ?`, bound(0x80));
-		sql.exec(`DELETE FROM key_size_estimates WHERE routing_hash >= ?`, bound(0x80));
+		sql.exec(`DELETE FROM item_stats WHERE routing_hash >= ?`, bound(0x80));
 		const half = store.databaseSize / full;
 		// Keep [0, 2^62).
 		sql.exec(`DELETE FROM items WHERE routing_hash >= ?`, bound(0x40));
-		sql.exec(`DELETE FROM key_size_estimates WHERE routing_hash >= ?`, bound(0x40));
+		sql.exec(`DELETE FROM item_stats WHERE routing_hash >= ?`, bound(0x40));
 		const quarter = store.databaseSize / full;
 		console.log(
 			`| ${dataBytes} | ${rows} | ${(full / 1024 / 1024).toFixed(2)} MiB | ${(half * 100).toFixed(1)}% | ${(quarter * 100).toFixed(1)}% |`,

@@ -8,22 +8,22 @@ import { createQueryPageCollector } from "./query-collector.js";
 const hk = KeyCodec.encode("hk");
 
 // One scan candidate as the store hands it to the consumer, with the payload it would decode.
-type Candidate = { sk: string; estRowBytes: number; matched: boolean; payload: StoredItem | ProjectedWireRow | null };
+type Candidate = { sk: string; itemBytes: number; matched: boolean; payload: StoredItem | ProjectedWireRow | null };
 
 // A matched candidate that decodes to a complete item.
-function row(sk: string, estRowBytes: number, item: Partial<StoredItem> = {}): Candidate {
+function row(sk: string, itemBytes: number, item: Partial<StoredItem> = {}): Candidate {
 	const skBytes = KeyCodec.encode(sk);
 	return {
 		sk,
-		estRowBytes,
+		itemBytes,
 		matched: true,
 		payload: { hk, sk: skBytes, data: "x", kind: "text", ttl_epoch_utc_seconds: null, v: 1, last_read_ts: 0, last_write_ts: 0, ...item },
 	};
 }
 
 // A matched candidate that decodes to a projected wire row instead of a complete item.
-function projectedRow(sk: string, estRowBytes: number, projected: ProjectedWireRow): Candidate {
-	return { sk, estRowBytes, matched: true, payload: projected };
+function projectedRow(sk: string, itemBytes: number, projected: ProjectedWireRow): Candidate {
+	return { sk, itemBytes, matched: true, payload: projected };
 }
 
 type Budget = Pick<
@@ -61,7 +61,7 @@ function collect(
 			}
 			return c.payload;
 		};
-		if (!collector.consume(KeyCodec.encode(c.sk), c.estRowBytes, c.matched, decode)) {
+		if (!collector.consume(KeyCodec.encode(c.sk), c.itemBytes, c.matched, decode)) {
 			break;
 		}
 	}
@@ -101,9 +101,9 @@ describe("createQueryPageCollector", () => {
 		const estimate = vi.fn();
 		const { state, pulled, decoded } = collect(
 			[
-				{ sk: "a", estRowBytes: 10, matched: true, payload: null },
-				{ sk: "b", estRowBytes: 20, matched: true, payload: null },
-				{ sk: "c", estRowBytes: 30, matched: true, payload: null },
+				{ sk: "a", itemBytes: 10, matched: true, payload: null },
+				{ sk: "b", itemBytes: 20, matched: true, payload: null },
+				{ sk: "c", itemBytes: 30, matched: true, payload: null },
 			],
 			{ select: "count", estimateResponseBytes: estimate },
 		);
@@ -174,9 +174,9 @@ describe("createQueryPageCollector", () => {
 	it("count mode ignores the response budget entirely", () => {
 		const { state } = collect(
 			[
-				{ sk: "a", estRowBytes: 10, matched: true, payload: null },
-				{ sk: "b", estRowBytes: 20, matched: true, payload: null },
-				{ sk: "c", estRowBytes: 30, matched: true, payload: null },
+				{ sk: "a", itemBytes: 10, matched: true, payload: null },
+				{ sk: "b", itemBytes: 20, matched: true, payload: null },
+				{ sk: "c", itemBytes: 30, matched: true, payload: null },
 			],
 			{ select: "count", budget: budget({ remainingResponseBytes: 0, allowOversizedFirstItem: false }), estimateResponseBytes: () => 50 },
 		);
@@ -199,7 +199,7 @@ describe("createQueryPageCollector", () => {
 
 	it("an unmatched candidate consumes the evaluated budgets and advances the cursor but counts nothing and decodes nothing", () => {
 		const estimate = vi.fn();
-		const { state, decoded } = collect([{ sk: "a", estRowBytes: 10, matched: false, payload: null }], {
+		const { state, decoded } = collect([{ sk: "a", itemBytes: 10, matched: false, payload: null }], {
 			select: "projection",
 			estimateResponseBytes: estimate,
 		});

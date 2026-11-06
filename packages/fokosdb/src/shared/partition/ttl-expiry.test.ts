@@ -4,7 +4,6 @@ import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { type KeyBytes, KeyCodec } from "../../sharding/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
-import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";
 import { invariantFailure } from "../../../test/errors-matchers.js";
 import { routingHashFor } from "../../../test/routing-hash.js";
@@ -36,7 +35,7 @@ function config(overrides: Partial<TtlSweepConfig> = {}): TtlSweepConfig {
 
 function putExpired(store: PartitionStore, hk: string, ttlAt: number, data = "d"): number {
 	store.upsertItem({ routingHash: P(kb(hk)), hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, txOrderTs: 1 });
-	return new TextEncoder().encode(data).length + kb(hk).byteLength + kb("s").byteLength + EST_ROW_BYTES_K;
+	return new TextEncoder().encode(data).length + kb(hk).byteLength + kb("s").byteLength;
 }
 
 function itemCount(state: DurableObjectState): number {

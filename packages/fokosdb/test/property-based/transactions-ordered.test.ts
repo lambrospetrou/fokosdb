@@ -6,8 +6,8 @@
 //   - the two-phase path (`prepareLocal`, then `commitLocal`),
 //   - the reference run: each operation alone, as a one-operation `executeSingleShot`.
 //
-// All three must leave the same `items` (data, `v`, TTL, stamps, `item_id`, `est_row_bytes`), the
-// same `deletion_metadata`, and the same `key_size_estimates`. Every operation of the list passes,
+// All three must leave the same `items` (data, `v`, TTL, stamps, `item_id`, `item_bytes`), the
+// same `deletion_metadata`, and the same `item_stats`. Every operation of the list passes,
 // so the comparison holds: a check has a condition that is always true, and the list has no
 // condition on `v` after a write, because the version-reference check refuses that case (its own
 // tests cover it).
@@ -92,7 +92,7 @@ const arbCase = fc.record({
 });
 
 function reset(storage: DurableObjectStorage): void {
-	for (const table of ["items", "key_size_estimates", "pending_transactions", "pending_tx_info"]) {
+	for (const table of ["items", "item_stats", "pending_transactions", "pending_tx_info"]) {
 		storage.sql.exec(`DELETE FROM ${table}`);
 	}
 	storage.sql.exec(`UPDATE deletion_metadata SET max_delete_tx_order_ts = 0, max_deleted_v = 0`);
@@ -139,15 +139,15 @@ function snapshot(storage: DurableObjectStorage) {
 	return {
 		items: storage.sql
 			.exec(
-				`SELECT hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, est_row_bytes FROM items ORDER BY hk, sk`,
+				`SELECT hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, item_bytes FROM items ORDER BY hk, sk`,
 			)
 			.toArray()
 			.map((r) => ({ ...r, hk: b64(r.hk), sk: b64(r.sk), data: b64(r.data) })),
 		deletion: storage.sql.exec(`SELECT max_delete_tx_order_ts, max_deleted_v FROM deletion_metadata`).one(),
 		sizes: storage.sql
-			.exec(`SELECT hk, est_bytes FROM key_size_estimates ORDER BY hk`)
+			.exec(`SELECT * FROM item_stats ORDER BY routing_hash, lower_hk, lower_sk`)
 			.toArray()
-			.map((r) => ({ ...r, hk: b64(r.hk) })),
+			.map((r) => ({ ...r, routing_hash: b64(r.routing_hash), lower_hk: b64(r.lower_hk), lower_sk: b64(r.lower_sk) })),
 		locks: storage.sql.exec(`SELECT COUNT(*) AS n FROM pending_transactions`).one().n,
 	};
 }

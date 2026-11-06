@@ -27,8 +27,9 @@ import {
 import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS, decodeItemKeys } from "../transaction-limits.js";
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import { withExpressionErrors } from "../errors-operations.js";
-import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
-import { KeySizeStats } from "./key-size-stats.js";
+import { itemBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-bytes.js";
+import { itemFacts, ITEMS_MODEL, type ItemFacts } from "./item-size.js";
+import { addFacts, ItemStats } from "./item-stats.js";
 import type { TransactionOperationType } from "../transaction-wire-types.js";
 import type { FokosStorageInterval } from "../../sharding/runtime-types.js";
 
@@ -106,8 +107,8 @@ function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
 /**
  * PartitionStore owns ALL SQL on the partition's data tables: items, pending_transactions,
  * deletion_metadata and the materialization outbox, plus their schema migrations and the row-size
- * estimators. No other class touches these tables. The size estimate of each hash key belongs to
- * `keySizes`, which this store updates in the transaction of each item write. The `fokos_` tables
+ * estimators. No other class touches these tables. The item facts of each routingHash belong to
+ * `itemStats`, which this store updates in the transaction of each item write. The `fokos_` tables
  * belong to `FokosShardingStore`, and no statement here may name one.
  *
  * Design rules:
@@ -279,7 +280,7 @@ export type ExportFence = { ancestorId: string; minEpoch: number };
 export type ProducerFence = { producerId: string; epoch: number };
 
 /** The stored representation of a live item for its export: a json item is its JSONB blob. */
-export type ExportItemImage = { v: number; data: string | Uint8Array; kind: DataKind; ttlAt: number | null; estRowBytes: number };
+export type ExportItemImage = { v: number; data: string | Uint8Array; kind: DataKind; ttlAt: number | null; itemBytes: number };
 
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
@@ -303,7 +304,7 @@ export type RangeScanBounds = {
  */
 export type QueryCandidateConsumer = (
 	sk: KeyBytes,
-	estRowBytes: number,
+	itemBytes: number,
 	matched: boolean,
 	decodePayload: () => StoredItem | ProjectedWireRow,
 ) => boolean;
@@ -380,7 +381,7 @@ export function estimateItemBytes(item: StoredItem): number {
 /**
  * Estimated RPC bytes of one projected row: the item envelope plus per-cell sizes, `length * 2`
  * for a string and for the JSON text of an array or an object, `byteLength` for a `Uint8Array`, and
- * 8 for every other cell. It does not use `est_row_bytes`: a projected row carries only its cells.
+ * 8 for every other cell. It does not use `item_bytes`: a projected row carries only its cells.
  */
 export function estimateProjectedRowBytes(row: ProjectedWireRow): number {
 	let bytes = ITEM_ENVELOPE_BYTES;
@@ -469,8 +470,7 @@ function rangeScanConditions(opts: RangeScanBounds): { conds: string[]; params: 
 
 /**
  * The SQL of one queryItems leaf scan. Without a plan, the count selection reads only `sk` and
- * `est_row_bytes` from the covering `idx_items_scan` index; the `INDEXED BY` pin is needed for the
- * same reason as in `#storedEstRowBytes`. The projection selection reads the complete item with json
+ * `item_bytes` from the primary key, which stops before `data`. The projection selection reads the complete item with json
  * decoded to text. `limit` binds as given.
  *
  * With a plan the statement is the composed query statement, which gives every scan parameter an
@@ -491,9 +491,28 @@ export function queryScanStatement(opts: RangeScanBounds & { limit: number; sele
 	const order = `ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`;
 	const sql =
 		opts.select === "count"
-			? `SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan WHERE ${conds.join(" AND ")} ${order}`
-			: `SELECT hk, sk, est_row_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
+			? `SELECT sk, item_bytes FROM items WHERE ${conds.join(" AND ")} ${order}`
+			: `SELECT hk, sk, item_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
 	return { sql, params: [...params, opts.limit] };
+}
+
+/** The `WHERE` terms of the items of `routingHash` in the composite interval `[start, end)`. A null edge is unbounded. */
+function compositeSliceTerms(
+	routingHash: RoutingHash,
+	start: FokosCompositeKey | null,
+	end: FokosCompositeKey | null,
+): { conds: string; params: unknown[] } {
+	const conds = ["routing_hash = ?"];
+	const params: unknown[] = [routingHash];
+	if (start !== null) {
+		conds.push("(hk, sk) >= (?, ?)");
+		params.push(start.hk, start.sk);
+	}
+	if (end !== null) {
+		conds.push("(hk, sk) < (?, ?)");
+		params.push(end.hk, end.sk);
+	}
+	return { conds: conds.join(" AND "), params };
 }
 
 /** The bound key of a storage position. An absent `hk` or `sk` is the empty key, the minimum. */
@@ -639,22 +658,19 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//   only from its parent, where the ids are unique, and it raises its mark above each copied id.
 		// - Do NOT send `item_id` through the API, in cursors, or in transaction rows.
 		//
-		// Column `est_row_bytes`:
-		// - The value is the encoded size from octet_length: UTF-8 bytes for TEXT, and blob bytes for BLOB
-		//   and JSONB.
-		// - It is a normal column, NOT a generated column. SQLite does not use an index that contains a
-		//   generated column as a covering index. The est_row_bytes scans would then read each full row.
-		// - Both writers calculate the value with estRowBytesExpr. Thus, SQLite measures the stored value,
+		// Column `item_bytes`:
+		// - The exact size of the item: the encoded bytes of the stored data, of `hk`, and of `sk`, from
+		//   octet_length (UTF-8 bytes for TEXT, and blob bytes for BLOB and JSONB). The item limit, the query
+		//   budget, and the export budget use it. The storage estimate of promotion and range splits prices
+		//   the facts of `item_stats`, which `itemStats` keeps from this value.
+		// - It is a normal column, NOT a generated column: the size checks before a write need the same
+		//   SQL expression anyway, and a change of a generated expression needs a table rebuild.
+		// - Each writer calculates the value with itemBytesExpr. Thus, SQLite measures the stored value,
 		//   and JavaScript does not estimate it.
-		// - octet_length gives the variable part of the row (data and keys). The constant K gives the fixed
-		//   part: the routingHash, the integer columns, the record header, and the two index entries of each
-		//   row (idx_items_scan and idx_items_item_id).
-		// - K is an approximate value for size accounting (promotion and split). It is not an exact value.
+		// - It is before `data`, so a size read stops before `data` and reads no overflow page.
 		//
-		// Index `idx_items_scan`:
-		// - The index contains (routing_hash, hk, sk, est_row_bytes). Thus, the est_row_bytes scans
-		//   (computeRangeSplitBoundaries) and the count queries read only the index, and never read the
-		//   item rows.
+		// No index repeats the table order. The size reads, the counts, and the split scans read the
+		// primary key, which is in storage order and holds each column before `data`.
 		//
 		// Index `idx_items_ttl`:
 		// - It declares the primary-key columns after the TTL, so the sweep seeks on its row-value cursor.
@@ -673,14 +689,13 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 last_read_ts          INTEGER NOT NULL DEFAULT 0,
                 last_write_ts         INTEGER NOT NULL DEFAULT 0,
                 ttl_epoch_utc_seconds INTEGER,
-                est_row_bytes         INTEGER NOT NULL,
+                item_bytes            INTEGER NOT NULL,
                 data                  ANY     NOT NULL,
 
                 PRIMARY KEY (routing_hash, hk, sk)
             ) WITHOUT ROWID, STRICT;
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_items_item_id ON items (item_id);
-            CREATE INDEX IF NOT EXISTS idx_items_scan ON items (routing_hash, hk, sk, est_row_bytes);
             CREATE INDEX IF NOT EXISTS idx_items_ttl ON items (ttl_epoch_utc_seconds, routing_hash, hk, sk)
                 WHERE ttl_epoch_utc_seconds IS NOT NULL;
 
@@ -854,14 +869,18 @@ export type PartitionStoreOptions = {
 	onChangeCaptured?: () => void;
 	/** True on a GSI table, so that a query compiles `{ ref: "sortKey" }` against the physical GSI sort key. Default: false. */
 	gsiSortKey?: () => boolean;
+	/** The promotion floor of the current policy, or null when the partition has no promotion. Read at each fact write. Default: null. */
+	promotionFloor?: () => number | null;
+	/** The parameters of each log message of the store. */
+	logParams?: () => Record<string, unknown>;
 };
 
 /** The count of item ids that one reservation of `item_id_counter` takes. */
 const ITEM_ID_BLOCK = 1024;
 
 export class PartitionStore {
-	/** The size estimate of each hash key. */
-	readonly keySizes: KeySizeStats;
+	/** The item facts of each routingHash. */
+	readonly itemStats: ItemStats;
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
 	#captureChanges: () => boolean;
@@ -877,7 +896,16 @@ export class PartitionStore {
 
 	constructor(storage: DurableObjectStorage, opts: PartitionStoreOptions = {}) {
 		this.#storage = storage;
-		this.keySizes = new KeySizeStats(storage);
+		this.itemStats = new ItemStats(storage, {
+			table: "items",
+			hkColumn: "hk",
+			skColumn: "sk",
+			indexedCondition: "ttl_epoch_utc_seconds IS NOT NULL",
+			model: ITEMS_MODEL,
+			promotionFloor: opts.promotionFloor ?? (() => null),
+			logName: "fokos/partition",
+			logParams: opts.logParams ?? (() => ({})),
+		});
 		this.#captureChanges = opts.captureChanges ?? (() => false);
 		this.#gsiSortKey = opts.gsiSortKey ?? (() => false);
 		this.#onChangeCaptured = opts.onChangeCaptured ?? (() => {});
@@ -890,7 +918,7 @@ export class PartitionStore {
 
 	runMigrations(): void {
 		this.#migrations.runAllSync();
-		this.keySizes.runMigrations();
+		this.itemStats.runMigrations();
 	}
 
 	get databaseSize(): number {
@@ -1063,46 +1091,35 @@ export class PartitionStore {
 	}
 
 	/**
-	 * The row's currently stored `est_row_bytes`, or 0 when the row is absent. `upsertItem` and
-	 * `updateItemSingleShot` need it to compute the `key_size_estimates` delta. `deleteItem` reads the
-	 * size together with the `v` and the `last_read_ts` of the row, so it does not use this read.
-	 *
-	 * `INDEXED BY idx_items_scan` is a deliberate plan pin, not decoration. `idx_items_scan
-	 * (routing_hash, hk, sk, est_row_bytes)` covers this query exactly, but SQLite prefers the
-	 * primary key, whose rows also hold the item data:
-	 *
-	 *   without the hint: SEARCH items USING PRIMARY KEY (routing_hash=? AND hk=? AND sk=?)
-	 *   with the hint:    SEARCH items USING COVERING INDEX idx_items_scan (routing_hash=? AND hk=? AND sk=?)
-	 *
-	 * The hint reads the narrow index entry in place of the wide row on every put. It saves page
-	 * reads, not billed rows — SQLite reports one row read either way. `INDEXED BY` makes the dependency on
-	 * `idx_items_scan` hard: dropping or renaming that index fails this query loudly rather than
-	 * silently regressing both write paths. A query-plan test asserts the pin still works AND that it
-	 * is still needed, so it can be removed if SQLite ever picks the covering index unaided.
-	 *
-	 * A fold into the DELETE with `DELETE ... RETURNING` measured the returned row as an extra read, so
-	 * it costs the same on a hit and one more on a miss.
+	 * The facts of the stored row, or undefined when the row is absent. One primary-key seek, which
+	 * stops before `data`. `upsertItem` and `updateItemSingleShot` subtract these facts from the bucket of
+	 * the routingHash and add the new facts. The presence of the row also tells whether the write creates it.
 	 *
 	 * Do NOT replace this read with `AFTER INSERT/UPDATE/DELETE` triggers on items that maintain
-	 * key_size_estimates. A trigger fires for EVERY writer of items, including the two that do their
-	 * size accounting in bulk: insertItemIfAbsent (migration ingest, one `keySizes.add` per key per
-	 * page) and deleteItemsBatchForRoutingHash (cleanup, 1000 rows per call, followed by one
-	 * `keySizes.remove`). It would add one row WRITE per row on those paths to save one row READ here.
+	 * item_stats. A trigger fires for EVERY writer of items, including the two that do their fact
+	 * accounting in bulk: insertItemIfAbsent (migration ingest, one bucket write per routingHash per
+	 * page) and deleteItemsBatchForRoutingHash (cleanup of a routingHash that has no bucket). It would
+	 * add one row WRITE per row on those paths to save one row READ here.
 	 */
-	#storedEstRowBytes(routingHash: RoutingHash, hk: KeyBytes, sk: KeyBytes): number {
+	#oldFacts(routingHash: RoutingHash, hk: KeyBytes, sk: KeyBytes): ItemFacts | undefined {
 		const row = tryOne(
-			this.#storage.sql.exec<{ est_row_bytes: number }>(
-				`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE routing_hash = ? AND hk = ? AND sk = ? LIMIT 1`,
+			this.#storage.sql.exec<{ item_bytes: number; ttl_epoch_utc_seconds: number | null }>(
+				`SELECT item_bytes, ttl_epoch_utc_seconds FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 				routingHash,
 				hk,
 				sk,
 			),
 		);
-		return row?.est_row_bytes ?? 0;
+		return row && this.#facts(hk, sk, row.item_bytes, row.ttl_epoch_utc_seconds);
+	}
+
+	/** The facts of one item of `items`. */
+	#facts(hk: KeyBytes, sk: KeyBytes, itemBytes: number, ttlAt: number | null): ItemFacts {
+		return itemFacts(this.itemStats.model, { itemBytes, keyBytes: hk.byteLength + sk.byteLength, indexed: ttlAt !== null });
 	}
 
 	/**
-	 * The exact `est_row_bytes` that `upsertItem` would store for this value, measured by SQLite over
+	 * The exact `item_bytes` that `upsertItem` would store for this value, measured by SQLite over
 	 * the same expression the write uses. It reads no row: the statement has no FROM clause, so the
 	 * cost is the encode that the write would pay anyway.
 	 *
@@ -1113,8 +1130,8 @@ export class PartitionStore {
 	measureItemBytes(opts: { hk: KeyBytes; sk: KeyBytes; data: string | Uint8Array; kind: DataKind }): number {
 		const dataExpr = itemDataExpr(opts.kind, opts.data, "?3");
 		return this.#storage.sql
-			.exec<{ est_row_bytes: number }>(`SELECT ${estRowBytesExpr(dataExpr, "?1", "?2")} AS est_row_bytes`, opts.hk, opts.sk, opts.data)
-			.one().est_row_bytes;
+			.exec<{ item_bytes: number }>(`SELECT ${itemBytesExpr(dataExpr, "?1", "?2")} AS item_bytes`, opts.hk, opts.sk, opts.data)
+			.one().item_bytes;
 	}
 
 	/**
@@ -1129,7 +1146,7 @@ export class PartitionStore {
 	 * absent item, `present` is 0 and both stamps are NULL.
 	 */
 	measureItemBytesWithStamp(opts: { routingHash: RoutingHash; hk: KeyBytes; sk: KeyBytes; data: string | Uint8Array; kind: DataKind }): {
-		estRowBytes: number;
+		itemBytes: number;
 		itemPresent: boolean;
 		lastReadTs: number | null;
 		lastWriteTs: number | null;
@@ -1137,12 +1154,12 @@ export class PartitionStore {
 	} {
 		const dataExpr = itemDataExpr(opts.kind, opts.data, "?3");
 		const res = this.#storage.sql.exec<{
-			est_row_bytes: number;
+			item_bytes: number;
 			present: number;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
 		}>(
-			`SELECT ${estRowBytesExpr(dataExpr, "?1", "?2")} AS est_row_bytes, COUNT(*) AS present,
+			`SELECT ${itemBytesExpr(dataExpr, "?1", "?2")} AS item_bytes, COUNT(*) AS present,
 			        MAX(last_read_ts) AS last_read_ts, MAX(last_write_ts) AS last_write_ts
 			   FROM items WHERE routing_hash = ?4 AND hk = ?1 AND sk = ?2`,
 			opts.hk,
@@ -1152,7 +1169,7 @@ export class PartitionStore {
 		);
 		const row = res.one();
 		return {
-			estRowBytes: row.est_row_bytes,
+			itemBytes: row.item_bytes,
 			itemPresent: row.present > 0,
 			lastReadTs: row.last_read_ts,
 			lastWriteTs: row.last_write_ts,
@@ -1161,12 +1178,12 @@ export class PartitionStore {
 	}
 
 	/**
-	 * The items upsert with est_row_bytes / key_size_estimates bookkeeping — the single
-	 * definition used by BOTH the non-transactional putItem and the transactional commit apply.
-	 * Returns the new item version and the key's updated size estimate (feeds promotion checks).
-	 * Throws when the row would exceed MAX_ITEM_BYTES, which writes nothing — see throwItemTooLarge.
-	 * Metrics cover ONLY the items upsert statement (matching the DO's previous meta math —
-	 * the old-estimate read and the key_size_estimates upsert were never counted).
+	 * The items upsert with its item_stats bookkeeping — the single definition used by BOTH the
+	 * non-transactional putItem and the transactional commit apply. Returns the new item version and
+	 * the rounded estimate of the routingHash after the write (feeds promotion checks), or 0 when it
+	 * has no bucket. Throws when the row would exceed MAX_ITEM_BYTES, which writes nothing — see
+	 * throwItemTooLarge. Metrics cover ONLY the items upsert statement (the old-facts read and the
+	 * item_stats write are not counted).
 	 */
 	upsertItem(opts: {
 		/** The routingHash of `hk`. */
@@ -1185,12 +1202,12 @@ export class PartitionStore {
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		const oldEst = this.#storedEstRowBytes(opts.routingHash, opts.hk, opts.sk);
-		// A row is absent when its stored size is 0. An overwrite keeps its id, and the insert branch
-		// does not run for it, so it binds -1, which no row holds.
-		const itemId = oldEst === 0 ? this.#nextItemId() : -1;
+		const old = this.#oldFacts(opts.routingHash, opts.hk, opts.sk);
+		// An overwrite keeps its id, and the insert branch does not run for it, so it binds -1, which no
+		// row holds.
+		const itemId = old === undefined ? this.#nextItemId() : -1;
 
-		// data binds at ?6 because est_row_bytes must measure this same expression.
+		// data binds at ?6 because item_bytes must measure this same expression.
 		const dataExpr = itemDataExpr(opts.kind, opts.data, "?6");
 
 		// INVARIANT: last_read_ts and last_write_ts are monotonic per item — neither must ever move
@@ -1214,21 +1231,21 @@ export class PartitionStore {
 		// and its timestamp watermark never go below those of an earlier, deleted row of the key. The
 		// conflict branch uses ?5 and not `excluded`, because `excluded` holds the stamps of the insert
 		// branch, which include the partition delete timestamp.
-		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+		const writeRes = this.#storage.sql.exec<{ v: number; item_bytes: number }>(
+			`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, item_bytes, data)
 			 SELECT ?8, ?1, ?2, ?9, ?3, ?4, d.max_deleted_v + 1, MAX(?5, d.max_delete_tx_order_ts), MAX(?5, d.max_delete_tx_order_ts),
-			        ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
+			        ${itemBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
 			   FROM deletion_metadata AS d
-			  WHERE d.id = 1 AND ${estRowBytesExpr(dataExpr, "?1", "?2")} <= ?7
+			  WHERE d.id = 1 AND ${itemBytesExpr(dataExpr, "?1", "?2")} <= ?7
 			 ON CONFLICT(routing_hash, hk, sk) DO UPDATE SET
 			   data = excluded.data,
 			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-			   est_row_bytes = excluded.est_row_bytes,
+			   item_bytes = excluded.item_bytes,
 			   v = v + 1,
 			   last_read_ts = MAX(last_read_ts, ?5),
 			   last_write_ts = MAX(last_write_ts, ?5)
-			 RETURNING v, est_row_bytes`,
+			 RETURNING v, item_bytes`,
 			opts.hk,
 			opts.sk,
 			DATA_KINDS.indexOf(opts.kind),
@@ -1248,17 +1265,18 @@ export class PartitionStore {
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
 			`fokos/partition-store.upsertItem: unexpected version value: ${version}`,
 		);
-		this.#captureWrite(opts.routingHash, opts.hk, opts.sk, version, oldEst === 0);
+		this.#captureWrite(opts.routingHash, opts.hk, opts.sk, version, old === undefined);
 		// Exact stored size, measured by SQLite in the statement above.
-		const keyEstBytes = this.keySizes.change(opts.routingHash, opts.hk, oldEst, rows[0].est_row_bytes);
+		const newFacts = this.#facts(opts.hk, opts.sk, rows[0].item_bytes, opts.ttlAt);
+		const keyEstBytes = this.itemStats.change(opts.routingHash, old ?? null, newFacts) ?? 0;
 
 		return { version, keyEstBytes, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
 
 	/**
-	 * Deletes an item, keeping the deletion metadata and key-size estimate consistent.
-	 * `bumpTxOrderTsAlways` gives the transactional-delete behavior: it advances the transaction order watermark and
-	 * the estimate even when the row was already absent. The non-transactional path updates them only
+	 * Deletes an item, keeping the deletion metadata and the item facts consistent.
+	 * `bumpTxOrderTsAlways` gives the transactional-delete behavior: it advances the transaction order watermark
+	 * even when the row was already absent. The non-transactional path updates them only
 	 * when the statement deleted a row. `max_deleted_v` advances only when a row was removed, because
 	 * an absent row has no `v`; `max_delete_tx_order_ts` also advances for an absent row when
 	 * `bumpTxOrderTsAlways`. The metrics cover the DELETE statement ONLY.
@@ -1274,18 +1292,17 @@ export class PartitionStore {
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		// One read gives the size and the values that the deletion metadata records. The DELETE runs in
+		// One read gives the facts and the values that the deletion metadata records. The DELETE runs in
 		// the same synchronous call, so it removes this same row. Do not move the read into a RETURNING
 		// clause of the DELETE: RETURNING adds one row read to each delete, also when no row exists.
 		const before = tryOne(
-			this.#storage.sql.exec<{ est_row_bytes: number; v: number; last_read_ts: number }>(
-				`SELECT est_row_bytes, v, last_read_ts FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
+			this.#storage.sql.exec<{ item_bytes: number; ttl_epoch_utc_seconds: number | null; v: number; last_read_ts: number }>(
+				`SELECT item_bytes, ttl_epoch_utc_seconds, v, last_read_ts FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 				opts.routingHash,
 				opts.hk,
 				opts.sk,
 			),
 		);
-		const delEst = before?.est_row_bytes ?? 0;
 
 		const writeRes = this.#storage.sql.exec(
 			`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
@@ -1300,11 +1317,9 @@ export class PartitionStore {
 			deleteVersion = before.v + 1;
 			this.#raiseDeletionMetadata(Math.max(opts.txOrderTs, before.last_read_ts), deleteVersion);
 			this.#captureDelete(opts.routingHash, opts.hk, opts.sk, deleteVersion);
+			this.itemStats.change(opts.routingHash, this.#facts(opts.hk, opts.sk, before.item_bytes, before.ttl_epoch_utc_seconds), null);
 		} else if (opts.bumpTxOrderTsAlways) {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
-		}
-		if (deleted || opts.bumpTxOrderTsAlways) {
-			this.keySizes.subtract(opts.routingHash, delEst);
 		}
 		return { deleted, deleteVersion, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
@@ -1447,11 +1462,13 @@ export class PartitionStore {
 			let deletedBytes = 0;
 			let maxDeleteTxOrderTs = 0;
 			let maxDeletedV = 0;
+			// The facts of the deleted rows of each routingHash. Each bucket gets one write for the chunk.
+			const deletedFacts = new Map<string, { routingHash: RoutingHash; facts: ItemFacts }>();
 			for (const key of owned) {
 				const row = tryOne(
-					sql.exec<{ est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
+					sql.exec<{ item_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
 						`DELETE FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?
-						 RETURNING est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
+						 RETURNING item_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 						key.routingHash,
 						key.hk,
 						key.sk,
@@ -1461,12 +1478,18 @@ export class PartitionStore {
 					continue;
 				}
 				deletedRows++;
-				deletedBytes += row.est_row_bytes;
+				deletedBytes += row.item_bytes;
 				maxDeleteTxOrderTs = Math.max(maxDeleteTxOrderTs, row.ttl_epoch_utc_seconds * 1000 * TX_ORDER_TS_UNITS_PER_MS, row.last_read_ts);
 				// The expiry of a row at v has the delete revision v + 1, the same as a user delete.
 				maxDeletedV = Math.max(maxDeletedV, row.v + 1);
 				this.#captureDelete(key.routingHash, key.hk, key.sk, row.v + 1);
-				this.keySizes.subtract(key.routingHash, row.est_row_bytes);
+				const facts = this.#facts(key.hk, key.sk, row.item_bytes, row.ttl_epoch_utc_seconds);
+				const id = key.routingHash.toHex();
+				const group = deletedFacts.get(id);
+				deletedFacts.set(id, { routingHash: key.routingHash, facts: group ? addFacts(group.facts, facts) : facts });
+			}
+			for (const { routingHash, facts } of deletedFacts.values()) {
+				this.itemStats.subtract(routingHash, facts);
 			}
 			// The logical delete of an expired row happened at its expiry. The sweep records the removed
 			// rows the same as a user delete, so a later create of the key starts above their delete
@@ -1505,21 +1528,21 @@ export class PartitionStore {
 	 * explicit target, a retried row is skipped, and an `item_id` that another item already holds fails
 	 * the statement. The caller raises the item-id mark after the page (`raiseItemIdMark`).
 	 *
-	 * It reports whether it inserted the row and the exact `est_row_bytes` SQLite stored, so the caller
-	 * adds the same number to `key_size_estimates` in the same transaction. A skipped row reports
-	 * `inserted: false` and zero bytes, because a retry must not count a row twice. Maintaining the
-	 * estimates page by page is what removes the unbounded whole-table rebuild at the end of an import.
+	 * It returns the facts of the row that it inserted, so the caller adds them to `item_stats` in the
+	 * same transaction, or undefined for a skipped row, because a retry must not count a row twice.
+	 * Maintaining the facts page by page is what removes the unbounded whole-table rebuild at the end
+	 * of an import.
 	 */
-	insertItemIfAbsent(item: MigratedItem): { inserted: boolean; estRowBytes: number } {
+	insertItemIfAbsent(item: MigratedItem): ItemFacts | undefined {
 		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
-		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?9) so est_row_bytes can
+		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?9) so item_bytes can
 		// measure the same parameter.
 		const row = tryOne(
-			this.#storage.sql.exec<{ est_row_bytes: number }>(
-				`INSERT INTO items (routing_hash, item_id, hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
-			 VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${estRowBytesExpr("?9", "?2", "?3")}, ?9)
+			this.#storage.sql.exec<{ item_bytes: number }>(
+				`INSERT INTO items (routing_hash, item_id, hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, item_bytes, data)
+			 VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${itemBytesExpr("?9", "?2", "?3")}, ?9)
 			 ON CONFLICT (routing_hash, hk, sk) DO NOTHING
-			 RETURNING est_row_bytes`,
+			 RETURNING item_bytes`,
 				item.item_id,
 				item.hk,
 				item.sk,
@@ -1532,7 +1555,7 @@ export class PartitionStore {
 				item.routingHash,
 			),
 		);
-		return row ? { inserted: true, estRowBytes: row.est_row_bytes } : { inserted: false, estRowBytes: 0 };
+		return row && this.#facts(item.hk, item.sk, row.item_bytes, item.ttl_epoch_utc_seconds ?? null);
 	}
 
 	hasItemsForRoutingHash(routingHash: RoutingHash): boolean {
@@ -1541,8 +1564,7 @@ export class PartitionStore {
 
 	/**
 	 * One hash key of the first routingHash of `table`, and whether another routingHash follows it. Two
-	 * seeks of the index that leads with `routing_hash`: `idx_items_scan`, or the primary key of
-	 * `pending_transactions`. The second seek starts past every row of the first routingHash, so the cost
+	 * seeks of the primary key, which leads with `routing_hash`. The second seek starts past every row of the first routingHash, so the cost
 	 * does not depend on the row count.
 	 */
 	probeRoutingHashes(table: "items" | "pending_transactions"): { first: KeyBytes; more: boolean } | null {
@@ -1560,31 +1582,30 @@ export class PartitionStore {
 	}
 
 	/**
-	 * The rows of `routingHash` in the composite interval `[start, end)` of `(hk, sk)`, in that order, each
-	 * with its `est_row_bytes`. A null edge is unbounded. The generator reads one row each time the
-	 * caller asks for the next row. `idx_items_scan` covers the scan, so it does not read the item data.
+	 * The items of `routingHash` in the composite interval `[start, end)` of `(hk, sk)`, in that order, each
+	 * with its size facts. A null edge is unbounded. The generator reads one row each time the caller asks
+	 * for the next row. The scan reads the primary key and stops before `data` in each row.
 	 */
-	*compositeKeySizes(
+	*compositeKeyFacts(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
-	): Generator<{ hk: KeyBytes; sk: KeyBytes; bytes: number }> {
-		const conds = ["routing_hash = ?"];
-		const params: unknown[] = [routingHash];
-		if (start !== null) {
-			conds.push("(hk, sk) >= (?, ?)");
-			params.push(start.hk, start.sk);
-		}
-		if (end !== null) {
-			conds.push("(hk, sk) < (?, ?)");
-			params.push(end.hk, end.sk);
-		}
-		for (const row of this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; est_row_bytes: number }>(
-			`SELECT hk, sk, est_row_bytes FROM items INDEXED BY idx_items_scan WHERE ${conds.join(" AND ")} ORDER BY hk, sk`,
+	): Generator<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }> {
+		const { conds, params } = compositeSliceTerms(routingHash, start, end);
+		for (const row of this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; item_bytes: number; indexed: number }>(
+			`SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds IS NOT NULL AS indexed FROM items WHERE ${conds} ORDER BY hk, sk`,
 			...params,
 		)) {
-			yield { hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), bytes: row.est_row_bytes };
+			yield { hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), itemBytes: row.item_bytes, indexed: row.indexed === 1 };
 		}
+	}
+
+	/** The count of the items of `routingHash` in `[start, end)`, at most `limit`. It reads at most `limit` rows of the primary key. */
+	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number {
+		const { conds, params } = compositeSliceTerms(routingHash, start, end);
+		return one(
+			this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE ${conds} LIMIT ?)`, ...params, limit),
+		).n;
 	}
 
 	/**
@@ -1678,7 +1699,7 @@ export class PartitionStore {
 			currentSk = fromSqlKey(row.sk as ArrayBuffer);
 			// Without a plan the statement yields no `matched` column; every candidate matches.
 			const matched = plan === null ? true : row.matched === 1;
-			if (!consumer(currentSk, row.est_row_bytes as number, matched, decodePayload)) {
+			if (!consumer(currentSk, row.item_bytes as number, matched, decodePayload)) {
 				break;
 			}
 		}
@@ -1832,22 +1853,20 @@ export class PartitionStore {
 		rowsWritten: number;
 	} {
 		const plan = this.#updatePlan(opts.plan);
-		// Zero means the row is absent, never a row of zero size: est_row_bytes always carries both keys
-		// and EST_ROW_BYTES_K. It is also the right old value for the key_size_estimates delta of an
-		// item this statement creates. The size guard is then the only cause of a statement that writes
-		// no row, which is what lets it report that one cause.
-		const oldEst = this.#storedEstRowBytes(opts.routingHash, opts.hk, opts.sk);
+		// The size guard is the only cause of a statement that writes no row, which is what lets it
+		// report that one cause.
+		const old = this.#oldFacts(opts.routingHash, opts.hk, opts.sk);
 		const tail = new StatementTail(plan);
 		const txOrderTsParam = tail.param(opts.txOrderTs);
 		// WHICH TTL branch applies is known here, so the statement carries the branch it needs instead
 		// of testing a flag at run time. The value still binds.
 		const ttlSql = opts.ttlAt === undefined ? UPDATE_STORED_TTL_SQL : tail.param(opts.ttlAt);
 		// The rules of the id of a new row are the same as in upsertItem.
-		const itemIdParam = tail.param(oldEst === 0 ? this.#nextItemId() : -1);
+		const itemIdParam = tail.param(old === undefined ? this.#nextItemId() : -1);
 		const limitParam = tail.param(MAX_ITEM_BYTES);
 
 		// The start values of a new row follow the same rules, for the same reason, as upsertItem.
-		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
+		const writeRes = this.#storage.sql.exec<{ v: number; item_bytes: number; ttl_epoch_utc_seconds: number | null }>(
 			composeUpdateWriteStatement(plan, { txOrderTsParam, ttlSql, itemIdParam, limitParam }),
 			...tail.bindings(opts.hk, opts.sk, opts.routingHash),
 		);
@@ -1860,8 +1879,9 @@ export class PartitionStore {
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
 			`fokos/partition-store.updateItemSingleShot: unexpected version value: ${version}`,
 		);
-		this.#captureWrite(opts.routingHash, opts.hk, opts.sk, version, oldEst === 0);
-		const keyEstBytes = this.keySizes.change(opts.routingHash, opts.hk, oldEst, rows[0].est_row_bytes);
+		this.#captureWrite(opts.routingHash, opts.hk, opts.sk, version, old === undefined);
+		const newFacts = this.#facts(opts.hk, opts.sk, rows[0].item_bytes, rows[0].ttl_epoch_utc_seconds);
+		const keyEstBytes = this.itemStats.change(opts.routingHash, old ?? null, newFacts) ?? 0;
 
 		return {
 			version,
@@ -2251,9 +2271,9 @@ export class PartitionStore {
 				data: string | ArrayBuffer;
 				data_kind: number;
 				ttl_epoch_utc_seconds: number | null;
-				est_row_bytes: number;
+				item_bytes: number;
 			}>(
-				`SELECT v, data_kind, ttl_epoch_utc_seconds, est_row_bytes, data FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
+				`SELECT v, data_kind, ttl_epoch_utc_seconds, item_bytes, data FROM items WHERE routing_hash = ? AND hk = ? AND sk = ?`,
 				routingHash,
 				hk,
 				sk,
@@ -2267,7 +2287,7 @@ export class PartitionStore {
 			data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
 			kind: DATA_KINDS[row.data_kind],
 			ttlAt: row.ttl_epoch_utc_seconds,
-			estRowBytes: row.est_row_bytes,
+			itemBytes: row.item_bytes,
 		};
 	}
 

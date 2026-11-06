@@ -684,6 +684,9 @@ measured optimum:
   their index entry at each write.
 - A higher value does the opposite. The value must be greater than 0 and at most 1.
 - On a range leaf, the floor is `NULL`. `estimate >= NULL` is `NULL` in SQLite, so `promotionEstSql` gives `NULL`.
+- On a hash leaf at the depth limit, the floor is 0, so each bucket stores its estimate. That leaf cannot make a hash
+  split. After a cap reduction, a routingHash with `NULL` would stay hidden: the leaf refuses each write for size, and a
+  refused write writes no bucket. The cost is the promotion index entry at each write, on these leaves only.
 
 The cap comes from the policy, and the client sends the current policy with each request. Each statement that writes
 facts binds the floor from the policy that the partition holds when the statement runs. The index condition is a
@@ -804,7 +807,7 @@ changes only at a write of that routingHash. Thus the stored value of a row with
 | --- | --- | --- |
 | `T` goes up | Rows below the new floor keep a value until their next write. The lookup filters on `T`, so it does not return them | A few more index entries for a short time |
 | `T` goes down, to the old floor or above | Each routingHash at or above the new `T` was at or above the old floor at its last write, so it has a value. The lookup finds it with its exact estimate | None |
-| `T` goes down, below the old floor | A routingHash at or above the new `T` but below the old floor has `NULL` until its next write. The lookup can miss it. The leaf then makes a hash split, and the import of the child sets its value | One more copy of the routingHash |
+| `T` goes down, below the old floor | A routingHash at or above the new `T` but below the old floor has `NULL` until its next write. The lookup can miss it. The leaf then makes a hash split, and the import of the child sets its value. A leaf at the depth limit has the floor 0, so this case does not occur there | One more copy of the routingHash |
 
 With `promotionIndexFraction` 0.5, the lookup misses no candidate after a cap reduction of up to 2 times. A change of
 `promotionIndexFraction` has the same effects as a change of the floor.

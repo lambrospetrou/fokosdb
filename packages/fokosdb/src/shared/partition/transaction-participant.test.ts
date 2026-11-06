@@ -1,5 +1,5 @@
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../server/host-config.js";
 import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helpers.js";
@@ -10,7 +10,7 @@ import { KeyCodec } from "../../sharding/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import invariant from "../invariant.js";
 import { conditionTree, updateTree } from "../expression/test-fixtures.js";
-import { EST_ROW_BYTES_K } from "./item-size.js";
+import { estimate, itemFacts, ITEMS_MODEL } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
 import { ALL_ROWS, routingHashFor } from "../../../test/routing-hash.js";
@@ -31,6 +31,7 @@ type Harness = {
 	participant: TransactionParticipant;
 	store: PartitionStore;
 	clock: { now: number };
+	sql: SqlStorage;
 };
 
 // Runs `fn` against a TransactionParticipant over REAL Durable Object storage (vitest-pool-workers).
@@ -51,7 +52,7 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 			// This store has no routing, so it holds no copy of a moved key.
 			ownerCheck: () => () => true,
 		});
-		await fn({ participant, store, clock });
+		await fn({ participant, store, clock, sql: state.storage.sql });
 	});
 }
 
@@ -370,14 +371,15 @@ describe("TransactionParticipant - prepare", () => {
 			expect(JSON.parse(committed.row?.data as string)).toEqual({ name: "Alice", score: 20, role: "admin" });
 
 			// Commit stored the pending bytes verbatim, so the size prepare accepted is the size on disk.
-			expect(store.measureItemBytes({ hk: kb("user"), sk, data: pending?.data as Uint8Array, kind: "json" })).toBe(
-				materializedBytes + kb("user").byteLength + sk.byteLength + EST_ROW_BYTES_K,
-			);
+			const itemBytes = materializedBytes + kb("user").byteLength + sk.byteLength;
+			expect(store.measureItemBytes({ hk: kb("user"), sk, data: pending?.data as Uint8Array, kind: "json" })).toBe(itemBytes);
 
-			// An update reports its new key size like a put does, so promotion and split accounting see
-			// the growth of an item that the request itself never carried.
+			// An update reports the new estimate of its routingHash like a put does, so promotion and split
+			// accounting see the growth of an item that the request itself never carried. The item is the
+			// only item of its routingHash, and it has a TTL.
+			const keyBytes = kb("user").byteLength + sk.byteLength;
 			expect(commit.promotionCandidates).toEqual([
-				{ hashKey: kb("user"), keyEstBytes: materializedBytes + kb("user").byteLength + sk.byteLength + EST_ROW_BYTES_K },
+				{ hashKey: kb("user"), keyEstBytes: Math.ceil(estimate(ITEMS_MODEL, itemFacts(ITEMS_MODEL, { itemBytes, keyBytes, indexed: true }))) },
 			]);
 		});
 	});
@@ -882,6 +884,32 @@ describe("TransactionParticipant - commit", () => {
 		});
 	});
 
+	it("repairs the bucket of a committed delete when the stored facts disagree with the items, and logs it one time", async () => {
+		await withParticipant(({ participant, store, sql }) => {
+			const hk = kb("drift");
+			for (const sk of ["1", "2"]) {
+				store.upsertItem({ routingHash: P(hk), hk, sk: kb(sk), data: "value", kind: "text", ttlAt: null, txOrderTs: 1 });
+			}
+			const exact = store.itemStats.factsOf(P(hk));
+			// The bucket says one item of 1 byte: the delete would make its bytes negative.
+			sql.exec(`UPDATE item_stats SET item_count = 1, item_bytes = 1 WHERE routing_hash = ?`, P(hk));
+			const request = prepareReq({ items: [{ hashKey: hk, sortKey: kb("1"), operation: "delete" }] });
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			const commit = participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: request.transactionTimestamp, items: request.items });
+			expect(commit.response).toEqual({ outcome: "committed" });
+			const defects = errors.mock.calls.filter(([entry]) => (entry as { message?: string }).message?.includes("the facts of a bucket disagree with its items"));
+			expect(defects).toHaveLength(1);
+			expect(store.itemStats.factsOf(P(hk))).toEqual({
+				...exact,
+				itemCount: 1,
+				itemBytes: exact.itemBytes / 2,
+				keyBytes: exact.keyBytes / 2,
+			});
+		});
+	});
+
 	it("keeps the copies of a moved key, and asks the owner one time for each hash key", async () => {
 		await withParticipant(({ participant, store }) => {
 			const request = prepareReq({
@@ -1110,7 +1138,7 @@ describe("TransactionParticipant - cancel", () => {
 			expect(committed.row?.v).toBe(2);
 			expect(JSON.parse(committed.row?.data as string)).toEqual({ score: 999 });
 			// Applied exactly once, for this key. The byte arithmetic of the estimate is partition-store's
-			// own test: est_row_bytes measures the stored JSONB, which is not the length of the JSON text.
+			// own test: item_bytes measures the stored JSONB, which is not the length of the JSON text.
 			expect(commit.promotionCandidates).toHaveLength(1);
 			expect(commit.promotionCandidates[0].hashKey).toEqual(kb("user"));
 		});

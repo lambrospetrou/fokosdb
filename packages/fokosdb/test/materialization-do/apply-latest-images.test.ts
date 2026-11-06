@@ -20,7 +20,7 @@ type StoredImage = {
 	data: SqlStorageValue;
 	data_kind: number | null;
 	ttl_at: number | null;
-	est_row_bytes: number;
+	item_bytes: number;
 };
 
 /**
@@ -79,7 +79,7 @@ async function storedImage(stub: DurableObjectStub<FokosDBMaterializationDO>, ha
 		const row = state.storage.sql
 			.exec<
 				Omit<StoredImage, "deleted"> & { deleted_at_ms: number | null }
-			>(`SELECT revision, deleted_at_ms, data, data_kind, ttl_at, est_row_bytes FROM latest_items WHERE base_hk = ? AND base_sk = ?`, kb(hashKey), kb("s"))
+			>(`SELECT revision, deleted_at_ms, data, data_kind, ttl_at, item_bytes FROM latest_items WHERE base_hk = ? AND base_sk = ?`, kb(hashKey), kb("s"))
 			.toArray()[0];
 		if (!row) {
 			return undefined;
@@ -89,12 +89,20 @@ async function storedImage(stub: DurableObjectStub<FokosDBMaterializationDO>, ha
 	});
 }
 
-async function keyEstimate(stub: DurableObjectStub<FokosDBMaterializationDO>, hashKey: string): Promise<number | undefined> {
+type BucketFacts = { item_count: number; item_bytes: number; key_bytes: number; indexed_item_count: number; indexed_key_bytes: number };
+
+/** The facts of the bucket of the routingHash of `hashKey`. */
+async function bucketFacts(stub: DurableObjectStub<FokosDBMaterializationDO>, hashKey: string): Promise<BucketFacts | undefined> {
 	return await runInDurableObject(
 		stub,
 		(_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
-			state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb(hashKey)).toArray()[0]
-				?.est_bytes,
+			state.storage.sql
+				.exec<BucketFacts>(
+					`SELECT s.item_count, s.item_bytes, s.key_bytes, s.indexed_item_count, s.indexed_key_bytes
+					   FROM item_stats s WHERE s.routing_hash = (SELECT routing_hash FROM latest_items WHERE base_hk = ? LIMIT 1)`,
+					kb(hashKey),
+				)
+				.toArray()[0],
 	);
 }
 
@@ -120,8 +128,16 @@ describe("FokosDBMaterializationDO — applyLatestImages revisions", () => {
 
 		expect(await apply(m, { items: [live(0, "x", 5)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		expect(await storedImage(m.stub, "x")).toMatchObject({ revision: 5, data: "v5" });
-		// The update has the same size, so the estimate of the hash key stays the size of its one row.
-		expect(await keyEstimate(m.stub, "x")).toBe((await storedImage(m.stub, "x"))!.est_row_bytes);
+		// The bucket holds the one row, with its exact size.
+		const keyBytes = kb("x").byteLength + kb("s").byteLength;
+		expect((await storedImage(m.stub, "x"))!.item_bytes).toBe(new TextEncoder().encode("v5").byteLength + keyBytes);
+		expect(await bucketFacts(m.stub, "x")).toEqual({
+			item_count: 1,
+			item_bytes: (await storedImage(m.stub, "x"))!.item_bytes,
+			key_bytes: keyBytes,
+			indexed_item_count: 0,
+			indexed_key_bytes: 0,
+		});
 	});
 
 	it("a delete keeps a tombstone with no data, and a late live image below it does not create the item again", async () => {
@@ -129,14 +145,23 @@ describe("FokosDBMaterializationDO — applyLatestImages revisions", () => {
 		await mat.refuse("x");
 		const m = mat.at("x");
 		await apply(m, { items: [live(0, "x", 1, "x".repeat(1000))] });
-		const liveBytes = (await storedImage(m.stub, "x"))!.est_row_bytes;
-		expect(await keyEstimate(m.stub, "x")).toBe(liveBytes);
+		const keyBytes = kb("x").byteLength + kb("s").byteLength;
+		const liveBytes = (await storedImage(m.stub, "x"))!.item_bytes;
+		expect(liveBytes).toBe(1000 + keyBytes);
+		expect(await bucketFacts(m.stub, "x")).toMatchObject({ item_count: 1, item_bytes: liveBytes, indexed_item_count: 0 });
 
 		expect(await apply(m, { items: [deleted(0, "x", 2)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		const tombstone = (await storedImage(m.stub, "x"))!;
 		expect(tombstone).toMatchObject({ revision: 2, deleted: true, data: null, data_kind: null, ttl_at: null });
-		expect(tombstone.est_row_bytes).toBeLessThan(liveBytes);
-		expect(await keyEstimate(m.stub, "x")).toBe(tombstone.est_row_bytes);
+		// A tombstone has no data, so its size is its key bytes, and it is an indexed item.
+		expect(tombstone.item_bytes).toBe(keyBytes);
+		expect(await bucketFacts(m.stub, "x")).toEqual({
+			item_count: 1,
+			item_bytes: keyBytes,
+			key_bytes: keyBytes,
+			indexed_item_count: 1,
+			indexed_key_bytes: keyBytes,
+		});
 
 		expect(await apply(m, { items: [live(0, "x", 1)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		expect(await storedImage(m.stub, "x")).toMatchObject({ revision: 2, deleted: true });

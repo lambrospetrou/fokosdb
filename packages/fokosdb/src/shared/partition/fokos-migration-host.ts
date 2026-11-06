@@ -38,6 +38,7 @@ import type { FokosSlice } from "../../sharding/repartition-slice.js";
 import { compareRoutingHashes, type RoutingHash } from "../../sharding/hash-primitives.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
 import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js";
+import type { ItemFacts } from "./item-size.js";
 
 type BelongsToTarget = (key: RouteKey) => boolean;
 
@@ -191,19 +192,18 @@ export class FokosMigrationHost implements MigrationHost {
 
 	#applyItems(items: readonly MigratedItem[]): void {
 		const { store } = this.deps;
-		// The exact stored sizes, added per page, are what removes the whole-table estimate rebuild that
-		// used to close an import. A row already present contributes nothing, so a retried page cannot
-		// count its rows twice.
-		const added: Array<{ routingHash: RoutingHash; hk: KeyBytes; bytes: number }> = [];
+		// The exact facts, added per page, are what removes a whole-table recount at the end of an import.
+		// A row already present contributes nothing, so a retried page cannot count its rows twice.
+		const added: Array<{ routingHash: RoutingHash; facts: ItemFacts }> = [];
 		let maxItemId = 0;
 		for (const item of items) {
-			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);
-			if (inserted) {
-				added.push({ routingHash: item.routingHash, hk: item.hk, bytes: estRowBytes });
+			const facts = store.insertItemIfAbsent(item);
+			if (facts) {
+				added.push({ routingHash: item.routingHash, facts });
 			}
 			maxItemId = Math.max(maxItemId, item.item_id);
 		}
-		store.keySizes.addRows(added);
+		store.itemStats.addRows(added);
 		if (items.length > 0) {
 			store.raiseItemIdMark(maxItemId);
 		}

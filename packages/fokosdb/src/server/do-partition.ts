@@ -49,7 +49,7 @@ import {
 	type PromotionCandidate,
 } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry } from "../shared/partition/ttl-expiry.js";
-import { SplitPlanner } from "../shared/partition/split-planner.js";
+import { promotionFloor, SplitPlanner } from "../shared/partition/split-planner.js";
 import { promotedRoutingHashOf } from "../sharding/repartition-slice.js";
 import { resolvePartitionConfig, type PartitionDOConfig, type PartitionDOConfigOverrides } from "./host-config.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
@@ -423,14 +423,17 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			captureChanges: () => this.#captureEnabled(),
 			onChangeCaptured: () => this.#exporter.wake(),
 			gsiSortKey: () => isGsiShardGroup(this.fokos.routeContext().topology.shardGroup),
+			promotionFloor: () => promotionFloor(this.fokos.identity(), this.fokos.policy(), this.config()),
+			logParams: () => this.logParams(),
 		});
 		// A hash leaf probes `pending_transactions` when `items` is empty, because a pending payload
 		// moves with its key.
 		this.#splitPlanner = new SplitPlanner({
-			keySizes: this.#store.keySizes,
+			itemStats: this.#store.itemStats,
 			source: {
 				probeRoutingHashes: () => this.#store.probeRoutingHashes("items") ?? this.#store.probeRoutingHashes("pending_transactions"),
-				compositeKeySizes: (routingHash, start, end) => this.#store.compositeKeySizes(routingHash, start, end),
+				compositeKeyFacts: (routingHash, start, end) => this.#store.compositeKeyFacts(routingHash, start, end),
+				countItems: (routingHash, start, end, limit) => this.#store.countItems(routingHash, start, end, limit),
 			},
 			databaseSize: () => this.#store.databaseSize,
 			promotionFraction: () => this.config().promotionFraction,
@@ -1165,13 +1168,14 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					this.#store.raiseExportEpoch();
 				}
 			},
-			// A promotion deletes the size estimate of its routingHash. Every new write of it goes to
-			// the range tree, so nothing here reads the estimate again. Without the delete, it stays in the
-			// promotion list of the split decision until the cleanup deletes its last row, and the split
-			// behind it waits. The cleanup keeps its own delete of the estimate as a guard.
+			// A promotion deletes the buckets of its routingHash, one key range. Every new write of it goes
+			// to the range tree, so nothing here reads the facts again. Without the delete, it stays in the
+			// promotion lookup of the split decision until the cleanup deletes its last row, and the split
+			// behind it waits. The cleanup deletes the copies with no fact change, because the routingHash
+			// has no bucket, and keeps its own delete of the buckets as a guard.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
-					this.#store.keySizes.remove(promotedRoutingHashOf(plan));
+					this.#store.itemStats.remove(promotedRoutingHashOf(plan));
 				}
 			},
 			// Each target now holds its own locks, so the lock copies here are not necessary. The
@@ -1205,7 +1209,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				if (this.#store.hasItemsForRoutingHash(routingHash)) {
 					return false;
 				}
-				this.#store.keySizes.remove(routingHash);
+				this.#store.itemStats.remove(routingHash);
 				return true;
 			},
 			// Size backpressure gates on "write" alone, because only a write can grow a partition: a read

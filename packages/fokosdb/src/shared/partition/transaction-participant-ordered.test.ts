@@ -140,15 +140,15 @@ function snapshot(storage: DurableObjectStorage) {
 	return {
 		items: storage.sql
 			.exec(
-				`SELECT item_id, hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, est_row_bytes FROM items ORDER BY hk, sk`,
+				`SELECT item_id, hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, item_bytes FROM items ORDER BY hk, sk`,
 			)
 			.toArray()
 			.map((r) => ({ ...r, hk: b64(r.hk), sk: b64(r.sk), data: b64(r.data) })),
 		deletion: storage.sql.exec(`SELECT max_delete_tx_order_ts, max_deleted_v FROM deletion_metadata`).one(),
 		sizes: storage.sql
-			.exec(`SELECT hk, est_bytes FROM key_size_estimates ORDER BY hk`)
+			.exec(`SELECT * FROM item_stats ORDER BY routing_hash, lower_hk, lower_sk`)
 			.toArray()
-			.map((r) => ({ ...r, hk: b64(r.hk) })),
+			.map((r) => ({ ...r, routing_hash: b64(r.routing_hash), lower_hk: b64(r.lower_hk), lower_sk: b64(r.lower_sk) })),
 		locks: storage.sql.exec(`SELECT COUNT(*) AS n FROM pending_transactions`).one().n,
 	};
 }

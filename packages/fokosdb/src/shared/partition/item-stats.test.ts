@@ -1,0 +1,779 @@
+import { runInDurableObject } from "cloudflare:test";
+import fc from "fast-check";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import type { FokosDBPartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
+import { collidingHashKeys } from "../../../test/hash-digits.js";
+import { propertyRuns } from "../../../test/property-based/harness.js";
+import { updateTree } from "../expression/test-fixtures.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
+import { routingHashOf, type RoutingHash } from "../../sharding/hash-primitives.js";
+import type { FokosPartitionIdentity } from "../../sharding/route-context.js";
+import type { FokosDBPolicy } from "../partition-context.js";
+import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+import {
+	estimate,
+	ITEMS_MODEL,
+	itemFacts,
+	NO_FACTS,
+	overflowBytes,
+	overflowBytesSql,
+	validateStorageModel,
+	type ItemFacts,
+	type StorageModel,
+} from "./item-size.js";
+import { addFacts, ItemStats } from "./item-stats.js";
+import { PartitionStore, type ItemLinkId, type KeyRange } from "./partition-store.js";
+import { SplitPlanner } from "./split-planner.js";
+
+const GROUP = "fokos.p.item-stats-test";
+const P = (hk: KeyBytes) => routingHashOf(hk, GROUP);
+const kb = (v: string | Uint8Array) => KeyCodec.encode(v);
+const NO_SK = KeyCodec.encodeOptional(undefined);
+const ALL: KeyRange = { start: { routingHash: new Uint8Array() }, end: null };
+const DEFECT = "fokos/partition: the facts of a bucket disagree with its items, so they are counted again";
+
+// Each test of this file fails when the defect log appears, except the tests that break a bucket on
+// purpose and set `expectedDefects`.
+let errors: MockInstance<typeof console.error>;
+let expectedDefects = 0;
+beforeEach(() => {
+	errors = vi.spyOn(console, "error");
+	expectedDefects = 0;
+});
+afterEach(() => {
+	const defects = errors.mock.calls.filter(([entry]) => (entry as { message?: string } | undefined)?.message === DEFECT);
+	expect(defects).toHaveLength(expectedDefects);
+});
+
+type Ctx = { store: PartitionStore; state: DurableObjectState; setFloor: (floor: number | null) => void };
+
+async function withStore(floor: number | null, fn: (ctx: Ctx) => void | Promise<void>): Promise<void> {
+	const stub = testPartitionStub(`item-stats-test.${crypto.randomUUID()}`);
+	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
+		let current = floor;
+		const store = new PartitionStore(state.storage, { promotionFloor: () => current });
+		await fn({ store, state, setFloor: (f) => (current = f) });
+	});
+}
+
+type BucketRow = ItemFacts & { lowerHk: Uint8Array; lowerSk: Uint8Array; promotionEst: number | null; promotionType: string };
+
+/** Every bucket of `routingHash`, as the table stores it. */
+function buckets(state: DurableObjectState, routingHash: RoutingHash): BucketRow[] {
+	return state.storage.sql
+		.exec<{
+			lower_hk: ArrayBuffer;
+			lower_sk: ArrayBuffer;
+			item_count: number;
+			item_bytes: number;
+			key_bytes: number;
+			indexed_item_count: number;
+			indexed_key_bytes: number;
+			overflow_bytes: number;
+			promotion_est_bytes: number | null;
+			t: string;
+		}>(`SELECT *, typeof(promotion_est_bytes) AS t FROM item_stats WHERE routing_hash = ? ORDER BY lower_hk, lower_sk`, routingHash)
+		.toArray()
+		.map((r) => ({
+			lowerHk: new Uint8Array(r.lower_hk),
+			lowerSk: new Uint8Array(r.lower_sk),
+			itemCount: r.item_count,
+			itemBytes: r.item_bytes,
+			keyBytes: r.key_bytes,
+			indexedItemCount: r.indexed_item_count,
+			indexedKeyBytes: r.indexed_key_bytes,
+			overflowBytes: r.overflow_bytes,
+			promotionEst: r.promotion_est_bytes,
+			promotionType: r.t,
+		}));
+}
+
+/** The sums over the items of `routingHash`, from SQL over the item rows. */
+function sqlSums(state: DurableObjectState, routingHash: RoutingHash): ItemFacts {
+	const r = state.storage.sql
+		.exec<{ c: number; b: number; k: number; ic: number; ik: number; o: number }>(
+			`SELECT COUNT(*) AS c, COALESCE(SUM(item_bytes), 0) AS b, COALESCE(SUM(octet_length(hk) + octet_length(sk)), 0) AS k,
+			        COALESCE(SUM(ttl_epoch_utc_seconds IS NOT NULL), 0) AS ic,
+			        COALESCE(SUM(CASE WHEN ttl_epoch_utc_seconds IS NOT NULL THEN octet_length(hk) + octet_length(sk) ELSE 0 END), 0) AS ik,
+			        COALESCE(SUM(${overflowBytesSql(ITEMS_MODEL, "item_bytes")}), 0) AS o
+			   FROM items WHERE routing_hash = ?`,
+			routingHash,
+		)
+		.one();
+	return { itemCount: r.c, itemBytes: r.b, keyBytes: r.k, indexedItemCount: r.ic, indexedKeyBytes: r.ik, overflowBytes: r.o };
+}
+
+const rounded = (facts: ItemFacts) => Math.ceil(estimate(ITEMS_MODEL, facts));
+
+/**
+ * Checks invariants I1, I3 and I4 for `routingHash`: one first bucket while it has items, facts equal
+ * to the SQL sums, and `promotion_est_bytes` from the facts and `floor`.
+ */
+function expectExact(state: DurableObjectState, routingHash: RoutingHash, floor: number | null): void {
+	const sums = sqlSums(state, routingHash);
+	const rows = buckets(state, routingHash);
+	if (sums.itemCount === 0) {
+		expect(rows).toEqual([]);
+		return;
+	}
+	expect(rows).toHaveLength(1);
+	const [{ lowerHk, lowerSk, promotionEst, promotionType, ...facts }] = rows;
+	expect([lowerHk.byteLength, lowerSk.byteLength]).toEqual([0, 0]);
+	expect(facts).toEqual(sums);
+	const est = rounded(sums);
+	expect(promotionEst).toBe(floor !== null && est >= floor ? est : null);
+	expect(promotionType).toBe(promotionEst === null ? "null" : "integer");
+}
+
+const put = (store: PartitionStore, hk: KeyBytes, sk: KeyBytes, data: string | Uint8Array, opts: { kind?: "text" | "bytes" | "json"; ttlAt?: number | null } = {}) =>
+	store.upsertItem({
+		routingHash: P(hk),
+		hk,
+		sk,
+		data,
+		kind: opts.kind ?? (typeof data === "string" ? "text" : "bytes"),
+		ttlAt: opts.ttlAt ?? null,
+		txOrderTs: 1,
+	});
+const del = (store: PartitionStore, hk: KeyBytes, sk: KeyBytes) => store.deleteItem({ routingHash: P(hk), hk, sk, txOrderTs: 2 });
+
+describe("item-size", () => {
+	it("throws for a coefficient that is not a multiple of 1/4, or is negative", () => {
+		expect(() => validateStorageModel({ ...ITEMS_MODEL, keyIndexFactor: 1.3 })).toThrow(/keyIndexFactor .* multiple of 1\/4/);
+		expect(() => validateStorageModel({ ...ITEMS_MODEL, baseOverhead: -1 })).toThrow(/baseOverhead/);
+		expect(() => validateStorageModel({ ...ITEMS_MODEL, rowPayloadOverhead: 1.5 })).toThrow(/rowPayloadOverhead/);
+		expect(() => validateStorageModel({ ...ITEMS_MODEL, keyIndexFactor: 1.75 })).not.toThrow();
+	});
+
+	it("gives overflow bytes from the payload size, the same in JavaScript and in SQL", async () => {
+		const rpo = ITEMS_MODEL.rowPayloadOverhead;
+		const oro = ITEMS_MODEL.overflowRowOverhead;
+		// A payload of 1,002 bytes stays on the tree page.
+		expect(overflowBytes(ITEMS_MODEL, 1002 - rpo)).toBe(0);
+		// 1,003 bytes: 489 bytes stay, 514 go to one overflow page of 4,096 bytes.
+		expect(overflowBytes(ITEMS_MODEL, 1003 - rpo)).toBe(4096 - 514 + oro);
+		// 5,094 bytes: 1,002 bytes stay, and 4,092 bytes fill one overflow page.
+		expect(overflowBytes(ITEMS_MODEL, 5094 - rpo)).toBe(4 + oro);
+		// 5,095 bytes: 489 bytes stay, and 4,606 bytes need two overflow pages.
+		expect(overflowBytes(ITEMS_MODEL, 5095 - rpo)).toBe(2 * 4096 - 4606 + oro);
+
+		const sizes = [0, 1, 1002 - rpo, 1003 - rpo, 5094 - rpo, 5095 - rpo, MAX_ITEM_BYTES];
+		for (let n = 0; n < 30_000; n += 37) {
+			sizes.push(n);
+		}
+		await withStore(null, ({ state }) => {
+			for (const model of [ITEMS_MODEL, { ...ITEMS_MODEL, rowPayloadOverhead: 29, overflowRowOverhead: 69 }]) {
+				for (const size of sizes) {
+					const sql = state.storage.sql.exec<{ o: number }>(`SELECT ${overflowBytesSql(model, "?1")} AS o`, size).one().o;
+					expect(sql, `item_bytes ${size}`).toBe(overflowBytes(model, size));
+				}
+			}
+		});
+	});
+
+	it("gives a group the sum of the estimates of its items", () => {
+		const items = [
+			{ itemBytes: 10, keyBytes: 5, indexed: false },
+			{ itemBytes: 3000, keyBytes: 401, indexed: true },
+			{ itemBytes: MAX_ITEM_BYTES, keyBytes: 9, indexed: false },
+		];
+		const facts = items.map((item) => itemFacts(ITEMS_MODEL, item));
+		const group = facts.reduce(addFacts, { ...NO_FACTS });
+		expect(estimate(ITEMS_MODEL, group)).toBe(facts.reduce((sum, f) => sum + estimate(ITEMS_MODEL, f), 0));
+	});
+});
+
+describe("ItemStats on a hash leaf", () => {
+	it("keeps the exact facts through inserts, overwrites, compiled updates, TTL changes, and deletes", async () => {
+		await withStore(1, ({ store, state }) => {
+			const hk = kb("h");
+			const rh = P(hk);
+			const check = () => expectExact(state, rh, 1);
+			put(store, hk, kb("multibyte"), "héllo—✓");
+			check();
+			put(store, hk, kb(new Uint8Array([0, 1, 2])), new Uint8Array([1, 2, 3, 4]));
+			check();
+			put(store, hk, NO_SK, JSON.stringify({ a: [1, 2, 3], b: "text" }), { kind: "json" });
+			check();
+			expect(buckets(state, rh)[0].itemCount).toBe(3);
+			// An overwrite keeps the count, and an equal size changes nothing.
+			put(store, hk, kb("multibyte"), "a longer value than before");
+			check();
+			put(store, hk, kb("multibyte"), "a longer value than before");
+			check();
+			// TTL changes: null to a value, a value to another value, a value to null.
+			put(store, hk, kb("multibyte"), "x", { ttlAt: 2_000_000_000 });
+			check();
+			expect(buckets(state, rh)[0].indexedItemCount).toBe(1);
+			put(store, hk, kb("multibyte"), "x", { ttlAt: 2_000_000_001 });
+			check();
+			put(store, hk, kb("multibyte"), "x", { ttlAt: null });
+			check();
+			expect(buckets(state, rh)[0].indexedItemCount).toBe(0);
+			// A compiled update that creates an item, and one that changes it and keeps its TTL.
+			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.n" }, value: { val: "a long value" } }]);
+			store.updateItemSingleShot({ routingHash: rh, hk, sk: kb("created"), plan, txOrderTs: 3 });
+			check();
+			store.updateItemSingleShot({ routingHash: rh, hk, sk: kb("created"), plan, ttlAt: 2_000_000_000, txOrderTs: 4 });
+			check();
+			store.updateItemSingleShot({ routingHash: rh, hk, sk: kb("created"), plan, txOrderTs: 5 });
+			check();
+			expect(buckets(state, rh)[0].indexedItemCount).toBe(1);
+			// Deletes, and deletes of absent items in both forms.
+			expect(del(store, hk, kb("multibyte")).deleted).toBe(true);
+			check();
+			del(store, hk, kb("absent"));
+			store.deleteItem({ routingHash: rh, hk, sk: kb("absent"), txOrderTs: 6, bumpTxOrderTsAlways: true });
+			check();
+			for (const sk of [kb(new Uint8Array([0, 1, 2])), NO_SK, kb("created")]) {
+				del(store, hk, sk);
+				check();
+			}
+			expect(buckets(state, rh)).toEqual([]);
+		});
+	});
+
+	it("counts the overflow pages of large items, and returns to no bucket when the items go", async () => {
+		await withStore(null, ({ store, state }) => {
+			const hk = kb("big");
+			const rh = P(hk);
+			const keyBytes = hk.byteLength + kb("s0").byteLength;
+			const rpo = ITEMS_MODEL.rowPayloadOverhead;
+			const dataFor = (itemBytes: number) => "x".repeat(itemBytes - keyBytes);
+			const sizes = [1002 - rpo, 1003 - rpo, 5094 - rpo, 5095 - rpo, MAX_ITEM_BYTES];
+			for (const [i, size] of sizes.entries()) {
+				put(store, hk, kb(`s${i}`), dataFor(size));
+				expectExact(state, rh, null);
+			}
+			expect(buckets(state, rh)[0].overflowBytes).toBe(sizes.reduce((sum, size) => sum + overflowBytes(ITEMS_MODEL, size), 0));
+			// Updates across the overflow limit, in both directions.
+			put(store, hk, kb("s0"), dataFor(1003 - rpo));
+			expectExact(state, rh, null);
+			put(store, hk, kb("s1"), dataFor(1002 - rpo));
+			expectExact(state, rh, null);
+			for (let i = 0; i < sizes.length; i++) {
+				del(store, hk, kb(`s${i}`));
+				expectExact(state, rh, null);
+			}
+			expect(buckets(state, rh)).toEqual([]);
+		});
+	});
+
+	it("subtracts the facts of expired items, with one bucket for each routingHash", async () => {
+		await withStore(null, ({ store, state }) => {
+			const [a, b] = [kb("a"), kb("b")];
+			put(store, a, kb("1"), "x", { ttlAt: 10 });
+			put(store, a, kb("2"), "yy", { ttlAt: 20 });
+			put(store, a, kb("3"), "zzz", { ttlAt: 1_000 });
+			put(store, a, kb("4"), "w");
+			put(store, b, kb("1"), "x", { ttlAt: 15 });
+			expect(store.deleteExpiredItems(100, 10, () => true)).toMatchObject({ deletedRows: 3 });
+			expectExact(state, P(a), null);
+			expectExact(state, P(b), null);
+			expect(buckets(state, P(a))[0]).toMatchObject({ itemCount: 2, indexedItemCount: 1 });
+			expect(buckets(state, P(b))).toEqual([]);
+		});
+	});
+
+	it("shares one bucket between two hash keys of one routingHash", async () => {
+		await withStore(null, ({ store, state }) => {
+			const [a, b] = collidingHashKeys(GROUP).map((raw) => KeyCodec.encode(raw));
+			expect(P(b)).toEqual(P(a));
+			put(store, a, kb("s"), "a-data");
+			put(store, b, kb("s"), "b-data");
+			put(store, b, kb("t"), "b-data");
+			expectExact(state, P(a), null);
+			expect(buckets(state, P(a))[0].itemCount).toBe(3);
+			del(store, a, kb("s"));
+			expectExact(state, P(a), null);
+		});
+	});
+
+	it("adds the facts of an import page one time, and a retried page adds nothing", async () => {
+		await withStore(null, async ({ store: source }) => {
+			const hks = [kb("p"), kb("q")];
+			for (const hk of hks) {
+				for (const sk of ["1", "2", "3"]) {
+					put(source, hk, kb(sk), `data-${sk}`, { ttlAt: sk === "2" ? 2_000_000_000 : null });
+				}
+			}
+			const page = [...source.queryItemsPage(null, 100, ALL)];
+			await withStore(null, ({ store, state }) => {
+				const apply = () =>
+					store.itemStats.addRows(
+						page.flatMap((item) => {
+							const facts = store.insertItemIfAbsent(item);
+							return facts ? [{ routingHash: item.routingHash, facts }] : [];
+						}),
+					);
+				apply();
+				apply();
+				for (const hk of hks) {
+					expectExact(state, P(hk), null);
+					expect(buckets(state, P(hk))[0]).toMatchObject({ itemCount: 3, indexedItemCount: 1 });
+				}
+			});
+		});
+	});
+
+	it("after a promotion removes the buckets, a delete of a copy creates no bucket and changes no other bucket", async () => {
+		await withStore(null, ({ store, state }) => {
+			const [moved, stays] = [kb("moved"), kb("stays")];
+			put(store, moved, kb("1"), "x", { ttlAt: 10 });
+			put(store, moved, kb("2"), "x");
+			put(store, stays, kb("1"), "x");
+			const before = buckets(state, P(stays));
+			store.itemStats.remove(P(moved));
+			del(store, moved, kb("2"));
+			store.deleteExpiredItems(100, 10, () => true);
+			store.deleteItemsBatchForRoutingHash(P(moved), 10);
+			expect(buckets(state, P(moved))).toEqual([]);
+			expect(buckets(state, P(stays))).toEqual(before);
+		});
+	});
+
+	it("repairs a bucket whose facts disagree with its items, in the same write, and logs the defect one time", async () => {
+		expectedDefects = 2;
+		await withStore(null, ({ store, state }) => {
+			const hk = kb("drift");
+			const rh = P(hk);
+			put(store, hk, kb("1"), "aaaa");
+			put(store, hk, kb("2"), "bbbb");
+			// The bucket says one item: the delete of both would make the count negative.
+			state.storage.sql.exec(`UPDATE item_stats SET item_count = 1, item_bytes = 1 WHERE routing_hash = ?`, rh);
+			del(store, hk, kb("1"));
+			expectExact(state, rh, null);
+			expect(errors.mock.calls.filter(([e]) => (e as { message?: string }).message === DEFECT)).toEqual([
+				[expect.objectContaining({ routingHash: rh.toHex(), stored: expect.objectContaining({ itemCount: 1, itemBytes: 1 }) })],
+			]);
+			// A present item whose routingHash has no bucket: the overwrite counts the bucket again.
+			store.itemStats.remove(rh);
+			put(store, hk, kb("2"), "a longer value");
+			expectExact(state, rh, null);
+		});
+	});
+
+	it("keeps exact facts through random writes, deletes, TTL expiries, and import pages", async () => {
+		const [ca, cb] = collidingHashKeys(GROUP).map((raw) => KeyCodec.encode(raw));
+		const hks = [kb("a"), kb("b"), ca, cb];
+		const sks = [NO_SK, kb("1"), kb("2"), kb(new Uint8Array([7]))];
+		const arbOp = fc.oneof(
+			fc.record({
+				op: fc.constant("put" as const),
+				hk: fc.nat(hks.length - 1),
+				sk: fc.nat(sks.length - 1),
+				size: fc.oneof(fc.nat(50), fc.integer({ min: 900, max: 6000 })),
+				ttl: fc.option(fc.integer({ min: 1, max: 100 }), { nil: null }),
+			}),
+			fc.record({ op: fc.constant("delete" as const), hk: fc.nat(hks.length - 1), sk: fc.nat(sks.length - 1) }),
+			fc.record({ op: fc.constant("expire" as const), now: fc.integer({ min: 1, max: 100 }) }),
+			fc.record({ op: fc.constant("import" as const), hk: fc.nat(hks.length - 1), count: fc.integer({ min: 1, max: 3 }) }),
+		);
+		await withStore(200, async ({ store, state }) => {
+			let importId = 1_000_000;
+			await fc.assert(
+				fc.asyncProperty(fc.array(arbOp, { minLength: 1, maxLength: 25 }), async (ops) => {
+					state.storage.sql.exec(`DELETE FROM items`);
+					state.storage.sql.exec(`DELETE FROM item_stats`);
+					for (const op of ops) {
+						if (op.op === "put") {
+							put(store, hks[op.hk], sks[op.sk], "x".repeat(op.size), { ttlAt: op.ttl });
+						} else if (op.op === "delete") {
+							del(store, hks[op.hk], sks[op.sk]);
+						} else if (op.op === "expire") {
+							store.deleteExpiredItems(op.now, 100, () => true);
+						} else {
+							const hk = hks[op.hk];
+							const rows = Array.from({ length: op.count }, (_, i) => ({
+								item_id: (importId++) as ItemLinkId,
+								routingHash: P(hk),
+								hk,
+								sk: kb(`import-${importId}-${i}`),
+								data: "imported",
+								kind: "text" as const,
+								ttl_epoch_utc_seconds: null,
+								v: 1,
+								last_read_ts: 1,
+								last_write_ts: 1,
+							}));
+							store.itemStats.addRows(
+								rows.flatMap((row) => {
+									const facts = store.insertItemIfAbsent(row);
+									return facts ? [{ routingHash: row.routingHash, facts }] : [];
+								}),
+							);
+						}
+						for (const hk of hks) {
+							expectExact(state, P(hk), 200);
+						}
+					}
+				}),
+				{ numRuns: propertyRuns(30) },
+			);
+		});
+	});
+});
+
+describe("ItemStats statements", () => {
+	/** An `ItemStats` over the storage of `state` that records the cursor of each statement. */
+	function recorded(state: DurableObjectState, floor: number | null, model: StorageModel = ITEMS_MODEL) {
+		const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+		const storage = {
+			sql: {
+				exec: (query: string, ...bindings: unknown[]) => {
+					const cursor = state.storage.sql.exec(query, ...bindings);
+					cursors.push(cursor);
+					return cursor;
+				},
+			},
+		} as unknown as DurableObjectStorage;
+		const stats = new ItemStats(storage, {
+			table: "items",
+			hkColumn: "hk",
+			skColumn: "sk",
+			indexedCondition: "ttl_epoch_utc_seconds IS NOT NULL",
+			model,
+			promotionFloor: () => floor,
+			logName: "fokos/partition",
+			logParams: () => ({}),
+		});
+		const take = () => {
+			const metrics = cursors.map((c) => ({ rowsRead: c.rowsRead, rowsWritten: c.rowsWritten }));
+			cursors.length = 0;
+			return metrics;
+		};
+		return { stats, take };
+	}
+	const one = (itemBytes: number) => itemFacts(ITEMS_MODEL, { itemBytes, keyBytes: 4, indexed: false });
+
+	it("writes 1 row below the promotion floor, 2 at or above it, and 1 with no floor", async () => {
+		await withStore(null, ({ state }) => {
+			const below = recorded(state, 1_000_000);
+			below.stats.change(P(kb("below")), null, one(100));
+			below.stats.change(P(kb("below")), one(100), one(200));
+			expect(below.take().map((m) => m.rowsWritten)).toEqual([1, 1]);
+
+			const above = recorded(state, 10);
+			above.stats.change(P(kb("above")), null, one(100));
+			above.stats.change(P(kb("above")), one(100), one(200));
+			expect(above.take().map((m) => m.rowsWritten)).toEqual([2, 2]);
+
+			// A value that falls below the floor removes its index entry only.
+			const falls = recorded(state, 250);
+			falls.stats.change(P(kb("above")), one(200), one(100));
+			expect(falls.take().map((m) => m.rowsWritten)).toEqual([1]);
+
+			// A range leaf has no floor, also for the first bucket.
+			const range = recorded(state, null);
+			range.stats.change(P(kb("range")), null, one(100));
+			range.stats.change(P(kb("range")), one(100), one(200));
+			expect(range.take().map((m) => m.rowsWritten)).toEqual([1, 1]);
+			expect(buckets(state, P(kb("range")))[0].promotionEst).toBeNull();
+		});
+	});
+
+	it("stores the facts of two coefficient sets the same, and only the stored estimate differs", async () => {
+		await withStore(null, ({ state }) => {
+			const other: StorageModel = { ...ITEMS_MODEL, baseOverhead: 152, keyIndexFactor: 2.5 };
+			const a = recorded(state, 0, ITEMS_MODEL);
+			const b = recorded(state, 0, other);
+			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 300, keyBytes: 21, indexed: true });
+			a.stats.change(P(kb("a")), null, facts);
+			b.stats.change(P(kb("b")), null, facts);
+			const [ra, rb] = [buckets(state, P(kb("a")))[0], buckets(state, P(kb("b")))[0]];
+			const strip = ({ promotionEst: _p, promotionType: _t, ...rest }: BucketRow) => rest;
+			expect(strip(ra)).toEqual(strip(rb));
+			expect(ra.promotionEst).toBe(Math.ceil(estimate(ITEMS_MODEL, facts)));
+			expect(rb.promotionEst).toBe(Math.ceil(estimate(other, facts)));
+		});
+	});
+
+	it("binds the deltas as JavaScript numbers and stores the rounded estimate as an integer", async () => {
+		await withStore(null, ({ state }) => {
+			const { stats } = recorded(state, 0);
+			// 1.25 * 5 key bytes gives an estimate with a part of a byte.
+			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 10, keyBytes: 5, indexed: false });
+			const exact = estimate(ITEMS_MODEL, facts);
+			expect(exact % 1).toBe(0.25);
+			expect(stats.change(P(kb("f")), null, facts)).toBe(Math.ceil(exact));
+			expect(stats.change(P(kb("f")), facts, { ...facts, itemBytes: 11 })).toBe(Math.ceil(exact + 1));
+			const [row] = buckets(state, P(kb("f")));
+			expect(row).toMatchObject({ promotionEst: Math.ceil(exact + 1), promotionType: "integer" });
+		});
+	});
+});
+
+describe("ItemStats promotion lookup", () => {
+	const MB = 1024 * 1024;
+	const hashIdentity = {
+		schema: 1,
+		ref: { partitionId: "00", doName: "leaf" },
+		kind: "hash",
+		hash: { rootIndex: 0, path: [], depth: 0, start: new Uint8Array(8), end: null },
+		topology: { shardGroup: GROUP, rootTreesN: 4, hashSplitN: 4 },
+		routingHashSeed: "",
+	} as unknown as FokosPartitionIdentity;
+	const policy = { hashSplitConditions: { maxSizeMb: 1 }, rangeSplitConditions: { maxSizeMb: 1 } } as FokosDBPolicy;
+
+	/** The reference: each first bucket at or above `threshold` by its estimate from the facts, largest first, up to 5. */
+	function reference(state: DurableObjectState, threshold: number): RoutingHash[] {
+		return state.storage.sql
+			.exec<{ routing_hash: ArrayBuffer }>(`SELECT routing_hash FROM item_stats`)
+			.toArray()
+			.map(({ routing_hash }) => new Uint8Array(routing_hash) as RoutingHash)
+			.map((rh) => ({ rh, est: rounded(sqlSums(state, rh)) }))
+			.filter(({ est }) => est >= threshold)
+			.sort((x, y) => y.est - x.est)
+			.slice(0, 5)
+			.map(({ rh }) => rh);
+	}
+	const lookup = (store: PartitionStore, threshold: number) => store.itemStats.largestAtLeast(threshold, 5).map((hk) => P(hk));
+	/** The lookup equals the reference. Two routingHashes with equal estimates can come back in either order. */
+	function expectLookup(store: PartitionStore, state: DurableObjectState, threshold: number): void {
+		const ests = (rhs: RoutingHash[]) => rhs.map((rh) => rounded(sqlSums(state, rh)));
+		expect(ests(lookup(store, threshold))).toEqual(ests(reference(state, threshold)));
+	}
+
+	it("finds the routingHashes at or above T by estimate, and not by item bytes", async () => {
+		await withStore(0, ({ store, state }) => {
+			// Many small items with long keys: few item bytes, but a large estimate from the key copies and
+			// the fixed bytes of each item.
+			const longKey = (i: number) => kb(`${"k".repeat(200)}-${i}`);
+			for (let i = 0; i < 40; i++) {
+				put(store, kb("small"), longKey(i), "");
+			}
+			// A few large items: more item bytes, a smaller estimate.
+			for (let i = 0; i < 2; i++) {
+				put(store, kb("large"), kb(`${i}`), "x".repeat(8000));
+			}
+			// Items of 1 byte with no data.
+			for (let i = 0; i < 300; i++) {
+				put(store, kb("tiny"), kb(String.fromCharCode(33 + (i % 90)) + String.fromCharCode(33 + Math.floor(i / 90))), "");
+			}
+			const small = sqlSums(state, P(kb("small")));
+			const large = sqlSums(state, P(kb("large")));
+			expect(small.itemBytes).toBeLessThan(large.itemBytes);
+			expect(rounded(small)).toBeGreaterThan(rounded(large));
+			for (const threshold of [0, rounded(large), rounded(large) + 1, rounded(sqlSums(state, P(kb("tiny")))), rounded(small), rounded(small) + 1]) {
+				expectLookup(store, state, threshold);
+			}
+		});
+	});
+
+	it("reports a rounded estimate against a T with a part of a byte, the same on the write path and in the lookup", async () => {
+		await withStore(0, ({ store }) => {
+			const hk = kb("frac");
+			// An odd count of key bytes on an item with a TTL gives an estimate with a part of a byte.
+			const sk = kb("abc");
+			const keyBytes = hk.byteLength + sk.byteLength;
+			expect(keyBytes % 2).toBe(1);
+			const { keyEstBytes } = put(store, hk, sk, "0123456789", { ttlAt: 2_000_000_000 });
+			const exact = estimate(ITEMS_MODEL, itemFacts(ITEMS_MODEL, { itemBytes: 10 + keyBytes, keyBytes, indexed: true }));
+			expect(exact % 1).not.toBe(0);
+			expect(keyEstBytes).toBe(Math.ceil(exact));
+			const planner = (threshold: number) =>
+				new SplitPlanner({
+					itemStats: store.itemStats,
+					source: { probeRoutingHashes: () => null, compositeKeyFacts: () => [], countItems: () => 0 },
+					databaseSize: () => 0,
+					promotionFraction: () => threshold / MB,
+					rangeSplitN: () => 4,
+					logName: "test",
+					logParams: () => ({}),
+				});
+			// T between the exact estimate and its rounded value: both checks report it.
+			const below = (exact + Math.ceil(exact)) / 2;
+			expect(planner(below).promotionCandidates(hashIdentity, policy, [{ hashKey: hk, keyEstBytes }])).toEqual([{ hashKey: hk }]);
+			expect(store.itemStats.largestAtLeast(below, 5)).toEqual([hk]);
+			// T above the rounded value: neither reports it.
+			const above = Math.ceil(exact) + 0.25;
+			expect(planner(above).promotionCandidates(hashIdentity, policy, [{ hashKey: hk, keyEstBytes }])).toEqual([]);
+			expect(store.itemStats.largestAtLeast(above, 5)).toEqual([]);
+		});
+	});
+
+	it("stores the estimate only at or above the floor, from NULL to a value when a write reaches the floor", async () => {
+		await withStore(null, ({ store, state, setFloor }) => {
+			const hk = kb("grows");
+			put(store, hk, kb("1"), "x".repeat(100));
+			const floor = rounded(sqlSums(state, P(hk))) + 50;
+			setFloor(floor);
+			put(store, hk, kb("1"), "x".repeat(110));
+			expect(buckets(state, P(hk))[0].promotionEst).toBeNull();
+			put(store, hk, kb("1"), "x".repeat(200));
+			expectExact(state, P(hk), floor);
+			expect(buckets(state, P(hk))[0].promotionEst).toBe(rounded(sqlSums(state, P(hk))));
+		});
+	});
+
+	it("follows a cap reduction of 2 times with no write, and finds a routingHash below the old floor after its next write", async () => {
+		await withStore(null, ({ store, state, setFloor }) => {
+			const T = 20_000;
+			setFloor(T / 2);
+			// Estimates of about 0.3 T to 1.5 T.
+			const sizes = [6, 8, 12, 16, 22, 30];
+			for (const [i, n] of sizes.entries()) {
+				for (let j = 0; j < n; j++) {
+					put(store, kb(`rh${i}`), kb(`${j}`), "x".repeat(900));
+				}
+			}
+			expectLookup(store, state, T);
+			// A cap reduction of 2 times: the new T is the old floor.
+			expectLookup(store, state, T / 2);
+			// A cap reduction of 3 times: a routingHash between the new T and the old floor keeps NULL.
+			const third = T / 3;
+			const missed = reference(state, third).filter((rh) => !lookup(store, third).some((x) => x.toHex() === rh.toHex()));
+			expect(missed.length).toBeGreaterThan(0);
+			for (const rh of missed) {
+				expect(buckets(state, rh)[0].promotionEst).toBeNull();
+			}
+			// The next write of that routingHash binds the floor of the new policy.
+			setFloor(third / 2);
+			const i = sizes.findIndex((_, k) => P(kb(`rh${k}`)).toHex() === missed[0].toHex());
+			put(store, kb(`rh${i}`), kb("new"), "x");
+			expect(lookup(store, third).map((rh) => rh.toHex())).toContain(missed[0].toHex());
+			// A raise of the cap: the lookup filters on T, so it returns no routingHash below the new T.
+			for (const rh of lookup(store, 4 * T)) {
+				expect(rounded(sqlSums(state, rh))).toBeGreaterThanOrEqual(4 * T);
+			}
+			expectLookup(store, state, 4 * T);
+		});
+	});
+
+	it("takes the next write or import to replace a stale estimate", async () => {
+		await withStore(0, async ({ store, state }) => {
+			const hk = kb("stale");
+			put(store, hk, kb("1"), "x".repeat(500));
+			put(store, hk, kb("2"), "x".repeat(500));
+			// A value of other coefficients, as after a coefficient change.
+			state.storage.sql.exec(`UPDATE item_stats SET promotion_est_bytes = 7 WHERE routing_hash = ?`, P(hk));
+			const page = [...store.queryItemsPage(null, 100, ALL)];
+			put(store, hk, kb("1"), "x".repeat(501));
+			expectExact(state, P(hk), 0);
+			// An import builds its buckets with the coefficients of the code.
+			await withStore(0, ({ store: child, state: childState }) => {
+				child.itemStats.addRows(
+					page.flatMap((item) => {
+						const facts = child.insertItemIfAbsent(item);
+						return facts ? [{ routingHash: item.routingHash, facts }] : [];
+					}),
+				);
+				expectExact(childState, P(hk), 0);
+			});
+		});
+	});
+
+	it("reads at most 5 index entries and 5 seeks of one row, for each leaf size", async () => {
+		await withStore(0, ({ store, state }) => {
+			for (let i = 0; i < 40; i++) {
+				put(store, kb(`rh${i}`), kb("1"), "x".repeat(100 + i));
+				put(store, kb(`rh${i}`), kb("2"), "x");
+			}
+			const sql = state.storage.sql;
+			const index = sql.exec(`SELECT routing_hash FROM item_stats WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT ?2`, 0, 5);
+			const rows = index.toArray();
+			expect(rows).toHaveLength(5);
+			expect(index.rowsRead).toBeLessThanOrEqual(5);
+			for (const { routing_hash } of rows) {
+				const seek = sql.exec(`SELECT hk FROM items WHERE routing_hash = ?1 ORDER BY hk, sk LIMIT 1`, routing_hash);
+				seek.toArray();
+				expect(seek.rowsRead).toBeLessThanOrEqual(1);
+			}
+			expectLookup(store, state, 0);
+		});
+	});
+
+	it("uses the partial index for the lookup and the primary key for the cleanup and the recount", async () => {
+		await withStore(0, ({ state }) => {
+			const plan = (query: string, ...params: unknown[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+			expect(plan(`SELECT routing_hash FROM item_stats WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT ?2`, 1, 5)).toBe(
+				"SEARCH item_stats USING COVERING INDEX item_stats_promotion (promotion_est_bytes>?)",
+			);
+			expect(plan(`DELETE FROM item_stats WHERE routing_hash = ?1`, P(kb("a")))).toBe("SEARCH item_stats USING PRIMARY KEY (routing_hash=?)");
+			expect(plan(`SELECT COUNT(*), SUM(item_bytes) FROM items WHERE routing_hash = ?1`, P(kb("a")))).toBe(
+				"SEARCH items USING PRIMARY KEY (routing_hash=?)",
+			);
+			expect(plan(`SELECT hk FROM items WHERE routing_hash = ?1 ORDER BY hk, sk LIMIT 1`, P(kb("a")))).toBe(
+				"SEARCH items USING PRIMARY KEY (routing_hash=?)",
+			);
+		});
+	});
+
+	it("returns the sixth routingHash first after deletes reduce the first five", async () => {
+		await withStore(0, ({ store, state }) => {
+			const counts = [10, 9, 8, 7, 6, 5];
+			for (const [i, n] of counts.entries()) {
+				for (let j = 0; j < n; j++) {
+					put(store, kb(`rh${i}`), kb(`${j}`), "x".repeat(10 * 1024));
+				}
+			}
+			const T = 10 * 1024;
+			expect(lookup(store, T).map((rh) => rh.toHex())).toEqual(counts.slice(0, 5).map((_, i) => P(kb(`rh${i}`)).toHex()));
+			for (const [i, n] of counts.slice(0, 5).entries()) {
+				for (let j = 1; j < n; j++) {
+					del(store, kb(`rh${i}`), kb(`${j}`));
+				}
+			}
+			expect(lookup(store, T)[0].toHex()).toBe(P(kb("rh5")).toHex());
+			expectLookup(store, state, T);
+		});
+	});
+
+	it("reports the same estimate on the write path and in the lookup, for long sort keys and TTLs", async () => {
+		await withStore(0, ({ store }) => {
+			const hk = kb("ttl");
+			let last = 0;
+			for (let i = 0; i < 20; i++) {
+				last = put(store, hk, kb(`${"s".repeat(300)}${i}`), "x".repeat(i * 37), { ttlAt: i % 2 === 0 ? 2_000_000_000 : null }).keyEstBytes;
+			}
+			expect(store.itemStats.largestAtLeast(last, 5)).toEqual([hk]);
+			expect(store.itemStats.largestAtLeast(last + 1, 5)).toEqual([]);
+		});
+	});
+});
+
+describe("SplitPlanner decision of a range leaf", () => {
+	const policy = { hashSplitConditions: { maxSizeMb: 1 }, rangeSplitConditions: { maxSizeMb: 1 } } as FokosDBPolicy;
+	const rangeIdentity = {
+		schema: 1,
+		ref: { partitionId: "00", doName: "leaf" },
+		kind: "range",
+		range: { routingHash: P(kb("r")), start: null, end: null },
+		topology: { shardGroup: GROUP, rootTreesN: 4, hashSplitN: 4 },
+		routingHashSeed: "",
+	} as unknown as FokosPartitionIdentity;
+
+	it("answers a split with at least N items and the floor with fewer, and does not scan the slice", () => {
+		const counted: number[] = [];
+		const planner = (items: number) =>
+			new SplitPlanner({
+				itemStats: {} as ItemStats,
+				source: {
+					probeRoutingHashes: () => null,
+					compositeKeyFacts: () => {
+						throw new Error("the decision must not scan the slice");
+					},
+					countItems: (_rh, _start, _end, limit) => {
+						counted.push(limit);
+						return Math.min(items, limit);
+					},
+				},
+				databaseSize: () => 2 * 1024 * 1024,
+				promotionFraction: () => 0.25,
+				rangeSplitN: () => 4,
+				logName: "test",
+				logParams: () => ({}),
+			});
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		expect(planner(10).evaluateSplit({ identity: rangeIdentity, policy })).toEqual({});
+		expect(planner(3).evaluateSplit({ identity: rangeIdentity, policy })).toBe(false);
+		expect(error).toHaveBeenCalledWith(expect.objectContaining({ reason: "fewer_items" }));
+		expect(counted).toEqual([4, 4]);
+	});
+});

@@ -1,16 +1,17 @@
 /**
  * The SQLite storage of `FokosDBMaterializationDO`: the latest image of each base item that the partition
  * accepted, the highest epoch of each producer, the change positions that the targets read, the state
- * of each target, and the failed items of each target. The size estimate of each base hash key
- * belongs to `keySizes`, which this store updates in the transaction of each image write.
+ * of each target, and the failed items of each target. The item facts of each routingHash belong to
+ * `itemStats`, which this store updates in the transaction of each image write.
  */
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind } from "../../shared/types.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../sharding/key-codec.js";
 import { asRoutingHash, type RoutingHash } from "../../sharding/hash-primitives.js";
 import { exists, one, tryOne } from "../../shared/sql-cursor.js";
-import { JSON_KIND_CODE } from "../../shared/partition/item-size.js";
-import { KeySizeStats } from "../../shared/partition/key-size-stats.js";
+import { itemBytesExpr, JSON_KIND_CODE } from "../../shared/partition/item-bytes.js";
+import { itemFacts, LATEST_ITEMS_MODEL, type ItemFacts } from "../../shared/partition/item-size.js";
+import { ItemStats } from "../../shared/partition/item-stats.js";
 import { intervalTerms, type KeyRange, type StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosTargetDefinition } from "./targets.js";
 import { materializedPlanBindings } from "../../shared/expression/bindings.js";
@@ -50,25 +51,6 @@ export type LatestImage =
 	  }
 	| { opIndex: number; hashKey: KeyBytes; sortKey: KeyBytes; revision: number; deleted: true };
 
-/**
- * The fixed part of the `est_row_bytes` of a `latest_items` row. The migration tells what it covers.
- * test/storage-bench/row-bytes.workerd-bench.ts measures the storage of a row. With the key copies of
- * `latestRowBytesExpr`, the fixed part was 39 to 88 bytes for a live row and 61 to 102 bytes for a
- * tombstone, 69 on average.
- */
-const LATEST_ROW_BYTES_K = 70;
-
-/**
- * The SQL of the `est_row_bytes` of a `latest_items` row, with the base hash key in `?1` and the base
- * sort key in `?2`. `routingHashParam` holds the routingHash. `dataParam` holds the stored `data` value,
- * or is null for a tombstone. The routingHash and the keys count two times for a live row (the row and the
- * `item_id` index) and three times for a tombstone (also the tombstone index).
- */
-function latestRowBytesExpr(routingHashParam: string, dataParam: string | null): string {
-	const keys = `(octet_length(${routingHashParam}) + octet_length(?1) + octet_length(?2))`;
-	return dataParam === null ? `3 * ${keys} + ${LATEST_ROW_BYTES_K}` : `octet_length(${dataParam}) + 2 * ${keys} + ${LATEST_ROW_BYTES_K}`;
-}
-
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 1,
@@ -91,13 +73,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - No rule reads the value of `deleted_at_ms`. It orders the garbage collection of tombstones.
 		//   The tombstone index declares `item_id`, because a WITHOUT ROWID index holds only the primary
 		//   key after its own columns, and the collection seeks on `(deleted_at_ms, item_id)`.
-		// - `est_row_bytes` is the size estimate of the row, from `latestRowBytesExpr`. The routingHash and the
-		//   keys count two times, because the `item_id` index holds a second copy of them, and three
-		//   times for a tombstone, because the tombstone index holds a third. LATEST_ROW_BYTES_K gives the
-		//   fixed part: the integer columns, the record header, and the fixed part of the index entries.
-		//   It is an approximate value for size accounting (promotion, split, batch and page budgets). A
-		//   change of the formula needs no data migration, because each change of a key size estimate
-		//   uses the value that the row stores.
+		// - `item_bytes` is the exact size of the item, from `itemBytesExpr`: the stored data plus the key
+		//   bytes. A tombstone has no data, so its `item_bytes` is its key bytes. The batch budget of a
+		//   target uses it. The storage estimate of promotion and range splits prices the facts of
+		//   `item_stats`, which `itemStats` keeps from this value. It is before `data`, so a size read
+		//   stops before `data`. The table needs no other index for the size reads: it is in storage order.
 		//
 		// item_id_counter:
 		// - One row (id = 1). Every `item_id` below `hwm` is reserved.
@@ -137,7 +117,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 newest_seq         INTEGER,
                 data_kind          INTEGER,
                 ttl_at             INTEGER,
-                est_row_bytes      INTEGER NOT NULL DEFAULT 0,
+                item_bytes         INTEGER NOT NULL,
                 data               ANY,
 
                 PRIMARY KEY (routing_hash, base_hk, base_sk),
@@ -221,8 +201,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 const ITEM_ID_BLOCK = 1024;
 
 export class MaterializationStore {
-	/** The size estimate of each base hash key. */
-	readonly keySizes: KeySizeStats;
+	/** The item facts of each routingHash. */
+	readonly itemStats: ItemStats;
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
 	/**
@@ -233,9 +213,24 @@ export class MaterializationStore {
 	#nextId = 0;
 	#idLimit = 0;
 
-	constructor(storage: DurableObjectStorage) {
+	constructor(
+		storage: DurableObjectStorage,
+		opts: { promotionFloor: () => number | null; logParams: () => Record<string, unknown> } = {
+			promotionFloor: () => null,
+			logParams: () => ({}),
+		},
+	) {
 		this.#storage = storage;
-		this.keySizes = new KeySizeStats(storage);
+		this.itemStats = new ItemStats(storage, {
+			table: "latest_items",
+			hkColumn: "base_hk",
+			skColumn: "base_sk",
+			indexedCondition: "deleted_at_ms IS NOT NULL",
+			model: LATEST_ITEMS_MODEL,
+			promotionFloor: opts.promotionFloor,
+			logName: "fokos/materialization",
+			logParams: opts.logParams,
+		});
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
@@ -245,7 +240,7 @@ export class MaterializationStore {
 
 	runMigrations(): void {
 		this.#migrations.runAllSync();
-		this.keySizes.runMigrations();
+		this.itemStats.runMigrations();
 	}
 
 	get databaseSize(): number {
@@ -320,26 +315,39 @@ export class MaterializationStore {
 	/** The stored image of a base item, live or tombstone, or undefined when it has none. */
 	storedImage(routingHash: RoutingHash, hk: KeyBytes, sk: KeyBytes): StoredImage | undefined {
 		const row = tryOne(
-			this.#storage.sql.exec<{ item_id: number; revision: number; est_row_bytes: number; newest_seq: number | null }>(
-				`SELECT item_id, revision, est_row_bytes, newest_seq FROM latest_items WHERE routing_hash = ? AND base_hk = ? AND base_sk = ?`,
+			this.#storage.sql.exec<{ item_id: number; revision: number; item_bytes: number; deleted: number; newest_seq: number | null }>(
+				`SELECT item_id, revision, item_bytes, deleted_at_ms IS NOT NULL AS deleted, newest_seq
+				   FROM latest_items WHERE routing_hash = ? AND base_hk = ? AND base_sk = ?`,
 				routingHash,
 				hk,
 				sk,
 			),
 		);
-		return row && { itemId: row.item_id, revision: row.revision, estRowBytes: row.est_row_bytes, newestSeq: row.newest_seq };
+		return (
+			row && {
+				itemId: row.item_id,
+				revision: row.revision,
+				facts: this.#facts(hk, sk, row.item_bytes, row.deleted === 1),
+				newestSeq: row.newest_seq,
+			}
+		);
+	}
+
+	/** The facts of one item of `latest_items`. A tombstone is an indexed item. */
+	#facts(hk: KeyBytes, sk: KeyBytes, itemBytes: number, tombstone: boolean): ItemFacts {
+		return itemFacts(this.itemStats.model, { itemBytes, keyBytes: hk.byteLength + sk.byteLength, indexed: tombstone });
 	}
 
 	/**
 	 * Stores an image that is newer than the stored one (`current`, or undefined when there is none).
 	 * A live image replaces the data. A delete keeps the row as a tombstone with no data, so the space
 	 * of the payload is free at once, and the tombstone holds the revision that a late export must not
-	 * go below. The size estimate of the base hash key changes by the difference of the two row sizes.
+	 * go below. The facts of the routingHash change by the difference of the facts of the two rows.
 	 *
 	 * When targets exist, the image gets a change position (see `#planPosition`), and the `retry` rows
 	 * of the item become due, because the cursor skips the item while it has a `retry` row.
 	 *
-	 * Returns the new size estimate of the base hash key when the size of the row changed, or undefined.
+	 * Returns the rounded estimate of the routingHash after the write, or undefined when it has no bucket.
 	 */
 	putLatestImage(
 		routingHash: RoutingHash,
@@ -355,13 +363,13 @@ export class MaterializationStore {
 		// row holds.
 		const newItemId = current === undefined ? this.#nextItemId() : -1;
 		const row = image.deleted
-			? sql.exec<{ item_id: number; est_row_bytes: number }>(
-					`INSERT INTO latest_items (routing_hash, base_hk, base_sk, item_id, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?6, ?1, ?2, ?7, ?3, ?4, ?5, NULL, NULL, ${latestRowBytesExpr("?6", null)}, NULL)
+			? sql.exec<{ item_id: number; item_bytes: number }>(
+					`INSERT INTO latest_items (routing_hash, base_hk, base_sk, item_id, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, item_bytes, data)
+					 VALUES (?6, ?1, ?2, ?7, ?3, ?4, ?5, NULL, NULL, ${itemBytesExpr(null, "?1", "?2")}, NULL)
 					 ON CONFLICT (routing_hash, base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = excluded.deleted_at_ms, newest_seq = excluded.newest_seq,
-					   data_kind = NULL, ttl_at = NULL, est_row_bytes = excluded.est_row_bytes, data = NULL
-					 RETURNING item_id, est_row_bytes`,
+					   data_kind = NULL, ttl_at = NULL, item_bytes = excluded.item_bytes, data = NULL
+					 RETURNING item_id, item_bytes`,
 					image.hashKey,
 					image.sortKey,
 					image.revision,
@@ -370,13 +378,13 @@ export class MaterializationStore {
 					routingHash,
 					newItemId,
 				)
-			: sql.exec<{ item_id: number; est_row_bytes: number }>(
-					`INSERT INTO latest_items (routing_hash, base_hk, base_sk, item_id, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-					 VALUES (?8, ?1, ?2, ?9, ?3, NULL, ?7, ?4, ?5, ${latestRowBytesExpr("?8", "?6")}, ?6)
+			: sql.exec<{ item_id: number; item_bytes: number }>(
+					`INSERT INTO latest_items (routing_hash, base_hk, base_sk, item_id, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, item_bytes, data)
+					 VALUES (?8, ?1, ?2, ?9, ?3, NULL, ?7, ?4, ?5, ${itemBytesExpr("?6", "?1", "?2")}, ?6)
 					 ON CONFLICT (routing_hash, base_hk, base_sk) DO UPDATE SET
 					   revision = excluded.revision, deleted_at_ms = NULL, newest_seq = excluded.newest_seq,
-					   data_kind = excluded.data_kind, ttl_at = excluded.ttl_at, est_row_bytes = excluded.est_row_bytes, data = excluded.data
-					 RETURNING item_id, est_row_bytes`,
+					   data_kind = excluded.data_kind, ttl_at = excluded.ttl_at, item_bytes = excluded.item_bytes, data = excluded.data
+					 RETURNING item_id, item_bytes`,
 					image.hashKey,
 					image.sortKey,
 					image.revision,
@@ -387,7 +395,7 @@ export class MaterializationStore {
 					routingHash,
 					newItemId,
 				);
-		const { item_id: itemId, est_row_bytes: newEst } = row.one();
+		const { item_id: itemId, item_bytes: itemBytes } = row.one();
 		if (position?.kind === "insert") {
 			sql.exec(`INSERT INTO change_positions (seq, item_id, prev_seq) VALUES (?, ?, ?)`, position.seq, itemId, position.prevSeq);
 		} else if (position?.kind === "move") {
@@ -401,9 +409,8 @@ export class MaterializationStore {
 				itemId,
 			);
 		}
-		// The ingest reads the new estimate only when the key grew, so an equal size needs no read.
-		const oldEst = current?.estRowBytes ?? 0;
-		return newEst === oldEst ? undefined : this.keySizes.change(routingHash, image.hashKey, oldEst, newEst);
+		const newFacts = this.#facts(image.hashKey, image.sortKey, itemBytes, image.deleted);
+		return this.itemStats.change(routingHash, current?.facts ?? null, newFacts) ?? undefined;
 	}
 
 	/**
@@ -609,8 +616,8 @@ export class MaterializationStore {
 	/** The due `retry` items of a target, the oldest backoff first. */
 	dueRetryItems(targetId: string, nowMs: number, limit: number): TargetItemRef[] {
 		const items: TargetItemRef[] = [];
-		for (const row of this.#storage.sql.exec<{ item_id: number; est_row_bytes: number }>(
-			`SELECT r.item_id, li.est_row_bytes
+		for (const row of this.#storage.sql.exec<{ item_id: number; item_bytes: number }>(
+			`SELECT r.item_id, li.item_bytes
 			 FROM target_retry r JOIN latest_items li ON li.item_id = r.item_id
 			 WHERE r.target_id = ? AND r.kind = 'retry' AND r.not_before <= ?
 			 ORDER BY r.not_before LIMIT ?`,
@@ -618,7 +625,7 @@ export class MaterializationStore {
 			nowMs,
 			limit,
 		)) {
-			items.push({ itemId: row.item_id, estRowBytes: row.est_row_bytes });
+			items.push({ itemId: row.item_id, itemBytes: row.item_bytes });
 		}
 		return items;
 	}
@@ -631,10 +638,10 @@ export class MaterializationStore {
 		const rows = this.#storage.sql.exec<{
 			seq: number;
 			item_id: number;
-			est_row_bytes: number;
+			item_bytes: number;
 			in_retry: number;
 		}>(
-			`SELECT p.seq, p.item_id, li.est_row_bytes,
+			`SELECT p.seq, p.item_id, li.item_bytes,
 			   EXISTS (SELECT 1 FROM target_retry r WHERE r.target_id = ?2 AND r.item_id = p.item_id AND r.kind = 'retry') AS in_retry
 			 FROM change_positions p JOIN latest_items li ON li.item_id = p.item_id
 			 WHERE p.seq > ?1 ORDER BY p.seq LIMIT ?3`,
@@ -646,7 +653,7 @@ export class MaterializationStore {
 			yield {
 				seq: row.seq,
 				itemId: row.item_id,
-				estRowBytes: row.est_row_bytes,
+				itemBytes: row.item_bytes,
 				inRetry: row.in_retry === 1,
 			};
 		}
@@ -865,7 +872,7 @@ export class MaterializationStore {
 	}
 
 	/**
-	 * Deletes a tombstone and its positions, and subtracts its size from the estimate of its hash key.
+	 * Deletes a tombstone and its positions, and subtracts its facts from the bucket of its routingHash.
 	 * It deletes nothing while a target has a `retry` or `violation` row for the item. The caller
 	 * checks that each target read the newest position of the item, so each position of the item is
 	 * at or below each cursor. Returns true when it deleted the tombstone.
@@ -882,9 +889,9 @@ export class MaterializationStore {
 			return false;
 		}
 		const row = tryOne(
-			sql.exec<{ routing_hash: ArrayBuffer; base_hk: ArrayBuffer; est_row_bytes: number; newest_seq: number | null }>(
+			sql.exec<{ routing_hash: ArrayBuffer; base_hk: ArrayBuffer; base_sk: ArrayBuffer; item_bytes: number; newest_seq: number | null }>(
 				`DELETE FROM latest_items WHERE item_id = ? AND deleted_at_ms IS NOT NULL
-				 RETURNING routing_hash, base_hk, est_row_bytes, newest_seq`,
+				 RETURNING routing_hash, base_hk, base_sk, item_bytes, newest_seq`,
 				itemId,
 			),
 		);
@@ -892,7 +899,8 @@ export class MaterializationStore {
 			return false;
 		}
 		this.#deletePositions(row.newest_seq);
-		this.keySizes.subtract(asRoutingHash(new Uint8Array(row.routing_hash)), row.est_row_bytes);
+		const facts = this.#facts(asKey(row.base_hk), asKey(row.base_sk), row.item_bytes, true);
+		this.itemStats.change(asRoutingHash(new Uint8Array(row.routing_hash)), facts, null);
 		return true;
 	}
 
@@ -972,29 +980,29 @@ export class MaterializationStore {
 
 	/**
 	 * The items of `routingHash` in the composite interval `[start, end)` of `(base_hk, base_sk)`, in that
-	 * order, each with its `est_row_bytes`. A null edge is unbounded. It reads one row at a time.
+	 * order, each with its size facts. A null edge is unbounded. It reads one row at a time, and stops
+	 * before `data` in each row.
 	 */
-	*compositeKeySizes(
+	*compositeKeyFacts(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
-	): Generator<{ hk: KeyBytes; sk: KeyBytes; bytes: number }> {
-		const conds = ["routing_hash = ?"];
-		const params: unknown[] = [routingHash];
-		if (start !== null) {
-			conds.push("(base_hk, base_sk) >= (?, ?)");
-			params.push(start.hk, start.sk);
-		}
-		if (end !== null) {
-			conds.push("(base_hk, base_sk) < (?, ?)");
-			params.push(end.hk, end.sk);
-		}
-		for (const row of this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer; est_row_bytes: number }>(
-			`SELECT base_hk, base_sk, est_row_bytes FROM latest_items WHERE ${conds.join(" AND ")} ORDER BY base_hk, base_sk`,
+	): Generator<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }> {
+		const { conds, params } = latestSliceTerms(routingHash, start, end);
+		for (const row of this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer; item_bytes: number; indexed: number }>(
+			`SELECT base_hk, base_sk, item_bytes, deleted_at_ms IS NOT NULL AS indexed FROM latest_items WHERE ${conds} ORDER BY base_hk, base_sk`,
 			...params,
 		)) {
-			yield { hk: asKey(row.base_hk), sk: asKey(row.base_sk), bytes: row.est_row_bytes };
+			yield { hk: asKey(row.base_hk), sk: asKey(row.base_sk), itemBytes: row.item_bytes, indexed: row.indexed === 1 };
 		}
+	}
+
+	/** The count of the items of `routingHash` in `[start, end)`, at most `limit`. It reads at most `limit` rows of the primary key. */
+	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number {
+		const { conds, params } = latestSliceTerms(routingHash, start, end);
+		return one(
+			this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM latest_items WHERE ${conds} LIMIT ?)`, ...params, limit),
+		).n;
 	}
 
 	// ─── migration ────────────────────────────────────────────────────────────
@@ -1021,10 +1029,10 @@ export class MaterializationStore {
 			newest_seq: number | null;
 			data_kind: number | null;
 			ttl_at: number | null;
-			est_row_bytes: number;
+			item_bytes: number;
 			data: string | ArrayBuffer | null;
 		}>(
-			`SELECT item_id, routing_hash, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data
+			`SELECT item_id, routing_hash, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, item_bytes, data
 			 FROM latest_items WHERE ${conds.join(" AND ")} ORDER BY routing_hash, base_hk, base_sk LIMIT ?`,
 			...params,
 			limit,
@@ -1089,16 +1097,19 @@ export class MaterializationStore {
 	 * earlier try of the same page, and the insert keeps it. The conflict target stays
 	 * `(routing_hash, base_hk, base_sk)`, so an `item_id` that another item holds fails the
 	 * statement, as in `PartitionStore.insertItemIfAbsent`. The caller raises the item-id mark after the
-	 * page (`raiseItemIdMark`). Returns true when it inserted the item.
+	 * page (`raiseItemIdMark`). Returns the facts of the item when it inserted it, so the caller adds
+	 * them to `item_stats` in the same transaction, or undefined when the item was present.
 	 */
-	insertMigratedItem(item: MigratedLatestItem): boolean {
+	insertMigratedItem(item: MigratedLatestItem): ItemFacts | undefined {
 		const sql = this.#storage.sql;
+		// A tombstone has no data.
+		const itemBytes = `CASE WHEN ?9 IS NULL THEN ${itemBytesExpr(null, "?2", "?3")} ELSE ${itemBytesExpr("?9", "?2", "?3")} END`;
 		const inserted = tryOne(
-			sql.exec(
-				`INSERT INTO latest_items (item_id, routing_hash, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, est_row_bytes, data)
-				 VALUES (?1, ?11, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+			sql.exec<{ item_bytes: number }>(
+				`INSERT INTO latest_items (item_id, routing_hash, base_hk, base_sk, revision, deleted_at_ms, newest_seq, data_kind, ttl_at, item_bytes, data)
+				 VALUES (?1, ?10, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${itemBytes}, ?9)
 				 ON CONFLICT (routing_hash, base_hk, base_sk) DO NOTHING
-				 RETURNING item_id`,
+				 RETURNING item_bytes`,
 				item.item_id,
 				item.hk,
 				item.sk,
@@ -1107,13 +1118,12 @@ export class MaterializationStore {
 				item.newest_seq,
 				item.data_kind,
 				item.ttl_at,
-				item.est_row_bytes,
 				item.data,
 				item.routingHash,
 			),
 		);
 		if (inserted === undefined) {
-			return false;
+			return undefined;
 		}
 		for (const position of item.positions) {
 			sql.exec(`INSERT INTO change_positions (seq, item_id, prev_seq) VALUES (?1, ?2, ?3)`, position.seq, item.item_id, position.prev_seq);
@@ -1139,7 +1149,7 @@ export class MaterializationStore {
 				key.index_sk,
 			);
 		}
-		return true;
+		return this.#facts(item.hk, item.sk, inserted.item_bytes, item.deleted_at_ms !== null);
 	}
 
 	/** Up to `limit` producer fences after `after`, in `producer_id` order. */
@@ -1216,7 +1226,7 @@ export class MaterializationStore {
 }
 
 /** The stored image of a base item. `newestSeq` is its newest change position, or null. */
-export type StoredImage = { itemId: number; revision: number; estRowBytes: number; newestSeq: number | null };
+export type StoredImage = { itemId: number; revision: number; facts: ItemFacts; newestSeq: number | null };
 
 /**
  * The positions of one target that the ingest reads: its cursor, and the highest position that its
@@ -1227,7 +1237,7 @@ export type TargetPositions = { cursor: number; read: number };
 export type TargetRow = { targetId: string; cursorSeq: number; epoch: number; isBatchOpen: boolean };
 
 /** An item that a target step can send: its ID and its size, and no data. */
-export type TargetItemRef = { itemId: number; estRowBytes: number };
+export type TargetItemRef = { itemId: number; itemBytes: number };
 
 export type TargetPosition = TargetItemRef & { seq: number; inRetry: boolean };
 
@@ -1257,7 +1267,8 @@ export type MigratedLatestItem = {
 	newest_seq: number | null;
 	data_kind: number | null;
 	ttl_at: number | null;
-	est_row_bytes: number;
+	/** The `item_bytes` of the source row. The page budget reads it; the insert measures the row again. */
+	item_bytes: number;
 	data: string | Uint8Array | null;
 	positions: Array<{ seq: number; prev_seq: number | null }>;
 	retries: MigratedRetryRow[];
@@ -1287,6 +1298,25 @@ export type MigratedState = {
 };
 
 /** The KV field name of the snapshot of a promoted hash key. */
+
+/** The `WHERE` terms of the items of `routingHash` in the composite interval `[start, end)`. A null edge is unbounded. */
+function latestSliceTerms(
+	routingHash: RoutingHash,
+	start: FokosCompositeKey | null,
+	end: FokosCompositeKey | null,
+): { conds: string; params: unknown[] } {
+	const conds = ["routing_hash = ?"];
+	const params: unknown[] = [routingHash];
+	if (start !== null) {
+		conds.push("(base_hk, base_sk) >= (?, ?)");
+		params.push(start.hk, start.sk);
+	}
+	if (end !== null) {
+		conds.push("(base_hk, base_sk) < (?, ?)");
+		params.push(end.hk, end.sk);
+	}
+	return { conds: conds.join(" AND "), params };
+}
 
 function asKey(value: ArrayBuffer): KeyBytes {
 	return KeyCodec.asKeyBytes(new Uint8Array(value));

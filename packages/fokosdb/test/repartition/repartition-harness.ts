@@ -34,6 +34,7 @@ import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import { planRangeBoundaries } from "../../src/shared/partition/split-planner.js";
+import { estimate } from "../../src/shared/partition/item-size.js";
 import {
 	RepartitionSource,
 	RepartitionTarget,
@@ -246,13 +247,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					routingHashForKey: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
 				}),
 				computeRangeBoundaries: ({ routingHash, start, end, childCount }) => {
-					const plan = planRangeBoundaries(
-						store.keySizes.bytesOf(routingHash),
+					const model = store.itemStats.model;
+					return planRangeBoundaries(
+						model,
+						estimate(model, store.itemStats.factsOf(routingHash)),
 						childCount,
 						start,
-						store.compositeKeySizes(routingHash, start, end),
+						store.compositeKeyFacts(routingHash, start, end),
 					);
-					return "boundaries" in plan ? plan.boundaries : null;
 				},
 				onRepartitionCutover: (plan) => {
 					const calls = cutovers.get(doName) ?? [];
@@ -271,7 +273,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					if (store.hasItemsForRoutingHash(routingHash)) {
 						return false;
 					}
-					store.keySizes.remove(routingHash);
+					store.itemStats.remove(routingHash);
 					return true;
 				},
 			},
@@ -335,12 +337,17 @@ export function lockCount(store: PartitionStore, hk: string): number {
 	return [...store.queryPendingTxPage(null, 1_000_000, ALL_ROWS)].filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
 }
 
-/** The running size estimate of one hash key, which the import maintains page by page. */
+/** The `item_bytes` sum of the bucket of the routingHash of one hash key, which the import maintains page by page. */
 export function keySizeEstimate(storage: DurableObjectStorage, hk: string): number | undefined {
-	return storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb(hk)).toArray()[0]?.est_bytes;
+	return storage.sql
+		.exec<{ item_bytes: number }>(
+			`SELECT item_bytes FROM item_stats WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`,
+			kb(hk),
+		)
+		.toArray()[0]?.item_bytes;
 }
 
 /** The bytes SQLite actually stored for one hash key, which the estimate must match exactly. */
 export function storedBytes(storage: DurableObjectStorage, hk: string): number {
-	return storage.sql.exec<{ n: number }>(`SELECT COALESCE(SUM(est_row_bytes), 0) AS n FROM items WHERE hk = ?`, kb(hk)).one().n;
+	return storage.sql.exec<{ n: number }>(`SELECT COALESCE(SUM(item_bytes), 0) AS n FROM items WHERE hk = ?`, kb(hk)).one().n;
 }

@@ -30,9 +30,13 @@ import type { FokosSlice } from "../../sharding/repartition-slice.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
 import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js";
 import type { MaterializationStore, MigratedLatestItem, MigratedState } from "./materialization-store.js";
+import type { ItemFacts } from "../../shared/partition/item-size.js";
 
 /** The page size estimate of a position or of a `target_retry` row, beside the item. */
 const LINKED_ROW_BYTES = 64;
+
+/** The page size estimate of the fixed fields of an item: its id, revision, timestamps, kind, and TTL. */
+const ITEM_FIELD_BYTES = 64;
 
 /** Where the host has got to. The flow stores it as it is and never reads inside it. */
 export type MaterializationHostCursor =
@@ -76,7 +80,9 @@ export class MaterializationMigrationHost implements MigrationHost {
 					read: (c, limit, i) => store.queryMigrationItems(c, limit, i, minSeq),
 					cursorOf: (row) => ({ routingHash: row.routingHash, hk: row.hk, sk: row.sk }),
 					estimateBytes: (row) =>
-						row.est_row_bytes +
+						row.routingHash.byteLength +
+						row.item_bytes +
+						ITEM_FIELD_BYTES +
 						(row.positions.length + row.retries.length) * LINKED_ROW_BYTES +
 						(row.indexKeys ?? []).reduce((n, key) => n + LINKED_ROW_BYTES + key.index_hk.length + key.index_sk.length, 0),
 				};
@@ -122,15 +128,16 @@ export class MaterializationMigrationHost implements MigrationHost {
 			case "items": {
 				// An item that is present already contributes nothing, so a retried page does not count
 				// its rows two times.
-				const added: Array<{ routingHash: RoutingHash; hk: MigratedLatestItem["hk"]; bytes: number }> = [];
+				const added: Array<{ routingHash: RoutingHash; facts: ItemFacts }> = [];
 				let maxItemId = 0;
 				for (const item of p.items) {
-					if (store.insertMigratedItem(item)) {
-						added.push({ routingHash: item.routingHash, hk: item.hk, bytes: item.est_row_bytes });
+					const facts = store.insertMigratedItem(item);
+					if (facts) {
+						added.push({ routingHash: item.routingHash, facts });
 					}
 					maxItemId = Math.max(maxItemId, item.item_id);
 				}
-				store.keySizes.addRows(added);
+				store.itemStats.addRows(added);
 				if (p.items.length > 0) {
 					store.raiseItemIdMark(maxItemId);
 				}

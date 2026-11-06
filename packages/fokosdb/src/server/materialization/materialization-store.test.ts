@@ -128,17 +128,18 @@ describe("MaterializationStore — change positions", () => {
 	});
 });
 
-describe("MaterializationStore — row size estimate", () => {
-	it("counts the data, the keys two times, and the fixed part for a live image, and the keys three times for a tombstone", async () => {
+describe("MaterializationStore — item size", () => {
+	it("counts the data and the keys for a live image, and only the keys for an indexed tombstone", async () => {
 		await withStore((h) => {
-			// The keys and the 8-byte routingHash.
-			const keys = 8 + kb("x").byteLength + NO_SK.byteLength;
+			const keys = kb("x").byteLength + NO_SK.byteLength;
 			h.ingest("x", 1, []);
-			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe("v1".length + 2 * keys + 70);
-			expect(h.store.keySizes.bytesOf(P(kb("x")))).toBe("v1".length + 2 * keys + 70);
+			const live = { itemCount: 1, itemBytes: "v1".length + keys, keyBytes: keys, indexedItemCount: 0, indexedKeyBytes: 0, overflowBytes: 0 };
+			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.facts).toEqual(live);
+			expect(h.store.itemStats.factsOf(P(kb("x")))).toEqual(live);
 			h.ingest("x", 2, [], true);
-			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe(3 * keys + 70);
-			expect(h.store.keySizes.bytesOf(P(kb("x")))).toBe(3 * keys + 70);
+			const tombstone = { itemCount: 1, itemBytes: keys, keyBytes: keys, indexedItemCount: 1, indexedKeyBytes: keys, overflowBytes: 0 };
+			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.facts).toEqual(tombstone);
+			expect(h.store.itemStats.factsOf(P(kb("x")))).toEqual(tombstone);
 		});
 	});
 });
@@ -224,7 +225,7 @@ describe("MaterializationStore — the item-id counter", () => {
 					newest_seq: null,
 					data_kind: 0,
 					ttl_at: null,
-					est_row_bytes: 1,
+					item_bytes: 1,
 					data: "d",
 					positions: [],
 					retries: [],
@@ -253,12 +254,12 @@ describe("MaterializationStore — the item-id counter", () => {
 				newest_seq: null,
 				data_kind: 0,
 				ttl_at: null,
-				est_row_bytes: 1,
+				item_bytes: 1,
 				data: "d",
 				positions: [],
 				retries: [],
 			});
-			expect(h.store.insertMigratedItem(copy("local"))).toBe(false);
+			expect(h.store.insertMigratedItem(copy("local"))).toBeUndefined();
 			expect(() => h.store.insertMigratedItem(copy("other"))).toThrow(/UNIQUE constraint failed: latest_items\.item_id/);
 		});
 	});

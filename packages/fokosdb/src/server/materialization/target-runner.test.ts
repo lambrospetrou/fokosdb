@@ -48,7 +48,7 @@ type Harness = {
 	ingest: (hk: string, revision: number, opts?: { deleted?: boolean; data?: string }) => void;
 	target: (targetId: string) => TargetRow;
 	retryRows: () => Array<{ target_id: string; hk: string; kind: string; not_before: number; attempts: number; last_error: string | null }>;
-	count: (table: "latest_items" | "change_positions" | "key_size_estimates") => number;
+	count: (table: "latest_items" | "change_positions" | "item_stats") => number;
 	/** Waits until each worker stopped. */
 	drain: () => Promise<void>;
 	advance: (ms: number) => void;
@@ -357,7 +357,7 @@ describe("TargetRunner — failed items", () => {
 			async (h) => {
 				// Each item has the same size. A batch holds 2 items and a half by bytes.
 				h.ingest("r1", 1, { data });
-				config.maxBytesPerStep = Math.floor(2.5 * h.store.storedImage(P(kb("r1")), kb("r1"), NO_SK)!.estRowBytes);
+				config.maxBytesPerStep = Math.floor(2.5 * h.store.storedImage(P(kb("r1")), kb("r1"), NO_SK)!.facts.itemBytes);
 				h.ingest("o1", 1, { data });
 				await h.drain();
 				h.ingest("r2", 1, { data });
@@ -574,8 +574,8 @@ describe("TargetRunner — cleanup", () => {
 			await h.drain();
 			expect(h.count("change_positions")).toBe(0);
 			expect(h.count("latest_items")).toBe(1);
-			// The estimate of the deleted hash key goes with its last row.
-			expect(h.count("key_size_estimates")).toBe(1);
+			// The bucket of the deleted hash key goes with its last row.
+			expect(h.count("item_stats")).toBe(1);
 		});
 	});
 

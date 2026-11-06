@@ -31,6 +31,13 @@ export type PartitionDOConfig = Readonly<{
 	 */
 	promotionFraction: number;
 	/**
+	 * The promotion floor of a hash leaf is the promotion threshold times this fraction. A bucket stores
+	 * its estimate for the promotion lookup only at or above the floor. A lower value lets the lookup
+	 * find each candidate after a larger cap reduction, and makes more routingHashes write their index
+	 * entry at each write. Valid values are in (0, 1].
+	 */
+	promotionIndexFraction: number;
+	/**
 	 * The farthest into the future that the timestamp of a transaction can be when this partition
 	 * accepts its prepare. It must be larger than the real clock difference between the caller Worker,
 	 * the coordinator and the partition.
@@ -80,6 +87,13 @@ export type MaterializationDOConfig = Readonly<{
 	 * `hashSplitConditions.maxSizeMb` times this fraction. Valid values are in (0, 1).
 	 */
 	promotionFraction: number;
+	/**
+	 * The promotion floor of a hash leaf is the promotion threshold times this fraction. A bucket stores
+	 * its estimate for the promotion lookup only at or above the floor. A lower value lets the lookup
+	 * find each candidate after a larger cap reduction, and makes more routingHashes write their index
+	 * entry at each write. Valid values are in (0, 1].
+	 */
+	promotionIndexFraction: number;
 	/** The runner that sends the changes to the targets. */
 	targetRunner: Readonly<TargetRunnerConfig>;
 	/** The cleanup of the finished change positions and of the tombstones that no target needs. */
@@ -88,6 +102,7 @@ export type MaterializationDOConfig = Readonly<{
 
 export type MaterializationDOConfigOverrides = {
 	promotionFraction?: number;
+	promotionIndexFraction?: number;
 	targetRunner?: Partial<TargetRunnerConfig>;
 	cleanup?: Partial<MaterializationCleanupConfig>;
 };
@@ -159,6 +174,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 	staleTransactionMs: DEFAULT_STALE_TRANSACTION_MS,
 	coordinatorFanoutBudgetMs: DEFAULT_FANOUT_REQUEST_BUDGET_MS,
 	promotionFraction: 0.25,
+	promotionIndexFraction: 0.5,
 	maxClockSkewMs: 2_000,
 	ttlSweep: {
 		chunkSize: 100,
@@ -190,6 +206,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 
 export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreeze({
 	promotionFraction: 0.25,
+	promotionIndexFraction: 0.5,
 	targetRunner: {
 		concurrency: 2,
 		// The item limit of `batchWriteItems`.
@@ -236,6 +253,10 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 		() => `staleTransactionMs (${c.staleTransactionMs}) must be at least coordinatorFanoutBudgetMs (${c.coordinatorFanoutBudgetMs})`,
 	);
 	check(c.promotionFraction > 0 && c.promotionFraction < 1, () => `promotionFraction must be in (0, 1), got ${c.promotionFraction}`);
+	check(
+		c.promotionIndexFraction > 0 && c.promotionIndexFraction <= 1,
+		() => `promotionIndexFraction must be in (0, 1], got ${c.promotionIndexFraction}`,
+	);
 	checkInteger(c, "maxClockSkewMs", 0);
 	checkInteger(c, "staleLockScanRows", 1);
 	checkInteger(c, "cleanupPromotedKeyRows", 1);
@@ -254,6 +275,10 @@ export function resolveMaterializationConfig(overrides: MaterializationDOConfigO
 		return c;
 	}
 	check(c.promotionFraction > 0 && c.promotionFraction < 1, () => `promotionFraction must be in (0, 1), got ${c.promotionFraction}`);
+	check(
+		c.promotionIndexFraction > 0 && c.promotionIndexFraction <= 1,
+		() => `promotionIndexFraction must be in (0, 1], got ${c.promotionIndexFraction}`,
+	);
 	validateTargetRunnerConfig(c.targetRunner);
 	validateMaterializationCleanupConfig(c.cleanup);
 	return c;

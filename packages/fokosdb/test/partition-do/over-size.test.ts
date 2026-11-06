@@ -14,6 +14,7 @@ import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { estimate, ITEMS_MODEL } from "../../src/shared/partition/item-size.js";
 import { childDigit, type DigitTopology } from "../hash-digits.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
@@ -46,6 +47,22 @@ async function databaseSize(partition: TestPartition): Promise<number> {
 		partition.stub,
 		(_instance: FokosDBPartitionDO, state: DurableObjectState) => state.storage.sql.databaseSize,
 	);
+}
+
+/** The rounded estimate of each bucket that `where` selects, with the `items` coefficients. */
+function bucketEstimates(state: DurableObjectState, where: string, ...params: unknown[]): number[] {
+	return state.storage.sql
+		.exec<{ c: number; b: number; k: number; ic: number; ik: number; o: number }>(
+			`SELECT item_count AS c, item_bytes AS b, key_bytes AS k, indexed_item_count AS ic, indexed_key_bytes AS ik, overflow_bytes AS o
+			   FROM item_stats ${where}`,
+			...params,
+		)
+		.toArray()
+		.map((r) =>
+			Math.ceil(
+				estimate(ITEMS_MODEL, { itemCount: r.c, itemBytes: r.b, keyBytes: r.k, indexedItemCount: r.ic, indexedKeyBytes: r.ik, overflowBytes: r.o }),
+			),
+		);
 }
 
 /** The same partition with a hash cap that the current file exceeds by `CAP_DIVISOR`. */
@@ -179,11 +196,9 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 		const transactionId = await prepare(partition, "solo", ["p0", "p1", "p2", "p3"]);
 		const low = await lowHashCap(partition);
 		const threshold = (low.ctx.policy.hashSplitConditions.maxSizeMb ?? 0) * MB * DEFAULT_PARTITION_CONFIG.promotionFraction;
-		const estimate = await runInDurableObject(
-			partition.stub,
-			(_instance: FokosDBPartitionDO, state: DurableObjectState) =>
-				state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb("solo")).one().est_bytes,
-		);
+		const estimate = await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
+			bucketEstimates(state, `WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`, kb("solo")),
+		).then((rows) => rows[0]);
 		expect(estimate).toBeLessThan(threshold);
 
 		await expectRefused(low, "solo");
@@ -211,7 +226,11 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 		expect(await partition.localItemCount("large")).toBeGreaterThan(0);
 		// The completion deleted the estimate, so the decision does not name the key again.
 		await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			expect(state.storage.sql.exec(`SELECT 1 FROM key_size_estimates WHERE hk = ?`, kb("large")).toArray()).toEqual([]);
+			expect(
+				state.storage.sql
+					.exec(`SELECT 1 FROM item_stats WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`, kb("large"))
+					.toArray(),
+			).toEqual([]);
 		});
 		const low = await lowHashCap(partition);
 
@@ -238,15 +257,18 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 describe("FokosDBPartitionDO - a hash leaf with more than one large key", () => {
 	it("promotes the second large key while the promotion of the first cannot finish", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS });
+		// The cap goes down with no write of "second", so its bucket keeps the estimate that its writes
+		// stored. A low floor makes the writes store the estimate for the lower cap as well.
+		await partition.controlled.testConfig({ promotionIndexFraction: 0.001 });
 		// Both keys stay below the promotion threshold of the large cap, so no write promotes them.
 		await putRows(partition, "first", 24, 16 * 1024);
 		await putRows(partition, "second", 12, 16 * 1024);
 		const low = await lowHashCap(partition);
 		const threshold = (low.ctx.policy.hashSplitConditions.maxSizeMb ?? 0) * MB * DEFAULT_PARTITION_CONFIG.promotionFraction;
 		const estimates = await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
-			state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates ORDER BY est_bytes DESC`).toArray(),
+			bucketEstimates(state, ""),
 		);
-		expect(estimates.map((row) => row.est_bytes >= threshold)).toEqual([true, true]);
+		expect(estimates.sort((a, b) => b - a).map((est) => est >= threshold)).toEqual([true, true]);
 
 		const firstRoot = low.rangeRoot("first");
 		await low.controlled.testHoldPulls({ stream: "items", target: firstRoot.doName });
@@ -367,10 +389,7 @@ describe("FokosDBPartitionDO - a range leaf at its floor", () => {
 		vi.restoreAllMocks();
 	});
 
-	it.each([
-		{ reason: "fewer_items", rows: [16, 16, 16] },
-		{ reason: "skewed_bytes", rows: [150, 1, 1, 1] },
-	])("queues no split and logs the floor once: $reason", async ({ reason, rows }) => {
+	it.each([{ reason: "fewer_items", rows: [16, 16, 16] }])("queues no split and logs the floor once: $reason", async ({ reason, rows }) => {
 		const { root } = await makeRangeRoot(4, { rangeSplitConditions: { maxSizeMb: 500 } });
 		for (const [i, kib] of rows.entries()) {
 			await root.put({ hashKey: kb("alice"), sortKey: kb(`sk${i}`), data: "x".repeat(kib * 1024), kind: "text" });
@@ -387,5 +406,19 @@ describe("FokosDBPartitionDO - a range leaf at its floor", () => {
 		await runInDurableObject(low.stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).toBeNull();
 		});
+	});
+
+	it("queues a split when one large item holds most of the bytes", async () => {
+		const { root } = await makeRangeRoot(4, { rangeSplitConditions: { maxSizeMb: 500 } });
+		for (const [i, kib] of [150, 1, 1, 1].entries()) {
+			await root.put({ hashKey: kb("alice"), sortKey: kb(`sk${i}`), data: "x".repeat(kib * 1024), kind: "text" });
+		}
+		const low = withCaps(root, { range: (await databaseSize(root)) / CAP_DIVISOR / MB });
+		const logged = captureConsoleError();
+
+		await expectRefused(low, "alice");
+
+		expect((await low.status()).splitStatus).toBeDefined();
+		expect(logged.withMessage(FLOOR_LOG)).toEqual([]);
 	});
 });

@@ -71,7 +71,7 @@ async function rows(stub: DurableObjectStub<FokosDBMaterializationDO>) {
 			targets: sql.exec(`SELECT target_id, cursor_seq, epoch FROM materialization_targets`).toArray(),
 			fences: sql.exec(`SELECT target_id, ancestor_id, min_epoch FROM ancestor_fences`).toArray(),
 			producers: sql.exec(`SELECT producer_id, epoch FROM producer_fences`).toArray(),
-			keyBytes: sql.exec(`SELECT hk FROM key_size_estimates`).toArray().length,
+			keyBytes: sql.exec(`SELECT routing_hash FROM item_stats`).toArray().length,
 			snapshots: state.storage.kv.get("__fokosdb/mat/cursor_snapshots"),
 		};
 	});
