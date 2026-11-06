@@ -1014,3 +1014,211 @@ it("counts the rows written by an item insert", async () => {
 	});
 	console.log(lines.join("\n"));
 });
+
+it("measures a hash-leaf write with no bucket below m items", async () => {
+	const M = 16;
+	const FLOOR = 1e12; // Above each estimate here, so each bucket stores NULL.
+	const schema = `
+		CREATE TABLE m_hash_stats (
+			routing_hash        BLOB    NOT NULL,
+			lower_hk            BLOB    NOT NULL,
+			lower_sk            BLOB    NOT NULL,
+			item_count          INTEGER NOT NULL,
+			item_bytes          INTEGER NOT NULL,
+			key_bytes           INTEGER NOT NULL,
+			indexed_item_count  INTEGER NOT NULL,
+			indexed_key_bytes   INTEGER NOT NULL,
+			overflow_bytes      INTEGER NOT NULL,
+			promotion_est_bytes INTEGER,
+			PRIMARY KEY (routing_hash, lower_hk, lower_sk)
+		) WITHOUT ROWID, STRICT;
+		CREATE INDEX m_hash_stats_promotion ON m_hash_stats (promotion_est_bytes) WHERE promotion_est_bytes IS NOT NULL;`;
+	const promotionEst = (...f: [string, string, string, string, string, string]) =>
+		`CASE WHEN ${estSql(...f)} >= ?5 THEN ${estSql(...f)} ELSE NULL END`;
+	// ?1 routingHash, ?2 item-count delta, ?3 item-bytes delta, ?4 key-bytes delta, ?5 floor.
+	const upsert = `INSERT INTO m_hash_stats VALUES (?1, x'', x'', ?2, ?3, ?4, 0, 0, 0, ${promotionEst("?2", "?3", "?4", "0", "0", "0")})
+	                  ON CONFLICT (routing_hash, lower_hk, lower_sk) DO UPDATE SET
+	                    item_count = item_count + ?2, item_bytes = item_bytes + ?3, key_bytes = key_bytes + ?4,
+	                    promotion_est_bytes = ${promotionEst("item_count + ?2", "item_bytes + ?3", "key_bytes + ?4", "indexed_item_count", "indexed_key_bytes", "overflow_bytes")}
+	                  RETURNING item_count, ${estSql("item_count", "item_bytes", "key_bytes", "indexed_item_count", "indexed_key_bytes", "overflow_bytes")} AS e`;
+	const update = `UPDATE m_hash_stats SET
+	                    item_count = item_count + ?2, item_bytes = item_bytes + ?3, key_bytes = key_bytes + ?4,
+	                    promotion_est_bytes = ${promotionEst("item_count + ?2", "item_bytes + ?3", "key_bytes + ?4", "indexed_item_count", "indexed_key_bytes", "overflow_bytes")}
+	                  WHERE routing_hash = ?1 AND lower_hk = x'' AND lower_sk = x''
+	                  RETURNING item_count, ${estSql("item_count", "item_bytes", "key_bytes", "indexed_item_count", "indexed_key_bytes", "overflow_bytes")} AS e`;
+	// ?1 routingHash, ?2 m, ?3 the read limit, ?4 unused, ?5 floor. It inserts the first bucket from the counted
+	// facts when the routingHash holds at least m items, and it reads at most ?3 items.
+	const create = `INSERT INTO m_hash_stats
+	                  SELECT ?1, x'', x'', c, ib, kb, ic, ikb, ob, CASE WHEN e >= ?5 THEN e ELSE NULL END
+	                    FROM (SELECT c, ib, kb, ic, ikb, ob, ${estSql("c", "ib", "kb", "ic", "ikb", "ob")} AS e
+	                            FROM (SELECT ${FACTS}
+	                                    FROM (SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds FROM m_items
+	                                           WHERE routing_hash = ?1 LIMIT ?3)))
+	                   WHERE c >= ?2`;
+	// The count before the create statement. It reads at most ?2 items.
+	const count = `SELECT COUNT(*) AS n FROM (SELECT 1 FROM m_items WHERE routing_hash = ?1 LIMIT ?2)`;
+	const insertItem = `INSERT INTO m_items VALUES (?, ?, ?, ?, 0, 1, ?, ?, NULL, ?, 'dddddddddddddddddddd') RETURNING item_bytes`;
+	const updateItem = `UPDATE m_items SET item_bytes = item_bytes + 1, last_write_ts = ? WHERE routing_hash = ? AND hk = ? AND sk = ? RETURNING item_bytes`;
+	const deleteItem = `DELETE FROM m_items WHERE routing_hash = ? AND hk = ? AND sk = ? RETURNING item_bytes`;
+	const hk = hashKey(8);
+	const kb = hk.length + sortKey(0, 16).length;
+	const ib = 20 + kb;
+	let nextId = 1;
+	type Cost = { read: number; written: number };
+	const add = (a: Cost, c: { rowsRead: number; rowsWritten: number }) => {
+		a.read += c.rowsRead;
+		a.written += c.rowsWritten;
+	};
+	type Design = "always" | "from m" | "from m, count first";
+	/**
+	 * The bucket statements of one write. "always" keeps a bucket for each routingHash. "from m" and
+	 * "from m, count first" keep a bucket only for a routingHash that held `M` items at an insert.
+	 */
+	const bucketWrite = (sql: SqlStorage, cost: Cost, design: Design, r: Uint8Array, dc: number, db: number, dk: number, insert: boolean) => {
+		if (design === "always") {
+			const c = sql.exec(dc < 0 || !insert ? update : upsert, r, dc, db, dk, FLOOR);
+			c.toArray();
+			add(cost, c);
+			return;
+		}
+		const c = sql.exec(update, r, dc, db, dk, FLOOR);
+		const rows = c.toArray();
+		add(cost, c);
+		if (rows.length === 0 && insert && design === "from m, count first") {
+			const n = sql.exec(count, r, M + 1);
+			const counted = n.one().n as number;
+			add(cost, n);
+			if (counted < M) {
+				return;
+			}
+		}
+		if (rows.length === 0 && insert) {
+			const k = sql.exec(create, r, M, M + 1, 0, FLOOR);
+			k.toArray();
+			add(cost, k);
+		}
+	};
+	const lines = ["| Design | Write | Rows read | Rows written | Time |", "| --- | --- | --- | --- | --- |"];
+	for (const design of ["always", "from m", "from m, count first"] as const) {
+		const stub = testPartitionStub(`item-size-model.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
+			state.storage.sql.exec(ITEMS_SCHEMA);
+			state.storage.sql.exec(schema);
+		});
+		const slice: Slice = { stub, routingHash: new Uint8Array(), hk, skBytes: 16 };
+		const reps = 2_000;
+		// Background: 100,000 routingHashes with one item each, so the B-trees are not tiny.
+		await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
+			const cost = { read: 0, written: 0 };
+			state.storage.transactionSync(() => {
+				for (let i = 0; i < 100_000; i++) {
+					const r = crypto.getRandomValues(new Uint8Array(8));
+					state.storage.sql.exec(insertItem, r, hk, sortKey(0, 16), nextId++, NOW_MS, NOW_MS, ib).toArray();
+					bucketWrite(state.storage.sql, cost, design, r, 1, ib, kb, true);
+				}
+			});
+		});
+		const write = (name: string, fn: (sql: SqlStorage, cost: Cost) => void, count: number) =>
+			timeCall(slice, (state) => {
+				const cost = { read: 0, written: 0 };
+				state.storage.transactionSync(() => {
+					for (let i = 0; i < count; i++) {
+						fn(state.storage.sql, cost);
+					}
+				});
+				return cost;
+			}).then(({ ms, result }) => {
+				lines.push(
+					`| ${design} | ${name} | ${(result.read / count).toFixed(1)} | ${(result.written / count).toFixed(1)} | ${((ms * 1000) / count).toFixed(1)} µs |`,
+				);
+			});
+		// A new routingHash for each insert.
+		await write(
+			"Insert, first item of a routingHash",
+			(sql, cost) => {
+				const r = crypto.getRandomValues(new Uint8Array(8));
+				const c = sql.exec(insertItem, r, hk, sortKey(0, 16), nextId++, NOW_MS, NOW_MS, ib);
+				c.toArray();
+				add(cost, c);
+				bucketWrite(sql, cost, design, r, 1, ib, kb, true);
+			},
+			reps,
+		);
+		// A set of routingHashes that get their k-th item, for k = 2 to M + 1.
+		const group = Array.from({ length: reps }, () => crypto.getRandomValues(new Uint8Array(8)));
+		await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
+			const sql = state.storage.sql;
+			state.storage.transactionSync(() => {
+				for (const r of group) {
+					sql.exec(insertItem, r, hk, sortKey(1, 16), nextId++, NOW_MS, NOW_MS, ib).toArray();
+					bucketWrite(sql, { read: 0, written: 0 }, design, r, 1, ib, kb, true);
+				}
+			});
+			for (let k = 2; k <= M + 1; k++) {
+				const cost = { read: 0, written: 0 };
+				state.storage.transactionSync(() => {
+					for (const r of group) {
+						const c = sql.exec(insertItem, r, hk, sortKey(k, 16), nextId++, NOW_MS, NOW_MS, ib);
+						c.toArray();
+						add(cost, c);
+						bucketWrite(sql, cost, design, r, 1, ib, kb, true);
+					}
+				});
+				if ([2, M - 1, M, M + 1].includes(k)) {
+					lines.push(`| ${design} | Insert, item ${k} of a routingHash | ${(cost.read / reps).toFixed(1)} | ${(cost.written / reps).toFixed(1)} | |`);
+				}
+			}
+		});
+		// Updates and deletes of items of the routingHashes with one item. Each update adds 1 byte.
+		const singles = Array.from({ length: reps }, () => crypto.getRandomValues(new Uint8Array(8)));
+		await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
+			state.storage.transactionSync(() => {
+				for (const r of singles) {
+					state.storage.sql.exec(insertItem, r, hk, sortKey(0, 16), nextId++, NOW_MS, NOW_MS, ib).toArray();
+					bucketWrite(state.storage.sql, { read: 0, written: 0 }, design, r, 1, ib, kb, true);
+				}
+			});
+		});
+		let u = 0;
+		await write(
+			"Update, routingHash with one item",
+			(sql, cost) => {
+				const r = singles[u++ % reps];
+				const c = sql.exec(updateItem, NOW_MS, r, hk, sortKey(0, 16));
+				c.toArray();
+				add(cost, c);
+				bucketWrite(sql, cost, design, r, 0, 1, 0, false);
+			},
+			reps,
+		);
+		await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) => {
+			const sql = state.storage.sql;
+			const cost = { read: 0, written: 0 };
+			state.storage.transactionSync(() => {
+				for (const r of singles) {
+					const c = sql.exec(deleteItem, r, hk, sortKey(0, 16));
+					c.toArray();
+					add(cost, c);
+					if (design === "always") {
+						const d = sql.exec(`DELETE FROM m_hash_stats WHERE routing_hash = ?`, r);
+						d.toArray();
+						add(cost, d);
+					} else {
+						bucketWrite(sql, cost, design, r, -1, -ib, -kb, false);
+					}
+				}
+			});
+			lines.push(`| ${design} | Delete, last item of a routingHash | ${(cost.read / reps).toFixed(1)} | ${(cost.written / reps).toFixed(1)} | |`);
+		});
+		if (design === "from m, count first") {
+			const plan = await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) =>
+				plans(state, [
+					["Count", count, [group[0], M + 1]],
+					["Create", create, [group[0], M, M + 1, 0, FLOOR]],
+				]),
+			);
+			lines.push(...plan);
+		}
+	}
+	console.log(lines.join("\n"));
+});

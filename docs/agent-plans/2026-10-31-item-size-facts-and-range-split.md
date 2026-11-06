@@ -1,7 +1,7 @@
 # RFC — Exact item-size facts, item statistics in buckets, and correct range splits
 
 **State:** Draft
-**Date:** 2026-10-31, updated 2026-11-05
+**Date:** 2026-10-31, updated 2026-11-06
 
 ## Table of contents
 
@@ -191,7 +191,8 @@ and the deployment uses new namespaces.
 
 ## 3. Milestones
 
-The change ships as two milestones. Both milestones must ship before the first release. No delivery dates are set.
+The change ships as two milestones and one optional milestone. M1 and M2 must ship before the first release. No
+delivery dates are set.
 
 1. **M1 — Exact item sizes, the storage model, promotion, and the corrected planner.** Sections 4.2.1 to 4.2.5 and
    4.2.7 to 4.2.12. M1 drops `idx_items_scan`. Each leaf keeps one bucket for each routingHash. The planner scans the
@@ -200,6 +201,8 @@ The change ships as two milestones. Both milestones must ship before the first r
 2. **M2 — Buckets on range leaves.** Section 4.2.6, the import buckets, the bucket groups of the TTL sweep, and the
    bucket path of the planner. M2 changes no schema. No range leaf from M1 reaches a release, so M2 converts no data.
    A development namespace from M1 must be destroyed: the first split of its one large bucket reads the whole slice.
+3. **M3 (optional) — No bucket for a small routingHash on a hash leaf.** Section 4.2.17. M3 changes no schema
+   and converts no data. It can ship before or after the first release.
 
 ## 4. Proposed solution
 
@@ -465,7 +468,8 @@ CREATE INDEX item_stats_promotion ON item_stats (promotion_est_bytes) WHERE prom
 - **First bucket.** The first bucket of a routingHash has the bound `(x'', x'')`, the smallest composite key. It stays
   while the routingHash has an item. A merge never deletes it, because a merge deletes the upper row.
 - **Hash leaf.** Each routingHash has only its first bucket. Two hash keys with one routingHash share it, and their
-  combined estimate decides the promotion. A hash leaf never splits a bucket.
+  combined estimate decides the promotion. A hash leaf never splits a bucket. With M3, a routingHash with fewer than
+  `m` items has no bucket (section 4.2.17).
 - **Range leaf.** The one routingHash has buckets that cover its slice. The import builds them, and each write keeps
   them inside the band of section 4.2.6. The bounds are composite, so a bucket can hold the end of one hash key and
   the start of the next. Appendix G gives an example.
@@ -948,7 +952,7 @@ Each invariant must hold after each commit. The verification of section 4.2.16 c
 | I1 | The facts of each bucket equal the sums over the items in its key range | Each write changes the item and its facts in one storage transaction (section 4.2.5). The drift repair corrects a defect in the same transaction (section 4.2.7) |
 | I2 | The facts that a write adds for an item equal the facts that a later update or delete of that item subtracts | The old-facts read returns `item_bytes`, and `overflow_bytes` is a function of `item_bytes` only. Its JavaScript and SQL forms give the same value (sections 4.2.2 and 4.2.3) |
 | I3 | The `promotion_est_bytes` of each bucket equals `promotionEstSql` over its facts, with the coefficients of the code and the floor of the policy that last wrote the row. On a range leaf, it is `NULL`. After a coefficient change or a policy change, a row with no write since the change can keep the older value | Each statement that writes facts sets `promotion_est_bytes` from the new facts and the bound floor in the same statement, never from the old `promotion_est_bytes` (section 4.2.5) |
-| I4 | A hash leaf holds exactly one bucket for each routingHash that has items: its first bucket `(x'', x'')` | The helper upserts the first bucket and deletes it with the last item (section 4.2.5). A hash leaf never splits a bucket |
+| I4 | A hash leaf holds exactly one bucket for each routingHash that has items: its first bucket `(x'', x'')`. With M3, a routingHash can have no bucket under invariant I14 | The helper upserts the first bucket and deletes it with the last item (section 4.2.5). A hash leaf never splits a bucket |
 | I5 | On a range leaf, each bucket holds at most `2K` items, and each two neighbour buckets hold at least `K` items together. The first bucket stays while the routingHash has an item | The split and the merge run in the transaction of the write (section 4.2.6). The import makes buckets of `K` items. A merge deletes the upper row |
 | I6 | The buckets of a routingHash are one key range of `item_stats`, and the items of a bucket are one key range of the primary key of the item table | Both tables lead with `routing_hash` and are in storage order (section 4.2.4). Thus a promotion cleanup is one range delete |
 | I7 | The rows of an imported items page are strictly increasing in storage order above the page cursor | `assertItemFollows` in `validatePage` of both migration hosts (section 4.2.6) |
@@ -958,6 +962,7 @@ Each invariant must hold after each commit. The verification of section 4.2.16 c
 | I11 | When a slice holds at least `N` items, the planner returns `N - 1` boundaries in increasing order. Each child holds at least one item, and each boundary is the shortest key that separates two adjacent items | One `transactionSync` for all reads, gaps only between items, and `KeyCodec.shortestCompositeSeparator` (section 4.2.9) |
 | I12 | A read of sizes, counts, or facts reads no item data | `item_bytes` and the TTL columns are before `data`, and no size read selects `data` (sections 4.2.2 and 4.2.9) |
 | I13 | The split decision of a range leaf reads at most `N` items | The count check with `LIMIT N` (section 4.2.10) |
+| I14 | With M3, on a hash leaf, a routingHash that has items and no bucket has fewer than `m` items, with the `m` of the policy at its last insert or import page. Thus its estimate is below the floor of that policy | An insert or an import page creates the bucket when the routingHash has `m` items or more. Other writes add no item. Each item has an estimate of at most `maxItemEstimate` (section 4.2.17) |
 
 #### 4.2.14 Performance
 
@@ -968,7 +973,7 @@ deployed Durable Object (section 4.3.1).
 | Path | Cost |
 | --- | --- |
 | Old-facts read | 11 to 15 µs, 1 row read |
-| Write on a hash leaf | First-bucket upsert: about 12 µs on one hot routingHash, about 39 µs spread over 100,000 routingHashes. 1 row read, 1 row written below the promotion floor, 2 rows at or above it (the row and its promotion index entry). With the item row and its `idx_items_item_id` entry, an insert writes 3 rows below the floor. Today it writes 5: `items`, `idx_items_scan`, `idx_items_item_id`, and the `key_size_estimates` row and its index entry |
+| Write on a hash leaf | First-bucket upsert: about 12 µs on one hot routingHash, about 39 µs spread over 100,000 routingHashes. 1 row read, 1 row written below the promotion floor, 2 rows at or above it (the row and its promotion index entry). With the item row and its `idx_items_item_id` entry, an insert writes 3 rows below the floor. Today it writes 5: `items`, `idx_items_scan`, `idx_items_item_id`, and the `key_size_estimates` row and its index entry. With M3, a write of a routingHash with no bucket writes no bucket row (section 4.2.17) |
 | Write on a range leaf | One bucket seek update: 8 to 13 µs, 3 rows read, 1 row written, also for the first bucket |
 | Split | 1.45 to 1.65 ms, 6,150 rows read, 2 rows written, at most once for each `K` inserts into a bucket |
 | Merge | 2 more seeks for each delete while the bucket holds fewer than `K` items; 2 row writes for a merge |
@@ -1111,6 +1116,165 @@ Tests must check definitions, not only the agreement between two uses of the sam
   `item_stats_promotion`, and that the promotion cleanup of `item_stats` is a primary-key range delete.
 - Check range split, migration, promotion, and transaction flows in the Workers runtime with the existing partition
   harness. Add no production test hook.
+
+#### 4.2.17 No bucket for a small routingHash on a hash leaf (M3, optional)
+
+In M1, a hash leaf keeps one bucket for each routingHash, so each item write also writes the bucket row. A table with
+only a hash key usually has 1 item for each routingHash. For such a table, the bucket row is 1 of the 3 rows of an
+insert and 1 of the 2 rows of an update. M3 keeps no bucket for a routingHash that has fewer than `m` items. A range
+leaf does not change.
+
+**The bucket threshold `m`.**
+
+```text
+maxItemEstimate = MAX_ITEM_BYTES * (1 + key_index_factor + indexed_key_factor)
+                + base_overhead + indexed_overhead
+                + overflow_coefficient * (4092 + 4 * ceil((MAX_ITEM_BYTES + row_payload_overhead) / 4092)
+                                          + overflow_row_overhead)
+m = min(BUCKET_THRESHOLD_MAX, max(1, floor(promotion floor / maxItemEstimate)))
+```
+
+- `maxItemEstimate` is an upper bound of the estimate of one item (section 4.2.3):
+  - `key_bytes <= item_bytes <= MAX_ITEM_BYTES`. `item_bytes` includes the key bytes, and the item limit applies to
+    it (section 4.2.11). Thus the bound does not depend on the key limits of the policy, which a table can raise.
+  - The bound includes the indexed terms, because an indexed item has the larger estimate.
+  - `overflow_bytes = pages * 4096 - moved + overflow_row_overhead`, with `pages = ceil(moved / 4092)`. Thus
+    `pages * 4092 - moved < 4092`, and `overflow_bytes < 4092 + 4 * pages + overflow_row_overhead`. `moved` is at
+    most `MAX_ITEM_BYTES + row_payload_overhead`.
+  - The bound is 1,438,258 bytes for `items` and 1,438,257 bytes for `latest_items`. A calculation over each
+    `item_bytes` from 0 to `MAX_ITEM_BYTES`, with `key_bytes = item_bytes` and an indexed item, gives a largest
+    estimate of 1,434,211 bytes and 1,434,221 bytes.
+- `item-size.ts` calculates `maxItemEstimate` at module load from the coefficients of the code.
+- `BUCKET_THRESHOLD_MAX` is 16. The value 16 is a starting point, not a measured optimum. It limits the items that
+  the count of an insert reads. A larger value removes the bucket of more routingHashes, and each insert into such a
+  routingHash reads more rows.
+- The floor comes from the policy (section 4.2.8), so `m` changes with the policy. With the default fractions:
+
+  | Cap | Floor | `m` |
+  | --- | --- | --- |
+  | 10 MiB | 1.25 MiB | 1 |
+  | 50 MiB | 6.25 MiB | 4 |
+  | 100 MiB | 12.5 MiB | 9 |
+  | 176 MiB or more, also the default 500 MiB | 22 MiB or more | 16 |
+
+- With `m = 1`, each routingHash that has an item has a bucket, as in M1.
+
+**Write path.** The bucket helper of a hash leaf:
+
+1. Runs the bucket update `UPDATE item_stats SET … WHERE routing_hash = ? AND lower_hk = x'' AND lower_sk = x''
+   RETURNING …` for each write, in place of the upsert. When the bucket exists, the statement is the same as the
+   `ON CONFLICT DO UPDATE` branch of M1.
+2. When the update finds no row for an overwrite, an update, a TTL change, or a delete, changes no facts. The bucket
+   does not represent the item ("Delete of an unrepresented row", section 4.2.5). The TTL sweep and the commit apply
+   use the same rule.
+3. When the update finds no row for an insert, counts the items of the routingHash after the item insert:
+   `SELECT COUNT(*) FROM (SELECT 1 FROM items WHERE routing_hash = ? LIMIT BUCKET_THRESHOLD_MAX + 1)`.
+4. When the count is less than `m`, writes no bucket.
+5. When the count is `m` or more, inserts the first bucket. One aggregate over the same items, with the same `LIMIT`,
+   gives the facts. The statement sets `promotion_est_bytes` from them, as each statement of section 4.2.5 does.
+6. When the count is `BUCKET_THRESHOLD_MAX + 1`, the routingHash breaks invariant I14. The helper logs the defect one
+   time and inserts the bucket from a recount of the whole routingHash, as the drift repair does (section 4.2.7).
+
+A bucket stays while its routingHash has items, also when the count goes below `m`. Thus a routingHash at `m` items
+does not create and delete its bucket again and again. The rule for empty buckets of section 4.2.5 does not change.
+
+**Import of a hash child.** For each run of one routingHash in a page, in the page transaction:
+
+1. Seek the first bucket of the routingHash. When it exists, add the page sums, as in M1.
+2. Otherwise, read the facts of the items of the routingHash below the first item of the run, with one aggregate and
+   `LIMIT BUCKET_THRESHOLD_MAX + 1`. These items came with earlier pages, and they have no bucket, so they are fewer
+   than `BUCKET_THRESHOLD_MAX` (invariant I14). A result of `BUCKET_THRESHOLD_MAX + 1` items is a defect, as in step 6
+   of the write path.
+3. When the count of step 2 plus the run length is `m` or more, insert the first bucket with the facts of step 2 plus
+   the page sums. Otherwise, write no bucket.
+
+A retried page inserts no row, so it changes no bucket (invariant I8). The import of a range root or a range child
+does not change.
+
+**Why it is correct.** Invariant I14: on a hash leaf, a routingHash that has items and no bucket has fewer than `m`
+items, with the `m` of the policy at its last insert or import page. Thus its estimate is below the floor of that
+policy. The proof:
+
+1. Only an insert or an import page adds items to a routingHash. Each one creates the bucket when the routingHash then
+   has `m` items or more (write path steps 3 to 5, import step 3). Thus after an insert or a page with no bucket, the
+   routingHash has fewer than `m` items.
+2. An overwrite, an update, a TTL change, or a delete does not add an item, so the count stays below that `m`.
+3. The item limit applies to each write, so each item has an estimate of at most `maxItemEstimate`, also after an
+   update. Thus the estimate of the routingHash is at most `(m - 1) * maxItemEstimate`.
+4. When `m >= 2`, the definition of `m` gives `m * maxItemEstimate <= floor`, so `(m - 1) * maxItemEstimate < floor`.
+   When `m = 1`, the routingHash has no items, which is not the case of the invariant.
+5. `m` is at most `BUCKET_THRESHOLD_MAX` for each policy. Thus the routingHash has fewer than
+   `BUCKET_THRESHOLD_MAX` items, and after one more insert at most `BUCKET_THRESHOLD_MAX`. The count of step 3 and the
+   aggregate of step 5 thus read each item of the routingHash, and the new bucket gets exact facts (invariant I1).
+
+Thus a routingHash with no bucket has the same guarantee as a bucket with `promotion_est_bytes` `NULL`: its estimate is
+below the floor of the policy of an earlier write. The other paths keep their results:
+
+- **Write-path check.** A write with no bucket returns no estimate and reports no candidate. Its estimate is below the
+  floor, and the floor is at or below `T`, so the check of M1 also reports no candidate (invariant I10).
+- **Lookup.** A routingHash with no bucket has no index entry, as a bucket with `NULL`. The lookup and its bound
+  (invariant I9) do not change.
+- **Policy change.** The table of section 4.2.8 applies with no change. When `T` goes down to the old floor or above,
+  a routingHash with no bucket is below the old floor, so it is below the new `T`. When `T` goes down below the old
+  floor, the lookup can miss it, and the leaf makes a hash split. The import of the child then creates its bucket: a
+  routingHash at or above the `T` of the child has at least `T / maxItemEstimate` items, and that is at least the
+  `m` of the child.
+- **Optional backfill.** With M3, the backfill of section 4.2.8 must also create the missing buckets after a floor
+  change. It then reads the items in primary-key order, in bounded batches, and not only the bucket rows.
+- **Coefficient change.** A larger coefficient can take a routingHash with no bucket to the new floor or to `T`. This
+  is the row "Larger" of the table of section 4.2.8, with the same result: a hash split, and the import of the child
+  creates the bucket, with the argument of the policy change. A smaller coefficient makes the estimate smaller.
+- **Promotion.** `beforeComplete` and the cleanup guard delete the buckets of the routingHash. With no bucket, they
+  delete no row. The new range root builds its buckets from its import, and it does not read the buckets of the
+  source. A hash leaf with one routingHash promotes it with `probeRoutingHashes`, which reads no bucket.
+- **Two hash keys with one routingHash.** The count and the facts include each item of the routingHash, so the two
+  hash keys share the bucket rule and the bucket.
+
+**Costs.** Measured with `m = 16`, with the item statements included (appendix A.4):
+
+| Write on a hash leaf | M1 | M3 |
+| --- | --- | --- |
+| Insert, routingHash with 0 to `m - 2` items before | 3 rows written, 2 rows read | 2 rows written, 4 to 18 rows read |
+| Insert that takes the routingHash to `m` items, one time | 3 rows written, 2 rows read | 3 rows written, 36 rows read |
+| Insert, routingHash with a bucket | 3 rows written, 2 rows read | 3 rows written, 3 rows read |
+| Update or delete, routingHash with no bucket | 2 rows written, 4 rows read | 1 row written, 3 rows read |
+| Time of an insert of the first item | 73.5 to 79 µs | 71 to 91.5 µs |
+| Time of an update, routingHash with one item | 61.5 to 125.5 µs | 44 to 48 µs |
+
+- A routingHash with no bucket also stores no bucket row, about 66 bytes (appendix A.3). For example, a hash leaf
+  with 1,000,000 routingHashes of 1 item each stores about 66 MB less, and the import of a hash child writes no
+  bucket row for them.
+- Each insert into a routingHash with no bucket reads up to 18 rows more. Cloudflare bills a row read at one
+  thousandth of the price of a row written ([Durable Objects pricing][do-pricing]).
+- One statement can count and create: `INSERT … SELECT … WHERE count >= m`. It gives the same rows, but an insert of
+  the first item took 121.5 to 131.5 µs with it. Thus the helper counts first.
+
+[do-pricing]: https://developers.cloudflare.com/durable-objects/platform/pricing/
+
+**Deployment.** M3 changes no schema and converts no data. It can ship before or after the first release. On a leaf
+from M1 or M2, each routingHash has a bucket, so the helper updates it as before, and invariant I14 holds. Do not roll
+back from M3 to code without M3 on a leaf that has items: the upsert of M1 then inserts a bucket with only the facts
+of the new item.
+
+**Verification.**
+
+- In the property tests of section 4.2.16, use `m` from 1 to 16. After each operation, check invariant I14 and that
+  each bucket equals the SQL sums of its routingHash.
+- Check `rowsWritten` of the bucket statements: 0 for each write of a routingHash with no bucket below `m`, 1 for the
+  insert that takes it to `m` items.
+- Check that the insert that takes a routingHash to `m` items creates a bucket with the facts of all `m` items, and
+  that a later delete below `m` keeps the bucket.
+- Change the policy so that `m` goes from 16 to 4 for a routingHash of 10 items with no bucket. The next insert must
+  create the bucket with the facts of 11 items.
+- Reduce the cap by 3 times with no write, so that a routingHash with no bucket is at or above the new `T`. The leaf
+  must make a hash split, and the child must create the bucket and promote the routingHash.
+- Import a routingHash of 20 items in two pages of 10 items into a hash child, with `m = 16`. The second page must
+  create the bucket with the facts of the 20 items, and its aggregate must read only the 10 items of the first page.
+- Insert 17 items of one routingHash with no bucket directly with SQL in the test, and then commit one more insert.
+  The defect log must appear one time, and the bucket must equal the SQL sums.
+- Check that `maxItemEstimate` is at or above the estimate of an indexed item for each `item_bytes` from 0 to
+  `MAX_ITEM_BYTES`, with `key_bytes = item_bytes`.
+- Use `EXPLAIN QUERY PLAN` to assert a primary-key search on `routing_hash` for the count and the aggregate.
 
 ### 4.3 Open questions
 
@@ -1552,6 +1716,31 @@ Date: 2026-11-06. Rows written by one statement on a bucket table with `promotio
 -  The lookup `WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT 5` is `SEARCH m_promotion_stats
   USING COVERING INDEX m_promotion_stats_promotion (promotion_est_bytes>?)`. The query does not repeat the index
   condition.
+
+Date: 2026-11-06. Hash-leaf writes with and without a bucket for a small routingHash (section 4.2.17), with
+`m = 16`. The leaf has 100,000 routingHashes of 1 item each before the measured writes. Each write is the item
+statement plus the bucket statements, in one `transactionSync` of 2,000 writes. Each item has an 8-byte hash key, a
+16-byte sort key, and 20 bytes of data, and the floor is above each estimate. Three runs:
+
+| Design | Write | Rows read | Rows written | Time |
+| --- | --- | --- | --- | --- |
+| A bucket for each routingHash (M1) | Insert, first item of a routingHash | 2 | 3 | 73.5 to 79 µs |
+| | Insert, item 2, 15, 16, or 17 of a routingHash | 2 | 3 | |
+| | Update, routingHash with 1 item | 4 | 2 | 61.5 to 125.5 µs |
+| | Delete, last item of a routingHash | 4 | 2 | |
+| No bucket below `m`, count first (M3) | Insert, first item of a routingHash | 4 | 2 | 71 to 91.5 µs |
+| | Insert, item 2 of a routingHash | 5 | 2 | |
+| | Insert, item 15 of a routingHash | 18 | 2 | |
+| | Insert, item 16 of a routingHash (the bucket is created) | 36 | 3 | |
+| | Insert, item 17 of a routingHash | 3 | 3 | |
+| | Update, routingHash with 1 item | 3 | 1 | 44 to 48 µs |
+| | Delete, last item of a routingHash | 3 | 1 | |
+| No bucket below `m`, count and create in one statement | Insert, first item of a routingHash | 4 | 2 | 121.5 to 131.5 µs |
+| | Update, routingHash with 1 item | 3 | 1 | 44 to 46.5 µs |
+
+- The rows of the item statements are in each value: an insert writes 2 rows, an update and a delete 1 row.
+- The count and the aggregate are `SEARCH m_items USING PRIMARY KEY (routing_hash=?)`.
+- The update of M1 ran 125.5 µs one time and 61.5 to 66.5 µs in the other runs.
 
 The current layout reads its sizes from the covering index `idx_items_scan`. On 2026-10-30, a JavaScript iteration of
 that index cost 1.17 µs for each row with a 16-byte sort key, and 1.30 µs with a 100-byte sort key.
