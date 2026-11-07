@@ -126,7 +126,13 @@ function expectExact(state: DurableObjectState, routingHash: RoutingHash, floor:
 	expect(promotionType).toBe(promotionEst === null ? "null" : "integer");
 }
 
-const put = (store: PartitionStore, hk: KeyBytes, sk: KeyBytes, data: string | Uint8Array, opts: { kind?: "text" | "bytes" | "json"; ttlAt?: number | null } = {}) =>
+const put = (
+	store: PartitionStore,
+	hk: KeyBytes,
+	sk: KeyBytes,
+	data: string | Uint8Array,
+	opts: { kind?: "text" | "bytes" | "json"; ttlAt?: number | null } = {},
+) =>
 	store.upsertItem({
 		routingHash: P(hk),
 		hk,
@@ -304,7 +310,7 @@ describe("ItemStats on a hash leaf", () => {
 					store.itemStats.addRows(
 						page.flatMap((item) => {
 							const facts = store.insertItemIfAbsent(item);
-							return facts ? [{ routingHash: item.routingHash, facts }] : [];
+							return facts ? [{ routingHash: item.routingHash, hk: item.hk, sk: item.sk, facts }] : [];
 						}),
 					);
 				apply();
@@ -386,7 +392,7 @@ describe("ItemStats on a hash leaf", () => {
 						} else {
 							const hk = hks[op.hk];
 							const rows = Array.from({ length: op.count }, (_, i) => ({
-								item_id: (importId++) as ItemLinkId,
+								item_id: importId++ as ItemLinkId,
 								routingHash: P(hk),
 								hk,
 								sk: kb(`import-${importId}-${i}`),
@@ -400,7 +406,7 @@ describe("ItemStats on a hash leaf", () => {
 							store.itemStats.addRows(
 								rows.flatMap((row) => {
 									const facts = store.insertItemIfAbsent(row);
-									return facts ? [{ routingHash: row.routingHash, facts }] : [];
+									return facts ? [{ routingHash: row.routingHash, hk: row.hk, sk: row.sk, facts }] : [];
 								}),
 							);
 						}
@@ -435,6 +441,8 @@ describe("ItemStats statements", () => {
 			indexedCondition: "ttl_epoch_utc_seconds IS NOT NULL",
 			model,
 			promotionFloor: () => floor,
+			rangeLeaf: () => false,
+			bucketItems: 2048,
 			logName: "fokos/partition",
 			logParams: () => ({}),
 		});
@@ -450,24 +458,24 @@ describe("ItemStats statements", () => {
 	it("writes 1 row below the promotion floor, 2 at or above it, and 1 with no floor", async () => {
 		await withStore(null, ({ state }) => {
 			const below = recorded(state, 1_000_000);
-			below.stats.change(P(kb("below")), null, one(100));
-			below.stats.change(P(kb("below")), one(100), one(200));
+			below.stats.change(P(kb("below")), kb("below"), NO_SK, null, one(100));
+			below.stats.change(P(kb("below")), kb("below"), NO_SK, one(100), one(200));
 			expect(below.take().map((m) => m.rowsWritten)).toEqual([1, 1]);
 
 			const above = recorded(state, 10);
-			above.stats.change(P(kb("above")), null, one(100));
-			above.stats.change(P(kb("above")), one(100), one(200));
+			above.stats.change(P(kb("above")), kb("above"), NO_SK, null, one(100));
+			above.stats.change(P(kb("above")), kb("above"), NO_SK, one(100), one(200));
 			expect(above.take().map((m) => m.rowsWritten)).toEqual([2, 2]);
 
 			// A value that falls below the floor removes its index entry only.
 			const falls = recorded(state, 250);
-			falls.stats.change(P(kb("above")), one(200), one(100));
+			falls.stats.change(P(kb("above")), kb("above"), NO_SK, one(200), one(100));
 			expect(falls.take().map((m) => m.rowsWritten)).toEqual([1]);
 
 			// A range leaf has no floor, also for the first bucket.
 			const range = recorded(state, null);
-			range.stats.change(P(kb("range")), null, one(100));
-			range.stats.change(P(kb("range")), one(100), one(200));
+			range.stats.change(P(kb("range")), kb("range"), NO_SK, null, one(100));
+			range.stats.change(P(kb("range")), kb("range"), NO_SK, one(100), one(200));
 			expect(range.take().map((m) => m.rowsWritten)).toEqual([1, 1]);
 			expect(buckets(state, P(kb("range")))[0].promotionEst).toBeNull();
 		});
@@ -479,8 +487,8 @@ describe("ItemStats statements", () => {
 			const a = recorded(state, 0, ITEMS_MODEL);
 			const b = recorded(state, 0, other);
 			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 300, keyBytes: 21, indexed: true });
-			a.stats.change(P(kb("a")), null, facts);
-			b.stats.change(P(kb("b")), null, facts);
+			a.stats.change(P(kb("a")), kb("a"), NO_SK, null, facts);
+			b.stats.change(P(kb("b")), kb("b"), NO_SK, null, facts);
 			const [ra, rb] = [buckets(state, P(kb("a")))[0], buckets(state, P(kb("b")))[0]];
 			const strip = ({ promotionEst: _p, promotionType: _t, ...rest }: BucketRow) => rest;
 			expect(strip(ra)).toEqual(strip(rb));
@@ -496,8 +504,8 @@ describe("ItemStats statements", () => {
 			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 10, keyBytes: 5, indexed: false });
 			const exact = estimate(ITEMS_MODEL, facts);
 			expect(exact % 1).toBe(0.25);
-			expect(stats.change(P(kb("f")), null, facts)).toBe(Math.ceil(exact));
-			expect(stats.change(P(kb("f")), facts, { ...facts, itemBytes: 11 })).toBe(Math.ceil(exact + 1));
+			expect(stats.change(P(kb("f")), kb("f"), NO_SK, null, facts)).toBe(Math.ceil(exact));
+			expect(stats.change(P(kb("f")), kb("f"), NO_SK, facts, { ...facts, itemBytes: 11 })).toBe(Math.ceil(exact + 1));
 			const [row] = buckets(state, P(kb("f")));
 			expect(row).toMatchObject({ promotionEst: Math.ceil(exact + 1), promotionType: "integer" });
 		});
@@ -555,7 +563,14 @@ describe("ItemStats promotion lookup", () => {
 			const large = sqlSums(state, P(kb("large")));
 			expect(small.itemBytes).toBeLessThan(large.itemBytes);
 			expect(rounded(small)).toBeGreaterThan(rounded(large));
-			for (const threshold of [0, rounded(large), rounded(large) + 1, rounded(sqlSums(state, P(kb("tiny")))), rounded(small), rounded(small) + 1]) {
+			for (const threshold of [
+				0,
+				rounded(large),
+				rounded(large) + 1,
+				rounded(sqlSums(state, P(kb("tiny")))),
+				rounded(small),
+				rounded(small) + 1,
+			]) {
 				expectLookup(store, state, threshold);
 			}
 		});
@@ -656,7 +671,7 @@ describe("ItemStats promotion lookup", () => {
 				child.itemStats.addRows(
 					page.flatMap((item) => {
 						const facts = child.insertItemIfAbsent(item);
-						return facts ? [{ routingHash: item.routingHash, facts }] : [];
+						return facts ? [{ routingHash: item.routingHash, hk: item.hk, sk: item.sk, facts }] : [];
 					}),
 				);
 				expectExact(childState, P(hk), 0);
@@ -671,7 +686,11 @@ describe("ItemStats promotion lookup", () => {
 				put(store, kb(`rh${i}`), kb("2"), "x");
 			}
 			const sql = state.storage.sql;
-			const index = sql.exec(`SELECT routing_hash FROM item_stats WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT ?2`, 0, 5);
+			const index = sql.exec(
+				`SELECT routing_hash FROM item_stats WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT ?2`,
+				0,
+				5,
+			);
 			const rows = index.toArray();
 			expect(rows).toHaveLength(5);
 			expect(index.rowsRead).toBeLessThanOrEqual(5);
@@ -692,10 +711,12 @@ describe("ItemStats promotion lookup", () => {
 					.toArray()
 					.map((r) => r.detail)
 					.join(" | ");
-			expect(plan(`SELECT routing_hash FROM item_stats WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT ?2`, 1, 5)).toBe(
-				"SEARCH item_stats USING COVERING INDEX item_stats_promotion (promotion_est_bytes>?)",
+			expect(
+				plan(`SELECT routing_hash FROM item_stats WHERE promotion_est_bytes >= ?1 ORDER BY promotion_est_bytes DESC LIMIT ?2`, 1, 5),
+			).toBe("SEARCH item_stats USING COVERING INDEX item_stats_promotion (promotion_est_bytes>?)");
+			expect(plan(`DELETE FROM item_stats WHERE routing_hash = ?1`, P(kb("a")))).toBe(
+				"SEARCH item_stats USING PRIMARY KEY (routing_hash=?)",
 			);
-			expect(plan(`DELETE FROM item_stats WHERE routing_hash = ?1`, P(kb("a")))).toBe("SEARCH item_stats USING PRIMARY KEY (routing_hash=?)");
 			expect(plan(`SELECT COUNT(*), SUM(item_bytes) FROM items WHERE routing_hash = ?1`, P(kb("a")))).toBe(
 				"SEARCH items USING PRIMARY KEY (routing_hash=?)",
 			);

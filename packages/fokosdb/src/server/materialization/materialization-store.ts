@@ -11,7 +11,7 @@ import { asRoutingHash, type RoutingHash } from "../../sharding/hash-primitives.
 import { exists, one, tryOne } from "../../shared/sql-cursor.js";
 import { itemBytesExpr, JSON_KIND_CODE } from "../../shared/partition/item-bytes.js";
 import { itemFacts, LATEST_ITEMS_MODEL, type ItemFacts } from "../../shared/partition/item-size.js";
-import { ItemStats } from "../../shared/partition/item-stats.js";
+import { BUCKET_ITEMS, ItemStats } from "../../shared/partition/item-stats.js";
 import { intervalTerms, type KeyRange, type StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosTargetDefinition } from "./targets.js";
 import { materializedPlanBindings } from "../../shared/expression/bindings.js";
@@ -215,8 +215,15 @@ export class MaterializationStore {
 
 	constructor(
 		storage: DurableObjectStorage,
-		opts: { promotionFloor: () => number | null; logParams: () => Record<string, unknown> } = {
+		opts: {
+			promotionFloor: () => number | null;
+			rangeLeaf: () => boolean;
+			logParams: () => Record<string, unknown>;
+			/** The bucket size `K` of a range leaf. Default: `BUCKET_ITEMS`. */
+			bucketItems?: number;
+		} = {
 			promotionFloor: () => null,
+			rangeLeaf: () => false,
 			logParams: () => ({}),
 		},
 	) {
@@ -228,6 +235,8 @@ export class MaterializationStore {
 			indexedCondition: "deleted_at_ms IS NOT NULL",
 			model: LATEST_ITEMS_MODEL,
 			promotionFloor: opts.promotionFloor,
+			rangeLeaf: opts.rangeLeaf,
+			bucketItems: opts.bucketItems ?? BUCKET_ITEMS,
 			logName: "fokos/materialization",
 			logParams: opts.logParams,
 		});
@@ -410,7 +419,7 @@ export class MaterializationStore {
 			);
 		}
 		const newFacts = this.#facts(image.hashKey, image.sortKey, itemBytes, image.deleted);
-		return this.itemStats.change(routingHash, current?.facts ?? null, newFacts) ?? undefined;
+		return this.itemStats.change(routingHash, image.hashKey, image.sortKey, current?.facts ?? null, newFacts) ?? undefined;
 	}
 
 	/**
@@ -899,8 +908,8 @@ export class MaterializationStore {
 			return false;
 		}
 		this.#deletePositions(row.newest_seq);
-		const facts = this.#facts(asKey(row.base_hk), asKey(row.base_sk), row.item_bytes, true);
-		this.itemStats.change(asRoutingHash(new Uint8Array(row.routing_hash)), facts, null);
+		const [hk, sk] = [asKey(row.base_hk), asKey(row.base_sk)];
+		this.itemStats.change(asRoutingHash(new Uint8Array(row.routing_hash)), hk, sk, this.#facts(hk, sk, row.item_bytes, true), null);
 		return true;
 	}
 
@@ -980,17 +989,18 @@ export class MaterializationStore {
 
 	/**
 	 * The items of `routingHash` in the composite interval `[start, end)` of `(base_hk, base_sk)`, in that
-	 * order, each with its size facts. A null edge is unbounded. It reads one row at a time, and stops
+	 * order (or in reverse order for `desc`), each with its size facts. A null edge is unbounded. It reads one row at a time, and stops
 	 * before `data` in each row.
 	 */
 	*compositeKeyFacts(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
+		order: "asc" | "desc" = "asc",
 	): Generator<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }> {
 		const { conds, params } = latestSliceTerms(routingHash, start, end);
 		for (const row of this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer; item_bytes: number; indexed: number }>(
-			`SELECT base_hk, base_sk, item_bytes, deleted_at_ms IS NOT NULL AS indexed FROM latest_items WHERE ${conds} ORDER BY base_hk, base_sk`,
+			`SELECT base_hk, base_sk, item_bytes, deleted_at_ms IS NOT NULL AS indexed FROM latest_items WHERE ${conds} ORDER BY base_hk ${order}, base_sk ${order}`,
 			...params,
 		)) {
 			yield { hk: asKey(row.base_hk), sk: asKey(row.base_sk), itemBytes: row.item_bytes, indexed: row.indexed === 1 };
@@ -1001,7 +1011,11 @@ export class MaterializationStore {
 	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number {
 		const { conds, params } = latestSliceTerms(routingHash, start, end);
 		return one(
-			this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM latest_items WHERE ${conds} LIMIT ?)`, ...params, limit),
+			this.#storage.sql.exec<{ n: number }>(
+				`SELECT COUNT(*) AS n FROM (SELECT 1 FROM latest_items WHERE ${conds} LIMIT ?)`,
+				...params,
+				limit,
+			),
 		).n;
 	}
 

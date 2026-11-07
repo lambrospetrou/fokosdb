@@ -134,13 +134,14 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		super(ctx, env);
 		this.#store = new MaterializationStore(ctx.storage, {
 			promotionFloor: () => promotionFloor(this.fokos.identity(), this.fokos.policy(), this.config()),
+			rangeLeaf: () => this.fokos.identity().kind === "range",
 			logParams: () => this.logParams(),
 		});
 		this.#splitPlanner = new SplitPlanner({
 			itemStats: this.#store.itemStats,
 			source: {
 				probeRoutingHashes: () => this.#store.probeRoutingHashes(),
-				compositeKeyFacts: (routingHash, start, end) => this.#store.compositeKeyFacts(routingHash, start, end),
+				compositeKeyFacts: (routingHash, start, end, order) => this.#store.compositeKeyFacts(routingHash, start, end, order),
 				countItems: (routingHash, start, end, limit) => this.#store.countItems(routingHash, start, end, limit),
 			},
 			databaseSize: () => this.#store.databaseSize,

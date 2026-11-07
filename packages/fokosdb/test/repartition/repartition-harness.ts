@@ -33,8 +33,7 @@ import { PartitionStore, type PendingTxItem } from "../../src/shared/partition/p
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
-import { planRangeBoundaries } from "../../src/shared/partition/split-planner.js";
-import { estimate } from "../../src/shared/partition/item-size.js";
+import { SplitPlanner } from "../../src/shared/partition/split-planner.js";
 import {
 	RepartitionSource,
 	RepartitionTarget,
@@ -180,7 +179,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			await runInDurableObject(testPartitionStub(stubName), async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const sharding = new FokosShardingStore(storage);
-				const store = new PartitionStore(storage);
+				const store = new PartitionStore(storage, { rangeLeaf: () => isRangePartition(ctx) });
 				sharding.runMigrations();
 				store.runMigrations();
 				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
@@ -246,16 +245,20 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					selfId: () => doName,
 					routingHashForKey: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
 				}),
-				computeRangeBoundaries: ({ routingHash, start, end, childCount }) => {
-					const model = store.itemStats.model;
-					return planRangeBoundaries(
-						model,
-						estimate(model, store.itemStats.factsOf(routingHash)),
-						childCount,
-						start,
-						store.compositeKeyFacts(routingHash, start, end),
-					);
-				},
+				computeRangeBoundaries: ({ routingHash, start, end, childCount }) =>
+					new SplitPlanner({
+						itemStats: store.itemStats,
+						source: {
+							probeRoutingHashes: () => store.probeRoutingHashes("items"),
+							compositeKeyFacts: (rh, from, to, order) => store.compositeKeyFacts(rh, from, to, order),
+							countItems: (rh, from, to, limit) => store.countItems(rh, from, to, limit),
+						},
+						databaseSize: () => store.databaseSize,
+						promotionFraction: () => 0.5,
+						rangeSplitN: () => childCount,
+						logName: "fokos/partition",
+						logParams: () => ({ doName }),
+					}).rangeBoundaries(routingHash, start, end, childCount),
 				onRepartitionCutover: (plan) => {
 					const calls = cutovers.get(doName) ?? [];
 					calls.push({ id: plan.id, kind: plan.kind, state: sharding.getRepartition(plan.id)?.state });
@@ -340,10 +343,9 @@ export function lockCount(store: PartitionStore, hk: string): number {
 /** The `item_bytes` sum of the bucket of the routingHash of one hash key, which the import maintains page by page. */
 export function keySizeEstimate(storage: DurableObjectStorage, hk: string): number | undefined {
 	return storage.sql
-		.exec<{ item_bytes: number }>(
-			`SELECT item_bytes FROM item_stats WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`,
-			kb(hk),
-		)
+		.exec<{
+			item_bytes: number;
+		}>(`SELECT item_bytes FROM item_stats WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`, kb(hk))
 		.toArray()[0]?.item_bytes;
 }
 

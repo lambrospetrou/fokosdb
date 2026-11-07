@@ -5,7 +5,7 @@ import type { FokosShardingHooks } from "../../sharding/runtime-types.js";
 import invariant from "../invariant.js";
 import type { FokosDBPolicy } from "../partition-context.js";
 import { estimate, itemFacts, type StorageModel } from "./item-size.js";
-import type { ItemStats } from "./item-stats.js";
+import type { Bucket, ItemStats } from "./item-stats.js";
 
 /**
  * The most routingHashes that one split decision asks to promote. When this many all have
@@ -24,11 +24,16 @@ export type SplitSource = {
 	 */
 	probeRoutingHashes(): { first: KeyBytes; more: boolean } | null;
 	/**
-	 * The items of `routingHash` in the composite interval `[start, end)` in `(hk, sk)` order, each
-	 * with its size facts. The planner stops early, so the host must read the items one by one, and
-	 * not load them all. It must not read the item data.
+	 * The items of `routingHash` in the composite interval `[start, end)` in `(hk, sk)` order, or in the
+	 * reverse order for `desc`, each with its size facts. The planner stops early, so the host must
+	 * read the items one by one, and not load them all. It must not read the item data.
 	 */
-	compositeKeyFacts(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null): Iterable<ItemSizeFacts>;
+	compositeKeyFacts(
+		routingHash: RoutingHash,
+		start: FokosCompositeKey | null,
+		end: FokosCompositeKey | null,
+		order?: "asc" | "desc",
+	): Iterable<ItemSizeFacts>;
 	/** The count of the items of `routingHash` in `[start, end)`, at most `limit`. It reads at most `limit` items. */
 	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number;
 };
@@ -131,14 +136,19 @@ export class SplitPlanner {
 	 * The answer of the `computeRangeBoundaries` hook: the `N - 1` boundaries of the slice, or null when
 	 * the slice holds fewer than `N` items. All reads run in one storage transaction.
 	 */
-	rangeBoundaries(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, N: number): FokosCompositeKey[] | null {
+	rangeBoundaries(
+		routingHash: RoutingHash,
+		start: FokosCompositeKey | null,
+		end: FokosCompositeKey | null,
+		N: number,
+	): FokosCompositeKey[] | null {
 		const { itemStats, source } = this.#opts;
 		if (source.countItems(routingHash, start, end, N) < N) {
 			return null;
 		}
-		const model = itemStats.model;
-		const total = estimate(model, itemStats.factsOf(routingHash));
-		return planRangeBoundaries(model, total, N, start, source.compositeKeyFacts(routingHash, start, end));
+		// Each read stays inside the slice: a bucket bound can be below `start`.
+		const read: SliceRead = (from, to, order) => source.compositeKeyFacts(routingHash, laterKey(start, from), earlierKey(end, to), order);
+		return planBucketBoundaries(itemStats.model, N, start, itemStats.buckets(routingHash, end), read);
 	}
 
 	/**
@@ -306,7 +316,10 @@ export function planRangeBoundaries(
 				break;
 			}
 		}
-		before += estimate(model, itemFacts(model, { itemBytes: item.itemBytes, keyBytes: item.hk.byteLength + item.sk.byteLength, indexed: item.indexed }));
+		before += estimate(
+			model,
+			itemFacts(model, { itemBytes: item.itemBytes, keyBytes: item.hk.byteLength + item.sk.byteLength, indexed: item.indexed }),
+		);
 	}
 	if (count < N) {
 		return null;
@@ -330,6 +343,164 @@ export function planRangeBoundaries(
 			boundaries.push(separatorAt(gap));
 		}
 	}
+	return checkedBoundaries(boundaries, start);
+}
+
+/** Reads the items of a slice in `[from, to)`, in key order or in reverse order. A null edge is the edge of the slice. */
+export type SliceRead = (from: FokosCompositeKey | null, to: FokosCompositeKey | null, order: "asc" | "desc") => Iterable<ItemSizeFacts>;
+
+/** A gap between two adjacent items. An unknown item is read only when the planner needs it. */
+type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: number };
+
+/**
+ * The boundaries of `planRangeBoundaries` from the buckets of the slice. It gives the same boundaries
+ * as `planRangeBoundaries` over the same items when the facts of the buckets are exact. The caller
+ * checks before that the slice holds at least `N` items.
+ *
+ * The estimate before each bucket comes from the bucket facts, and its total is `B`. For each target
+ * `i * B / N`, the planner scans the bucket that holds the target one time. The candidate gaps are the
+ * start of the bucket, the gaps inside it, and the start of the next bucket. When the gap nearest the
+ * target is at or before the previous boundary, the boundary is the first gap after the previous
+ * boundary: one more item read. When the items end with fewer boundaries, the repair reads the last
+ * `N` items, as in `planRangeBoundaries`.
+ *
+ * The planner identifies a gap by its items, not by a count from the facts. Thus wrong facts give a
+ * worse balance, but the boundaries stay valid.
+ */
+export function planBucketBoundaries(
+	model: StorageModel,
+	N: number,
+	start: FokosCompositeKey | null,
+	buckets: readonly Bucket[],
+	read: SliceRead,
+): FokosCompositeKey[] {
+	invariant(N >= 2, `fokos/split-planner: a range split needs at least 2 children, got ${N}`);
+	const weight = (item: ItemSizeFacts) =>
+		estimate(
+			model,
+			itemFacts(model, { itemBytes: item.itemBytes, keyBytes: item.hk.byteLength + item.sk.byteLength, indexed: item.indexed }),
+		);
+	const firstOf = (items: Iterable<ItemSizeFacts>) => {
+		for (const item of items) {
+			return item;
+		}
+		return null;
+	};
+	const itemBefore = (item: ItemSizeFacts) => firstOf(read(null, item, "desc"));
+	// The smallest composite key above `(hk, sk)` is `(hk, sk || 0x00)`, so this read starts at the next item.
+	const itemAfter = (item: ItemSizeFacts) =>
+		firstOf(read({ hk: item.hk, sk: KeyCodec.asKeyBytes(new Uint8Array([...item.sk, 0])) }, null, "asc"));
+	// Reads the unknown item of a gap. It returns false when no such item exists, so the gap does not exist.
+	const resolve = (gap: Gap & { next?: FokosCompositeKey | null }) => {
+		gap.lower ??= itemBefore(gap.upper!);
+		if (gap.upper === null) {
+			// The end gap of a bucket: its upper item is the first item at or above the next bucket bound.
+			gap.upper = gap.next === null ? null : firstOf(read(gap.next!, null, "asc"));
+		}
+		return gap.lower !== null && gap.upper !== null;
+	};
+	const isAfter = (gap: Gap, previous: Gap) =>
+		gap.lower !== null
+			? KeyCodec.compareComposite(gap.lower, previous.lower!) > 0
+			: KeyCodec.compareComposite(gap.upper!, previous.upper!) > 0;
+
+	// The estimate before each bucket.
+	const lowerEst: number[] = [];
+	let total = 0;
+	for (const bucket of buckets) {
+		lowerEst.push(total);
+		total += estimate(model, bucket.facts);
+	}
+	const step = total / N;
+	// The candidate gaps of each scanned bucket. Each bucket is scanned at most one time.
+	const scanned = new Map<number, Gap[]>();
+	const gapsOf = (b: number): Gap[] => {
+		let gaps = scanned.get(b);
+		if (gaps === undefined) {
+			const items = [...read(buckets[b].bound, buckets[b + 1]?.bound ?? null, "asc")];
+			gaps = [];
+			if (items.length > 0) {
+				let before = lowerEst[b];
+				gaps.push({ lower: null, upper: items[0], before });
+				for (let i = 0; i + 1 < items.length; i++) {
+					before += weight(items[i]);
+					gaps.push({ lower: items[i], upper: items[i + 1], before });
+				}
+				const end: Gap & { next: FokosCompositeKey | null } = {
+					lower: items[items.length - 1],
+					upper: null,
+					before: lowerEst[b] + estimate(model, buckets[b].facts),
+					next: buckets[b + 1]?.bound ?? null,
+				};
+				gaps.push(end);
+			}
+			scanned.set(b, gaps);
+		}
+		return gaps;
+	};
+
+	let chosen: Gap[] = [];
+	for (let k = 1; k < N; k++) {
+		const target = step * k;
+		const b = lowerEst.findIndex((lower, i) => lower < target && target <= lower + estimate(model, buckets[i].facts));
+		if (b === -1) {
+			break;
+		}
+		const gaps = gapsOf(b);
+		let nearBelow = gaps.findLast((gap) => gap.before < target);
+		let nearAbove = gaps.find((gap) => gap.before >= target);
+		if (nearBelow !== undefined && !resolve(nearBelow)) {
+			nearBelow = undefined;
+		}
+		if (nearAbove !== undefined && !resolve(nearAbove)) {
+			nearAbove = undefined;
+		}
+		const previous = chosen.at(-1);
+		if (nearBelow !== undefined && previous !== undefined && !isAfter(nearBelow, previous)) {
+			nearBelow = undefined;
+		}
+		let pick: Gap | undefined;
+		if (nearAbove !== undefined && previous !== undefined && !isAfter(nearAbove, previous)) {
+			// Each gap near the target is at or before the previous boundary.
+			const upper = itemAfter(previous.upper!);
+			pick = upper === null ? undefined : { lower: previous.upper, upper, before: Number.NaN };
+		} else if (nearAbove !== undefined) {
+			pick = nearBelow !== undefined && target - nearBelow.before <= nearAbove.before - target ? nearBelow : nearAbove;
+		} else {
+			pick = nearBelow;
+		}
+		if (pick === undefined) {
+			break;
+		}
+		chosen.push(pick);
+		if (nearAbove === undefined) {
+			break;
+		}
+	}
+	if (chosen.length < N - 1) {
+		const last: ItemSizeFacts[] = [];
+		for (const item of read(null, null, "desc")) {
+			last.unshift(item);
+			if (last.length === N) {
+				break;
+			}
+		}
+		invariant(last.length === N, `fokos/split-planner: the slice holds fewer than ${N} items`);
+		const kept = chosen.filter((gap) => KeyCodec.compareComposite(gap.lower!, last[0]) < 0);
+		const missing = N - 1 - kept.length;
+		for (let i = N - 1 - missing; i < N - 1; i++) {
+			kept.push({ lower: last[i], upper: last[i + 1], before: Number.NaN });
+		}
+		chosen = kept;
+	}
+	return checkedBoundaries(
+		chosen.map((gap) => KeyCodec.shortestCompositeSeparator(gap.lower!, gap.upper!)),
+		start,
+	);
+}
+
+/** Checks that each boundary is above `start` and that the boundaries strictly increase. */
+function checkedBoundaries(boundaries: FokosCompositeKey[], start: FokosCompositeKey | null): FokosCompositeKey[] {
 	for (let i = 0; i < boundaries.length; i++) {
 		invariant(
 			start === null || KeyCodec.compareComposite(boundaries[i], start) > 0,
@@ -341,4 +512,12 @@ export function planRangeBoundaries(
 		);
 	}
 	return boundaries;
+}
+
+function laterKey(a: FokosCompositeKey | null, b: FokosCompositeKey | null): FokosCompositeKey | null {
+	return a === null ? b : b === null || KeyCodec.compareComposite(a, b) >= 0 ? a : b;
+}
+
+function earlierKey(a: FokosCompositeKey | null, b: FokosCompositeKey | null): FokosCompositeKey | null {
+	return a === null ? b : b === null || KeyCodec.compareComposite(a, b) <= 0 ? a : b;
 }

@@ -10,9 +10,16 @@ import type { FokosPartitionIdentity } from "../../sharding/route-context.js";
 import type { FokosDBPolicy } from "../partition-context.js";
 import fc from "fast-check";
 import type { FokosCompositeKey } from "../../sharding/key-codec.js";
-import type { StorageModel } from "./item-size.js";
-import type { ItemStats } from "./item-stats.js";
-import { planRangeBoundaries, promotionFloor, SplitPlanner, type ItemSizeFacts } from "./split-planner.js";
+import { itemFacts, NO_FACTS, type ItemFacts, type StorageModel } from "./item-size.js";
+import { addFacts, type Bucket, type ItemStats } from "./item-stats.js";
+import {
+	planBucketBoundaries,
+	planRangeBoundaries,
+	promotionFloor,
+	SplitPlanner,
+	type ItemSizeFacts,
+	type SliceRead,
+} from "./split-planner.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -152,6 +159,147 @@ describe("planRangeBoundaries", () => {
 				},
 			),
 		);
+	});
+});
+
+/** The bound of the first bucket: the smallest composite key. */
+const FIRST: FokosCompositeKey = { hk: KeyCodec.asKeyBytes(new Uint8Array()), sk: KeyCodec.asKeyBytes(new Uint8Array()) };
+
+/**
+ * Buckets over `list` with `sizes` items each, in order: the first bucket starts at the smallest key,
+ * and each other bucket at its first item. `facts` gives the facts of each bucket, exact by default.
+ */
+function bucketsOf(list: ItemSizeFacts[], sizes: number[], facts: (exact: ItemFacts, b: number) => ItemFacts = (exact) => exact): Bucket[] {
+	const out: Bucket[] = [];
+	let at = 0;
+	for (const [b, size] of sizes.entries()) {
+		const exact = list
+			.slice(at, at + size)
+			.map((item) =>
+				itemFacts(WEIGHT_MODEL, { itemBytes: item.itemBytes, keyBytes: item.hk.byteLength + item.sk.byteLength, indexed: item.indexed }),
+			)
+			.reduce(addFacts, { ...NO_FACTS });
+		out.push({ bound: b === 0 ? FIRST : { hk: list[at].hk, sk: list[at].sk }, facts: facts(exact, b) });
+		at += size;
+	}
+	return out;
+}
+
+/** A read of `list` in `[from, to)` that counts the rows it gives. */
+function reader(list: ItemSizeFacts[]): { read: SliceRead; rows: () => number } {
+	let rows = 0;
+	const read: SliceRead = function* (from, to, order) {
+		const inside = list.filter(
+			(item) => (from === null || KeyCodec.compareComposite(item, from) >= 0) && (to === null || KeyCodec.compareComposite(item, to) < 0),
+		);
+		for (const item of order === "asc" ? inside : inside.reverse()) {
+			rows++;
+			yield item;
+		}
+	};
+	return { read, rows: () => rows };
+}
+
+/** Random bucket sizes from 1 to `max` items that cover `count` items. */
+const arbSizes = (count: number, max: number) =>
+	fc.array(fc.integer({ min: 1, max }), { minLength: count, maxLength: count }).map((raw) => {
+		const sizes: number[] = [];
+		let left = count;
+		for (const size of raw) {
+			if (left === 0) {
+				break;
+			}
+			sizes.push(Math.min(size, left));
+			left -= sizes.at(-1)!;
+		}
+		return sizes;
+	});
+
+describe("planBucketBoundaries", () => {
+	const bucketPlan = (weights: number[], N: number, sizes: number[]) => {
+		const list = items(...weights);
+		return planBucketBoundaries(WEIGHT_MODEL, N, null, bucketsOf(list, sizes), reader(list).read);
+	};
+
+	it("gives the boundaries of the streaming path for the cases of a dominant item, equal weights, and exactly N items", () => {
+		const cases: Array<[number[], number]> = [
+			[[111, 111, 111, 111], 2],
+			[[5111, 111, 111], 3],
+			[[111, 5111, 111], 3],
+			[[111, 111, 5111], 3],
+			[[1, 2, 3, 4], 4],
+		];
+		for (const [weights, N] of cases) {
+			for (const sizes of [[weights.length], weights.map(() => 1), [1, weights.length - 1]]) {
+				expect(bucketPlan(weights, N, sizes), `${weights.join(",")} N=${N} sizes=${sizes.join(",")}`).toEqual(plan(weights, N));
+			}
+		}
+		expect(children([111, 111, 5111], bucketPlan([111, 111, 5111], 3, [2, 1]))).toEqual([[111], [111], [5111]]);
+	});
+
+	it("gives the boundaries of the streaming path for each bucket layout, and reads at most the bucket bound of rows", () => {
+		fc.assert(
+			fc.property(
+				fc.array(fc.oneof(fc.integer({ min: 1, max: 200 }), fc.integer({ min: 1000, max: 20_000 })), { minLength: 2, maxLength: 60 }),
+				fc.integer({ min: 2, max: 8 }),
+				fc.integer({ min: 1, max: 8 }),
+				fc.boolean(),
+				(weights, N, maxBucket, emptyFirst) => {
+					fc.pre(weights.length >= N);
+					const list = items(...weights);
+					return fc.assert(
+						fc.property(arbSizes(weights.length, maxBucket), (sizes) => {
+							// An empty first bucket can stay in front of the others.
+							const buckets = bucketsOf(list, sizes);
+							const layout = emptyFirst
+								? [
+										{ bound: FIRST, facts: { ...NO_FACTS } },
+										{ ...buckets[0], bound: { hk: list[0].hk, sk: list[0].sk } },
+										...buckets.slice(1),
+									]
+								: buckets;
+							const { read, rows } = reader(list);
+							expect(planBucketBoundaries(WEIGHT_MODEL, N, null, layout, read)).toEqual(plan(weights, N));
+							// Each target scans one bucket of at most `maxBucket` items, and reads at most 3 more
+							// rows: the item before the bucket, the item after it, and the item after a boundary
+							// that the target cannot use. The repair reads the last N items.
+							expect(rows()).toBeLessThanOrEqual(Math.min(N - 1, layout.length) * maxBucket + 3 * (N - 1) + N);
+						}),
+						{ numRuns: 5 },
+					);
+				},
+			),
+			{ numRuns: 200 },
+		);
+	});
+
+	it("gives N - 1 valid boundaries for wrong bucket facts, with a worse balance", () => {
+		fc.assert(
+			fc.property(
+				fc.array(fc.integer({ min: 1, max: 5000 }), { minLength: 2, maxLength: 40 }),
+				fc.integer({ min: 2, max: 6 }),
+				fc.array(fc.integer({ min: 0, max: 100_000 }), { minLength: 40, maxLength: 40 }),
+				(weights, N, wrong) => {
+					fc.pre(weights.length >= N);
+					const list = items(...weights);
+					const sizes = weights.map(() => 1);
+					const buckets = bucketsOf(list, sizes, (exact, b) => ({ ...exact, itemBytes: wrong[b], itemCount: wrong[b] % 7 }));
+					const boundaries = planBucketBoundaries(WEIGHT_MODEL, N, null, buckets, reader(list).read);
+					expect(boundaries).toHaveLength(N - 1);
+					expect(children(weights, boundaries).every((c) => c.length > 0)).toBe(true);
+				},
+			),
+		);
+	});
+
+	it("keeps each boundary inside the slice and above its lower bound", () => {
+		const list = items(10, 10, 10, 10, 10, 10);
+		const inSlice = list.slice(2);
+		const start = { hk: list[2].hk, sk: list[2].sk };
+		// The first bucket starts below the slice, as on a range child.
+		const buckets = bucketsOf(inSlice, [2, 2]);
+		const boundaries = planBucketBoundaries(WEIGHT_MODEL, 2, start, buckets, reader(inSlice).read);
+		expect(boundaries).toEqual(planRangeBoundaries(WEIGHT_MODEL, 40, 2, start, inSlice));
 	});
 });
 

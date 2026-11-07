@@ -194,12 +194,12 @@ export class FokosMigrationHost implements MigrationHost {
 		const { store } = this.deps;
 		// The exact facts, added per page, are what removes a whole-table recount at the end of an import.
 		// A row already present contributes nothing, so a retried page cannot count its rows twice.
-		const added: Array<{ routingHash: RoutingHash; facts: ItemFacts }> = [];
+		const added: Array<{ routingHash: RoutingHash; hk: KeyBytes; sk: KeyBytes; facts: ItemFacts }> = [];
 		let maxItemId = 0;
 		for (const item of items) {
 			const facts = store.insertItemIfAbsent(item);
 			if (facts) {
-				added.push({ routingHash: item.routingHash, facts });
+				added.push({ routingHash: item.routingHash, hk: item.hk, sk: item.sk, facts });
 			}
 			maxItemId = Math.max(maxItemId, item.item_id);
 		}

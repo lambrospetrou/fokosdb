@@ -379,7 +379,10 @@ describe("TransactionParticipant - prepare", () => {
 			// only item of its routingHash, and it has a TTL.
 			const keyBytes = kb("user").byteLength + sk.byteLength;
 			expect(commit.promotionCandidates).toEqual([
-				{ hashKey: kb("user"), keyEstBytes: Math.ceil(estimate(ITEMS_MODEL, itemFacts(ITEMS_MODEL, { itemBytes, keyBytes, indexed: true }))) },
+				{
+					hashKey: kb("user"),
+					keyEstBytes: Math.ceil(estimate(ITEMS_MODEL, itemFacts(ITEMS_MODEL, { itemBytes, keyBytes, indexed: true }))),
+				},
 			]);
 		});
 	});
@@ -897,9 +900,15 @@ describe("TransactionParticipant - commit", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
 			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-			const commit = participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: request.transactionTimestamp, items: request.items });
+			const commit = participant.commitLocal({
+				transactionId: request.transactionId,
+				transactionTimestamp: request.transactionTimestamp,
+				items: request.items,
+			});
 			expect(commit.response).toEqual({ outcome: "committed" });
-			const defects = errors.mock.calls.filter(([entry]) => (entry as { message?: string }).message?.includes("the facts of a bucket disagree with its items"));
+			const defects = errors.mock.calls.filter(([entry]) =>
+				(entry as { message?: string }).message?.includes("the facts of a bucket disagree with its items"),
+			);
 			expect(defects).toHaveLength(1);
 			expect(store.itemStats.factsOf(P(hk))).toEqual({
 				...exact,

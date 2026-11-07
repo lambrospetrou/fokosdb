@@ -97,7 +97,14 @@ function scanRows(
 	return { rows, metrics };
 }
 
-type BucketRow = { item_count: number; item_bytes: number; key_bytes: number; indexed_item_count: number; indexed_key_bytes: number; overflow_bytes: number };
+type BucketRow = {
+	item_count: number;
+	item_bytes: number;
+	key_bytes: number;
+	indexed_item_count: number;
+	indexed_key_bytes: number;
+	overflow_bytes: number;
+};
 
 /** The facts of the bucket of the routingHash of `hk`, or undefined when it has none. */
 function bucketRow(state: DurableObjectState, hk: string): BucketRow | undefined {
@@ -508,9 +515,7 @@ describe("PartitionStore - items", () => {
 				state.storage.sql.exec<{ e: number }>(`SELECT item_bytes AS e FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb(sk)).toArray()[0]
 					?.e;
 			const octetLen = (sk: string, data: string | Uint8Array) =>
-				(typeof data === "string" ? new TextEncoder().encode(data).length : data.byteLength) +
-				kb("hk").byteLength +
-				kb(sk).byteLength;
+				(typeof data === "string" ? new TextEncoder().encode(data).length : data.byteLength) + kb("hk").byteLength + kb(sk).byteLength;
 
 			const multibyte = "héllo—✓"; // multi-byte UTF-8: octet_length > .length
 			store.upsertItem({ routingHash: P(kb("hk")), hk: kb("hk"), sk: kb("t"), data: multibyte, kind: "text", ttlAt: null, txOrderTs: 1 });
@@ -589,7 +594,13 @@ describe("PartitionStore - items", () => {
 				),
 			).toBe("SEARCH items USING PRIMARY KEY (routing_hash=? AND (hk,sk)>(?,?) AND (hk,sk)<(?,?))");
 			expect(
-				plan(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE routing_hash = ? AND (hk, sk) >= (?, ?) LIMIT ?)`, rh, kb("a"), kb("a"), 4),
+				plan(
+					`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE routing_hash = ? AND (hk, sk) >= (?, ?) LIMIT ?)`,
+					rh,
+					kb("a"),
+					kb("a"),
+					4,
+				),
 			).toContain("SEARCH items USING PRIMARY KEY (routing_hash=? AND (hk,sk)>(?,?))");
 		});
 	});

@@ -138,9 +138,7 @@ const b64 = (value: unknown) => (typeof value === "string" ? value : new Uint8Ar
 function snapshot(storage: DurableObjectStorage) {
 	return {
 		items: storage.sql
-			.exec(
-				`SELECT hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, item_bytes FROM items ORDER BY hk, sk`,
-			)
+			.exec(`SELECT hk, sk, v, data, data_kind, ttl_epoch_utc_seconds, last_read_ts, last_write_ts, item_bytes FROM items ORDER BY hk, sk`)
 			.toArray()
 			.map((r) => ({ ...r, hk: b64(r.hk), sk: b64(r.sk), data: b64(r.data) })),
 		deletion: storage.sql.exec(`SELECT max_delete_tx_order_ts, max_deleted_v FROM deletion_metadata`).one(),

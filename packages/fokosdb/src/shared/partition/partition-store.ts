@@ -29,7 +29,7 @@ import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import { withExpressionErrors } from "../errors-operations.js";
 import { itemBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-bytes.js";
 import { itemFacts, ITEMS_MODEL, type ItemFacts } from "./item-size.js";
-import { addFacts, ItemStats } from "./item-stats.js";
+import { BUCKET_ITEMS, ItemStats } from "./item-stats.js";
 import type { TransactionOperationType } from "../transaction-wire-types.js";
 import type { FokosStorageInterval } from "../../sharding/runtime-types.js";
 
@@ -871,6 +871,10 @@ export type PartitionStoreOptions = {
 	gsiSortKey?: () => boolean;
 	/** The promotion floor of the current policy, or null when the partition has no promotion. Read at each fact write. Default: null. */
 	promotionFloor?: () => number | null;
+	/** True when the partition is a range leaf. Read at each fact write. Default: false. */
+	rangeLeaf?: () => boolean;
+	/** The bucket size `K` of a range leaf. Default: `BUCKET_ITEMS`. */
+	bucketItems?: number;
 	/** The parameters of each log message of the store. */
 	logParams?: () => Record<string, unknown>;
 };
@@ -903,6 +907,8 @@ export class PartitionStore {
 			indexedCondition: "ttl_epoch_utc_seconds IS NOT NULL",
 			model: ITEMS_MODEL,
 			promotionFloor: opts.promotionFloor ?? (() => null),
+			rangeLeaf: opts.rangeLeaf ?? (() => false),
+			bucketItems: opts.bucketItems ?? BUCKET_ITEMS,
 			logName: "fokos/partition",
 			logParams: opts.logParams ?? (() => ({})),
 		});
@@ -1268,7 +1274,7 @@ export class PartitionStore {
 		this.#captureWrite(opts.routingHash, opts.hk, opts.sk, version, old === undefined);
 		// Exact stored size, measured by SQLite in the statement above.
 		const newFacts = this.#facts(opts.hk, opts.sk, rows[0].item_bytes, opts.ttlAt);
-		const keyEstBytes = this.itemStats.change(opts.routingHash, old ?? null, newFacts) ?? 0;
+		const keyEstBytes = this.itemStats.change(opts.routingHash, opts.hk, opts.sk, old ?? null, newFacts) ?? 0;
 
 		return { version, keyEstBytes, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
@@ -1317,7 +1323,13 @@ export class PartitionStore {
 			deleteVersion = before.v + 1;
 			this.#raiseDeletionMetadata(Math.max(opts.txOrderTs, before.last_read_ts), deleteVersion);
 			this.#captureDelete(opts.routingHash, opts.hk, opts.sk, deleteVersion);
-			this.itemStats.change(opts.routingHash, this.#facts(opts.hk, opts.sk, before.item_bytes, before.ttl_epoch_utc_seconds), null);
+			this.itemStats.change(
+				opts.routingHash,
+				opts.hk,
+				opts.sk,
+				this.#facts(opts.hk, opts.sk, before.item_bytes, before.ttl_epoch_utc_seconds),
+				null,
+			);
 		} else if (opts.bumpTxOrderTsAlways) {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
 		}
@@ -1462,8 +1474,8 @@ export class PartitionStore {
 			let deletedBytes = 0;
 			let maxDeleteTxOrderTs = 0;
 			let maxDeletedV = 0;
-			// The facts of the deleted rows of each routingHash. Each bucket gets one write for the chunk.
-			const deletedFacts = new Map<string, { routingHash: RoutingHash; facts: ItemFacts }>();
+			// The facts of the deleted rows. Each bucket gets one write for the chunk.
+			const deletedFacts: Array<{ routingHash: RoutingHash; hk: KeyBytes; sk: KeyBytes; facts: ItemFacts }> = [];
 			for (const key of owned) {
 				const row = tryOne(
 					sql.exec<{ item_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
@@ -1483,14 +1495,9 @@ export class PartitionStore {
 				// The expiry of a row at v has the delete revision v + 1, the same as a user delete.
 				maxDeletedV = Math.max(maxDeletedV, row.v + 1);
 				this.#captureDelete(key.routingHash, key.hk, key.sk, row.v + 1);
-				const facts = this.#facts(key.hk, key.sk, row.item_bytes, row.ttl_epoch_utc_seconds);
-				const id = key.routingHash.toHex();
-				const group = deletedFacts.get(id);
-				deletedFacts.set(id, { routingHash: key.routingHash, facts: group ? addFacts(group.facts, facts) : facts });
+				deletedFacts.push({ ...key, facts: this.#facts(key.hk, key.sk, row.item_bytes, row.ttl_epoch_utc_seconds) });
 			}
-			for (const { routingHash, facts } of deletedFacts.values()) {
-				this.itemStats.subtract(routingHash, facts);
-			}
+			this.itemStats.subtractRows(deletedFacts);
 			// The logical delete of an expired row happened at its expiry. The sweep records the removed
 			// rows the same as a user delete, so a later create of the key starts above their delete
 			// revisions and their stamps.
@@ -1582,18 +1589,19 @@ export class PartitionStore {
 	}
 
 	/**
-	 * The items of `routingHash` in the composite interval `[start, end)` of `(hk, sk)`, in that order, each
-	 * with its size facts. A null edge is unbounded. The generator reads one row each time the caller asks
-	 * for the next row. The scan reads the primary key and stops before `data` in each row.
+	 * The items of `routingHash` in the composite interval `[start, end)` of `(hk, sk)`, in that order (or
+	 * in reverse order for `desc`), each with its size facts. A null edge is unbounded. The generator reads
+	 * one row each time the caller asks for the next row. The scan reads the primary key and stops before `data` in each row.
 	 */
 	*compositeKeyFacts(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
+		order: "asc" | "desc" = "asc",
 	): Generator<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }> {
 		const { conds, params } = compositeSliceTerms(routingHash, start, end);
 		for (const row of this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; item_bytes: number; indexed: number }>(
-			`SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds IS NOT NULL AS indexed FROM items WHERE ${conds} ORDER BY hk, sk`,
+			`SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds IS NOT NULL AS indexed FROM items WHERE ${conds} ORDER BY hk ${order}, sk ${order}`,
 			...params,
 		)) {
 			yield { hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), itemBytes: row.item_bytes, indexed: row.indexed === 1 };
@@ -1881,7 +1889,7 @@ export class PartitionStore {
 		);
 		this.#captureWrite(opts.routingHash, opts.hk, opts.sk, version, old === undefined);
 		const newFacts = this.#facts(opts.hk, opts.sk, rows[0].item_bytes, rows[0].ttl_epoch_utc_seconds);
-		const keyEstBytes = this.itemStats.change(opts.routingHash, old ?? null, newFacts) ?? 0;
+		const keyEstBytes = this.itemStats.change(opts.routingHash, opts.hk, opts.sk, old ?? null, newFacts) ?? 0;
 
 		return {
 			version,

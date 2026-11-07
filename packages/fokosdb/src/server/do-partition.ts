@@ -424,6 +424,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			onChangeCaptured: () => this.#exporter.wake(),
 			gsiSortKey: () => isGsiShardGroup(this.fokos.routeContext().topology.shardGroup),
 			promotionFloor: () => promotionFloor(this.fokos.identity(), this.fokos.policy(), this.config()),
+			rangeLeaf: () => this.fokos.identity().kind === "range",
 			logParams: () => this.logParams(),
 		});
 		// A hash leaf probes `pending_transactions` when `items` is empty, because a pending payload
@@ -432,7 +433,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			itemStats: this.#store.itemStats,
 			source: {
 				probeRoutingHashes: () => this.#store.probeRoutingHashes("items") ?? this.#store.probeRoutingHashes("pending_transactions"),
-				compositeKeyFacts: (routingHash, start, end) => this.#store.compositeKeyFacts(routingHash, start, end),
+				compositeKeyFacts: (routingHash, start, end, order) => this.#store.compositeKeyFacts(routingHash, start, end, order),
 				countItems: (routingHash, start, end, limit) => this.#store.countItems(routingHash, start, end, limit),
 			},
 			databaseSize: () => this.#store.databaseSize,

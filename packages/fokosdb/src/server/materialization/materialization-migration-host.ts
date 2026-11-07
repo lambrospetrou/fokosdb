@@ -128,12 +128,12 @@ export class MaterializationMigrationHost implements MigrationHost {
 			case "items": {
 				// An item that is present already contributes nothing, so a retried page does not count
 				// its rows two times.
-				const added: Array<{ routingHash: RoutingHash; facts: ItemFacts }> = [];
+				const added: Array<{ routingHash: RoutingHash; hk: KeyBytes; sk: KeyBytes; facts: ItemFacts }> = [];
 				let maxItemId = 0;
 				for (const item of p.items) {
 					const facts = store.insertMigratedItem(item);
 					if (facts) {
-						added.push({ routingHash: item.routingHash, facts });
+						added.push({ routingHash: item.routingHash, hk: item.hk, sk: item.sk, facts });
 					}
 					maxItemId = Math.max(maxItemId, item.item_id);
 				}

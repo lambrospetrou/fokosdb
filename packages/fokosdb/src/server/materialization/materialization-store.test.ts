@@ -133,13 +133,99 @@ describe("MaterializationStore — item size", () => {
 		await withStore((h) => {
 			const keys = kb("x").byteLength + NO_SK.byteLength;
 			h.ingest("x", 1, []);
-			const live = { itemCount: 1, itemBytes: "v1".length + keys, keyBytes: keys, indexedItemCount: 0, indexedKeyBytes: 0, overflowBytes: 0 };
+			const live = {
+				itemCount: 1,
+				itemBytes: "v1".length + keys,
+				keyBytes: keys,
+				indexedItemCount: 0,
+				indexedKeyBytes: 0,
+				overflowBytes: 0,
+			};
 			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.facts).toEqual(live);
 			expect(h.store.itemStats.factsOf(P(kb("x")))).toEqual(live);
 			h.ingest("x", 2, [], true);
 			const tombstone = { itemCount: 1, itemBytes: keys, keyBytes: keys, indexedItemCount: 1, indexedKeyBytes: keys, overflowBytes: 0 };
 			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.facts).toEqual(tombstone);
 			expect(h.store.itemStats.factsOf(P(kb("x")))).toEqual(tombstone);
+		});
+	});
+});
+
+describe("MaterializationStore — buckets on a range leaf", () => {
+	it("keeps each bucket equal to the sums of its key range through live images, tombstones, and tombstone collection", async () => {
+		const stub = env.MATERIALIZATION_DO.getByName(`mat-store.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
+			const K = 2;
+			const store = new MaterializationStore(state.storage, {
+				promotionFloor: () => null,
+				rangeLeaf: () => true,
+				logParams: () => ({}),
+				bucketItems: K,
+			});
+			const hk = kb("r");
+			const rh = P(hk);
+			const image = (sk: string, revision: number, deleted: boolean): LatestImage =>
+				deleted
+					? { opIndex: 0, hashKey: hk, sortKey: kb(sk), revision, deleted: true }
+					: {
+							opIndex: 0,
+							hashKey: hk,
+							sortKey: kb(sk),
+							revision,
+							deleted: false,
+							data: "v".repeat(revision * 5),
+							kind: "text",
+							ttlAt: null,
+						};
+			const apply = (sk: string, revision: number, deleted: boolean) =>
+				store.putLatestImage(rh, image(sk, revision, deleted), 1_000, store.storedImage(rh, hk, kb(sk)), []);
+			const expectExact = () => {
+				const rows = state.storage.sql
+					.exec<{
+						lower_hk: ArrayBuffer;
+						lower_sk: ArrayBuffer;
+						item_count: number;
+						item_bytes: number;
+						indexed_item_count: number;
+						promotion_est_bytes: number | null;
+					}>(
+						`SELECT lower_hk, lower_sk, item_count, item_bytes, indexed_item_count, promotion_est_bytes FROM item_stats WHERE routing_hash = ? ORDER BY lower_hk, lower_sk`,
+						rh,
+					)
+					.toArray();
+				for (const [i, row] of rows.entries()) {
+					const next = rows[i + 1];
+					const sums = state.storage.sql
+						.exec<{ c: number; b: number; t: number }>(
+							`SELECT COUNT(*) AS c, COALESCE(SUM(item_bytes), 0) AS b, COALESCE(SUM(deleted_at_ms IS NOT NULL), 0) AS t FROM latest_items
+							  WHERE routing_hash = ?1 AND (base_hk, base_sk) >= (?2, ?3) ${next ? "AND (base_hk, base_sk) < (?4, ?5)" : ""}`,
+							rh,
+							row.lower_hk,
+							row.lower_sk,
+							...(next ? [next.lower_hk, next.lower_sk] : []),
+						)
+						.one();
+					expect([row.item_count, row.item_bytes, row.indexed_item_count]).toEqual([sums.c, sums.b, sums.t]);
+					expect(row.item_count).toBeLessThanOrEqual(2 * K);
+					expect(row.promotion_est_bytes).toBeNull();
+				}
+				return rows;
+			};
+			const sks = Array.from({ length: 9 }, (_, i) => `s${i}`);
+			for (const sk of sks) {
+				apply(sk, 1, false);
+				expectExact();
+			}
+			expect(expectExact().length).toBeGreaterThan(1);
+			for (const sk of sks) {
+				apply(sk, 2, true);
+				expectExact();
+			}
+			for (const sk of sks) {
+				expect(store.deleteTombstone(store.storedImage(rh, hk, kb(sk))!.itemId)).toBe(true);
+				expectExact();
+			}
+			expect(expectExact()).toEqual([]);
 		});
 	});
 });

@@ -60,7 +60,14 @@ function bucketEstimates(state: DurableObjectState, where: string, ...params: un
 		.toArray()
 		.map((r) =>
 			Math.ceil(
-				estimate(ITEMS_MODEL, { itemCount: r.c, itemBytes: r.b, keyBytes: r.k, indexedItemCount: r.ic, indexedKeyBytes: r.ik, overflowBytes: r.o }),
+				estimate(ITEMS_MODEL, {
+					itemCount: r.c,
+					itemBytes: r.b,
+					keyBytes: r.k,
+					indexedItemCount: r.ic,
+					indexedKeyBytes: r.ik,
+					overflowBytes: r.o,
+				}),
 			),
 		);
 }
