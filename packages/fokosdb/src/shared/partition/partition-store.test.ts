@@ -25,7 +25,7 @@ import {
 } from "./partition-store.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
 import { planRangeBoundaries } from "./split-planner.js";
-import { estimate, ITEMS_MODEL } from "./item-size.js";
+import { estimate, ITEMS_MODEL, maxItemEstimate } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
@@ -71,10 +71,11 @@ function expectedRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes)
 // Runs `fn` against a PartitionStore over REAL Durable Object storage (vitest-pool-workers).
 // The FokosDBPartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
+// The floor gives the bucket threshold m = 1, so each routingHash with an item has a bucket.
 async function withStore(fn: (store: PartitionStore, state: DurableObjectState) => void | Promise<void>): Promise<void> {
 	const stub = testPartitionStub(`store-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-		await fn(new PartitionStore(state.storage), state);
+		await fn(new PartitionStore(state.storage, { promotionFloor: () => maxItemEstimate(ITEMS_MODEL) }), state);
 	});
 }
 

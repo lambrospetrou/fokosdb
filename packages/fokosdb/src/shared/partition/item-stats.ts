@@ -3,6 +3,8 @@ import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../sharding/
 import type { RoutingHash } from "../../sharding/hash-primitives.js";
 import { one, tryOne } from "../sql-cursor.js";
 import {
+	BUCKET_THRESHOLD_MAX,
+	bucketThreshold,
 	estSql,
 	FACT_NAMES,
 	NO_FACTS,
@@ -20,8 +22,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// A bucket is one row: the facts of the items of one routingHash from its lower bound
 		// `(lower_hk, lower_sk)` up to the lower bound of the next bucket, in composite-key order. The
 		// first bucket of a routingHash has the bound (x'', x''), the smallest composite key. A hash leaf
-		// keeps only the first bucket of each routingHash that has items. A range leaf keeps buckets of
-		// K to 2K items that cover its slice.
+		// keeps at most the first bucket of each routingHash, and a routingHash with fewer than m items
+		// can have none. A range leaf keeps buckets of K to 2K items that cover its slice.
 		//
 		// The table leads with `routing_hash`, like the item table. Thus the buckets of one routingHash
 		// are one key range, and a promotion deletes them with one range delete.
@@ -94,7 +96,8 @@ export type ItemStatsOptions = {
 	model: StorageModel;
 	/**
 	 * The promotion floor of the current policy, or null when the partition has no promotion. Each
-	 * statement that writes facts binds it when it runs.
+	 * statement that writes facts binds it when it runs. On a hash leaf, it also sets the bucket
+	 * threshold (`bucketThreshold`).
 	 */
 	promotionFloor: () => number | null;
 	/** True when the partition is a range leaf. Read at each fact change. */
@@ -116,7 +119,9 @@ export type ItemStatsOptions = {
  * true, it logs the defect and counts the facts again from the items in the same transaction. It
  * never throws for a defect, because a throw rolls back a commit apply that must not fail.
  *
- * On a hash leaf, each routingHash has one bucket, its first bucket. On a range leaf, the bucket of
+ * On a hash leaf, a routingHash has at most one bucket, its first bucket. A routingHash with fewer
+ * than `m` items (`bucketThreshold`) can have no bucket, and then its estimate is below the promotion
+ * floor. A bucket stays while its routingHash has items. On a range leaf, the bucket of
  * an item is the bucket with the greatest bound at or below its key. An insert splits a bucket above
  * `2K` items, and a delete merges a bucket below `K` items with its smaller neighbour when the two
  * hold fewer than `K` items together. A split bound is the key of a real item, so the items of a
@@ -163,13 +168,13 @@ export class ItemStats {
 			return range ? null : this.#estimateOf(routingHash);
 		}
 		if (!range) {
-			const row = oldFacts === null ? this.#upsertAt(routingHash, FIRST_BOUND, delta) : this.#addAt(routingHash, FIRST_BOUND, delta);
+			const row = this.#addAt(routingHash, FIRST_BOUND, delta);
 			if (row) {
 				return this.#checkedHash(routingHash, row, delta);
 			}
-			// A delete of an item that its routingHash has no bucket for changes no facts: the bucket did
-			// not represent the item. A present item that stays with no bucket is a defect.
-			return newFacts === null ? null : (this.#repair(routingHash, null, delta)?.est ?? null);
+			// A routingHash with no bucket has fewer than `m` items. A change that adds no item changes no
+			// facts, because no bucket represents the item.
+			return oldFacts === null ? (this.#createFirst(routingHash, delta)?.est ?? null) : null;
 		}
 
 		const key = { hk, sk };
@@ -240,25 +245,37 @@ export class ItemStats {
 	/**
 	 * Adds the facts of imported items. The items are in storage order, so the items of one
 	 * routingHash are next to each other. A hash leaf adds each run of one routingHash to its first
-	 * bucket with one statement. A range leaf adds the items to its last bucket until it holds `K`
+	 * bucket with one statement. When the routingHash has no bucket, it creates the bucket only when the
+	 * routingHash then has `m` items or more. A range leaf adds the items to its last bucket until it holds `K`
 	 * items, and the next item then starts a new bucket at its own key. It reads no item.
 	 */
 	addRows(rows: Iterable<{ routingHash: RoutingHash; hk: KeyBytes; sk: KeyBytes; facts: ItemFacts }>): void {
 		const range = this.#opts.rangeLeaf();
 		const K = this.#opts.bucketItems;
-		type Pending = { routingHash: RoutingHash; bound: FokosCompositeKey; stored: boolean; count: number; facts: ItemFacts };
+		type Pending = {
+			routingHash: RoutingHash;
+			bound: FokosCompositeKey;
+			stored: boolean;
+			first: FokosCompositeKey;
+			count: number;
+			facts: ItemFacts;
+		};
 		const flush = (p: Pending) => {
 			if (p.facts.itemCount === 0) {
 				return;
 			}
-			const row = p.stored ? this.#addAt(p.routingHash, p.bound, p.facts) : this.#upsertAt(p.routingHash, p.bound, p.facts);
-			if (row === undefined) {
+			if (!range) {
+				const row = this.#addAt(p.routingHash, FIRST_BOUND, p.facts);
+				if (row !== undefined) {
+					this.#checkedHash(p.routingHash, row, p.facts);
+				} else {
+					this.#importFirst(p.routingHash, p.first, p.facts);
+				}
 				return;
 			}
-			if (range) {
+			const row = p.stored ? this.#addAt(p.routingHash, p.bound, p.facts) : this.#upsertAt(p.routingHash, p.bound, p.facts);
+			if (row !== undefined) {
 				this.#checkedRange(p.routingHash, row, p.facts);
-			} else {
-				this.#checkedHash(p.routingHash, row, p.facts);
 			}
 		};
 		let run: Pending | null = null;
@@ -269,14 +286,14 @@ export class ItemStats {
 				}
 				const last = range ? this.#lastBucket(routingHash) : undefined;
 				run = last
-					? { routingHash, bound: boundOf(last), stored: true, count: last.item_count, facts: { ...NO_FACTS } }
-					: { routingHash, bound: FIRST_BOUND, stored: false, count: 0, facts: { ...NO_FACTS } };
+					? { routingHash, bound: boundOf(last), stored: true, first: { hk, sk }, count: last.item_count, facts: { ...NO_FACTS } }
+					: { routingHash, bound: FIRST_BOUND, stored: false, first: { hk, sk }, count: 0, facts: { ...NO_FACTS } };
 			}
 			// A full last bucket gets no item: the item starts a new bucket. This also applies to the first
 			// item of a page when the last bucket that the target holds is full.
 			if (range && run.count >= K) {
 				flush(run);
-				run = { routingHash, bound: { hk, sk }, stored: false, count: 0, facts: { ...NO_FACTS } };
+				run = { routingHash, bound: { hk, sk }, stored: false, first: { hk, sk }, count: 0, facts: { ...NO_FACTS } };
 			}
 			run.count++;
 			run.facts = addFacts(run.facts, facts);
@@ -486,11 +503,26 @@ export class ItemStats {
 		return row && factsOfRow(row);
 	}
 
-	/** The facts of the items of `routingHash` in `[from, to)`, counted from the primary key. A null `to` is unbounded. */
-	#count(routingHash: RoutingHash, from: FokosCompositeKey, to: FokosCompositeKey | null): ItemFacts {
-		const { table, hkColumn, skColumn, indexedCondition } = this.#opts;
+	/**
+	 * The facts of the items of `routingHash` in `[from, to)`, counted from the primary key. A null `to`
+	 * is unbounded. With `limit`, it counts at most `limit` items.
+	 */
+	#count(routingHash: RoutingHash, from: FokosCompositeKey, to: FokosCompositeKey | null, limit?: number): ItemFacts {
+		const opts = this.#opts;
+		const below = to === null ? "" : `AND (${opts.hkColumn}, ${opts.skColumn}) < (?4, ?5)`;
+		const where = `routing_hash = ?1 AND (${opts.hkColumn}, ${opts.skColumn}) >= (?2, ?3) ${below}`;
+		// The limited form selects only the key columns, `item_bytes`, and the index flag, so it reads no data.
+		const [source, hkColumn, skColumn, indexedCondition] =
+			limit === undefined
+				? [`${opts.table} WHERE ${where}`, opts.hkColumn, opts.skColumn, opts.indexedCondition]
+				: [
+						`(SELECT ${opts.hkColumn} AS hk, ${opts.skColumn} AS sk, item_bytes, (${opts.indexedCondition}) AS indexed
+						    FROM ${opts.table} WHERE ${where} LIMIT ?${to === null ? 4 : 6})`,
+						"hk",
+						"sk",
+						"indexed",
+					];
 		const keyBytes = `octet_length(${hkColumn}) + octet_length(${skColumn})`;
-		const below = to === null ? "" : `AND (${hkColumn}, ${skColumn}) < (?4, ?5)`;
 		return factsOfRow(
 			one(
 				this.#storage.sql.exec<FactsRow>(
@@ -500,11 +532,12 @@ export class ItemStats {
 					        COALESCE(SUM(CASE WHEN ${indexedCondition} THEN 1 ELSE 0 END), 0) AS indexed_item_count,
 					        COALESCE(SUM(CASE WHEN ${indexedCondition} THEN ${keyBytes} ELSE 0 END), 0) AS indexed_key_bytes,
 					        COALESCE(SUM(${overflowBytesSql(this.model, "item_bytes")}), 0) AS overflow_bytes
-					   FROM ${table} WHERE routing_hash = ?1 AND (${hkColumn}, ${skColumn}) >= (?2, ?3) ${below}`,
+					   FROM ${source}`,
 					routingHash,
 					from.hk,
 					from.sk,
 					...(to === null ? [] : [to.hk, to.sk]),
+					...(limit === undefined ? [] : [limit]),
 				),
 			),
 		);
@@ -527,6 +560,44 @@ export class ItemStats {
 			),
 		);
 		return row && { hk: KeyCodec.asKeyBytes(new Uint8Array(row.hk)), sk: KeyCodec.asKeyBytes(new Uint8Array(row.sk)) };
+	}
+
+	/**
+	 * After an insert on a hash leaf into a routingHash with no bucket: creates the first bucket when
+	 * the routingHash now has `m` items or more. Such a routingHash has at most `BUCKET_THRESHOLD_MAX`
+	 * items, so the count and the facts read each of its items. More items is a defect, and the recount
+	 * of the whole routingHash creates the bucket.
+	 */
+	#createFirst(routingHash: RoutingHash, delta: ItemFacts): WrittenRow | undefined {
+		const count = one(
+			this.#storage.sql.exec<{ n: number }>(
+				`SELECT COUNT(*) AS n FROM (SELECT 1 FROM ${this.#opts.table} WHERE routing_hash = ?1 LIMIT ?2)`,
+				routingHash,
+				BUCKET_THRESHOLD_MAX + 1,
+			),
+		).n;
+		if (count > BUCKET_THRESHOLD_MAX) {
+			return this.#repair(routingHash, null, delta);
+		}
+		if (count < bucketThreshold(this.model, this.#opts.promotionFloor())) {
+			return undefined;
+		}
+		return this.#putAt(routingHash, FIRST_BOUND, this.#count(routingHash, FIRST_BOUND, null, BUCKET_THRESHOLD_MAX + 1));
+	}
+
+	/**
+	 * After an import page on a hash leaf into a routingHash with no bucket: creates the first bucket
+	 * when the items of the earlier pages and of this page are `m` or more. The earlier items are below
+	 * `first`, the first item of the page, and they are fewer than `BUCKET_THRESHOLD_MAX`. More items is
+	 * a defect, and the recount of the whole routingHash creates the bucket.
+	 */
+	#importFirst(routingHash: RoutingHash, first: FokosCompositeKey, facts: ItemFacts): void {
+		const earlier = this.#count(routingHash, FIRST_BOUND, first, BUCKET_THRESHOLD_MAX + 1);
+		if (earlier.itemCount > BUCKET_THRESHOLD_MAX) {
+			this.#repair(routingHash, null, facts);
+		} else if (earlier.itemCount + facts.itemCount >= bucketThreshold(this.model, this.#opts.promotionFloor())) {
+			this.#putAt(routingHash, FIRST_BOUND, addFacts(earlier, facts));
+		}
 	}
 
 	/**

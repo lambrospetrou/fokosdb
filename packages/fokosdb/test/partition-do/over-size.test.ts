@@ -202,11 +202,12 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 		await putRows(partition, "solo", 4, 1024);
 		const transactionId = await prepare(partition, "solo", ["p0", "p1", "p2", "p3"]);
 		const low = await lowHashCap(partition);
-		const threshold = (low.ctx.policy.hashSplitConditions.maxSizeMb ?? 0) * MB * DEFAULT_PARTITION_CONFIG.promotionFraction;
-		const estimate = await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
+		// The key has fewer items than the bucket threshold m, so it has no bucket, and its estimate is
+		// below the promotion floor of the policy at its last insert.
+		const estimates = await runInDurableObject(partition.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 			bucketEstimates(state, `WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`, kb("solo")),
-		).then((rows) => rows[0]);
-		expect(estimate).toBeLessThan(threshold);
+		);
+		expect(estimates).toEqual([]);
 
 		await expectRefused(low, "solo");
 		await awaitPromotionQueued(low, "solo");

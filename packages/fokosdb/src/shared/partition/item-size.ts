@@ -11,6 +11,8 @@
  * planner calculates at once, and it changes no stored row.
  */
 
+import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+
 /**
  * The storage model of one item table. An indexed item is an item with an entry in the partial
  * index of its table: an item with a TTL in `items`, and a tombstone in `latest_items`.
@@ -165,6 +167,36 @@ export function estimate(model: StorageModel, f: ItemFacts): number {
 		model.indexedOverhead * f.indexedItemCount +
 		model.overflowCoefficient * f.overflowBytes
 	);
+}
+
+/**
+ * An upper bound of the estimate of one item. `key_bytes <= item_bytes <= MAX_ITEM_BYTES`, the bound
+ * includes the indexed terms, and the overflow bytes of a row are less than one overflow page plus 4
+ * bytes for each overflow page plus `overflowRowOverhead`.
+ */
+export function maxItemEstimate(model: StorageModel): number {
+	const pages = Math.ceil((MAX_ITEM_BYTES + model.rowPayloadOverhead) / OVERFLOW_PAGE_DATA);
+	return (
+		MAX_ITEM_BYTES * (1 + model.keyIndexFactor + model.indexedKeyFactor) +
+		model.baseOverhead +
+		model.indexedOverhead +
+		model.overflowCoefficient * (OVERFLOW_PAGE_DATA + 4 * pages + model.overflowRowOverhead)
+	);
+}
+
+/** The largest bucket threshold `m` of a hash leaf. It limits the items that the count of an insert reads. */
+export const BUCKET_THRESHOLD_MAX = 16;
+
+/**
+ * The bucket threshold `m` of a hash leaf: a routingHash with fewer than `m` items can have no bucket.
+ * Then `(m - 1)` items have an estimate below the promotion floor. A null floor (no promotion) gives
+ * `BUCKET_THRESHOLD_MAX`.
+ */
+export function bucketThreshold(model: StorageModel, floor: number | null): number {
+	if (floor === null) {
+		return BUCKET_THRESHOLD_MAX;
+	}
+	return Math.min(BUCKET_THRESHOLD_MAX, Math.max(1, Math.floor(floor / maxItemEstimate(model))));
 }
 
 /** Six SQL expressions for the facts, in the order of `FACT_NAMES`. */

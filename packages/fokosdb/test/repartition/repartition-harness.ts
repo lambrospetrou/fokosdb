@@ -34,6 +34,7 @@ import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import { SplitPlanner } from "../../src/shared/partition/split-planner.js";
+import { ITEMS_MODEL, maxItemEstimate } from "../../src/shared/partition/item-size.js";
 import {
 	RepartitionSource,
 	RepartitionTarget,
@@ -179,7 +180,11 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			await runInDurableObject(testPartitionStub(stubName), async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const sharding = new FokosShardingStore(storage);
-				const store = new PartitionStore(storage, { rangeLeaf: () => isRangePartition(ctx) });
+				// The floor gives the bucket threshold m = 1, so each routingHash with an item has a bucket.
+				const store = new PartitionStore(storage, {
+					rangeLeaf: () => isRangePartition(ctx),
+					promotionFloor: () => maxItemEstimate(ITEMS_MODEL),
+				});
 				sharding.runMigrations();
 				store.runMigrations();
 				// The stored identity is what the flow reads back, so a target has none until fokosInit. A

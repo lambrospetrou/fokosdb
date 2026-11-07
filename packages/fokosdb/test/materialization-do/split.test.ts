@@ -159,10 +159,11 @@ describe("FokosDBMaterializationDO — splits", () => {
 			async () => (await promotion())?.repartition.state === "cleaned",
 		);
 
-		// The source keeps its other key, and no row or snapshot of the promoted key.
+		// The source keeps its other key, and no row or snapshot of the promoted key. The other key has
+		// one item, below the bucket threshold m, so the source has no bucket.
 		expect(await rows(root.stub)).toMatchObject({
 			items: 1,
-			keyBytes: 1,
+			keyBytes: 0,
 			snapshots: undefined,
 			targets: [{ target_id: "sink", epoch: 2 }],
 		});

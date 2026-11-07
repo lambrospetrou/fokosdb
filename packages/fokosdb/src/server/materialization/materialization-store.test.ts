@@ -5,6 +5,7 @@ import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
 import { routingHashFor } from "../../../test/routing-hash.js";
+import { LATEST_ITEMS_MODEL, maxItemEstimate } from "../../shared/partition/item-size.js";
 
 /** The routingHash of a hash key, as the partition stores it. */
 const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
@@ -25,7 +26,11 @@ type Harness = {
 async function withStore(fn: (h: Harness) => void): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`mat-store.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
-		const store = new MaterializationStore(state.storage);
+		const store = new MaterializationStore(state.storage, {
+			promotionFloor: () => maxItemEstimate(LATEST_ITEMS_MODEL),
+			rangeLeaf: () => false,
+			logParams: () => ({}),
+		});
 		const image = (hk: string, revision: number, deleted: boolean): LatestImage =>
 			deleted
 				? { opIndex: 0, hashKey: kb(hk), sortKey: NO_SK, revision, deleted: true }

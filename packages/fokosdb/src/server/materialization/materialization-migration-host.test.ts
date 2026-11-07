@@ -12,6 +12,7 @@ import { ALL_ROWS, routingHashFor } from "../../../test/routing-hash.js";
 import { collidingHashKeys } from "../../../test/hash-digits.js";
 import { compareRoutingHashes } from "../../sharding/hash-primitives.js";
 import { rangeStorageInterval } from "../../sharding/repartition-slice.js";
+import { LATEST_ITEMS_MODEL, maxItemEstimate } from "../../shared/partition/item-size.js";
 
 /** The shard group of `routingHashFor`. */
 const STORE_GROUP = "fokos.p.store-test";
@@ -39,7 +40,14 @@ function image(hk: string, sk: string): LatestImage {
 async function inPartition<T>(name: string, fn: (store: MaterializationStore, sql: SqlStorage) => T): Promise<T> {
 	const stub = env.MATERIALIZATION_DO.getByName(`${name}.${crypto.randomUUID()}`);
 	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
-		fn(new MaterializationStore(state.storage), state.storage.sql),
+		fn(
+			new MaterializationStore(state.storage, {
+				promotionFloor: () => maxItemEstimate(LATEST_ITEMS_MODEL),
+				rangeLeaf: () => false,
+				logParams: () => ({}),
+			}),
+			state.storage.sql,
+		),
 	);
 }
 

@@ -1,6 +1,6 @@
 # RFC — Exact item-size facts, item statistics in buckets, and correct range splits
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-31, updated 2026-11-06
 
 ## Table of contents

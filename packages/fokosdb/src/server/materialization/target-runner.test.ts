@@ -15,6 +15,7 @@ import invariant from "../../shared/invariant.js";
 import type { ExpressionValue } from "../../shared/expression/types.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
 import { routingHashFor } from "../../../test/routing-hash.js";
+import { LATEST_ITEMS_MODEL, maxItemEstimate } from "../../shared/partition/item-size.js";
 
 /** The routingHash of a hash key, as the partition stores it. */
 const P = (hk: KeyBytes) => routingHashFor(hk);
@@ -86,7 +87,11 @@ async function withRunner(
 ): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`runner-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
-		const store = new MaterializationStore(state.storage);
+		const store = new MaterializationStore(state.storage, {
+			promotionFloor: () => maxItemEstimate(LATEST_ITEMS_MODEL),
+			rangeLeaf: () => false,
+			logParams: () => ({}),
+		});
 		const targets: FokosTargetDefinition[] = (opts.targets ?? ["t1"]).map((targetId) =>
 			opts.gsi ? { kind: "gsi", targetId, hashKey: { ref: "data" } } : { kind: "push_sink", targetId, binding: "SINK", method: "push" },
 		);

@@ -128,16 +128,10 @@ describe("FokosDBMaterializationDO — applyLatestImages revisions", () => {
 
 		expect(await apply(m, { items: [live(0, "x", 5)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		expect(await storedImage(m.stub, "x")).toMatchObject({ revision: 5, data: "v5" });
-		// The bucket holds the one row, with its exact size.
+		// The row has its exact size. A routingHash of one item is below the bucket threshold m, so it has no bucket.
 		const keyBytes = kb("x").byteLength + kb("s").byteLength;
 		expect((await storedImage(m.stub, "x"))!.item_bytes).toBe(new TextEncoder().encode("v5").byteLength + keyBytes);
-		expect(await bucketFacts(m.stub, "x")).toEqual({
-			item_count: 1,
-			item_bytes: (await storedImage(m.stub, "x"))!.item_bytes,
-			key_bytes: keyBytes,
-			indexed_item_count: 0,
-			indexed_key_bytes: 0,
-		});
+		expect(await bucketFacts(m.stub, "x")).toBeUndefined();
 	});
 
 	it("a delete keeps a tombstone with no data, and a late live image below it does not create the item again", async () => {
@@ -148,20 +142,15 @@ describe("FokosDBMaterializationDO — applyLatestImages revisions", () => {
 		const keyBytes = kb("x").byteLength + kb("s").byteLength;
 		const liveBytes = (await storedImage(m.stub, "x"))!.item_bytes;
 		expect(liveBytes).toBe(1000 + keyBytes);
-		expect(await bucketFacts(m.stub, "x")).toMatchObject({ item_count: 1, item_bytes: liveBytes, indexed_item_count: 0 });
+		// A routingHash of one item is below the bucket threshold m, so it has no bucket.
+		expect(await bucketFacts(m.stub, "x")).toBeUndefined();
 
 		expect(await apply(m, { items: [deleted(0, "x", 2)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		const tombstone = (await storedImage(m.stub, "x"))!;
 		expect(tombstone).toMatchObject({ revision: 2, deleted: true, data: null, data_kind: null, ttl_at: null });
 		// A tombstone has no data, so its size is its key bytes, and it is an indexed item.
 		expect(tombstone.item_bytes).toBe(keyBytes);
-		expect(await bucketFacts(m.stub, "x")).toEqual({
-			item_count: 1,
-			item_bytes: keyBytes,
-			key_bytes: keyBytes,
-			indexed_item_count: 1,
-			indexed_key_bytes: keyBytes,
-		});
+		expect(await bucketFacts(m.stub, "x")).toBeUndefined();
 
 		expect(await apply(m, { items: [live(0, "x", 1)] })).toMatchObject({ acknowledged: [{ opIndex: 0 }] });
 		expect(await storedImage(m.stub, "x")).toMatchObject({ revision: 2, deleted: true });

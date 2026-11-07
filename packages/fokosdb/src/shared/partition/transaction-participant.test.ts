@@ -10,7 +10,7 @@ import { KeyCodec } from "../../sharding/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import invariant from "../invariant.js";
 import { conditionTree, updateTree } from "../expression/test-fixtures.js";
-import { estimate, itemFacts, ITEMS_MODEL } from "./item-size.js";
+import { estimate, itemFacts, ITEMS_MODEL, maxItemEstimate } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
 import { ALL_ROWS, routingHashFor } from "../../../test/routing-hash.js";
@@ -40,7 +40,8 @@ type Harness = {
 async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promise<void> {
 	const stub = testPartitionStub(`participant-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
-		const store = new PartitionStore(state.storage);
+		// The floor gives the bucket threshold m = 1, so each routingHash with an item has a bucket.
+		const store = new PartitionStore(state.storage, { promotionFloor: () => maxItemEstimate(ITEMS_MODEL) });
 		const clock = { now: BASE_NOW };
 		const participant = new TransactionParticipant({
 			store,

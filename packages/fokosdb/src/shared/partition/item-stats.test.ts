@@ -13,8 +13,12 @@ import type { FokosDBPolicy } from "../partition-context.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import {
 	estimate,
+	BUCKET_THRESHOLD_MAX,
+	bucketThreshold,
 	ITEMS_MODEL,
 	itemFacts,
+	LATEST_ITEMS_MODEL,
+	maxItemEstimate,
 	NO_FACTS,
 	overflowBytes,
 	overflowBytesSql,
@@ -32,6 +36,9 @@ const kb = (v: string | Uint8Array) => KeyCodec.encode(v);
 const NO_SK = KeyCodec.encodeOptional(undefined);
 const ALL: KeyRange = { start: { routingHash: new Uint8Array() }, end: null };
 const DEFECT = "fokos/partition: the facts of a bucket disagree with its items, so they are counted again";
+// A promotion floor with the bucket threshold m = 1: each routingHash with an item has a bucket. A
+// bucket with an estimate below about 1.4 MB stores no estimate.
+const ONE_ITEM_FLOOR = maxItemEstimate(ITEMS_MODEL);
 
 // Each test of this file fails when the defect log appears, except the tests that break a bucket on
 // purpose and set `expectedDefects`.
@@ -144,6 +151,20 @@ const put = (
 	});
 const del = (store: PartitionStore, hk: KeyBytes, sk: KeyBytes) => store.deleteItem({ routingHash: P(hk), hk, sk, txOrderTs: 2 });
 
+let nextItemId = 1_000_000;
+/** Inserts an item row with no fact change, as the item write does before it calls `ItemStats.change`. */
+function insertRow(state: DurableObjectState, hk: KeyBytes, itemBytes: number, opts: { sk?: KeyBytes; ttl?: number | null } = {}): void {
+	state.storage.sql.exec(
+		`INSERT INTO items (routing_hash, hk, sk, item_id, v, ttl_epoch_utc_seconds, item_bytes, data) VALUES (?, ?, ?, ?, 1, ?, ?, x'')`,
+		P(hk),
+		hk,
+		opts.sk ?? NO_SK,
+		nextItemId++,
+		opts.ttl ?? null,
+		itemBytes,
+	);
+}
+
 describe("item-size", () => {
 	it("throws for a coefficient that is not a multiple of 1/4, or is negative", () => {
 		expect(() => validateStorageModel({ ...ITEMS_MODEL, keyIndexFactor: 1.3 })).toThrow(/keyIndexFactor .* multiple of 1\/4/);
@@ -241,7 +262,7 @@ describe("ItemStats on a hash leaf", () => {
 	});
 
 	it("counts the overflow pages of large items, and returns to no bucket when the items go", async () => {
-		await withStore(null, ({ store, state }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ store, state }) => {
 			const hk = kb("big");
 			const rh = P(hk);
 			const keyBytes = hk.byteLength + kb("s0").byteLength;
@@ -250,24 +271,24 @@ describe("ItemStats on a hash leaf", () => {
 			const sizes = [1002 - rpo, 1003 - rpo, 5094 - rpo, 5095 - rpo, MAX_ITEM_BYTES];
 			for (const [i, size] of sizes.entries()) {
 				put(store, hk, kb(`s${i}`), dataFor(size));
-				expectExact(state, rh, null);
+				expectExact(state, rh, ONE_ITEM_FLOOR);
 			}
 			expect(buckets(state, rh)[0].overflowBytes).toBe(sizes.reduce((sum, size) => sum + overflowBytes(ITEMS_MODEL, size), 0));
 			// Updates across the overflow limit, in both directions.
 			put(store, hk, kb("s0"), dataFor(1003 - rpo));
-			expectExact(state, rh, null);
+			expectExact(state, rh, ONE_ITEM_FLOOR);
 			put(store, hk, kb("s1"), dataFor(1002 - rpo));
-			expectExact(state, rh, null);
+			expectExact(state, rh, ONE_ITEM_FLOOR);
 			for (let i = 0; i < sizes.length; i++) {
 				del(store, hk, kb(`s${i}`));
-				expectExact(state, rh, null);
+				expectExact(state, rh, ONE_ITEM_FLOOR);
 			}
 			expect(buckets(state, rh)).toEqual([]);
 		});
 	});
 
 	it("subtracts the facts of expired items, with one bucket for each routingHash", async () => {
-		await withStore(null, ({ store, state }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ store, state }) => {
 			const [a, b] = [kb("a"), kb("b")];
 			put(store, a, kb("1"), "x", { ttlAt: 10 });
 			put(store, a, kb("2"), "yy", { ttlAt: 20 });
@@ -275,29 +296,29 @@ describe("ItemStats on a hash leaf", () => {
 			put(store, a, kb("4"), "w");
 			put(store, b, kb("1"), "x", { ttlAt: 15 });
 			expect(store.deleteExpiredItems(100, 10, () => true)).toMatchObject({ deletedRows: 3 });
-			expectExact(state, P(a), null);
-			expectExact(state, P(b), null);
+			expectExact(state, P(a), ONE_ITEM_FLOOR);
+			expectExact(state, P(b), ONE_ITEM_FLOOR);
 			expect(buckets(state, P(a))[0]).toMatchObject({ itemCount: 2, indexedItemCount: 1 });
 			expect(buckets(state, P(b))).toEqual([]);
 		});
 	});
 
 	it("shares one bucket between two hash keys of one routingHash", async () => {
-		await withStore(null, ({ store, state }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ store, state }) => {
 			const [a, b] = collidingHashKeys(GROUP).map((raw) => KeyCodec.encode(raw));
 			expect(P(b)).toEqual(P(a));
 			put(store, a, kb("s"), "a-data");
 			put(store, b, kb("s"), "b-data");
 			put(store, b, kb("t"), "b-data");
-			expectExact(state, P(a), null);
+			expectExact(state, P(a), ONE_ITEM_FLOOR);
 			expect(buckets(state, P(a))[0].itemCount).toBe(3);
 			del(store, a, kb("s"));
-			expectExact(state, P(a), null);
+			expectExact(state, P(a), ONE_ITEM_FLOOR);
 		});
 	});
 
 	it("adds the facts of an import page one time, and a retried page adds nothing", async () => {
-		await withStore(null, async ({ store: source }) => {
+		await withStore(ONE_ITEM_FLOOR, async ({ store: source }) => {
 			const hks = [kb("p"), kb("q")];
 			for (const hk of hks) {
 				for (const sk of ["1", "2", "3"]) {
@@ -305,7 +326,7 @@ describe("ItemStats on a hash leaf", () => {
 				}
 			}
 			const page = [...source.queryItemsPage(null, 100, ALL)];
-			await withStore(null, ({ store, state }) => {
+			await withStore(ONE_ITEM_FLOOR, ({ store, state }) => {
 				const apply = () =>
 					store.itemStats.addRows(
 						page.flatMap((item) => {
@@ -316,7 +337,7 @@ describe("ItemStats on a hash leaf", () => {
 				apply();
 				apply();
 				for (const hk of hks) {
-					expectExact(state, P(hk), null);
+					expectExact(state, P(hk), ONE_ITEM_FLOOR);
 					expect(buckets(state, P(hk))[0]).toMatchObject({ itemCount: 3, indexedItemCount: 1 });
 				}
 			});
@@ -324,7 +345,7 @@ describe("ItemStats on a hash leaf", () => {
 	});
 
 	it("after a promotion removes the buckets, a delete of a copy creates no bucket and changes no other bucket", async () => {
-		await withStore(null, ({ store, state }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ store, state }) => {
 			const [moved, stays] = [kb("moved"), kb("stays")];
 			put(store, moved, kb("1"), "x", { ttlAt: 10 });
 			put(store, moved, kb("2"), "x");
@@ -340,8 +361,8 @@ describe("ItemStats on a hash leaf", () => {
 	});
 
 	it("repairs a bucket whose facts disagree with its items, in the same write, and logs the defect one time", async () => {
-		expectedDefects = 2;
-		await withStore(null, ({ store, state }) => {
+		expectedDefects = 1;
+		await withStore(ONE_ITEM_FLOOR, ({ store, state }) => {
 			const hk = kb("drift");
 			const rh = P(hk);
 			put(store, hk, kb("1"), "aaaa");
@@ -349,14 +370,14 @@ describe("ItemStats on a hash leaf", () => {
 			// The bucket says one item: the delete of both would make the count negative.
 			state.storage.sql.exec(`UPDATE item_stats SET item_count = 1, item_bytes = 1 WHERE routing_hash = ?`, rh);
 			del(store, hk, kb("1"));
-			expectExact(state, rh, null);
+			expectExact(state, rh, ONE_ITEM_FLOOR);
 			expect(errors.mock.calls.filter(([e]) => (e as { message?: string }).message === DEFECT)).toEqual([
 				[expect.objectContaining({ routingHash: rh.toHex(), stored: expect.objectContaining({ itemCount: 1, itemBytes: 1 }) })],
 			]);
-			// A present item whose routingHash has no bucket: the overwrite counts the bucket again.
+			// A routingHash with no bucket: an overwrite adds no item, so it changes no facts.
 			store.itemStats.remove(rh);
 			put(store, hk, kb("2"), "a longer value");
-			expectExact(state, rh, null);
+			expect(buckets(state, rh)).toEqual([]);
 		});
 	});
 
@@ -424,12 +445,12 @@ describe("ItemStats on a hash leaf", () => {
 describe("ItemStats statements", () => {
 	/** An `ItemStats` over the storage of `state` that records the cursor of each statement. */
 	function recorded(state: DurableObjectState, floor: number | null, model: StorageModel = ITEMS_MODEL) {
-		const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+		const cursors: Array<{ query: string; bindings: unknown[]; cursor: SqlStorageCursor<Record<string, SqlStorageValue>> }> = [];
 		const storage = {
 			sql: {
 				exec: (query: string, ...bindings: unknown[]) => {
 					const cursor = state.storage.sql.exec(query, ...bindings);
-					cursors.push(cursor);
+					cursors.push({ query, bindings, cursor });
 					return cursor;
 				},
 			},
@@ -447,7 +468,12 @@ describe("ItemStats statements", () => {
 			logParams: () => ({}),
 		});
 		const take = () => {
-			const metrics = cursors.map((c) => ({ rowsRead: c.rowsRead, rowsWritten: c.rowsWritten }));
+			const metrics = cursors.map(({ query, bindings, cursor }) => ({
+				query,
+				bindings,
+				rowsRead: cursor.rowsRead,
+				rowsWritten: cursor.rowsWritten,
+			}));
 			cursors.length = 0;
 			return metrics;
 		};
@@ -455,41 +481,53 @@ describe("ItemStats statements", () => {
 	}
 	const one = (itemBytes: number) => itemFacts(ITEMS_MODEL, { itemBytes, keyBytes: 4, indexed: false });
 
-	it("writes 1 row below the promotion floor, 2 at or above it, and 1 with no floor", async () => {
-		await withStore(null, ({ state }) => {
+	it("writes 1 row below the promotion floor, 2 at or above it, and none for a routingHash with no bucket", async () => {
+		await withStore(ONE_ITEM_FLOOR, ({ state }) => {
+			// The first insert of each routingHash creates its bucket. The test then measures an insert and
+			// an update of a routingHash with a bucket.
 			const below = recorded(state, 1_000_000);
+			insertRow(state, kb("below"), 100);
+			below.stats.change(P(kb("below")), kb("below"), NO_SK, null, one(100));
+			below.take();
 			below.stats.change(P(kb("below")), kb("below"), NO_SK, null, one(100));
 			below.stats.change(P(kb("below")), kb("below"), NO_SK, one(100), one(200));
 			expect(below.take().map((m) => m.rowsWritten)).toEqual([1, 1]);
 
 			const above = recorded(state, 10);
+			insertRow(state, kb("above"), 100);
+			above.stats.change(P(kb("above")), kb("above"), NO_SK, null, one(100));
+			above.take();
 			above.stats.change(P(kb("above")), kb("above"), NO_SK, null, one(100));
 			above.stats.change(P(kb("above")), kb("above"), NO_SK, one(100), one(200));
 			expect(above.take().map((m) => m.rowsWritten)).toEqual([2, 2]);
 
 			// A value that falls below the floor removes its index entry only.
-			const falls = recorded(state, 250);
+			const falls = recorded(state, 400);
 			falls.stats.change(P(kb("above")), kb("above"), NO_SK, one(200), one(100));
 			expect(falls.take().map((m) => m.rowsWritten)).toEqual([1]);
 
-			// A range leaf has no floor, also for the first bucket.
-			const range = recorded(state, null);
-			range.stats.change(P(kb("range")), kb("range"), NO_SK, null, one(100));
-			range.stats.change(P(kb("range")), kb("range"), NO_SK, one(100), one(200));
-			expect(range.take().map((m) => m.rowsWritten)).toEqual([1, 1]);
-			expect(buckets(state, P(kb("range")))[0].promotionEst).toBeNull();
+			// With no floor, m is 16: a routingHash of one item has no bucket, and its writes write no row.
+			const none = recorded(state, null);
+			insertRow(state, kb("none"), 100);
+			none.stats.change(P(kb("none")), kb("none"), NO_SK, null, one(100));
+			none.stats.change(P(kb("none")), kb("none"), NO_SK, one(100), one(200));
+			expect(none.take().every((m) => m.rowsWritten === 0)).toBe(true);
+			expect(buckets(state, P(kb("none")))).toEqual([]);
 		});
 	});
 
 	it("stores the facts of two coefficient sets the same, and only the stored estimate differs", async () => {
-		await withStore(null, ({ state }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ state }) => {
 			const other: StorageModel = { ...ITEMS_MODEL, baseOverhead: 152, keyIndexFactor: 2.5 };
 			const a = recorded(state, 0, ITEMS_MODEL);
 			const b = recorded(state, 0, other);
-			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 300, keyBytes: 21, indexed: true });
-			a.stats.change(P(kb("a")), kb("a"), NO_SK, null, facts);
-			b.stats.change(P(kb("b")), kb("b"), NO_SK, null, facts);
-			const [ra, rb] = [buckets(state, P(kb("a")))[0], buckets(state, P(kb("b")))[0]];
+			const [ha, hb] = [kb("a".repeat(21)), kb("b".repeat(21))];
+			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 300, keyBytes: ha.byteLength, indexed: true });
+			insertRow(state, ha, 300, { ttl: 2_000_000_000 });
+			insertRow(state, hb, 300, { ttl: 2_000_000_000 });
+			a.stats.change(P(ha), ha, NO_SK, null, facts);
+			b.stats.change(P(hb), hb, NO_SK, null, facts);
+			const [ra, rb] = [buckets(state, P(ha))[0], buckets(state, P(hb))[0]];
 			const strip = ({ promotionEst: _p, promotionType: _t, ...rest }: BucketRow) => rest;
 			expect(strip(ra)).toEqual(strip(rb));
 			expect(ra.promotionEst).toBe(Math.ceil(estimate(ITEMS_MODEL, facts)));
@@ -498,16 +536,263 @@ describe("ItemStats statements", () => {
 	});
 
 	it("binds the deltas as JavaScript numbers and stores the rounded estimate as an integer", async () => {
-		await withStore(null, ({ state }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ state }) => {
 			const { stats } = recorded(state, 0);
 			// 1.25 * 5 key bytes gives an estimate with a part of a byte.
-			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 10, keyBytes: 5, indexed: false });
+			const hk = kb("fffff");
+			const facts = itemFacts(ITEMS_MODEL, { itemBytes: 10, keyBytes: hk.byteLength, indexed: false });
 			const exact = estimate(ITEMS_MODEL, facts);
 			expect(exact % 1).toBe(0.25);
-			expect(stats.change(P(kb("f")), kb("f"), NO_SK, null, facts)).toBe(Math.ceil(exact));
-			expect(stats.change(P(kb("f")), kb("f"), NO_SK, facts, { ...facts, itemBytes: 11 })).toBe(Math.ceil(exact + 1));
-			const [row] = buckets(state, P(kb("f")));
+			insertRow(state, hk, 10);
+			expect(stats.change(P(hk), hk, NO_SK, null, facts)).toBe(Math.ceil(exact));
+			expect(stats.change(P(hk), hk, NO_SK, facts, { ...facts, itemBytes: 11 })).toBe(Math.ceil(exact + 1));
+			const [row] = buckets(state, P(hk));
 			expect(row).toMatchObject({ promotionEst: Math.ceil(exact + 1), promotionType: "integer" });
+		});
+	});
+
+	it("writes no bucket row below m, and one row at the insert that takes a routingHash to m items", async () => {
+		await withStore(ONE_ITEM_FLOOR, ({ state }) => {
+			const m = 4;
+			const floor = m * maxItemEstimate(ITEMS_MODEL);
+			const { stats, take } = recorded(state, floor);
+			const written = () => take().reduce((sum, metric) => sum + metric.rowsWritten, 0);
+			const hk = kb("small");
+			for (let i = 1; i <= m; i++) {
+				const sk = kb(`${i}`);
+				insertRow(state, hk, 100, { sk });
+				stats.change(
+					P(hk),
+					hk,
+					sk,
+					null,
+					itemFacts(ITEMS_MODEL, { itemBytes: 100, keyBytes: hk.byteLength + sk.byteLength, indexed: false }),
+				);
+				expect(written()).toBe(i < m ? 0 : 1);
+			}
+			expectExact(state, P(hk), floor);
+			// An update and a delete of a routingHash with no bucket write no bucket row.
+			const other = kb("other");
+			insertRow(state, other, 100);
+			stats.change(P(other), other, NO_SK, null, one(100));
+			stats.change(P(other), other, NO_SK, one(100), one(200));
+			stats.change(P(other), other, NO_SK, one(200), null);
+			expect(written()).toBe(0);
+			expect(buckets(state, P(other))).toEqual([]);
+		});
+	});
+
+	it("counts and sums the items of a routingHash with no bucket with a primary-key search", async () => {
+		await withStore(ONE_ITEM_FLOOR, ({ state }) => {
+			const { stats, take } = recorded(state, ONE_ITEM_FLOOR);
+			const hk = kb("plan");
+			insertRow(state, hk, 100);
+			stats.change(P(hk), hk, NO_SK, null, itemFacts(ITEMS_MODEL, { itemBytes: 100, keyBytes: hk.byteLength, indexed: false }));
+			const reads = take().filter(({ query }) => query.includes("FROM (SELECT"));
+			const plans = reads.map(({ query, bindings }) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, ...bindings)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | "),
+			);
+			// The count, then the aggregate of the facts.
+			expect(plans).toEqual([
+				"CO-ROUTINE (subquery-1) | SEARCH items USING PRIMARY KEY (routing_hash=?) | SCAN (subquery-1)",
+				"CO-ROUTINE (subquery-1) | SEARCH items USING PRIMARY KEY (routing_hash=? AND (hk,sk)>(?,?)) | SCAN (subquery-1)",
+			]);
+		});
+	});
+
+	it("creates the bucket of an imported routingHash at the page that takes it to m items, and reads only the earlier items for it", async () => {
+		await withStore(ONE_ITEM_FLOOR, ({ state }) => {
+			const floor = BUCKET_THRESHOLD_MAX * maxItemEstimate(ITEMS_MODEL);
+			const { stats, take } = recorded(state, floor);
+			const hk = kb("imported");
+			// The items of a page are inserted before their facts are added, as in the import.
+			const page = (from: number) =>
+				Array.from({ length: 10 }, (_, i) => {
+					const sk = kb(`p${String(from + i).padStart(2, "0")}`);
+					insertRow(state, hk, 100, { sk });
+					return {
+						routingHash: P(hk),
+						hk,
+						sk,
+						facts: itemFacts(ITEMS_MODEL, { itemBytes: 100, keyBytes: hk.byteLength + sk.byteLength, indexed: false }),
+					};
+				});
+			stats.addRows(page(0));
+			expect(buckets(state, P(hk))).toEqual([]);
+			take();
+			stats.addRows(page(10));
+			expectExact(state, P(hk), floor);
+			expect(buckets(state, P(hk))[0].itemCount).toBe(20);
+			// The reference: a count of the 10 items of the first page only.
+			const firstPage = state.storage.sql.exec(
+				`SELECT COUNT(*) AS n FROM items WHERE routing_hash = ?1 AND (hk, sk) < (?2, ?3)`,
+				P(hk),
+				hk,
+				kb("p10"),
+			);
+			expect(firstPage.one().n).toBe(10);
+			const aggregates = take().filter(({ query }) => query.includes("AS item_count"));
+			expect(aggregates.map((metric) => metric.rowsRead)).toEqual([firstPage.rowsRead]);
+		});
+	});
+});
+
+describe("ItemStats bucket threshold on a hash leaf", () => {
+	const MAX_EST = maxItemEstimate(ITEMS_MODEL);
+	const MiB = 1024 * 1024;
+
+	it("bounds the estimate of each item, and gives m from the promotion floor", () => {
+		expect(MAX_EST).toBe(1_438_258);
+		expect(maxItemEstimate(LATEST_ITEMS_MODEL)).toBe(1_438_257);
+		for (const model of [ITEMS_MODEL, LATEST_ITEMS_MODEL]) {
+			let largest = 0;
+			for (let itemBytes = 0; itemBytes <= MAX_ITEM_BYTES; itemBytes++) {
+				largest = Math.max(largest, estimate(model, itemFacts(model, { itemBytes, keyBytes: itemBytes, indexed: true })));
+			}
+			expect(largest).toBeLessThanOrEqual(maxItemEstimate(model));
+		}
+		// The floors of the caps 10, 50, 100, and 176 MiB with the default fractions.
+		expect([1.25, 6.25, 12.5, 22].map((mb) => bucketThreshold(ITEMS_MODEL, mb * MiB))).toEqual([1, 4, 9, 16]);
+		expect(bucketThreshold(ITEMS_MODEL, 0)).toBe(1);
+		expect(bucketThreshold(ITEMS_MODEL, null)).toBe(BUCKET_THRESHOLD_MAX);
+	});
+
+	it("creates the bucket with the facts of all m items at the insert that reaches m, and keeps it after a delete below m", async () => {
+		const floor = 4 * MAX_EST;
+		await withStore(floor, ({ store, state }) => {
+			const hk = kb("grows");
+			for (let i = 0; i < 3; i++) {
+				put(store, hk, kb(`${i}`), "x".repeat(10 * (i + 1)), { ttlAt: i === 1 ? 2_000_000_000 : null });
+				put(store, hk, kb(`${i}`), "y".repeat(10 * (i + 1)));
+				expect(buckets(state, P(hk))).toEqual([]);
+			}
+			put(store, hk, kb("3"), "z");
+			expectExact(state, P(hk), floor);
+			expect(buckets(state, P(hk))[0].itemCount).toBe(4);
+			del(store, hk, kb("0"));
+			expectExact(state, P(hk), floor);
+			expect(buckets(state, P(hk))[0].itemCount).toBe(3);
+		});
+	});
+
+	it("creates the bucket at the next insert after a policy change takes m from 16 to 4", async () => {
+		await withStore(null, ({ store, state, setFloor }) => {
+			const hk = kb("policy");
+			for (let i = 0; i < 10; i++) {
+				put(store, hk, kb(`${i}`), "x");
+			}
+			expect(buckets(state, P(hk))).toEqual([]);
+			setFloor(4 * MAX_EST);
+			// An overwrite adds no item, so it creates no bucket.
+			put(store, hk, kb("0"), "a longer value");
+			expect(buckets(state, P(hk))).toEqual([]);
+			put(store, hk, kb("10"), "x");
+			expectExact(state, P(hk), 4 * MAX_EST);
+			expect(buckets(state, P(hk))[0].itemCount).toBe(11);
+		});
+	});
+
+	it("logs the defect one time and counts the whole routingHash when more than 16 items have no bucket", async () => {
+		expectedDefects = 1;
+		await withStore(null, ({ store, state }) => {
+			const hk = kb("many");
+			for (let i = 0; i <= BUCKET_THRESHOLD_MAX; i++) {
+				const sk = kb(`${String(i).padStart(2, "0")}`);
+				insertRow(state, hk, hk.byteLength + sk.byteLength, { sk });
+			}
+			put(store, hk, kb("last"), "x");
+			expectExact(state, P(hk), null);
+			expect(buckets(state, P(hk))[0].itemCount).toBe(BUCKET_THRESHOLD_MAX + 2);
+		});
+	});
+
+	it("after a cap reduction of 3 times, the import of a hash child creates the bucket that the leaf did not have, and finds the routingHash", async () => {
+		// The old T gives the floor 4 * MAX_EST, so m = 4. The new T is a third of the old T, so the
+		// child has m = 1. Three items near MAX_EST are below the old floor and above the new T.
+		const oldT = 8 * MAX_EST;
+		const newT = oldT / 3;
+		const hk = KeyCodec.asKeyBytes(new Uint8Array(MAX_ITEM_BYTES - 1).fill(97));
+		const rows = [1, 2, 3].map((i) => {
+			const sk = KeyCodec.asKeyBytes(new Uint8Array([i]));
+			const itemBytes = hk.byteLength + sk.byteLength;
+			return { routingHash: P(hk), hk, sk, facts: itemFacts(ITEMS_MODEL, { itemBytes, keyBytes: itemBytes, indexed: true }) };
+		});
+		expect(rounded(rows.map((r) => r.facts).reduce(addFacts, { ...NO_FACTS }))).toBeGreaterThanOrEqual(newT);
+		const insertAll = (state: DurableObjectState) => {
+			for (const row of rows) {
+				insertRow(state, hk, row.facts.itemBytes, { sk: row.sk, ttl: 2_000_000_000 });
+			}
+		};
+		await withStore(oldT / 2, ({ store, state, setFloor }) => {
+			insertAll(state);
+			for (const row of rows) {
+				store.itemStats.change(row.routingHash, row.hk, row.sk, null, row.facts);
+			}
+			setFloor(newT / 2);
+			expect(buckets(state, P(hk))).toEqual([]);
+			expect(store.itemStats.largestAtLeast(newT, 5)).toEqual([]);
+		});
+		await withStore(newT / 2, ({ store, state }) => {
+			insertAll(state);
+			store.itemStats.addRows(rows);
+			expectExact(state, P(hk), newT / 2);
+			expect(store.itemStats.largestAtLeast(newT, 5)).toEqual([hk]);
+		});
+	});
+
+	it("keeps invariant I14 and exact buckets through random writes, deletes, and TTL expiries, for m from 1 to 16", async () => {
+		const [ca, cb] = collidingHashKeys(GROUP).map((raw) => KeyCodec.encode(raw));
+		const hks = [kb("a"), kb("b"), ca, cb];
+		const sks = Array.from({ length: 20 }, (_, i) => kb(`${i}`));
+		const arbOp = fc.oneof(
+			{
+				weight: 4,
+				arbitrary: fc.record({
+					op: fc.constant("put" as const),
+					hk: fc.nat(hks.length - 1),
+					sk: fc.nat(sks.length - 1),
+					size: fc.oneof(fc.nat(50), fc.integer({ min: 900, max: 6000 })),
+					ttl: fc.option(fc.integer({ min: 1, max: 100 }), { nil: null }),
+				}),
+			},
+			{ weight: 1, arbitrary: fc.record({ op: fc.constant("delete" as const), hk: fc.nat(hks.length - 1), sk: fc.nat(sks.length - 1) }) },
+			{ weight: 1, arbitrary: fc.record({ op: fc.constant("expire" as const), now: fc.integer({ min: 1, max: 100 }) }) },
+		);
+		await withStore(null, async ({ store, state, setFloor }) => {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.integer({ min: 1, max: BUCKET_THRESHOLD_MAX }),
+					fc.array(arbOp, { minLength: 1, maxLength: 60 }),
+					async (m, ops) => {
+						state.storage.sql.exec(`DELETE FROM items`);
+						state.storage.sql.exec(`DELETE FROM item_stats`);
+						const floor = m * MAX_EST;
+						expect(bucketThreshold(ITEMS_MODEL, floor)).toBe(m);
+						setFloor(floor);
+						for (const op of ops) {
+							if (op.op === "put") {
+								put(store, hks[op.hk], sks[op.sk], "x".repeat(op.size), { ttlAt: op.ttl });
+							} else if (op.op === "delete") {
+								del(store, hks[op.hk], sks[op.sk]);
+							} else {
+								store.deleteExpiredItems(op.now, 100, () => true);
+							}
+							for (const hk of hks) {
+								if (buckets(state, P(hk)).length === 0) {
+									expect(sqlSums(state, P(hk)).itemCount).toBeLessThan(m);
+								} else {
+									expectExact(state, P(hk), floor);
+								}
+							}
+						}
+					},
+				),
+				{ numRuns: propertyRuns(30) },
+			);
 		});
 	});
 });
@@ -609,7 +894,7 @@ describe("ItemStats promotion lookup", () => {
 	});
 
 	it("stores the estimate only at or above the floor, from NULL to a value when a write reaches the floor", async () => {
-		await withStore(null, ({ store, state, setFloor }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ store, state, setFloor }) => {
 			const hk = kb("grows");
 			put(store, hk, kb("1"), "x".repeat(100));
 			const floor = rounded(sqlSums(state, P(hk))) + 50;
@@ -623,7 +908,7 @@ describe("ItemStats promotion lookup", () => {
 	});
 
 	it("follows a cap reduction of 2 times with no write, and finds a routingHash below the old floor after its next write", async () => {
-		await withStore(null, ({ store, state, setFloor }) => {
+		await withStore(ONE_ITEM_FLOOR, ({ store, state, setFloor }) => {
 			const T = 20_000;
 			setFloor(T / 2);
 			// Estimates of about 0.3 T to 1.5 T.
