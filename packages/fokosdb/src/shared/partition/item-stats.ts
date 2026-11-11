@@ -78,6 +78,61 @@ type BucketRow = ItemFactsRow & { lower_hk: ArrayBuffer; lower_sk: ArrayBuffer }
 
 type WrittenRow = BucketRow & { est: number };
 
+const COLUMNS = FACT_COLUMNS.join(", ");
+
+/** The bucket with the greatest bound at or below `(?2, ?3)`. */
+const SEEK_BOUND_SQL = `SELECT lower_hk, lower_sk FROM item_stats
+	  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) <= (?2, ?3)
+	  ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1`;
+
+const NEXT_BUCKET_SQL = `SELECT lower_hk, lower_sk, ${COLUMNS} FROM item_stats
+	  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) > (?2, ?3)
+	  ORDER BY lower_hk ASC, lower_sk ASC LIMIT 1`;
+
+const PREVIOUS_BUCKET_SQL = `SELECT lower_hk, lower_sk, ${COLUMNS} FROM item_stats
+	  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) < (?2, ?3)
+	  ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1`;
+
+const LAST_BUCKET_SQL = `SELECT lower_hk, lower_sk, ${COLUMNS} FROM item_stats
+	  WHERE routing_hash = ?1 ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1`;
+
+const FACTS_AT_SQL = `SELECT ${COLUMNS} FROM item_stats WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = (?2, ?3)`;
+
+const FACTS_OF_SQL = `SELECT ${FACT_COLUMNS.map((c) => `COALESCE(SUM(${c}), 0) AS ${c}`).join(", ")} FROM item_stats WHERE routing_hash = ?1`;
+
+/**
+ * The statements of `ItemStats` that depend on the storage model. The model of an instance does not
+ * change, so the constructor builds them one time, and a write does not build SQL text.
+ */
+type ModelStatements = { addAt: string; seekAdd: string; upsert: string; put: string };
+
+function modelStatements(model: StorageModel): ModelStatements {
+	// In RETURNING, a column name reads the new value of the row.
+	const returning = `RETURNING lower_hk, lower_sk, ${COLUMNS}, ${estSql(model, FACT_COLUMNS)} AS est`;
+	// In UPDATE SET and in DO UPDATE SET, a column name reads the old value of the row.
+	const added = FACT_COLUMNS.map((c, i) => `${c} + ${FACT_PARAMS[i]}`) as unknown as FactsSql;
+	const update = (target: string) =>
+		`UPDATE item_stats SET ${FACT_COLUMNS.map((c, i) => `${c} = ${added[i]}`).join(", ")},
+		        promotion_est_bytes = ${promotionEstSql(model, added, FLOOR_PARAM)}
+		  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = ${target}
+		 ${returning}`;
+	const write = (mode: "add" | "set") => {
+		const merged = FACT_COLUMNS.map((c) => (mode === "add" ? `${c} + excluded.${c}` : `excluded.${c}`)) as unknown as FactsSql;
+		return `INSERT INTO item_stats (routing_hash, lower_hk, lower_sk, ${COLUMNS}, promotion_est_bytes)
+		 VALUES (?1, ?2, ?3, ${FACT_PARAMS.join(", ")}, ${promotionEstSql(model, FACT_PARAMS, FLOOR_PARAM)})
+		 ON CONFLICT (routing_hash, lower_hk, lower_sk) DO UPDATE SET
+		   ${FACT_COLUMNS.map((c, i) => `${c} = ${merged[i]}`).join(", ")},
+		   promotion_est_bytes = ${promotionEstSql(model, merged, FLOOR_PARAM)}
+		 ${returning}`;
+	};
+	return {
+		addAt: update("(?2, ?3)"),
+		seekAdd: update(`(${SEEK_BOUND_SQL})`),
+		upsert: write("add"),
+		put: write("set"),
+	};
+}
+
 /** One bucket: its lower bound and its facts. */
 export type Bucket = { bound: FokosCompositeKey; facts: ItemFacts };
 
@@ -164,7 +219,7 @@ export class ItemStats {
 	#storage: DurableObjectStorage;
 	#opts: ItemStatsOptions;
 	#migrations: SQLSchemaMigrations;
-	#returning: string;
+	#sql: ModelStatements;
 
 	constructor(storage: DurableObjectStorage, opts: ItemStatsOptions) {
 		this.#storage = storage;
@@ -175,8 +230,7 @@ export class ItemStats {
 			doStorage: storage,
 			keyNameTrackingLastMigrationID: "__fokosdb/item_stats/sql_schema_version",
 		});
-		// In RETURNING, a column name reads the new value of the row.
-		this.#returning = `RETURNING lower_hk, lower_sk, ${FACT_COLUMNS.join(", ")}, ${estSql(opts.model, FACT_COLUMNS)} AS est`;
+		this.#sql = modelStatements(opts.model);
 	}
 
 	runMigrations(): void {
@@ -189,20 +243,21 @@ export class ItemStats {
 	 * be done before this call, because a repair counts the items.
 	 *
 	 * On a hash leaf, it returns the rounded estimate of the routingHash after the change, or null when
-	 * the routingHash has no bucket. On a range leaf, it returns null, because a range leaf has no
-	 * promotion.
+	 * the routingHash has no bucket or when the facts of the item do not change. On a range leaf, it
+	 * returns null, because a range leaf has no promotion.
 	 */
 	change(routingHash: RoutingHash, hk: KeyBytes, sk: KeyBytes, oldFacts: ItemFacts | null, newFacts: ItemFacts | null): number | null {
 		if (oldFacts === null && newFacts === null) {
 			return null;
 		}
 		const delta = subtractFacts(newFacts ?? NO_FACTS, oldFacts ?? NO_FACTS);
-		const range = this.#opts.isRangeLeaf();
 		if (FACT_NAMES.every((name) => delta[name] === 0)) {
-			// The facts do not change, so this call writes nothing. An UPDATE with the same values writes
-			// the row and its index entry again, so it is not done.
-			return range ? null : this.#estimateOf(routingHash);
+			// The facts do not change, so this call reads and writes nothing. An UPDATE with the same values
+			// writes the row and its index entry again. The routingHash did not grow, so the write signals
+			// no promotion. When the leaf is over its cap, the promotion lookup finds the routingHash.
+			return null;
 		}
+		const range = this.#opts.isRangeLeaf();
 		if (!range) {
 			const row = this.#addAt(routingHash, FIRST_BOUND, delta);
 			if (row) {
@@ -249,22 +304,25 @@ export class ItemStats {
 			const group = groups.get(id);
 			groups.set(id, { routingHash, bound, facts: group ? addFacts(group.facts, facts) : facts });
 		}
+		// The buckets of a range leaf that hold fewer than `K` items after the subtraction. Only these can
+		// merge: a merge adds items to the bucket that stays, so a bucket with `K` items or more never merges.
+		const small: Array<{ routingHash: RoutingHash; bound: FokosCompositeKey }> = [];
 		for (const { routingHash, bound, facts } of groups.values()) {
 			const delta = subtractFacts(NO_FACTS, facts);
 			const row = this.#addAt(routingHash, bound, delta);
 			if (row === undefined) {
 				continue;
 			}
-			if (range) {
-				this.#checkedRange(routingHash, row, delta);
-			} else {
+			if (!range) {
 				this.#checkedHash(routingHash, row, delta);
+			} else if (this.#checkedRange(routingHash, row, delta).item_count < this.#opts.rangeBucketMinItems) {
+				small.push({ routingHash, bound });
 			}
 		}
-		if (range) {
+		if (small.length > 0) {
 			// A merge can delete the row of an earlier group. The items of that group are then in the lower
 			// bucket, so the merge check finds the current bucket again.
-			for (const { routingHash, bound } of groups.values()) {
+			for (const { routingHash, bound } of small) {
 				const current = this.#boundOf(routingHash, bound);
 				const facts = current && this.#factsAt(routingHash, current);
 				if (current !== undefined && facts !== undefined) {
@@ -331,7 +389,8 @@ export class ItemStats {
 				run = { routingHash, bound: { hk, sk }, stored: false, first: { hk, sk }, count: 0, facts: { ...NO_FACTS } };
 			}
 			run.count++;
-			run.facts = addFacts(run.facts, facts);
+			// Each run has its own facts object, so the sum changes it in place.
+			addFactsInto(run.facts, facts);
 		}
 		if (run !== null) {
 			flush(run);
@@ -345,12 +404,7 @@ export class ItemStats {
 
 	/** The sum of the facts of the buckets of `routingHash`. */
 	factsOf(routingHash: RoutingHash): ItemFacts {
-		const row = tryOne(
-			this.#storage.sql.exec<ItemFactsRow>(
-				`SELECT ${FACT_COLUMNS.map((c) => `COALESCE(SUM(${c}), 0) AS ${c}`).join(", ")} FROM item_stats WHERE routing_hash = ?1`,
-				routingHash,
-			),
-		);
+		const row = tryOne(this.#storage.sql.exec<ItemFactsRow>(FACTS_OF_SQL, routingHash));
 		return row ? factsOfRow(row) : { ...NO_FACTS };
 	}
 
@@ -359,7 +413,7 @@ export class ItemStats {
 		const below = end === null ? "" : "AND (lower_hk, lower_sk) < (?2, ?3)";
 		return this.#storage.sql
 			.exec<BucketRow>(
-				`SELECT lower_hk, lower_sk, ${FACT_COLUMNS.join(", ")} FROM item_stats
+				`SELECT lower_hk, lower_sk, ${COLUMNS} FROM item_stats
 				  WHERE routing_hash = ?1 ${below} ORDER BY lower_hk, lower_sk`,
 				routingHash,
 				...(end === null ? [] : [end.hk, end.sk]),
@@ -384,8 +438,8 @@ export class ItemStats {
 		for (const { routing_hash } of routingHashes) {
 			const hashKey = this.#opts.items.firstHashKey(asRoutingHash(new Uint8Array(routing_hash)));
 			if (hashKey === undefined) {
-				// The bucket has no items, which is a defect. The lookup skips it and reads no more entries,
-				// so the read stays bounded. The answer then has fewer keys.
+				// The bucket has no items, which is a defect. The lookup skips this entry and reads no other
+				// entry in its place, so the read stays bounded. The answer then has fewer keys.
 				this.#logDefect(new Uint8Array(routing_hash), FIRST_BOUND, "a bucket of the promotion index has no items", {});
 				continue;
 			}
@@ -394,57 +448,23 @@ export class ItemStats {
 		return keys;
 	}
 
-	/** The rounded estimate of the first bucket of `routingHash`, or null when it has none. One primary-key seek. */
-	#estimateOf(routingHash: RoutingHash): number | null {
-		const row = tryOne(
-			this.#storage.sql.exec<{ est: number }>(
-				`SELECT ${estSql(this.model, FACT_COLUMNS)} AS est FROM item_stats
-				  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = (x'', x'')`,
-				routingHash,
-			),
-		);
-		return row?.est ?? null;
-	}
-
 	/** The bound of the bucket of `key`: the greatest bound at or below it. One primary-key seek. */
 	#boundOf(routingHash: RoutingHash, key: FokosCompositeKey): FokosCompositeKey | undefined {
 		const row = tryOne(
-			this.#storage.sql.exec<{ lower_hk: ArrayBuffer; lower_sk: ArrayBuffer }>(
-				`SELECT lower_hk, lower_sk FROM item_stats
-				  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) <= (?2, ?3)
-				  ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1`,
-				routingHash,
-				key.hk,
-				key.sk,
-			),
+			this.#storage.sql.exec<{ lower_hk: ArrayBuffer; lower_sk: ArrayBuffer }>(SEEK_BOUND_SQL, routingHash, key.hk, key.sk),
 		);
 		return row && boundOf(row);
 	}
 
 	/** The bucket with the greatest bound of `routingHash`. One primary-key seek. */
 	#lastBucket(routingHash: RoutingHash): BucketRow | undefined {
-		return tryOne(
-			this.#storage.sql.exec<BucketRow>(
-				`SELECT lower_hk, lower_sk, ${FACT_COLUMNS.join(", ")} FROM item_stats
-				  WHERE routing_hash = ?1 ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1`,
-				routingHash,
-			),
-		);
+		return tryOne(this.#storage.sql.exec<BucketRow>(LAST_BUCKET_SQL, routingHash));
 	}
 
 	/** The next or the previous bucket of the bucket at `bound`. One primary-key seek. */
 	#neighbour(routingHash: RoutingHash, bound: FokosCompositeKey, direction: "next" | "previous"): BucketRow | undefined {
-		const [op, order] = direction === "next" ? [">", "ASC"] : ["<", "DESC"];
-		return tryOne(
-			this.#storage.sql.exec<BucketRow>(
-				`SELECT lower_hk, lower_sk, ${FACT_COLUMNS.join(", ")} FROM item_stats
-				  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) ${op} (?2, ?3)
-				  ORDER BY lower_hk ${order}, lower_sk ${order} LIMIT 1`,
-				routingHash,
-				bound.hk,
-				bound.sk,
-			),
-		);
+		const sql = direction === "next" ? NEXT_BUCKET_SQL : PREVIOUS_BUCKET_SQL;
+		return tryOne(this.#storage.sql.exec<BucketRow>(sql, routingHash, bound.hk, bound.sk));
 	}
 
 	/**
@@ -452,65 +472,30 @@ export class ItemStats {
 	 * `key`. One statement. It returns the new row, or undefined when the routingHash has no bucket.
 	 */
 	#seekAdd(routingHash: RoutingHash, key: FokosCompositeKey, delta: ItemFacts): WrittenRow | undefined {
-		return this.#add(
-			routingHash,
-			key,
-			delta,
-			`(SELECT lower_hk, lower_sk FROM item_stats
-			   WHERE routing_hash = ?1 AND (lower_hk, lower_sk) <= (?2, ?3)
-			   ORDER BY lower_hk DESC, lower_sk DESC LIMIT 1)`,
-		);
+		return this.#add(this.#sql.seekAdd, routingHash, key, delta);
 	}
 
 	/** Adds `delta` to the bucket at `bound`. It returns the new row, or undefined when the bucket is absent. */
 	#addAt(routingHash: RoutingHash, bound: FokosCompositeKey, delta: ItemFacts): WrittenRow | undefined {
-		return this.#add(routingHash, bound, delta, "(?2, ?3)");
+		return this.#add(this.#sql.addAt, routingHash, bound, delta);
 	}
 
-	#add(routingHash: RoutingHash, key: FokosCompositeKey, delta: ItemFacts, target: string): WrittenRow | undefined {
-		const added = FACT_COLUMNS.map((c, i) => `${c} + ${FACT_PARAMS[i]}`) as unknown as FactsSql;
-		return tryOne(
-			this.#storage.sql.exec<WrittenRow>(
-				`UPDATE item_stats SET ${FACT_COLUMNS.map((c, i) => `${c} = ${added[i]}`).join(", ")},
-				        promotion_est_bytes = ${promotionEstSql(this.model, added, FLOOR_PARAM)}
-				  WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = ${target}
-				 ${this.#returning}`,
-				routingHash,
-				key.hk,
-				key.sk,
-				...factValues(delta),
-				this.#opts.promotionFloor(),
-			),
-		);
+	#add(sql: string, routingHash: RoutingHash, key: FokosCompositeKey, delta: ItemFacts): WrittenRow | undefined {
+		return tryOne(this.#storage.sql.exec<WrittenRow>(sql, routingHash, key.hk, key.sk, ...factValues(delta), this.#opts.promotionFloor()));
 	}
 
 	/** Adds `facts` to the bucket at `bound`, and creates the bucket with `facts` when it is absent. */
 	#upsertAt(routingHash: RoutingHash, bound: FokosCompositeKey, facts: ItemFacts): WrittenRow {
-		return this.#write(routingHash, bound, facts, "add");
+		return this.#write(this.#sql.upsert, routingHash, bound, facts);
 	}
 
 	/** Sets the facts of the bucket at `bound` to `facts`, and creates the bucket when it is absent. */
 	#putAt(routingHash: RoutingHash, bound: FokosCompositeKey, facts: ItemFacts): WrittenRow {
-		return this.#write(routingHash, bound, facts, "set");
+		return this.#write(this.#sql.put, routingHash, bound, facts);
 	}
 
-	#write(routingHash: RoutingHash, bound: FokosCompositeKey, facts: ItemFacts, mode: "add" | "set"): WrittenRow {
-		const merged = FACT_COLUMNS.map((c) => (mode === "add" ? `${c} + excluded.${c}` : `excluded.${c}`)) as unknown as FactsSql;
-		return one(
-			this.#storage.sql.exec<WrittenRow>(
-				`INSERT INTO item_stats (routing_hash, lower_hk, lower_sk, ${FACT_COLUMNS.join(", ")}, promotion_est_bytes)
-				 VALUES (?1, ?2, ?3, ${FACT_PARAMS.join(", ")}, ${promotionEstSql(this.model, FACT_PARAMS, FLOOR_PARAM)})
-				 ON CONFLICT (routing_hash, lower_hk, lower_sk) DO UPDATE SET
-				   ${FACT_COLUMNS.map((c, i) => `${c} = ${merged[i]}`).join(", ")},
-				   promotion_est_bytes = ${promotionEstSql(this.model, merged, FLOOR_PARAM)}
-				 ${this.#returning}`,
-				routingHash,
-				bound.hk,
-				bound.sk,
-				...factValues(facts),
-				this.#opts.promotionFloor(),
-			),
-		);
+	#write(sql: string, routingHash: RoutingHash, bound: FokosCompositeKey, facts: ItemFacts): WrittenRow {
+		return one(this.#storage.sql.exec<WrittenRow>(sql, routingHash, bound.hk, bound.sk, ...factValues(facts), this.#opts.promotionFloor()));
 	}
 
 	#deleteAt(routingHash: RoutingHash, bound: FokosCompositeKey): void {
@@ -523,14 +508,7 @@ export class ItemStats {
 	}
 
 	#factsAt(routingHash: RoutingHash, bound: FokosCompositeKey): ItemFacts | undefined {
-		const row = tryOne(
-			this.#storage.sql.exec<ItemFactsRow>(
-				`SELECT ${FACT_COLUMNS.join(", ")} FROM item_stats WHERE routing_hash = ?1 AND (lower_hk, lower_sk) = (?2, ?3)`,
-				routingHash,
-				bound.hk,
-				bound.sk,
-			),
-		);
+		const row = tryOne(this.#storage.sql.exec<ItemFactsRow>(FACTS_AT_SQL, routingHash, bound.hk, bound.sk));
 		return row && factsOfRow(row);
 	}
 
@@ -759,6 +737,13 @@ function sameKey(a: RoutingHash, b: RoutingHash): boolean {
 
 function factValues(f: ItemFacts): number[] {
 	return FACT_NAMES.map((name) => f[name]);
+}
+
+/** Adds the facts `b` to `a`, in place. */
+function addFactsInto(a: ItemFacts, b: ItemFacts): void {
+	for (const name of FACT_NAMES) {
+		a[name] += b[name];
+	}
 }
 
 export function addFacts(a: ItemFacts, b: ItemFacts): ItemFacts {

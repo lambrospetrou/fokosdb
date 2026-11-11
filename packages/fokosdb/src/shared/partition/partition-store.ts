@@ -496,8 +496,13 @@ export function queryScanStatement(opts: RangeScanBounds & { limit: number; sele
 	return { sql, params: [...params, opts.limit] };
 }
 
-/** The `WHERE` terms of the items of `routingHash` in the composite interval `[start, end)`. A null edge is unbounded. */
-function compositeSliceTerms(
+/**
+ * The `WHERE` terms of the items of `routingHash` in the composite interval `[start, end)` of the key
+ * columns `keys` (for example `"hk, sk"`). A null edge is unbounded. The table must have a
+ * `routing_hash` column. `keys` is a fixed column list, never user input.
+ */
+export function compositeSliceTerms(
+	keys: string,
 	routingHash: RoutingHash,
 	start: FokosCompositeKey | null,
 	end: FokosCompositeKey | null,
@@ -505,15 +510,18 @@ function compositeSliceTerms(
 	const conds = ["routing_hash = ?"];
 	const params: unknown[] = [routingHash];
 	if (start !== null) {
-		conds.push("(hk, sk) >= (?, ?)");
+		conds.push(`(${keys}) >= (?, ?)`);
 		params.push(start.hk, start.sk);
 	}
 	if (end !== null) {
-		conds.push("(hk, sk) < (?, ?)");
+		conds.push(`(${keys}) < (?, ?)`);
 		params.push(end.hk, end.sk);
 	}
 	return { conds: conds.join(" AND "), params };
 }
+
+/** The select list that sums the facts of `items` rows. The model does not change, so it is built one time. */
+const ITEMS_FACTS_SQL = factsAggregateSql(ITEMS_MODEL);
 
 /** The bound key of a storage position. An absent `hk` or `sk` is the empty key, the minimum. */
 const NO_KEY = KeyCodec.encodeOptional(undefined);
@@ -1192,7 +1200,7 @@ export class PartitionStore implements ItemSource {
 	 * The items upsert with its item_stats bookkeeping — the single definition used by BOTH the
 	 * non-transactional putItem and the transactional commit apply. Returns the new item version and
 	 * the rounded estimate of the routingHash after the write (feeds promotion checks), or 0 when it
-	 * has no bucket. Throws when the row would exceed MAX_ITEM_BYTES, which writes nothing — see
+	 * has no bucket or when the facts of the item did not change. Throws when the row would exceed MAX_ITEM_BYTES, which writes nothing — see
 	 * throwItemTooLarge. Metrics cover ONLY the items upsert statement (the old-facts read and the
 	 * item_stats write are not counted).
 	 */
@@ -1605,7 +1613,7 @@ export class PartitionStore implements ItemSource {
 		end: FokosCompositeKey | null,
 		order: "asc" | "desc" = "asc",
 	): Generator<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }> {
-		const { conds, params } = compositeSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("hk, sk", routingHash, start, end);
 		for (const row of this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; item_bytes: number; indexed: number }>(
 			`SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds IS NOT NULL AS indexed FROM items WHERE ${conds} ORDER BY hk ${order}, sk ${order}`,
 			...params,
@@ -1616,7 +1624,7 @@ export class PartitionStore implements ItemSource {
 
 	/** The count of the items of `routingHash` in `[start, end)`, at most `limit`. It reads at most `limit` rows of the primary key. */
 	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number {
-		const { conds, params } = compositeSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("hk, sk", routingHash, start, end);
 		return one(
 			this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE ${conds} LIMIT ?)`, ...params, limit),
 		).n;
@@ -1627,12 +1635,12 @@ export class PartitionStore implements ItemSource {
 	 * the first `limit` items. The read seeks the primary key and stops before `data` in each row.
 	 */
 	countFacts(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit?: number): ItemFacts {
-		const { conds, params } = compositeSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("hk, sk", routingHash, start, end);
 		const limited = limit === undefined ? "" : "ORDER BY hk, sk LIMIT ?";
 		return factsOfRow(
 			one(
 				this.#storage.sql.exec<ItemFactsRow>(
-					`SELECT ${factsAggregateSql(this.itemStats.model)}
+					`SELECT ${ITEMS_FACTS_SQL}
 					   FROM (SELECT hk, sk, item_bytes, ttl_epoch_utc_seconds IS NOT NULL AS indexed FROM items WHERE ${conds} ${limited})`,
 					...params,
 					...(limit === undefined ? [] : [limit]),
@@ -1641,14 +1649,17 @@ export class PartitionStore implements ItemSource {
 		);
 	}
 
-	/** The key of the item at `offset` in `[start, end)` of `routingHash`, in key order. One primary-key seek. */
+	/**
+	 * The key of the item at `offset` in `[start, end)` of `routingHash`, in key order. It seeks the
+	 * primary key at `start` and then reads `offset + 1` rows, because `OFFSET` steps over each row.
+	 */
 	itemAt(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 		offset: number,
 	): FokosCompositeKey | undefined {
-		const { conds, params } = compositeSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("hk, sk", routingHash, start, end);
 		const row = tryOne(
 			this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(
 				`SELECT hk, sk FROM items WHERE ${conds} ORDER BY hk, sk LIMIT 1 OFFSET ?`,

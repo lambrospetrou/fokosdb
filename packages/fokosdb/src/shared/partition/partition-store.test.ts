@@ -959,7 +959,10 @@ describe("PartitionStore - items", () => {
 			// The second call finds the row it created and takes the conflict branch.
 			const second = store.updateItemSingleShot({ routingHash: P(hk), hk, sk, plan, txOrderTs: 6 });
 			expect(second.version).toBe(2);
-			expect(bucketEst(state, "created-hk")).toBe(second.keyEstBytes);
+			// The same document gives the same facts, so the bucket does not change and the write reports
+			// no estimate: the routingHash did not grow.
+			expect(bucketEst(state, "created-hk")).toBe(first.keyEstBytes);
+			expect(second.keyEstBytes).toBe(0);
 		});
 	});
 

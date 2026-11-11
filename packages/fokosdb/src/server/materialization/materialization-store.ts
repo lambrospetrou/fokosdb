@@ -11,7 +11,6 @@ import { asRoutingHash, type RoutingHash } from "../../sharding/hash-primitives.
 import { exists, one, tryOne } from "../../shared/sql-cursor.js";
 import { itemBytesExpr, JSON_KIND_CODE } from "../../shared/partition/item-bytes.js";
 import {
-	FACT_NAMES,
 	factsAggregateSql,
 	factsOfRow,
 	itemFacts,
@@ -20,7 +19,7 @@ import {
 	type ItemFactsRow,
 } from "../../shared/partition/item-size.js";
 import { RANGE_BUCKET_MIN_ITEMS, ItemStats, type ItemSource } from "../../shared/partition/item-stats.js";
-import { intervalTerms, type KeyRange, type StorageCursor } from "../../shared/partition/partition-store.js";
+import { compositeSliceTerms, intervalTerms, type KeyRange, type StorageCursor } from "../../shared/partition/partition-store.js";
 import type { FokosTargetDefinition } from "./targets.js";
 import { materializedPlanBindings } from "../../shared/expression/bindings.js";
 import type { CompiledProjectionPlan } from "../../shared/expression/plan.js";
@@ -207,6 +206,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
 /** The count of item ids that one reservation of `item_id_counter` takes. */
 const ITEM_ID_BLOCK = 1024;
+
+/** The select list that sums the facts of `latest_items` rows. The model does not change, so it is built one time. */
+const LATEST_FACTS_SQL = factsAggregateSql(LATEST_ITEMS_MODEL);
 
 export class MaterializationStore implements ItemSource {
 	/** The item facts of each routingHash. */
@@ -428,11 +430,6 @@ export class MaterializationStore implements ItemSource {
 			);
 		}
 		const newFacts = this.#facts(image.hashKey, image.sortKey, itemBytes, image.deleted);
-		if (current !== undefined && FACT_NAMES.every((name) => current.facts[name] === newFacts[name])) {
-			// The facts did not change, so the routingHash did not grow and the ingest signals no promotion.
-			// The bucket needs no write and no read.
-			return undefined;
-		}
 		return this.itemStats.change(routingHash, image.hashKey, image.sortKey, current?.facts ?? null, newFacts) ?? undefined;
 	}
 
@@ -1013,7 +1010,7 @@ export class MaterializationStore implements ItemSource {
 		end: FokosCompositeKey | null,
 		order: "asc" | "desc" = "asc",
 	): Generator<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }> {
-		const { conds, params } = latestSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("base_hk, base_sk", routingHash, start, end);
 		for (const row of this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer; item_bytes: number; indexed: number }>(
 			`SELECT base_hk, base_sk, item_bytes, deleted_at_ms IS NOT NULL AS indexed FROM latest_items WHERE ${conds} ORDER BY base_hk ${order}, base_sk ${order}`,
 			...params,
@@ -1024,7 +1021,7 @@ export class MaterializationStore implements ItemSource {
 
 	/** The count of the items of `routingHash` in `[start, end)`, at most `limit`. It reads at most `limit` rows of the primary key. */
 	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number {
-		const { conds, params } = latestSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("base_hk, base_sk", routingHash, start, end);
 		return one(
 			this.#storage.sql.exec<{ n: number }>(
 				`SELECT COUNT(*) AS n FROM (SELECT 1 FROM latest_items WHERE ${conds} LIMIT ?)`,
@@ -1040,12 +1037,12 @@ export class MaterializationStore implements ItemSource {
 	 * stops before `data` in each row.
 	 */
 	countFacts(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit?: number): ItemFacts {
-		const { conds, params } = latestSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("base_hk, base_sk", routingHash, start, end);
 		const limited = limit === undefined ? "" : "ORDER BY base_hk, base_sk LIMIT ?";
 		return factsOfRow(
 			one(
 				this.#storage.sql.exec<ItemFactsRow>(
-					`SELECT ${factsAggregateSql(this.itemStats.model)}
+					`SELECT ${LATEST_FACTS_SQL}
 					   FROM (SELECT base_hk AS hk, base_sk AS sk, item_bytes, deleted_at_ms IS NOT NULL AS indexed
 					           FROM latest_items WHERE ${conds} ${limited})`,
 					...params,
@@ -1055,14 +1052,17 @@ export class MaterializationStore implements ItemSource {
 		);
 	}
 
-	/** The key of the item at `offset` in `[start, end)` of `routingHash`, in key order. One primary-key seek. */
+	/**
+	 * The key of the item at `offset` in `[start, end)` of `routingHash`, in key order. It seeks the
+	 * primary key at `start` and then reads `offset + 1` rows, because `OFFSET` steps over each row.
+	 */
 	itemAt(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 		offset: number,
 	): FokosCompositeKey | undefined {
-		const { conds, params } = latestSliceTerms(routingHash, start, end);
+		const { conds, params } = compositeSliceTerms("base_hk, base_sk", routingHash, start, end);
 		const row = tryOne(
 			this.#storage.sql.exec<{ base_hk: ArrayBuffer; base_sk: ArrayBuffer }>(
 				`SELECT base_hk, base_sk FROM latest_items WHERE ${conds} ORDER BY base_hk, base_sk LIMIT 1 OFFSET ?`,
@@ -1375,25 +1375,6 @@ export type MigratedState = {
 	/** The ancestor fences of the source. */
 	fences: MigratedFence[];
 };
-
-/** The `WHERE` terms of the items of `routingHash` in the composite interval `[start, end)`. A null edge is unbounded. */
-function latestSliceTerms(
-	routingHash: RoutingHash,
-	start: FokosCompositeKey | null,
-	end: FokosCompositeKey | null,
-): { conds: string; params: unknown[] } {
-	const conds = ["routing_hash = ?"];
-	const params: unknown[] = [routingHash];
-	if (start !== null) {
-		conds.push("(base_hk, base_sk) >= (?, ?)");
-		params.push(start.hk, start.sk);
-	}
-	if (end !== null) {
-		conds.push("(base_hk, base_sk) < (?, ?)");
-		params.push(end.hk, end.sk);
-	}
-	return { conds: conds.join(" AND "), params };
-}
 
 function asKey(value: ArrayBuffer): KeyBytes {
 	return KeyCodec.asKeyBytes(new Uint8Array(value));
