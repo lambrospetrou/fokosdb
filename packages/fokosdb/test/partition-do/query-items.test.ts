@@ -16,7 +16,6 @@ import { estimateProjectedRowBytes, PartitionStore, type StoredItem } from "../.
 import { queryTree } from "../../src/shared/expression/test-fixtures.js";
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
 import type { ProjectionExpression } from "../../src/shared/expression/types.js";
-import { EST_ROW_BYTES_K } from "../../src/shared/partition/item-size.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { kb, makeStub, opened, type Opened } from "./helpers.js";
 import {
@@ -325,7 +324,7 @@ describe("FokosDBPartitionDO — range split", () => {
 				expect(res.count).toBe(2);
 				expect(res.nextCursor?.inclusive).toBe(true);
 				expect(KeyCodec.decode(res.nextCursor!.sk)).toBe("big2");
-				// The estimate is exact: it charges the envelope and the cells, never est_row_bytes.
+				// The estimate is exact: it charges the envelope and the cells, never item_bytes.
 				expect(res.responseBytes).toBe(res.items.reduce((sum, item) => sum + estimateProjectedRowBytes(item as ProjectedWireRow), 0));
 
 				// The first oversized projected row of a page is still admitted once.
@@ -414,7 +413,7 @@ describe("FokosDBPartitionDO — range split", () => {
 				const store = new PartitionStore(state.storage);
 				const P = partitionRoutingHashOf(state);
 				for (const sk of ["a", "b", "c"]) {
-					const dataBytes = MAX_ITEM_BYTES - hashKey.byteLength - kb(sk).byteLength - EST_ROW_BYTES_K;
+					const dataBytes = MAX_ITEM_BYTES - hashKey.byteLength - kb(sk).byteLength;
 					store.upsertItem({
 						routingHash: P(hashKey),
 						hk: hashKey,

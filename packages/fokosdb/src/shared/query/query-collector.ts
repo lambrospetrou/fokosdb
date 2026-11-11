@@ -62,9 +62,9 @@ export function createQueryPageCollector(opts: {
 		return false;
 	};
 
-	const consume: QueryCandidateConsumer = (sk, estRowBytes, matched, decodePayload) => {
+	const consume: QueryCandidateConsumer = (sk, itemBytes, matched, decodePayload) => {
 		state.rowsReturned++;
-		if (remainingItems <= 0 || estRowBytes > remainingEvaluatedBytes) {
+		if (remainingItems <= 0 || itemBytes > remainingEvaluatedBytes) {
 			return stopBefore(sk);
 		}
 
@@ -79,9 +79,9 @@ export function createQueryPageCollector(opts: {
 		}
 
 		state.scannedCount++;
-		state.evaluatedBytes += estRowBytes;
+		state.evaluatedBytes += itemBytes;
 		remainingItems--;
-		remainingEvaluatedBytes -= estRowBytes;
+		remainingEvaluatedBytes -= itemBytes;
 		state.lastEvaluatedCursor = { hk: hashKey, sk };
 		if (matched) {
 			state.count++;

@@ -31,6 +31,35 @@ export type PartitionDOConfig = Readonly<{
 	 */
 	promotionFraction: number;
 	/**
+	 * Sets the promotion floor of a hash leaf: the promotion threshold `T` times this fraction. `T` is
+	 * `hashSplitConditions.maxSizeMb` times `promotionFraction`. Valid values are in (0, 1].
+	 *
+	 * The split decision finds the routingHashes to promote with the index `item_stats_promotion`. A
+	 * routingHash has an entry in this index only when its estimate is at or above the floor. Thus:
+	 *
+	 * - A routingHash below the floor writes no index entry when its items change. Most routingHashes
+	 *   are small, so most writes do not write to the index.
+	 * - The floor is below `T`, so the index already holds the routingHashes that become candidates
+	 *   when an operator lowers `maxSizeMb`. The lookup finds them with no new write. This is
+	 *   important for a leaf that refuses writes because it is too large.
+	 *
+	 * Example with the defaults (`maxSizeMb` 500, `promotionFraction` 0.25, this fraction 0.5):
+	 *
+	 * - `T` is 125 MiB, and the floor is 62.5 MiB.
+	 * - A routingHash of 40 MiB has no index entry. A routingHash of 70 MiB has an entry, but it is not
+	 *   a candidate, because 70 MiB is below `T`.
+	 * - An operator changes `maxSizeMb` to 250. `T` is now 62.5 MiB, and the lookup finds the
+	 *   routingHash of 70 MiB at once.
+	 * - When the operator lowers `maxSizeMb` to less than half (this fraction) of its old value, a
+	 *   routingHash between the new `T` and the old floor has no entry. The lookup finds it only after
+	 *   its next write, or the leaf does a hash split first.
+	 *
+	 * A lower value makes the lookup correct after a larger reduction of `maxSizeMb`. It also makes
+	 * more routingHashes write an index entry. A value of 1 puts the floor at `T`. On a hash leaf at
+	 * the depth limit, the floor is always 0 (`promotionFloor` in `split-planner.ts`).
+	 */
+	promotionIndexFraction: number;
+	/**
 	 * The farthest into the future that the timestamp of a transaction can be when this partition
 	 * accepts its prepare. It must be larger than the real clock difference between the caller Worker,
 	 * the coordinator and the partition.
@@ -80,6 +109,11 @@ export type MaterializationDOConfig = Readonly<{
 	 * `hashSplitConditions.maxSizeMb` times this fraction. Valid values are in (0, 1).
 	 */
 	promotionFraction: number;
+	/**
+	 * Sets the promotion floor of a hash leaf: the promotion threshold times this fraction. Valid values
+	 * are in (0, 1]. `PartitionDOConfig.promotionIndexFraction` gives the rules and an example.
+	 */
+	promotionIndexFraction: number;
 	/** The runner that sends the changes to the targets. */
 	targetRunner: Readonly<TargetRunnerConfig>;
 	/** The cleanup of the finished change positions and of the tombstones that no target needs. */
@@ -88,6 +122,7 @@ export type MaterializationDOConfig = Readonly<{
 
 export type MaterializationDOConfigOverrides = {
 	promotionFraction?: number;
+	promotionIndexFraction?: number;
 	targetRunner?: Partial<TargetRunnerConfig>;
 	cleanup?: Partial<MaterializationCleanupConfig>;
 };
@@ -159,6 +194,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 	staleTransactionMs: DEFAULT_STALE_TRANSACTION_MS,
 	coordinatorFanoutBudgetMs: DEFAULT_FANOUT_REQUEST_BUDGET_MS,
 	promotionFraction: 0.25,
+	promotionIndexFraction: 0.5,
 	maxClockSkewMs: 2_000,
 	ttlSweep: {
 		chunkSize: 100,
@@ -190,6 +226,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 
 export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreeze({
 	promotionFraction: 0.25,
+	promotionIndexFraction: 0.5,
 	targetRunner: {
 		concurrency: 2,
 		// The item limit of `batchWriteItems`.
@@ -236,6 +273,10 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 		() => `staleTransactionMs (${c.staleTransactionMs}) must be at least coordinatorFanoutBudgetMs (${c.coordinatorFanoutBudgetMs})`,
 	);
 	check(c.promotionFraction > 0 && c.promotionFraction < 1, () => `promotionFraction must be in (0, 1), got ${c.promotionFraction}`);
+	check(
+		c.promotionIndexFraction > 0 && c.promotionIndexFraction <= 1,
+		() => `promotionIndexFraction must be in (0, 1], got ${c.promotionIndexFraction}`,
+	);
 	checkInteger(c, "maxClockSkewMs", 0);
 	checkInteger(c, "staleLockScanRows", 1);
 	checkInteger(c, "cleanupPromotedKeyRows", 1);
@@ -254,6 +295,10 @@ export function resolveMaterializationConfig(overrides: MaterializationDOConfigO
 		return c;
 	}
 	check(c.promotionFraction > 0 && c.promotionFraction < 1, () => `promotionFraction must be in (0, 1), got ${c.promotionFraction}`);
+	check(
+		c.promotionIndexFraction > 0 && c.promotionIndexFraction <= 1,
+		() => `promotionIndexFraction must be in (0, 1], got ${c.promotionIndexFraction}`,
+	);
 	validateTargetRunnerConfig(c.targetRunner);
 	validateMaterializationCleanupConfig(c.cleanup);
 	return c;

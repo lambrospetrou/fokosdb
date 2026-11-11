@@ -1,6 +1,6 @@
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import type { JsonPrimitive } from "../json-types.js";
-import { estRowBytesExpr, JSON_KIND_CODE } from "../partition/item-size.js";
+import { itemBytesExpr, JSON_KIND_CODE } from "../partition/item-bytes.js";
 import type { QuerySelect } from "../types.js";
 import type { ExpressionRequiredColumn } from "./semantic.js";
 
@@ -74,7 +74,7 @@ export function composeUpdateProbeStatement(plan: Pick<CompiledUpdatePlan, "docu
 SELECT i.hk IS NOT NULL AS item_present,
        i.applicable,
        CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
-       CASE WHEN i.applicable = 1 THEN (${estRowBytesExpr(plan.documentSql, "?1", "?2")}) ELSE NULL END AS new_size,
+       CASE WHEN i.applicable = 1 THEN (${itemBytesExpr(plan.documentSql, "?1", "?2")}) ELSE NULL END AS new_size,
        i.last_read_ts,
        i.last_write_ts
 FROM (SELECT i.*, (${plan.applicableSql}) AS applicable
@@ -107,22 +107,22 @@ export function composeUpdateWriteStatement(
 	tail: { txOrderTsParam: string; ttlSql: string; itemIdParam: string; limitParam: string },
 ): string {
 	const { txOrderTsParam, ttlSql, itemIdParam, limitParam } = tail;
-	const estRowBytes = estRowBytesExpr(plan.documentSql, "?1", "?2");
-	return `INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+	const itemBytes = itemBytesExpr(plan.documentSql, "?1", "?2");
+	return `INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, item_bytes, data)
 SELECT ?3, ?1, ?2, ${itemIdParam}, ${JSON_KIND_CODE}, ${ttlSql}, d.max_deleted_v + 1,
        MAX(${txOrderTsParam}, d.max_delete_tx_order_ts), MAX(${txOrderTsParam}, d.max_delete_tx_order_ts),
-       ${estRowBytes}, ${plan.documentSql}
+       ${itemBytes}, ${plan.documentSql}
   FROM deletion_metadata AS d LEFT JOIN items AS i ON i.routing_hash = ?3 AND i.hk = ?1 AND i.sk = ?2
- WHERE d.id = 1 AND ${estRowBytes} <= ${limitParam}
+ WHERE d.id = 1 AND ${itemBytes} <= ${limitParam}
 ON CONFLICT(routing_hash, hk, sk) DO UPDATE SET
   data = excluded.data,
   data_kind = excluded.data_kind,
   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-  est_row_bytes = excluded.est_row_bytes,
+  item_bytes = excluded.item_bytes,
   v = v + 1,
   last_read_ts = MAX(last_read_ts, ${txOrderTsParam}),
   last_write_ts = MAX(last_write_ts, ${txOrderTsParam})
-RETURNING v, est_row_bytes`;
+RETURNING v, item_bytes, ttl_epoch_utc_seconds`;
 }
 
 export function composeProjectionStatement(plan: Pick<CompiledProjectionPlan, "valueSql" | "typeSql">): string {
@@ -147,7 +147,7 @@ export function composeQueryStatement(
 	const order = opts.direction === "asc" ? "ASC" : "DESC";
 	const matchedSql = plan.filterSql === null ? "1 AS matched" : `CASE WHEN (${plan.filterSql}) THEN 1 ELSE 0 END AS matched`;
 	if (opts.select === "count") {
-		return `SELECT sk, est_row_bytes, ${matchedSql}
+		return `SELECT sk, item_bytes, ${matchedSql}
 FROM items AS i
 WHERE ${conds}
 ORDER BY sk ${order}
@@ -170,12 +170,12 @@ LIMIT ${limitParam}`;
 					`CASE WHEN matched THEN ${projection.typeSql[index]} END AS t${index}`,
 				]);
 	return `WITH candidates AS (
-SELECT hk, sk, est_row_bytes, v, ttl_epoch_utc_seconds, data_kind, data, last_read_ts, last_write_ts, ${matchedSql}
+SELECT hk, sk, item_bytes, v, ttl_epoch_utc_seconds, data_kind, data, last_read_ts, last_write_ts, ${matchedSql}
 FROM items AS i
 WHERE ${conds}
 ORDER BY sk ${order}
 LIMIT ${limitParam})
-SELECT sk, est_row_bytes, matched, ${outerColumns.join(", ")}
+SELECT sk, item_bytes, matched, ${outerColumns.join(", ")}
 FROM candidates AS i
 ORDER BY sk ${order}`;
 }

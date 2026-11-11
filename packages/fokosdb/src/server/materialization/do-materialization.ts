@@ -41,7 +41,7 @@ import { resolveMaterializationConfig, type MaterializationDOConfig, type Materi
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
 import { MaterializationCleanup } from "./materialization-cleanup.js";
 import { MaterializationMigrationHost } from "./materialization-migration-host.js";
-import { maxSplitBytes, SplitPlanner } from "../../shared/partition/split-planner.js";
+import { maxSplitBytes, promotionFloor, SplitPlanner } from "../../shared/partition/split-planner.js";
 import { TargetRunner } from "./target-runner.js";
 import { validateTargets, type FokosTargetDefinition } from "./targets.js";
 
@@ -132,12 +132,17 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.#store = new MaterializationStore(ctx.storage);
+		this.#store = new MaterializationStore(ctx.storage, {
+			promotionFloor: () => promotionFloor(this.fokos.identity(), this.fokos.policy(), this.config()),
+			isRangeLeaf: () => this.fokos.identity().kind === "range",
+			logParams: () => this.logParams(),
+		});
 		this.#splitPlanner = new SplitPlanner({
-			keySizes: this.#store.keySizes,
+			itemStats: this.#store.itemStats,
 			source: {
 				probeRoutingHashes: () => this.#store.probeRoutingHashes(),
-				compositeKeySizes: (routingHash, start, end) => this.#store.compositeKeySizes(routingHash, start, end),
+				compositeKeyFacts: (routingHash, start, end, order) => this.#store.compositeKeyFacts(routingHash, start, end, order),
+				countItems: (routingHash, start, end, limit) => this.#store.countItems(routingHash, start, end, limit),
 			},
 			databaseSize: () => this.#store.databaseSize,
 			promotionFraction: () => this.config().promotionFraction,
@@ -369,12 +374,13 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				}
 			},
 			// The child has each row of the promoted routingHash now. Each new write of it goes to the
-			// child, so the estimate is not necessary, and the cleanup can delete the rows above the
-			// snapshot.
+			// child, so its buckets are not necessary, and the cleanup can delete the rows above the
+			// snapshot. The cleanup deletes the copies with no fact change, because the routingHash then
+			// has no bucket.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
 					const routingHash = promotedRoutingHashOf(plan);
-					this.#store.keySizes.remove(routingHash);
+					this.#store.itemStats.remove(routingHash);
 					this.#store.deleteCursorSnapshot(routingHash);
 				}
 			},
@@ -389,7 +395,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				if (!this.#store.transactionSync(() => this.#store.deleteItemsOfRoutingHash(routingHash, this.config().cleanup.deleteRows))) {
 					return false;
 				}
-				this.#store.keySizes.remove(routingHash);
+				this.#store.itemStats.remove(routingHash);
 				return true;
 			},
 			jobs: [

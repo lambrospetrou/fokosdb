@@ -23,7 +23,7 @@ export type MaterializationExportConfig = {
 	maxCalls: number;
 	/** The items of one call. */
 	maxItems: number;
-	/** The item bytes of one call, by `est_row_bytes`. A call holds at least one item. */
+	/** The item bytes of one call, by `item_bytes`. A call holds at least one item. */
 	maxBytes: number;
 	/** The due outbox rows that one claim reads. Unowned rows and the keys of calls in flight count too. */
 	maxScannedRows: number;
@@ -293,7 +293,7 @@ export class MaterializationExporter {
 			kind: item.kind,
 			ttlAt: item.ttlAt,
 		};
-		return { image, bytes: item.estRowBytes };
+		return { image, bytes: item.itemBytes };
 	}
 
 	/**

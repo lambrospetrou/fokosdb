@@ -206,8 +206,8 @@ export function validateClientRequestToken(token: string): void {
  * so a 400 KB check can admit 1.2 MB of CJK.
  *
  * Being a lower bound is what makes it safe to keep. The store measures the truth with `octet_length`
- * over the value it writes, and it counts both keys and the per-row overhead as DynamoDB does
- * (`estRowBytesExpr` in `partition/item-size.ts`). Every transactional write path measures that exact
+ * over the value it writes, and it counts both keys as DynamoDB does (`itemBytesExpr` in
+ * `partition/item-bytes.ts`). Every transactional write path measures that exact
  * size in its check pass before it writes anything, so this function only has to avoid rejecting an
  * item the store would have accepted. It never has to agree with the store.
  */

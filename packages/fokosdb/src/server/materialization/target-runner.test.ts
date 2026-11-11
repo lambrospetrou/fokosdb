@@ -15,6 +15,7 @@ import invariant from "../../shared/invariant.js";
 import type { ExpressionValue } from "../../shared/expression/types.js";
 import { resolveLimits } from "../../shared/transaction-limits.js";
 import { routingHashFor } from "../../../test/routing-hash.js";
+import { LATEST_ITEMS_MODEL, maxItemEstimate } from "../../shared/partition/item-size.js";
 
 /** The routingHash of a hash key, as the partition stores it. */
 const P = (hk: KeyBytes) => routingHashFor(hk);
@@ -48,7 +49,7 @@ type Harness = {
 	ingest: (hk: string, revision: number, opts?: { deleted?: boolean; data?: string }) => void;
 	target: (targetId: string) => TargetRow;
 	retryRows: () => Array<{ target_id: string; hk: string; kind: string; not_before: number; attempts: number; last_error: string | null }>;
-	count: (table: "latest_items" | "change_positions" | "key_size_estimates") => number;
+	count: (table: "latest_items" | "change_positions" | "item_stats") => number;
 	/** Waits until each worker stopped. */
 	drain: () => Promise<void>;
 	advance: (ms: number) => void;
@@ -86,7 +87,11 @@ async function withRunner(
 ): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`runner-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
-		const store = new MaterializationStore(state.storage);
+		const store = new MaterializationStore(state.storage, {
+			promotionFloor: () => maxItemEstimate(LATEST_ITEMS_MODEL),
+			isRangeLeaf: () => false,
+			logParams: () => ({}),
+		});
 		const targets: FokosTargetDefinition[] = (opts.targets ?? ["t1"]).map((targetId) =>
 			opts.gsi ? { kind: "gsi", targetId, hashKey: { ref: "data" } } : { kind: "push_sink", targetId, binding: "SINK", method: "push" },
 		);
@@ -357,7 +362,7 @@ describe("TargetRunner — failed items", () => {
 			async (h) => {
 				// Each item has the same size. A batch holds 2 items and a half by bytes.
 				h.ingest("r1", 1, { data });
-				config.maxBytesPerStep = Math.floor(2.5 * h.store.storedImage(P(kb("r1")), kb("r1"), NO_SK)!.estRowBytes);
+				config.maxBytesPerStep = Math.floor(2.5 * h.store.storedImage(P(kb("r1")), kb("r1"), NO_SK)!.facts.itemBytes);
 				h.ingest("o1", 1, { data });
 				await h.drain();
 				h.ingest("r2", 1, { data });
@@ -574,8 +579,8 @@ describe("TargetRunner — cleanup", () => {
 			await h.drain();
 			expect(h.count("change_positions")).toBe(0);
 			expect(h.count("latest_items")).toBe(1);
-			// The estimate of the deleted hash key goes with its last row.
-			expect(h.count("key_size_estimates")).toBe(1);
+			// The bucket of the deleted hash key goes with its last row.
+			expect(h.count("item_stats")).toBe(1);
 		});
 	});
 

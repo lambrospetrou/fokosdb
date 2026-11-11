@@ -4,13 +4,17 @@ import type { FokosPartitionIdentity } from "../../sharding/route-context.js";
 import type { FokosShardingHooks } from "../../sharding/runtime-types.js";
 import invariant from "../invariant.js";
 import type { FokosDBPolicy } from "../partition-context.js";
-import type { KeySizeStats } from "./key-size-stats.js";
+import { estimate, itemFacts, type StorageModel } from "./item-size.js";
+import type { Bucket, ItemStats } from "./item-stats.js";
 
 /**
  * The most routingHashes that one split decision asks to promote. When this many all have
  * promotions that cannot finish, the next large one waits until one of them finishes.
  */
 const PROMOTION_CANDIDATES_MAX = 5;
+
+/** One item of a slice, with the facts that the storage model prices. */
+export type ItemSizeFacts = { hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean };
 
 /** The data of the host that the split planner reads. */
 export type SplitSource = {
@@ -20,29 +24,30 @@ export type SplitSource = {
 	 */
 	probeRoutingHashes(): { first: KeyBytes; more: boolean } | null;
 	/**
-	 * The rows of `routingHash` in the composite interval `[start, end)` in `(hk, sk)` order, each
-	 * with its size. The size of each row is the size that the host gives to `KeySizeStats`. The planner
-	 * stops early, so the host must read the rows one by one, and not load them all.
+	 * The items of `routingHash` in the composite interval `[start, end)` in `(hk, sk)` order, or in the
+	 * reverse order for `desc`, each with its size facts. The planner stops early, so the host must
+	 * read the items one by one, and not load them all. It must not read the item data.
 	 */
-	compositeKeySizes(
+	compositeKeyFacts(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
-	): Iterable<{ hk: KeyBytes; sk: KeyBytes; bytes: number }>;
+		order?: "asc" | "desc",
+	): Iterable<ItemSizeFacts>;
+	/** The count of the items of `routingHash` in `[start, end)`, at most `limit`. It reads at most `limit` items. */
+	countItems(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, limit: number): number;
 };
 
 /**
- * Why no repartition can make a partition smaller. `max_depth`: a hash leaf at the depth limit of its
- * topology has no large key to promote, and cannot hash-split.
+ * Why no repartition can make a partition smaller:
+ *
+ * - `no_hash_key`: a hash leaf has no hash key in its items and in its pending transactions.
+ * - `max_depth`: a hash leaf at the depth limit of its topology has no large routingHash to promote,
+ *   and it cannot do a hash split.
+ * - `fewer_items`: a range leaf holds fewer items than the number of children of a range split
+ *   (`rangeSplitN`). Each child must get at least one item.
  */
-export type SplitFloor = "no_hash_key" | "fewer_items" | "skewed_bytes" | "max_depth";
-
-/**
- * The range split of one slice: its boundaries, or why it has none.
- * - `fewer_items`: the slice holds fewer items than children.
- * - `skewed_bytes`: the bytes are so skewed that the scan finds fewer boundaries than it needs.
- */
-export type RangeSplitPlan = { boundaries: FokosCompositeKey[] } | { floor: "fewer_items" | "skewed_bytes" };
+export type SplitFloor = "no_hash_key" | "fewer_items" | "max_depth";
 
 /** A hash key that a write changed, with the estimate of its routingHash after the write. */
 type PromotionCandidate = { hashKey: KeyBytes; keyEstBytes: number };
@@ -50,8 +55,11 @@ type PromotionCandidate = { hashKey: KeyBytes; keyEstBytes: number };
 type EvaluateSplitAnswer = ReturnType<FokosShardingHooks<FokosDBPolicy>["evaluateSplit"]>;
 
 export type SplitPlannerOptions = {
-	keySizes: KeySizeStats;
+	/** The buckets of the partition. The planner reads the promotion lookup and the bucket facts from it. */
+	itemStats: ItemStats;
+	/** The items of the partition. */
 	source: SplitSource;
+	/** The size of the SQLite file of the partition, in bytes. The split decision compares it with the cap. */
 	databaseSize: () => number;
 	/** The part of the hash split size at which a hash key gets its own partition. */
 	promotionFraction: () => number;
@@ -69,9 +77,49 @@ export function maxSplitBytes(identity: FokosPartitionIdentity, policy: FokosDBP
 }
 
 /**
+ * The promotion floor of a partition. A bucket stores its estimate in `promotion_est_bytes`, and so gets
+ * an entry in the promotion index, only when the estimate is at or above the promotion floor. The
+ * promotion floor is one of these values, in this order:
+ *
+ * 1. On a range leaf: null. A range leaf has no promotion.
+ * 2. On a hash leaf at the depth limit: 0, so each bucket has an index entry. This also applies when
+ *    the policy has no size limit.
+ * 3. On a hash leaf below the depth limit, when the policy has no size limit: null.
+ * 4. On a hash leaf below the depth limit: `T` times `promotionIndexFraction`, where `T` is the
+ *    promotion threshold.
+ *
+ * Why 0 at the depth limit: that leaf cannot split, so a promotion is its only way to get smaller.
+ * When it is over its size limit, it refuses each write, so no bucket gets a new index entry. When the
+ * lookup then misses a large routingHash, the leaf refuses writes until an operator deletes data
+ * (`max_depth` in `SplitFloor`). Thus each routingHash must have an index entry before the leaf gets
+ * too large. This is also true when the policy has no size limit now, because an operator can add one
+ * later.
+ *
+ * Why null below the depth limit with no size limit: that leaf has no promotion now. When an operator
+ * adds a size limit, the lookup can miss a large routingHash until its next write. The leaf then does
+ * a hash split, so it does not stay too large.
+ */
+export function promotionFloor(
+	identity: FokosPartitionIdentity,
+	policy: FokosDBPolicy,
+	fractions: { promotionFraction: number; promotionIndexFraction: number },
+): number | null {
+	if (identity.kind !== "hash") {
+		return null;
+	}
+	invariant(identity.hash, "fokos/split-planner: hash identity must have a hash");
+	const { rootTreesN, hashSplitN } = identity.topology;
+	if (identity.hash.depth >= maxHashDepth(rootTreesN, hashSplitN)) {
+		return 0;
+	}
+	const threshold = maxSplitBytes(identity, policy) * fractions.promotionFraction;
+	return threshold > 0 ? threshold * fractions.promotionIndexFraction : null;
+}
+
+/**
  * The split decisions of a partition that uses hash splits, promotions of large routingHashes,
- * and range splits of a promoted routingHash. The host owns the rows. The planner reads the size
- * of each routingHash from `KeySizeStats`, and the rows of one from `SplitSource`.
+ * and range splits of a promoted routingHash. The host owns the rows. The planner reads the stored
+ * promotion estimates and the bucket facts from `ItemStats`, and the items of a slice from `SplitSource`.
  */
 export class SplitPlanner {
 	#opts: SplitPlannerOptions;
@@ -105,21 +153,29 @@ export class SplitPlanner {
 		return false;
 	}
 
-	/** The answer of the `computeRangeBoundaries` hook: the boundaries, or null. */
+	/**
+	 * The answer of the `computeRangeBoundaries` hook: the `N - 1` boundaries of the slice, or null when
+	 * the slice holds fewer than `N` items. All reads run in one storage transaction.
+	 */
 	rangeBoundaries(
 		routingHash: RoutingHash,
 		start: FokosCompositeKey | null,
 		end: FokosCompositeKey | null,
 		N: number,
 	): FokosCompositeKey[] | null {
-		const plan = this.#planRangeSplit(routingHash, start, end, N);
-		return "boundaries" in plan ? plan.boundaries : null;
+		const { itemStats, source } = this.#opts;
+		if (source.countItems(routingHash, start, end, N) < N) {
+			return null;
+		}
+		// Each read stays inside the slice: a bucket bound can be below `start`.
+		const read: SliceRead = (from, to, order) => source.compositeKeyFacts(routingHash, laterKey(start, from), earlierKey(end, to), order);
+		return planBucketBoundaries(itemStats.model, N, start, itemStats.buckets(routingHash, end), read);
 	}
 
 	/**
 	 * The keys of `candidates` that a hash partition must promote. The estimate of a candidate is the
-	 * total of its routingHash, so colliding hash keys add up. It keeps the largest candidate of
-	 * each key: one transaction can write many sort keys of one hash key, and each write reports the
+	 * rounded estimate of its routingHash, so colliding hash keys add up. It keeps the largest candidate
+	 * of each key: one transaction can write many sort keys of one hash key, and each write reports the
 	 * estimate after its own row. The runtime promotes the routingHash of a key one time.
 	 */
 	promotionCandidates(
@@ -160,8 +216,11 @@ export class SplitPlanner {
 	 * ones at or above the promotion threshold, up to `PROMOTION_CANDIDATES_MAX` and largest first, and
 	 * splits when it has none. At the hash depth limit it cannot split, so with no large one it is at
 	 * the floor. One routingHash is promoted whatever its estimate: the limit reads the physical
-	 * file, which can be much larger than the estimate. A range leaf splits when the planner finds its
-	 * boundaries, from the same arguments that the `computeRangeBoundaries` hook gets.
+	 * file, which can be much larger than the estimate.
+	 *
+	 * A range leaf splits when its slice holds at least `rangeSplitN` items, because the planner then
+	 * always finds the boundaries. It counts at most `rangeSplitN` items and does not call the planner:
+	 * the decision runs before a refused write gets its error.
 	 */
 	#decide(
 		identity: FokosPartitionIdentity,
@@ -174,8 +233,8 @@ export class SplitPlanner {
 		if (identity.kind === "range") {
 			invariant(identity.range, `fokos/split-planner: range identity must have a range`);
 			const { routingHash, start, end } = identity.range;
-			const plan = this.#planRangeSplit(routingHash, start, end, this.#opts.rangeSplitN());
-			return "boundaries" in plan ? { answer: {} } : { floor: plan.floor, maxSizeBytes };
+			const N = this.#opts.rangeSplitN();
+			return this.#opts.source.countItems(routingHash, start, end, N) >= N ? { answer: {} } : { floor: "fewer_items", maxSizeBytes };
 		}
 		const keys = this.#opts.source.probeRoutingHashes();
 		if (!keys) {
@@ -187,7 +246,7 @@ export class SplitPlanner {
 		// A split copies a large routingHash into a child, and the child promotes it with a second
 		// copy. A promotion that cannot finish blocks the split, and a refused write signals no promotion.
 		// So the large routingHashes are promoted first, and each promotion answers independently.
-		const large = this.#opts.keySizes.largestAtLeast(maxSizeBytes * this.#opts.promotionFraction(), PROMOTION_CANDIDATES_MAX);
+		const large = this.#opts.itemStats.largestAtLeast(maxSizeBytes * this.#opts.promotionFraction(), PROMOTION_CANDIDATES_MAX);
 		if (large.length > 0) {
 			return { answer: { promote: large } };
 		}
@@ -195,67 +254,225 @@ export class SplitPlanner {
 		const { rootTreesN, hashSplitN } = identity.topology;
 		return identity.hash.depth >= maxHashDepth(rootTreesN, hashSplitN) ? { floor: "max_depth", maxSizeBytes } : { answer: {} };
 	}
-
-	/**
-	 * The range split plan of `[start, end)` of `routingHash`. The caller gives the slice that
-	 * this partition owns, so the rows of the slice are all the rows of the routingHash here, and
-	 * its estimate is the byte total of the slice.
-	 */
-	#planRangeSplit(routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null, N: number): RangeSplitPlan {
-		const bytes = this.#opts.keySizes.bytesOf(routingHash);
-		return planRangeBoundaries(bytes, N, start, this.#opts.source.compositeKeySizes(routingHash, start, end));
-	}
 }
 
+/** Reads the items of a slice in `[from, to)`, in key order or in reverse order. A null edge is the edge of the slice. */
+export type SliceRead = (from: FokosCompositeKey | null, to: FokosCompositeKey | null, order: "asc" | "desc") => Iterable<ItemSizeFacts>;
+
 /**
- * Computes N-1 strictly increasing composite boundaries at the byte quantiles of `rows`, which are in
- * `(hk, sk)` order from `start`. When the rows cannot give N non-empty children, it returns the reason: fewer
- * than N rows, or bytes so skewed that the scan finds fewer boundaries.
- *
- * One scan adds the row sizes, and emits a boundary each time the total crosses the next threshold.
- * It stops at the last boundary. The split starts because of the size, so the children get equal
- * bytes, not equal row counts. Thus one large row gets its own child.
- *
- * Each boundary is the shortest separator of the row before it and the row that crosses the
- * threshold, so the DO names and the topology stay small.
+ * One gap: the item below it (`lower`), the item above it (`upper`), and `before`, the estimate below
+ * it. The planner has no item numbers, so the two items identify the gap. A null item is not read yet,
+ * and the planner reads it only when it needs the gap.
  */
-export function planRangeBoundaries(
-	totalBytes: number,
+type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: number };
+
+/**
+ * Computes the `N - 1` boundaries of a range split of a slice, from the buckets of the slice. The
+ * caller checks before that the slice holds at least `N` items.
+ *
+ * The words:
+ *
+ * - A gap is the position between two adjacent items of the slice, in `(hk, sk)` order. A boundary at
+ *   a gap puts the items below the gap in the lower child, and the items above it in the upper child.
+ *   No gap exists before the first item or after the last item, so each child gets at least one item.
+ * - `before` of a gap is the estimate of the items below the gap.
+ * - `B` is the total estimate of the buckets. Target `i` is `i * B / N`, for `i` from 1 to `N - 1`.
+ *   Boundary `i` must put about target `i` below it.
+ *
+ * For each target in order, the planner:
+ *
+ * 1. Finds the bucket that holds the target, with a binary search over the bucket estimates.
+ * 2. Reads the items of that bucket, one time for each bucket. The gaps of the bucket are the gap at
+ *    its start, the gaps between its items, and the gap at its end (the start of the next bucket).
+ * 3. Finds two gaps after the previous boundary, with a binary search: the last gap with
+ *    `before < target`, and the first gap with `before >= target`.
+ * 4. Selects the gap with the smaller distance to the target. When the distances are equal, it
+ *    selects the lower gap. When both gaps are at or below the previous boundary, the boundary is the
+ *    first gap after the previous boundary: one more item read.
+ *
+ * When the planner ends with fewer boundaries, a large item near the end took the remaining targets.
+ * The repair reads the last `N` items, keeps the boundaries below them, and puts the missing boundaries
+ * at the gaps between them.
+ *
+ * Cost: it reads the items of at most `min(N - 1, buckets)` buckets (each at most `2K` items), and
+ * about `2N` single items. The work in JavaScript is linear in the items read, plus O(log) for each
+ * target.
+ *
+ * Wrong bucket facts give a worse balance, but the boundaries stay valid, because the planner
+ * identifies a gap by its items. An item cannot cross a boundary, so a dominant item makes equal
+ * children impossible, and a child that is still over its cap splits again. Each boundary is the
+ * shortest separator of the two items at its gap, so the DO names and the topology stay small.
+ *
+ * `test/range-planner-reference.ts` holds a reference planner that reads every item of the slice. The
+ * tests check that this planner gives the same boundaries when the facts are exact.
+ */
+export function planBucketBoundaries(
+	model: StorageModel,
 	N: number,
 	start: FokosCompositeKey | null,
-	rows: Iterable<{ hk: KeyBytes; sk: KeyBytes; bytes: number }>,
-): RangeSplitPlan {
-	if (totalBytes <= 0) {
-		return { floor: "fewer_items" };
+	buckets: readonly Bucket[],
+	read: SliceRead,
+): FokosCompositeKey[] {
+	invariant(N >= 2, `fokos/split-planner: a range split needs at least 2 children, got ${N}`);
+	const weight = (item: ItemSizeFacts) =>
+		estimate(
+			model,
+			itemFacts(model, { itemBytes: item.itemBytes, keyBytes: item.hk.byteLength + item.sk.byteLength, indexed: item.indexed }),
+		);
+	const firstOf = (items: Iterable<ItemSizeFacts>) => {
+		for (const item of items) {
+			return item;
+		}
+		return null;
+	};
+	const itemBefore = (item: ItemSizeFacts) => firstOf(read(null, item, "desc"));
+	// The smallest composite key above `(hk, sk)` is `(hk, sk || 0x00)`, so this read starts at the next item.
+	const itemAfter = (item: ItemSizeFacts) =>
+		firstOf(read({ hk: item.hk, sk: KeyCodec.asKeyBytes(new Uint8Array([...item.sk, 0])) }, null, "asc"));
+	// Reads the unknown item of a gap. It returns false when no such item exists, so the gap does not exist.
+	const resolve = (gap: Gap & { next?: FokosCompositeKey | null }) => {
+		gap.lower ??= itemBefore(gap.upper!);
+		if (gap.upper === null) {
+			// The end gap of a bucket: its upper item is the first item at or above the next bucket bound.
+			gap.upper = gap.next === null ? null : firstOf(read(gap.next!, null, "asc"));
+		}
+		return gap.lower !== null && gap.upper !== null;
+	};
+	const isAfter = (gap: Gap, previous: Gap) =>
+		gap.lower !== null
+			? KeyCodec.compareComposite(gap.lower, previous.lower!) > 0
+			: KeyCodec.compareComposite(gap.upper!, previous.upper!) > 0;
+
+	// The estimate below the start and below the end of each bucket. Both arrays never decrease.
+	const lowerEst: number[] = [];
+	const upperEst: number[] = [];
+	let total = 0;
+	for (const bucket of buckets) {
+		lowerEst.push(total);
+		total += estimate(model, bucket.facts);
+		upperEst.push(total);
 	}
-	const step = totalBytes / N;
-	const boundaries: FokosCompositeKey[] = [];
-	let rowCount = 0;
-	let acc = 0;
-	let threshold = step;
-	let prev: FokosCompositeKey | null = null;
-	for (const { hk, sk, bytes } of rows) {
-		rowCount++;
-		acc += bytes;
-		const key = { hk, sk };
-		// The first row is never a boundary, so child 0 always has at least one row.
-		if (prev !== null && acc >= threshold) {
-			// The row that crosses the threshold goes to the upper child.
-			boundaries.push(KeyCodec.shortestCompositeSeparator(prev, key));
-			// The next threshold starts from this row (acc + step, not threshold + step). When one large
-			// row crosses many thresholds, the scan emits one boundary, so no two boundaries fall
-			// between the same two rows, and each child gets at least one row.
-			threshold = acc + step;
-			if (boundaries.length === N - 1) {
+	// The bucket that holds `target`: `lowerEst < target <= upperEst`, or -1. The first bucket with
+	// `upperEst >= target` is the only possible one, because each bucket before it ends below the target.
+	const bucketOf = (target: number) => {
+		const b = firstIndex(upperEst.length, (i) => upperEst[i] >= target);
+		return b < upperEst.length && lowerEst[b] < target ? b : -1;
+	};
+	const step = total / N;
+	// The gaps of each bucket that the planner read. It reads each bucket at most one time. In the gaps
+	// of a bucket, `before` increases, except at the end gap: its `before` comes from the bucket facts,
+	// and wrong facts can make it smaller.
+	const scanned = new Map<number, Gap[]>();
+	const gapsOf = (b: number): Gap[] => {
+		let gaps = scanned.get(b);
+		if (gaps === undefined) {
+			const items = [...read(buckets[b].bound, buckets[b + 1]?.bound ?? null, "asc")];
+			gaps = [];
+			if (items.length > 0) {
+				let before = lowerEst[b];
+				gaps.push({ lower: null, upper: items[0], before });
+				for (let i = 0; i + 1 < items.length; i++) {
+					before += weight(items[i]);
+					gaps.push({ lower: items[i], upper: items[i + 1], before });
+				}
+				const end: Gap & { next: FokosCompositeKey | null } = {
+					lower: items[items.length - 1],
+					upper: null,
+					before: lowerEst[b] + estimate(model, buckets[b].facts),
+					next: buckets[b + 1]?.bound ?? null,
+				};
+				gaps.push(end);
+			}
+			scanned.set(b, gaps);
+		}
+		return gaps;
+	};
+
+	let chosen: Gap[] = [];
+	for (let k = 1; k < N; k++) {
+		const target = step * k;
+		const b = bucketOf(target);
+		if (b === -1) {
+			break;
+		}
+		const gaps = gapsOf(b);
+		// The gap below the target: the last gap with `before < target`. The gap above: the first gap
+		// with `before >= target`. A binary search covers the gaps before the end gap, which are in order,
+		// and the end gap gets its own check.
+		const end = gaps.length - 1;
+		const firstAtOrAbove = firstIndex(end, (i) => gaps[i].before >= target);
+		let nearBelow: Gap | undefined =
+			end >= 0 && gaps[end].before < target ? gaps[end] : firstAtOrAbove > 0 ? gaps[firstAtOrAbove - 1] : undefined;
+		let nearAbove: Gap | undefined =
+			firstAtOrAbove < end ? gaps[firstAtOrAbove] : end >= 0 && gaps[end].before >= target ? gaps[end] : undefined;
+		if (nearBelow !== undefined && !resolve(nearBelow)) {
+			nearBelow = undefined;
+		}
+		if (nearAbove !== undefined && !resolve(nearAbove)) {
+			nearAbove = undefined;
+		}
+		const previous = chosen.at(-1);
+		if (nearBelow !== undefined && previous !== undefined && !isAfter(nearBelow, previous)) {
+			nearBelow = undefined;
+		}
+		let pick: Gap | undefined;
+		if (nearAbove !== undefined && previous !== undefined && !isAfter(nearAbove, previous)) {
+			// Each gap near the target is at or before the previous boundary.
+			const upper = itemAfter(previous.upper!);
+			pick = upper === null ? undefined : { lower: previous.upper, upper, before: Number.NaN };
+		} else if (nearAbove !== undefined) {
+			pick = nearBelow !== undefined && target - nearBelow.before <= nearAbove.before - target ? nearBelow : nearAbove;
+		} else {
+			pick = nearBelow;
+		}
+		if (pick === undefined) {
+			break;
+		}
+		chosen.push(pick);
+		if (nearAbove === undefined) {
+			break;
+		}
+	}
+	if (chosen.length < N - 1) {
+		const last: ItemSizeFacts[] = [];
+		for (const item of read(null, null, "desc")) {
+			last.push(item);
+			if (last.length === N) {
 				break;
 			}
 		}
-		prev = key;
+		last.reverse();
+		invariant(last.length === N, `fokos/split-planner: the slice holds fewer than ${N} items`);
+		const kept = chosen.filter((gap) => KeyCodec.compareComposite(gap.lower!, last[0]) < 0);
+		const missing = N - 1 - kept.length;
+		for (let i = N - 1 - missing; i < N - 1; i++) {
+			kept.push({ lower: last[i], upper: last[i + 1], before: Number.NaN });
+		}
+		chosen = kept;
 	}
-	// Each boundary needs a new row after the first row, so N-1 boundaries mean at least N rows.
-	if (boundaries.length !== N - 1) {
-		return { floor: rowCount < N ? "fewer_items" : "skewed_bytes" };
+	return checkedBoundaries(
+		chosen.map((gap) => KeyCodec.shortestCompositeSeparator(gap.lower!, gap.upper!)),
+		start,
+	);
+}
+
+/** The first index in `[0, length)` where `test` is true, or `length`. `test` must be false and then true. */
+function firstIndex(length: number, test: (i: number) => boolean): number {
+	let low = 0;
+	let high = length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (test(middle)) {
+			high = middle;
+		} else {
+			low = middle + 1;
+		}
 	}
+	return low;
+}
+
+/** Checks that each boundary is above `start` and that the boundaries strictly increase. */
+function checkedBoundaries(boundaries: FokosCompositeKey[], start: FokosCompositeKey | null): FokosCompositeKey[] {
 	for (let i = 0; i < boundaries.length; i++) {
 		invariant(
 			start === null || KeyCodec.compareComposite(boundaries[i], start) > 0,
@@ -266,5 +483,13 @@ export function planRangeBoundaries(
 			`fokos/split-planner: boundaries are not strictly increasing`,
 		);
 	}
-	return { boundaries };
+	return boundaries;
+}
+
+function laterKey(a: FokosCompositeKey | null, b: FokosCompositeKey | null): FokosCompositeKey | null {
+	return a === null ? b : b === null || KeyCodec.compareComposite(a, b) >= 0 ? a : b;
+}
+
+function earlierKey(a: FokosCompositeKey | null, b: FokosCompositeKey | null): FokosCompositeKey | null {
+	return a === null ? b : b === null || KeyCodec.compareComposite(a, b) <= 0 ? a : b;
 }

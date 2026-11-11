@@ -1,7 +1,7 @@
 # RFC — Exact item-size facts, item statistics in buckets, and correct range splits
 
-**State:** Draft
-**Date:** 2026-10-31, updated 2026-11-06
+**State:** Implemented
+**Date:** 2026-10-31, updated 2026-11-12
 
 ## Table of contents
 
@@ -482,11 +482,17 @@ CREATE INDEX item_stats_promotion ON item_stats (promotion_est_bytes) WHERE prom
 - **Storage order.** The table leads with `routing_hash`, like `items`. Thus the buckets of one routingHash are one
   key range, and the buckets of a hash child are one key range of the parent (I6 of the routingHash RFC).
 - One class, `ItemStats` in `shared/partition/item-stats.ts`, owns the table, its migrations under its own KV key,
-  and the split, merge, and recount statements. It replaces `KeySizeStats`. The host gives it the item table, the key
-  column names, the indexed-item condition (`ttl_epoch_utc_seconds IS NOT NULL` or `deleted_at_ms IS NOT NULL`),
-  the leaf kind, and the coefficient set. These are fixed SQL fragments from the code, never user input. The host
-  binds the promotion floor in each statement that writes facts (section 4.2.8). The host gives each routingHash as
-  opaque bytes, as it does to `KeySizeStats` today.
+  and the bucket logic: the fact updates, the split, the merge, and the recount. It replaces `KeySizeStats`. It runs
+  SQL only on `item_stats`.
+- `ItemStats` reads the item table only through `ItemSource`, which each store implements over its own table, next
+  to its schema: `countFacts`, `countItems`, `itemAt`, and `firstHashKey`. Each read covers a composite interval
+  `[start, end)` of one routingHash and seeks the primary key. Thus `ItemStats` makes no assumption about the
+  column names, the indexed-item condition, or the parameter order of the queries of a store.
+- `countFacts` of each store selects `hk`, `sk`, `item_bytes`, and an `indexed` flag (`ttl_epoch_utc_seconds IS NOT
+  NULL` in `items`, `deleted_at_ms IS NOT NULL` in `latest_items`) from its table, and sums them with
+  `factsAggregateSql` of `item-size.ts`. Thus both stores use one definition of the facts of a count.
+- The host gives `ItemStats` the leaf kind (`isRangeLeaf`), the coefficient set, and the promotion floor. Each
+  statement that writes facts binds the floor (section 4.2.8). The host gives each routingHash as opaque bytes.
 
 #### 4.2.5 Fact updates
 
@@ -598,6 +604,13 @@ the bulk paths with item-table triggers: a trigger adds one row write for each r
 
 #### 4.2.6 Bucket split, merge, and import (range leaf only)
 
+`K` is `RANGE_BUCKET_MIN_ITEMS` (2,048) in `item-stats.ts`. `PartitionStore` and `MaterializationStore` give it to
+`ItemStats` through the option `rangeBucketMinItems`, with `RANGE_BUCKET_MIN_ITEMS` as the default. Production code
+does not set the option. Tests set a small value, for example 3, so that a few items make splits, merges, and new
+import buckets. The option `isRangeLeaf` tells `ItemStats` which rules apply: the range-leaf rules of this section, or
+the hash-leaf rules of sections 4.2.5 and 4.2.17. The store reads it at each fact write, because the identity of the
+partition is not known when the store starts.
+
 The split and the merge run in the transaction of the write that makes them necessary. No job and no signal exist.
 
 **Split.** After an insert, while a bucket holds more than `2K` items:
@@ -670,6 +683,15 @@ In the same storage transaction:
 On a range leaf, the recount reads at most `2K` items. On a hash leaf, the bucket is the whole routingHash:
 `WHERE routing_hash = ?`. The recount runs only after a defect.
 
+Two more rules keep the repair of a range leaf bounded:
+
+- Before a merge deletes a bucket whose facts tell that it has no items, one seek checks its key range. When an item
+  is there, the bucket stays and gets the recount. Thus a wrong delete cannot leave items with no bucket.
+- When a change finds no bucket at or below its key, the first bucket is absent. For the first insert of the
+  routingHash this is normal: a count of at most 2 items checks that no other item is below the lowest bucket, and
+  the insert starts the first bucket. Else it is a defect. The recount reads only the items below the lowest bucket,
+  and writes them as buckets of `K` items. It reads every item of the routingHash only when no bucket is present.
+
 #### 4.2.8 Promotion
 
 `T` is the promotion threshold: the cap of the leaf in bytes times `promotionFraction`, 0.25 by default. The write-path
@@ -683,7 +705,19 @@ measured optimum:
 - A lower value lets the index find each candidate after a larger cap reduction, and it makes more routingHashes write
   their index entry at each write.
 - A higher value does the opposite. The value must be greater than 0 and at most 1.
-- On a range leaf, the floor is `NULL`. `estimate >= NULL` is `NULL` in SQLite, so `promotionEstSql` gives `NULL`.
+
+`promotionFloor` in `split-planner.ts` gives the floor of each partition, in this order:
+
+1. On a range leaf, the floor is `NULL`. `estimate >= NULL` is `NULL` in SQLite, so `promotionEstSql` gives `NULL`.
+2. On a hash leaf at the depth limit, the floor is 0, so each bucket stores its estimate. That leaf cannot make a hash
+   split. After a cap reduction, a routingHash with `NULL` would stay hidden: the leaf refuses each write for size, and
+   a refused write writes no bucket. The cost is the promotion index entry at each write, on these leaves only.
+3. The floor of a leaf at the depth limit is 0 also when the policy has no hash size limit. Else the buckets that the
+   leaf writes with no limit store `NULL`, and a routingHash with fewer than 16 items keeps no bucket. After an operator
+   sets a limit again, the lookup finds no candidate, and the leaf stays at the `max_depth` floor.
+4. On another hash leaf with no hash size limit, the floor is `NULL`. That leaf has no promotion. After an operator sets
+   a limit, it can miss a routingHash until its next write, and it then makes a hash split, as in the table below.
+5. On another hash leaf, the floor is `T` times `promotionIndexFraction`.
 
 The cap comes from the policy, and the client sends the current policy with each request. Each statement that writes
 facts binds the floor from the policy that the partition holds when the statement runs. The index condition is a
@@ -804,7 +838,7 @@ changes only at a write of that routingHash. Thus the stored value of a row with
 | --- | --- | --- |
 | `T` goes up | Rows below the new floor keep a value until their next write. The lookup filters on `T`, so it does not return them | A few more index entries for a short time |
 | `T` goes down, to the old floor or above | Each routingHash at or above the new `T` was at or above the old floor at its last write, so it has a value. The lookup finds it with its exact estimate | None |
-| `T` goes down, below the old floor | A routingHash at or above the new `T` but below the old floor has `NULL` until its next write. The lookup can miss it. The leaf then makes a hash split, and the import of the child sets its value | One more copy of the routingHash |
+| `T` goes down, below the old floor | A routingHash at or above the new `T` but below the old floor has `NULL` until its next write. The lookup can miss it. The leaf then makes a hash split, and the import of the child sets its value. A leaf at the depth limit has the floor 0, so this case does not occur there | One more copy of the routingHash |
 
 With `promotionIndexFraction` 0.5, the lookup misses no candidate after a cap reduction of up to 2 times. A change of
 `promotionIndexFraction` has the same effects as a change of the floor.
@@ -848,7 +882,8 @@ not read the buckets in size order, so it does not read `promotion_est_bytes`.
 1. Apply the count check of section 4.2.10. Return `fewer_items` when the slice holds fewer than `N` items.
 2. Read the bucket rows in storage order. Price each bucket with the model, and keep the running total before each
    bucket. The total is `B`.
-3. Calculate the targets `i * B / N` for `i = 1 … N - 1`, and find the bucket that holds each target.
+3. Calculate the targets `i * B / N` for `i = 1 … N - 1`, and find the bucket that holds each target with a binary
+   search over the running totals.
 4. Scan each of those buckets one time, in storage order. Start from the running total before the bucket, add each
    item estimate, and select the gap nearest each target. The candidate gaps are the gaps inside the bucket, the start
    of the bucket, and the start of the next bucket. When two gaps have the same distance, select the earlier gap.
@@ -867,12 +902,15 @@ not read the buckets in size order, so it does not read `promotion_est_bytes`.
 `min(N - 1, buckets) * 2K` rows for the buckets of the targets, at most `N - 1` rows for the collision steps, and at
 most `N` rows for the repair: at most `min(N - 1, buckets) * 2K + 2N` rows in total (appendix E).
 
-**Streaming path (M1).**
+**Streaming path (M1).** M2 replaces it in production with the bucket path. The streaming path stays only in the
+tests, as `planRangeBoundaries` in `test/range-planner-reference.ts`: the tests check that the bucket path gives the
+same boundaries when the facts are exact. It reads each item one time: O(`C`) time, and O(`N`) memory.
 
 1. Apply the count check.
 2. Read the items of the slice in storage order through a streaming cursor, and price each item with the model.
 3. For each target in order, select the gap nearest the target after the previous boundary. Ties select the earlier gap.
-4. Keep the last `N` items of the scan in a buffer. These items have `N - 1` gaps.
+4. Keep the keys of the last `N + 1` items in a ring buffer of fixed size, so each item costs O(1). The last `N` items
+   have `N - 1` gaps, and the gap before them gives the two items of the gap below the current target.
 5. Stop the scan when it has `N - 1` boundaries.
 6. When the cursor ends with fewer boundaries, repair: keep the boundaries before the first gap of the buffer, and fill
    the missing boundaries from the gaps of the buffer, latest gap first.
@@ -939,7 +977,9 @@ These changes move some page and batch boundaries.
 - `ItemStats` with the `latest_items` coefficients.
 - The same fact updates, split, merge, import, promotion lookup, and planner.
 
-Its routingHash comes from its own runtime, with the seed of the materialization shard group. Its indexed items are
+An image whose facts equal the facts of the stored image reads and writes no bucket: the routingHash did not grow,
+so the ingest signals no promotion. Its routingHash comes from its own runtime, with the seed of the materialization
+shard group. Its indexed items are
 its tombstones. The tombstone GC delete is a delete of a present item, and it returns `base_sk` (section 4.2.2). Its
 `beforeComplete` and its cleanup guard delete the buckets of the promoted routingHash, as in the partition.
 
@@ -1114,6 +1154,11 @@ Tests must check definitions, not only the agreement between two uses of the sam
 - Use `EXPLAIN QUERY PLAN` to assert a primary-key search on a key range for the size scans, the count checks, the
   split statements, the recount, the planner scans, and the old-facts read. Assert that the promotion lookup uses
   `item_stats_promotion`, and that the promotion cleanup of `item_stats` is a primary-key range delete.
+- For `compositeKeyFacts`, `countItems`, `countFacts`, `itemAt`, and `firstHashKey` of `PartitionStore` and of
+  `MaterializationStore`, record each statement that the method runs, for each bound shape (no bound, start only, end
+  only, both) and, for `compositeKeyFacts`, each order (`asc`, `desc`). Assert that each plan is a primary-key search
+  on `routing_hash` and the given bounds, with no table scan and no temporary B-tree. Check that `countFacts` equals
+  the sum of `itemFacts` over the same items, with and with no limit.
 - Check range split, migration, promotion, and transaction flows in the Workers runtime with the existing partition
   harness. Add no production test hook.
 
@@ -1500,7 +1545,8 @@ Code paths are relative to `packages/fokosdb/src`:
 
 - `shared/partition/item-size.ts` — the stored-size expression and the data expression.
 - `shared/partition/key-size-stats.ts` — the current summary for each routingHash, which `ItemStats` replaces.
-- `shared/partition/split-planner.ts` — `SplitPlanner`, `SplitSource`, and `planRangeBoundaries`.
+- `shared/partition/split-planner.ts` — `SplitPlanner`, `SplitSource`, and `planBucketBoundaries`.
+- `test/range-planner-reference.ts` — `planRangeBoundaries`, the streaming path, which only the tests use.
 - `shared/partition/partition-store.ts` — the schema, the mutations, the query scans, `#storedEstRowBytes`,
   `probeRoutingHashes`, and `compositeKeySizes`.
 - `shared/partition/fokos-migration-host.ts` — the per-page migration accounting, the page validation, and

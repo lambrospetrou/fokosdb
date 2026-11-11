@@ -21,7 +21,6 @@ import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.j
 import { KeyCodec } from "../sharding/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
 import type { JsonValue } from "../shared/json-types.js";
-import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 import { attachRouting } from "../sharding/envelope.js";
 import { FokosUnavailableError, type FokosError } from "../shared/errors.js";
@@ -1561,9 +1560,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			await expect(db.getItem({ hashKey: "over-row" })).resolves.toMatchObject({ found: false });
 
 			// Exactly at the limit is accepted by both.
-			const atLimitPut = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit").byteLength - EST_ROW_BYTES_K);
+			const atLimitPut = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit").byteLength);
 			await expect(db.putItem({ hashKey: "at-limit", data: atLimitPut })).resolves.toMatchObject({ version: 1 });
-			const atLimitTx = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit-tx").byteLength - EST_ROW_BYTES_K);
+			const atLimitTx = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit-tx").byteLength);
 			await expect(
 				db.transactWriteItems({ items: [{ hashKey: "at-limit-tx", operation: "put", data: atLimitTx }] }),
 			).resolves.toMatchObject({ transactionId: expect.any(String) });

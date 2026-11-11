@@ -922,7 +922,9 @@ it("counts the rows written with a promotion column that is NULL below a floor",
 		const r = crypto.getRandomValues(new Uint8Array(8));
 		const empty = new Uint8Array();
 		const promotionEstOf = (hk: Uint8Array) => {
-			const rows = sql.exec(`SELECT promotion_est_bytes FROM m_promotion_stats WHERE routing_hash = ? AND lower_hk = ? AND lower_sk = x''`, r, hk).toArray();
+			const rows = sql
+				.exec(`SELECT promotion_est_bytes FROM m_promotion_stats WHERE routing_hash = ? AND lower_hk = ? AND lower_sk = x''`, r, hk)
+				.toArray();
 			return rows.length === 0 ? "no row" : String(rows[0].promotion_est_bytes);
 		};
 		const step = (name: string, hk: Uint8Array, delta: number, floorValue: number | null) => {
@@ -942,7 +944,10 @@ it("counts the rows written with a promotion column that is NULL below a floor",
 		step("Update, NULL floor (range bucket)", KeyCodec.encode("a"), 100, null);
 		// An update that leaves promotion_est_bytes at the same non-NULL value.
 		sql.exec(`UPDATE m_promotion_stats SET promotion_est_bytes = 5 WHERE routing_hash = ? AND lower_hk = x''`, r);
-		const same = sql.exec(`UPDATE m_promotion_stats SET item_count = item_count + 1, promotion_est_bytes = 5 WHERE routing_hash = ? AND lower_hk = x''`, r);
+		const same = sql.exec(
+			`UPDATE m_promotion_stats SET item_count = item_count + 1, promotion_est_bytes = 5 WHERE routing_hash = ? AND lower_hk = x''`,
+			r,
+		);
 		same.toArray();
 		out.push(`| Update, same non-NULL value | 5 | 5 | ${same.rowsWritten} |`);
 		for (const [name, value] of [
@@ -1165,7 +1170,9 @@ it("measures a hash-leaf write with no bucket below m items", async () => {
 					}
 				});
 				if ([2, M - 1, M, M + 1].includes(k)) {
-					lines.push(`| ${design} | Insert, item ${k} of a routingHash | ${(cost.read / reps).toFixed(1)} | ${(cost.written / reps).toFixed(1)} | |`);
+					lines.push(
+						`| ${design} | Insert, item ${k} of a routingHash | ${(cost.read / reps).toFixed(1)} | ${(cost.written / reps).toFixed(1)} | |`,
+					);
 				}
 			}
 		});
@@ -1208,7 +1215,9 @@ it("measures a hash-leaf write with no bucket below m items", async () => {
 					}
 				}
 			});
-			lines.push(`| ${design} | Delete, last item of a routingHash | ${(cost.read / reps).toFixed(1)} | ${(cost.written / reps).toFixed(1)} | |`);
+			lines.push(
+				`| ${design} | Delete, last item of a routingHash | ${(cost.read / reps).toFixed(1)} | ${(cost.written / reps).toFixed(1)} | |`,
+			);
 		});
 		if (design === "from m, count first") {
 			const plan = await runInDurableObject(stub, (_i: FokosDBPartitionDO, state: DurableObjectState) =>

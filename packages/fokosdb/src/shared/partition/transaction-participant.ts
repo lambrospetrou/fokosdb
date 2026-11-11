@@ -349,7 +349,7 @@ export class TransactionParticipant {
 			);
 			const measureOpts = { routingHash, hk, sk, data: item.data, kind: item.kind };
 			const read = readStamp ? this.#store.measureItemBytesWithStamp(measureOpts) : null;
-			const bytes = read ? read.estRowBytes : this.#store.measureItemBytes(measureOpts);
+			const bytes = read ? read.itemBytes : this.#store.measureItemBytes(measureOpts);
 			return { reason: bytes > MAX_ITEM_BYTES ? { code: "item_too_large", ...decodeItemKeys(hk, sk) } : null, read };
 		}
 
@@ -730,7 +730,7 @@ export class TransactionParticipant {
 	 * Each write of an item uses the same data, also a write in the middle of its sequence. That data is
 	 * invisible: the writes run in one storage transaction, and a later write or delete replaces it. The
 	 * values that other requests see depend only on the order and the types of the writes: `v`,
-	 * `max_deleted_v`, the timestamps, and `key_size_estimates`.
+	 * `max_deleted_v`, the timestamps, and the item facts.
 	 */
 	#apply(entries: ApplyEntry[], ts: number): PromotionCandidate[] {
 		entries.sort((a, b) => a.opIndex - b.opIndex);
