@@ -5,6 +5,8 @@ import type { FokosDBMaterializationDO } from "./do-materialization.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { MaterializationStore, type LatestImage, type TargetPositions } from "./materialization-store.js";
 import { routingHashFor } from "../../../test/routing-hash.js";
+import { itemFacts, LATEST_ITEMS_MODEL, maxItemEstimate, NO_FACTS } from "../../shared/partition/item-size.js";
+import { addFacts } from "../../shared/partition/item-stats.js";
 
 /** The routingHash of a hash key, as the partition stores it. */
 const P = (hk: Parameters<typeof routingHashFor>[0]) => routingHashFor(hk);
@@ -25,7 +27,11 @@ type Harness = {
 async function withStore(fn: (h: Harness) => void): Promise<void> {
 	const stub = env.MATERIALIZATION_DO.getByName(`mat-store.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
-		const store = new MaterializationStore(state.storage);
+		const store = new MaterializationStore(state.storage, {
+			promotionFloor: () => maxItemEstimate(LATEST_ITEMS_MODEL),
+			isRangeLeaf: () => false,
+			logParams: () => ({}),
+		});
 		const image = (hk: string, revision: number, deleted: boolean): LatestImage =>
 			deleted
 				? { opIndex: 0, hashKey: kb(hk), sortKey: NO_SK, revision, deleted: true }
@@ -128,17 +134,104 @@ describe("MaterializationStore — change positions", () => {
 	});
 });
 
-describe("MaterializationStore — row size estimate", () => {
-	it("counts the data, the keys two times, and the fixed part for a live image, and the keys three times for a tombstone", async () => {
+describe("MaterializationStore — item size", () => {
+	it("counts the data and the keys for a live image, and only the keys for an indexed tombstone", async () => {
 		await withStore((h) => {
-			// The keys and the 8-byte routingHash.
-			const keys = 8 + kb("x").byteLength + NO_SK.byteLength;
+			const keys = kb("x").byteLength + NO_SK.byteLength;
 			h.ingest("x", 1, []);
-			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe("v1".length + 2 * keys + 70);
-			expect(h.store.keySizes.bytesOf(P(kb("x")))).toBe("v1".length + 2 * keys + 70);
+			const live = {
+				itemCount: 1,
+				itemBytes: "v1".length + keys,
+				keyBytes: keys,
+				indexedItemCount: 0,
+				indexedKeyBytes: 0,
+				overflowBytes: 0,
+			};
+			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.facts).toEqual(live);
+			expect(h.store.itemStats.factsOf(P(kb("x")))).toEqual(live);
 			h.ingest("x", 2, [], true);
-			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.estRowBytes).toBe(3 * keys + 70);
-			expect(h.store.keySizes.bytesOf(P(kb("x")))).toBe(3 * keys + 70);
+			const tombstone = { itemCount: 1, itemBytes: keys, keyBytes: keys, indexedItemCount: 1, indexedKeyBytes: keys, overflowBytes: 0 };
+			expect(h.store.storedImage(P(kb("x")), kb("x"), NO_SK)!.facts).toEqual(tombstone);
+			expect(h.store.itemStats.factsOf(P(kb("x")))).toEqual(tombstone);
+		});
+	});
+});
+
+describe("MaterializationStore — buckets on a range leaf", () => {
+	it("keeps each bucket equal to the sums of its key range through live images, tombstones, and tombstone collection", async () => {
+		const stub = env.MATERIALIZATION_DO.getByName(`mat-store.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) => {
+			const K = 2;
+			const store = new MaterializationStore(state.storage, {
+				promotionFloor: () => null,
+				isRangeLeaf: () => true,
+				logParams: () => ({}),
+				rangeBucketMinItems: K,
+			});
+			const hk = kb("r");
+			const rh = P(hk);
+			const image = (sk: string, revision: number, deleted: boolean): LatestImage =>
+				deleted
+					? { opIndex: 0, hashKey: hk, sortKey: kb(sk), revision, deleted: true }
+					: {
+							opIndex: 0,
+							hashKey: hk,
+							sortKey: kb(sk),
+							revision,
+							deleted: false,
+							data: "v".repeat(revision * 5),
+							kind: "text",
+							ttlAt: null,
+						};
+			const apply = (sk: string, revision: number, deleted: boolean) =>
+				store.putLatestImage(rh, image(sk, revision, deleted), 1_000, store.storedImage(rh, hk, kb(sk)), []);
+			const expectExact = () => {
+				const rows = state.storage.sql
+					.exec<{
+						lower_hk: ArrayBuffer;
+						lower_sk: ArrayBuffer;
+						item_count: number;
+						item_bytes: number;
+						indexed_item_count: number;
+						promotion_est_bytes: number | null;
+					}>(
+						`SELECT lower_hk, lower_sk, item_count, item_bytes, indexed_item_count, promotion_est_bytes FROM item_stats WHERE routing_hash = ? ORDER BY lower_hk, lower_sk`,
+						rh,
+					)
+					.toArray();
+				for (const [i, row] of rows.entries()) {
+					const next = rows[i + 1];
+					const sums = state.storage.sql
+						.exec<{ c: number; b: number; t: number }>(
+							`SELECT COUNT(*) AS c, COALESCE(SUM(item_bytes), 0) AS b, COALESCE(SUM(deleted_at_ms IS NOT NULL), 0) AS t FROM latest_items
+							  WHERE routing_hash = ?1 AND (base_hk, base_sk) >= (?2, ?3) ${next ? "AND (base_hk, base_sk) < (?4, ?5)" : ""}`,
+							rh,
+							row.lower_hk,
+							row.lower_sk,
+							...(next ? [next.lower_hk, next.lower_sk] : []),
+						)
+						.one();
+					expect([row.item_count, row.item_bytes, row.indexed_item_count]).toEqual([sums.c, sums.b, sums.t]);
+					expect(row.item_count).toBeLessThanOrEqual(2 * K);
+					expect(row.promotion_est_bytes).toBeNull();
+				}
+				return rows;
+			};
+			const sks = Array.from({ length: 9 }, (_, i) => `s${i}`);
+			for (const sk of sks) {
+				apply(sk, 1, false);
+				expectExact();
+			}
+			expect(expectExact().length).toBeGreaterThan(1);
+			for (const sk of sks) {
+				apply(sk, 2, true);
+				expectExact();
+			}
+			for (const sk of sks) {
+				expect(store.deleteTombstone(store.storedImage(rh, hk, kb(sk))!.itemId)).toBe(true);
+				expectExact();
+			}
+			expect(expectExact()).toEqual([]);
 		});
 	});
 });
@@ -224,7 +317,7 @@ describe("MaterializationStore — the item-id counter", () => {
 					newest_seq: null,
 					data_kind: 0,
 					ttl_at: null,
-					est_row_bytes: 1,
+					item_bytes: 1,
 					data: "d",
 					positions: [],
 					retries: [],
@@ -253,23 +346,24 @@ describe("MaterializationStore — the item-id counter", () => {
 				newest_seq: null,
 				data_kind: 0,
 				ttl_at: null,
-				est_row_bytes: 1,
+				item_bytes: 1,
 				data: "d",
 				positions: [],
 				retries: [],
 			});
-			expect(h.store.insertMigratedItem(copy("local"))).toBe(false);
+			expect(h.store.insertMigratedItem(copy("local"))).toBeUndefined();
 			expect(() => h.store.insertMigratedItem(copy("other"))).toThrow(/UNIQUE constraint failed: latest_items\.item_id/);
 		});
 	});
 });
 
 /**
- * A store whose storage records the text and the parameters of each `sql.exec` call. Each call runs
+ * A store whose storage records the text and the parameters of each `sql.exec` call. `queries` returns
+ * the text of each recorded statement since its last call, and clears the record. Each call runs
  * on the real storage without change. `plans` returns the query plan of each recorded statement on
  * `latest_items` since its last call, and clears the record.
  */
-function planRecorder(storage: DurableObjectStorage): { store: MaterializationStore; plans: () => string[] } {
+function planRecorder(storage: DurableObjectStorage): { store: MaterializationStore; plans: () => string[]; queries: () => string[] } {
 	const statements: Array<{ query: string; params: unknown[] }> = [];
 	// Native methods need their own object as `this`, so the proxy binds each method it forwards.
 	const forward = <T extends object>(target: T, own: (prop: string | symbol) => unknown): T =>
@@ -300,7 +394,8 @@ function planRecorder(storage: DurableObjectStorage): { store: MaterializationSt
 					.join(" | "),
 			);
 	plans();
-	return { store, plans };
+	const queries = () => statements.splice(0).map((s) => s.query);
+	return { store, plans, queries };
 }
 
 describe("MaterializationStore — plans of the storage order", () => {
@@ -360,6 +455,97 @@ describe("MaterializationStore — plans of the storage order", () => {
 
 			expect(store.deleteTombstone(y)).toBe(true);
 			expect(plans()).toEqual([`SEARCH latest_items ${byItemId}`]);
+		});
+	});
+
+	// The split planner and the split decision read a slice with these two methods. Each bound shape and
+	// each order must seek the primary key, never scan the table, and never sort in a temporary B-tree.
+	it("seeks the primary key for each slice read of compositeKeyFacts and countItems", async () => {
+		await withStore((h) => {
+			const { store, plans } = planRecorder(h.state.storage);
+			const hk = kb("hk");
+			const rh = P(hk);
+			const sks = ["a", "b", "c", "d", "e"];
+			for (const sk of sks) {
+				store.putLatestImage(rh, { ...live("hk"), sortKey: kb(sk) }, 1_000, undefined, []);
+			}
+			plans();
+			const at = (sk: string) => ({ hk, sk: kb(sk) });
+			const search = (start: boolean, end: boolean) =>
+				`SEARCH latest_items USING PRIMARY KEY (routing_hash=?${start ? " AND (base_hk,base_sk)>(?,?)" : ""}${end ? " AND (base_hk,base_sk)<(?,?)" : ""})`;
+			const cases = [
+				{ start: null, end: null, keys: sks },
+				{ start: at("b"), end: null, keys: ["b", "c", "d", "e"] },
+				{ start: null, end: at("d"), keys: ["a", "b", "c"] },
+				{ start: at("b"), end: at("d"), keys: ["b", "c"] },
+			];
+			for (const { start, end, keys } of cases) {
+				const expected = search(start !== null, end !== null);
+				for (const order of ["asc", "desc"] as const) {
+					const read = [...store.compositeKeyFacts(rh, start, end, order)].map((item) => KeyCodec.decode(item.sk));
+					expect(read).toEqual(order === "asc" ? keys : [...keys].reverse());
+					expect(plans()).toEqual([expected]);
+				}
+				expect(store.countItems(rh, start, end, 100)).toBe(keys.length);
+				const [count, ...rest] = plans();
+				expect(rest).toEqual([]);
+				expect(count).toContain(expected);
+				expect(count).not.toMatch(/SCAN latest_items|TEMP B-TREE/);
+
+				// The reads of ItemStats: the facts with and with no limit, and the item at an offset.
+				const factsOf = (items: Iterable<{ hk: KeyBytes; sk: KeyBytes; itemBytes: number; indexed: boolean }>) =>
+					[...items].reduce(
+						(sum, item) =>
+							addFacts(
+								sum,
+								itemFacts(store.itemStats.model, {
+									itemBytes: item.itemBytes,
+									keyBytes: item.hk.byteLength + item.sk.byteLength,
+									indexed: item.indexed,
+								}),
+							),
+						{ ...NO_FACTS },
+					);
+				const all = [...store.compositeKeyFacts(rh, start, end)];
+				plans();
+				expect(store.countFacts(rh, start, end)).toEqual(factsOf(all));
+				expect(store.countFacts(rh, start, end, 2)).toEqual(factsOf(all.slice(0, 2)));
+				expect(KeyCodec.decode(store.itemAt(rh, start, end, 1)!.sk)).toBe(keys[1]);
+				expect(store.itemAt(rh, start, end, keys.length)).toBeUndefined();
+				const reads = plans();
+				expect(reads).toHaveLength(4);
+				for (const read of reads) {
+					expect(read).toContain(expected);
+					expect(read).not.toMatch(/SCAN latest_items|TEMP B-TREE/);
+				}
+			}
+			expect(store.firstHashKey(rh)).toEqual(hk);
+			expect(plans()).toEqual(["SEARCH latest_items USING PRIMARY KEY (routing_hash=?)"]);
+		});
+	});
+
+	it("reads and writes no bucket when an image keeps the facts of the stored image", async () => {
+		await withStore((h) => {
+			const { store, queries } = planRecorder(h.state.storage);
+			const rh = P(kb("x"));
+			const image = (revision: number, data: string): LatestImage => ({
+				opIndex: 0,
+				hashKey: kb("x"),
+				sortKey: NO_SK,
+				revision,
+				deleted: false,
+				data,
+				kind: "text",
+				ttlAt: null,
+			});
+			store.putLatestImage(rh, image(1, "aaaa"), 1_000, undefined, []);
+			queries();
+			// The same size: the facts stay the same.
+			expect(store.putLatestImage(rh, image(2, "bbbb"), 1_000, store.storedImage(rh, kb("x"), NO_SK), [])).toBeUndefined();
+			expect(queries().filter((q) => q.includes("item_stats"))).toEqual([]);
+			// A larger size changes the facts, so the write goes to the bucket.
+			store.putLatestImage(rh, image(3, "cccccccc"), 1_000, store.storedImage(rh, kb("x"), NO_SK), []);
+			expect(queries().filter((q) => q.includes("item_stats")).length).toBeGreaterThan(0);
 		});
 	});
 

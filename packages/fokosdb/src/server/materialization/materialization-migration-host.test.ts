@@ -12,6 +12,7 @@ import { ALL_ROWS, routingHashFor } from "../../../test/routing-hash.js";
 import { collidingHashKeys } from "../../../test/hash-digits.js";
 import { compareRoutingHashes } from "../../sharding/hash-primitives.js";
 import { rangeStorageInterval } from "../../sharding/repartition-slice.js";
+import { LATEST_ITEMS_MODEL, maxItemEstimate } from "../../shared/partition/item-size.js";
 
 /** The shard group of `routingHashFor`. */
 const STORE_GROUP = "fokos.p.store-test";
@@ -39,7 +40,14 @@ function image(hk: string, sk: string): LatestImage {
 async function inPartition<T>(name: string, fn: (store: MaterializationStore, sql: SqlStorage) => T): Promise<T> {
 	const stub = env.MATERIALIZATION_DO.getByName(`${name}.${crypto.randomUUID()}`);
 	return await runInDurableObject(stub, (_instance: FokosDBMaterializationDO, state: DurableObjectState) =>
-		fn(new MaterializationStore(state.storage), state.storage.sql),
+		fn(
+			new MaterializationStore(state.storage, {
+				promotionFloor: () => maxItemEstimate(LATEST_ITEMS_MODEL),
+				isRangeLeaf: () => false,
+				logParams: () => ({}),
+			}),
+			state.storage.sql,
+		),
 	);
 }
 
@@ -116,7 +124,7 @@ describe("MaterializationMigrationHost", () => {
 				fences: rows(`SELECT target_id, ancestor_id, min_epoch, until_id FROM ancestor_fences ORDER BY target_id, ancestor_id`),
 				producers: rows(`SELECT producer_id, epoch FROM producer_fences ORDER BY producer_id`),
 				storedTargets: store.storedTargets(),
-				keyBytes: store.keySizes.bytesOf(P(kb("hot"))),
+				facts: store.itemStats.factsOf(P(kb("hot"))),
 			};
 		});
 		expect(child.items).toEqual(
@@ -144,7 +152,12 @@ describe("MaterializationMigrationHost", () => {
 			{ producer_id: "p3", epoch: 2 },
 		]);
 		expect(child.storedTargets).toEqual(targets);
-		expect(child.keyBytes).toBe(items.reduce((sum, item) => sum + item.est_row_bytes, 0));
+		// The bucket holds the exact facts of the copied items, each counted one time.
+		expect(child.facts).toMatchObject({
+			itemCount: items.length,
+			itemBytes: items.reduce((sum, item) => sum + item.item_bytes, 0),
+			keyBytes: items.reduce((sum, item) => sum + item.hk.byteLength + item.sk.byteLength, 0),
+		});
 	});
 
 	it("moves every hash key of the promoted routingHash, and the source cleanup deletes them all", async () => {
@@ -175,12 +188,12 @@ describe("MaterializationMigrationHost", () => {
 				pages.push(built.page);
 				cursor = built.nextCursor;
 			} while (cursor !== null);
-			const routingHashBytes = store.keySizes.bytesOf(routingHash);
+			const routingHashFacts = store.itemStats.factsOf(routingHash);
 			while (!store.deleteItemsOfRoutingHash(routingHash, 1)) {
 				// One bounded step at a time, as the cleanup runs.
 			}
 			const has = (hashKey: KeyBytes, sk: string) => store.storedImage(routingHashFor(hashKey), hashKey, kb(sk)) !== undefined;
-			return { pages, routingHashBytes, left: [has(a, "s1"), has(b, "s1"), has(b, "s2"), has(kb("cold"), "s")] };
+			return { pages, routingHashFacts, left: [has(a, "s1"), has(b, "s1"), has(b, "s2"), has(kb("cold"), "s")] };
 		});
 		const moved = source.pages.flatMap((p) => (p.stream === "items" ? p.items : []));
 		// The pages are in storage order: by hash key, then by sort key.
@@ -200,10 +213,10 @@ describe("MaterializationMigrationHost", () => {
 			}
 			// A retried page adds no bytes.
 			store.transactionSync(() => host.applyPage(source.pages[0], slice));
-			return { bytes: store.keySizes.bytesOf(routingHash), hwm: sql.exec<{ hwm: number }>(`SELECT hwm FROM item_id_counter`).one().hwm };
+			return { facts: store.itemStats.factsOf(routingHash), hwm: sql.exec<{ hwm: number }>(`SELECT hwm FROM item_id_counter`).one().hwm };
 		});
 		// The child has one total for the two hash keys, the same as the source.
-		expect(child.bytes).toBe(source.routingHashBytes);
+		expect(child.facts).toEqual(source.routingHashFacts);
 		// The ingest raised the item-id mark above each copied id.
 		expect(child.hwm).toBe(Math.max(...moved.map((item) => item.item_id)) + 1);
 	});

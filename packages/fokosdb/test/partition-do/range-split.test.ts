@@ -47,7 +47,10 @@ describe.concurrent("FokosDBPartitionDO — range split", () => {
 			// call, so adjacent boundaries are equal bytes and not one shared object.
 			expect(rangeOf(children[i]).endBoundary).toStrictEqual(rangeOf(children[i + 1]).startBoundary);
 		}
-		expect(children.map((c) => rangeOf(c).endBoundary)).toEqual([kb("sk004"), kb("sk009"), kb("sk014"), null]);
+		// 17 items of equal size give the targets 4.25, 8.5 and 12.75 items. Each boundary is the gap nearest
+		// its target, and the tie at 8.5 selects the earlier gap.
+		expect(sks).toHaveLength(17);
+		expect(children.map((c) => rangeOf(c).endBoundary)).toEqual([kb("sk004"), kb("sk008"), kb("sk013"), null]);
 
 		// Every item is still readable through the router, and each read forwards exactly once.
 		for (const sk of sks) {

@@ -33,7 +33,8 @@ import { PartitionStore, type PendingTxItem } from "../../src/shared/partition/p
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
-import { planRangeBoundaries } from "../../src/shared/partition/split-planner.js";
+import { SplitPlanner } from "../../src/shared/partition/split-planner.js";
+import { ITEMS_MODEL, maxItemEstimate } from "../../src/shared/partition/item-size.js";
 import {
 	RepartitionSource,
 	RepartitionTarget,
@@ -179,7 +180,11 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			await runInDurableObject(testPartitionStub(stubName), async (_i: FokosDBPartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const sharding = new FokosShardingStore(storage);
-				const store = new PartitionStore(storage);
+				// The floor gives the bucket threshold m = 1, so each routingHash with an item has a bucket.
+				const store = new PartitionStore(storage, {
+					isRangeLeaf: () => isRangePartition(ctx),
+					promotionFloor: () => maxItemEstimate(ITEMS_MODEL),
+				});
 				sharding.runMigrations();
 				store.runMigrations();
 				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
@@ -245,15 +250,20 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					selfId: () => doName,
 					routingHashForKey: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
 				}),
-				computeRangeBoundaries: ({ routingHash, start, end, childCount }) => {
-					const plan = planRangeBoundaries(
-						store.keySizes.bytesOf(routingHash),
-						childCount,
-						start,
-						store.compositeKeySizes(routingHash, start, end),
-					);
-					return "boundaries" in plan ? plan.boundaries : null;
-				},
+				computeRangeBoundaries: ({ routingHash, start, end, childCount }) =>
+					new SplitPlanner({
+						itemStats: store.itemStats,
+						source: {
+							probeRoutingHashes: () => store.probeRoutingHashes("items"),
+							compositeKeyFacts: (rh, from, to, order) => store.compositeKeyFacts(rh, from, to, order),
+							countItems: (rh, from, to, limit) => store.countItems(rh, from, to, limit),
+						},
+						databaseSize: () => store.databaseSize,
+						promotionFraction: () => 0.5,
+						rangeSplitN: () => childCount,
+						logName: "fokos/partition",
+						logParams: () => ({ doName }),
+					}).rangeBoundaries(routingHash, start, end, childCount),
 				onRepartitionCutover: (plan) => {
 					const calls = cutovers.get(doName) ?? [];
 					calls.push({ id: plan.id, kind: plan.kind, state: sharding.getRepartition(plan.id)?.state });
@@ -271,7 +281,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					if (store.hasItemsForRoutingHash(routingHash)) {
 						return false;
 					}
-					store.keySizes.remove(routingHash);
+					store.itemStats.remove(routingHash);
 					return true;
 				},
 			},
@@ -335,12 +345,16 @@ export function lockCount(store: PartitionStore, hk: string): number {
 	return [...store.queryPendingTxPage(null, 1_000_000, ALL_ROWS)].filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
 }
 
-/** The running size estimate of one hash key, which the import maintains page by page. */
+/** The `item_bytes` sum of the bucket of the routingHash of one hash key, which the import maintains page by page. */
 export function keySizeEstimate(storage: DurableObjectStorage, hk: string): number | undefined {
-	return storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, kb(hk)).toArray()[0]?.est_bytes;
+	return storage.sql
+		.exec<{
+			item_bytes: number;
+		}>(`SELECT item_bytes FROM item_stats WHERE routing_hash = (SELECT routing_hash FROM items WHERE hk = ? LIMIT 1)`, kb(hk))
+		.toArray()[0]?.item_bytes;
 }
 
 /** The bytes SQLite actually stored for one hash key, which the estimate must match exactly. */
 export function storedBytes(storage: DurableObjectStorage, hk: string): number {
-	return storage.sql.exec<{ n: number }>(`SELECT COALESCE(SUM(est_row_bytes), 0) AS n FROM items WHERE hk = ?`, kb(hk)).one().n;
+	return storage.sql.exec<{ n: number }>(`SELECT COALESCE(SUM(item_bytes), 0) AS n FROM items WHERE hk = ?`, kb(hk)).one().n;
 }

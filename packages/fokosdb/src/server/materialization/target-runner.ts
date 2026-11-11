@@ -65,7 +65,7 @@ export type TargetRunnerConfig = {
 	 */
 	maxItemsPerStep: number;
 	/**
-	 * The item bytes of one batch, by `est_row_bytes`. The first item from the positions goes into the
+	 * The item bytes of one batch, by `item_bytes`. The first item from the positions goes into the
 	 * batch even when it is above the limit.
 	 */
 	maxBytesPerStep: number;
@@ -438,12 +438,12 @@ export class TargetRunner {
 		let bytes = 0;
 		/** Adds an item when the part has no item yet, or when the batch stays within the limits. */
 		const add = (ref: TargetItemRef, partStart: number, maxItems: number, maxBytes: number): boolean => {
-			if (refs.length > partStart && (refs.length >= maxItems || bytes + ref.estRowBytes > maxBytes)) {
+			if (refs.length > partStart && (refs.length >= maxItems || bytes + ref.itemBytes > maxBytes)) {
 				return false;
 			}
 			refs.push(ref);
 			inBatch.add(ref.itemId);
-			bytes += ref.estRowBytes;
+			bytes += ref.itemBytes;
 			return true;
 		};
 		const retryItems = Math.max(1, Math.floor(config.maxItemsPerStep / 2));

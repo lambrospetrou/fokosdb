@@ -56,7 +56,7 @@ it("row sizes", async () => {
 		),
 		gsi_tombstone: await bytesPerRow(base.stub, (sql, i) =>
 			sql.exec(
-				`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, v, est_row_bytes, data) VALUES (?, ?, ?, ?, 0, 1, 0, x'')`,
+				`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, v, item_bytes, data) VALUES (?, ?, ?, ?, 0, 1, 0, x'')`,
 				routingHashOf(kb("OPEN"), base.ctx.topology.shardGroup),
 				kb("OPEN"),
 				gsiItemSortKey(kb(`2026-10-24T17:46:00.${String(i).padStart(6, "0")}Z`), kb(`order-${String(i).padStart(8, "0")}`), kb("s")),
