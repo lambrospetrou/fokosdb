@@ -290,6 +290,45 @@ type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: n
  *    selects the lower gap. When both gaps are at or below the previous boundary, the boundary is the
  *    first gap after the previous boundary: one more item read.
  *
+ * Example: a range split into `N = 3` children, of a slice with four buckets. The numbers are
+ * estimates in bytes. `B` is 120, so the targets are 40 and 80.
+ *
+ *     bucket      b0          b1                        b2              b3
+ *     estimate    30          40                        20              30
+ *               |-------|-------------------------|--------------|--------------|
+ *     before    0       30          ^             70      ^      90            120
+ *                                target 40             target 80
+ *
+ * Target 40. The binary search over the bucket estimates finds b1, because `30 < 40 <= 70`. The
+ * planner reads the four items of b1 (i1 to i4, with the estimates 12, 8, 15 and 5). The gaps of b1
+ * and their `before` are:
+ *
+ *                  i1     i2     i3     i4
+ *               |------|------|------|------|
+ *     before    30     42     50     65     70
+ *                  ^
+ *              target 40
+ *
+ * The gap below the target is the start gap of b1 (30, distance 10). The gap above is the gap
+ * between i1 and i2 (42, distance 2). The start gap has no lower item yet, so the planner reads one
+ * item: the last item of b0. The gap above is nearer, so boundary 1 is the gap between i1 and i2.
+ *
+ * Target 80. The search finds b2, because `70 < 80 <= 90`. The planner reads the three items of b2
+ * (j1 to j3, with the estimates 6, 9 and 5):
+ *
+ *                  j1     j2     j3
+ *               |------|------|------|
+ *     before    70     76     85     90
+ *                         ^
+ *                     target 80
+ *
+ * The gap below is the gap between j1 and j2 (76, distance 4). The gap above is the gap between j2
+ * and j3 (85, distance 5). The gap below is nearer, so boundary 2 is the gap between j1 and j2.
+ *
+ * The children get the estimates 42, 34 and 44. The planner read the items of b1 and b2, and one
+ * item of b0. It read no item of b3. Each boundary is the shortest separator of the two items at its
+ * gap, for example a key between i1 and i2.
+ *
  * When the planner ends with fewer boundaries, a large item near the end took the remaining targets.
  * The repair reads the last `N` items, keeps the boundaries below them, and puts the missing boundaries
  * at the gaps between them.
