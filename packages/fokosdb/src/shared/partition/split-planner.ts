@@ -260,11 +260,11 @@ export class SplitPlanner {
 export type SliceRead = (from: FokosCompositeKey | null, to: FokosCompositeKey | null, order: "asc" | "desc") => Iterable<ItemSizeFacts>;
 
 /**
- * One gap: the item below it (`lower`), the item above it (`upper`), and `before`, the estimate below
- * it. The planner has no item numbers, so the two items identify the gap. A null item is not read yet,
- * and the planner reads it only when it needs the gap.
+ * One gap: the item below it (`lower`), the item above it (`upper`), and `estBelow`, the estimate
+ * below it. The planner has no item numbers, so the two items identify the gap. A null item is not
+ * read yet, and the planner reads it only when it needs the gap.
  */
-type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: number };
+type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; estBelow: number };
 
 /**
  * Computes the `N - 1` boundaries of a range split of a slice, from the buckets of the slice. The
@@ -275,7 +275,9 @@ type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: n
  * - A gap is the position between two adjacent items of the slice, in `(hk, sk)` order. A boundary at
  *   a gap puts the items below the gap in the lower child, and the items above it in the upper child.
  *   No gap exists before the first item or after the last item, so each child gets at least one item.
- * - `before` of a gap is the estimate of the items below the gap.
+ * - `estBelow` of a gap is the estimate of the items below the gap: the running total of the item
+ *   estimates, from the start of the slice up to the gap. The lower child of a boundary at the gap
+ *   gets this estimate.
  * - `B` is the total estimate of the buckets. Target `i` is `i * B / N`, for `i` from 1 to `N - 1`.
  *   Boundary `i` must put about target `i` below it.
  *
@@ -285,7 +287,7 @@ type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: n
  * 2. Reads the items of that bucket, one time for each bucket. The gaps of the bucket are the gap at
  *    its start, the gaps between its items, and the gap at its end (the start of the next bucket).
  * 3. Finds two gaps after the previous boundary, with a binary search: the last gap with
- *    `before < target`, and the first gap with `before >= target`.
+ *    `estBelow < target`, and the first gap with `estBelow >= target`.
  * 4. Selects the gap with the smaller distance to the target. When the distances are equal, it
  *    selects the lower gap. When both gaps are at or below the previous boundary, the boundary is the
  *    first gap after the previous boundary: one more item read.
@@ -296,16 +298,16 @@ type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: n
  *     bucket      b0          b1                        b2              b3
  *     estimate    30          40                        20              30
  *               |-------|-------------------------|--------------|--------------|
- *     before    0       30          ^             70      ^      90            120
+ *     estBelow  0       30          ^             70      ^      90            120
  *                                target 40             target 80
  *
  * Target 40. The binary search over the bucket estimates finds b1, because `30 < 40 <= 70`. The
  * planner reads the four items of b1 (i1 to i4, with the estimates 12, 8, 15 and 5). The gaps of b1
- * and their `before` are:
+ * and their `estBelow` are:
  *
  *                  i1     i2     i3     i4
  *               |------|------|------|------|
- *     before    30     42     50     65     70
+ *     estBelow  30     42     50     65     70
  *                  ^
  *              target 40
  *
@@ -318,7 +320,7 @@ type Gap = { lower: ItemSizeFacts | null; upper: ItemSizeFacts | null; before: n
  *
  *                  j1     j2     j3
  *               |------|------|------|
- *     before    70     76     85     90
+ *     estBelow  70     76     85     90
  *                         ^
  *                     target 80
  *
@@ -383,24 +385,25 @@ export function planBucketBoundaries(
 			: KeyCodec.compareComposite(gap.upper!, previous.upper!) > 0;
 
 	// The estimate below the start and below the end of each bucket. Both arrays never decrease.
-	const lowerEst: number[] = [];
-	const upperEst: number[] = [];
+	const estBelowStart: number[] = [];
+	const estBelowEnd: number[] = [];
 	let total = 0;
 	for (const bucket of buckets) {
-		lowerEst.push(total);
+		estBelowStart.push(total);
 		total += estimate(model, bucket.facts);
-		upperEst.push(total);
+		estBelowEnd.push(total);
 	}
-	// The bucket that holds `target`: `lowerEst < target <= upperEst`, or -1. The first bucket with
-	// `upperEst >= target` is the only possible one, because each bucket before it ends below the target.
+	// The bucket that holds `target`: `estBelowStart < target <= estBelowEnd`, or -1. The first bucket
+	// with `estBelowEnd >= target` is the only possible one, because each bucket before it ends below
+	// the target.
 	const bucketOf = (target: number) => {
-		const b = firstIndex(upperEst.length, (i) => upperEst[i] >= target);
-		return b < upperEst.length && lowerEst[b] < target ? b : -1;
+		const b = firstIndex(estBelowEnd.length, (i) => estBelowEnd[i] >= target);
+		return b < estBelowEnd.length && estBelowStart[b] < target ? b : -1;
 	};
 	const step = total / N;
 	// The gaps of each bucket that the planner read. It reads each bucket at most one time. In the gaps
-	// of a bucket, `before` increases, except at the end gap: its `before` comes from the bucket facts,
-	// and wrong facts can make it smaller.
+	// of a bucket, `estBelow` increases, except at the end gap: its `estBelow` comes from the bucket
+	// facts, and wrong facts can make it smaller.
 	const scanned = new Map<number, Gap[]>();
 	const gapsOf = (b: number): Gap[] => {
 		let gaps = scanned.get(b);
@@ -408,16 +411,16 @@ export function planBucketBoundaries(
 			const items = [...read(buckets[b].bound, buckets[b + 1]?.bound ?? null, "asc")];
 			gaps = [];
 			if (items.length > 0) {
-				let before = lowerEst[b];
-				gaps.push({ lower: null, upper: items[0], before });
+				let estBelow = estBelowStart[b];
+				gaps.push({ lower: null, upper: items[0], estBelow });
 				for (let i = 0; i + 1 < items.length; i++) {
-					before += weight(items[i]);
-					gaps.push({ lower: items[i], upper: items[i + 1], before });
+					estBelow += weight(items[i]);
+					gaps.push({ lower: items[i], upper: items[i + 1], estBelow });
 				}
 				const end: Gap & { next: FokosCompositeKey | null } = {
 					lower: items[items.length - 1],
 					upper: null,
-					before: lowerEst[b] + estimate(model, buckets[b].facts),
+					estBelow: estBelowStart[b] + estimate(model, buckets[b].facts),
 					next: buckets[b + 1]?.bound ?? null,
 				};
 				gaps.push(end);
@@ -435,15 +438,15 @@ export function planBucketBoundaries(
 			break;
 		}
 		const gaps = gapsOf(b);
-		// The gap below the target: the last gap with `before < target`. The gap above: the first gap
-		// with `before >= target`. A binary search covers the gaps before the end gap, which are in order,
-		// and the end gap gets its own check.
+		// The gap below the target: the last gap with `estBelow < target`. The gap above: the first gap
+		// with `estBelow >= target`. A binary search covers the gaps before the end gap, which are in
+		// order, and the end gap gets its own check.
 		const end = gaps.length - 1;
-		const firstAtOrAbove = firstIndex(end, (i) => gaps[i].before >= target);
+		const firstAtOrAbove = firstIndex(end, (i) => gaps[i].estBelow >= target);
 		let nearBelow: Gap | undefined =
-			end >= 0 && gaps[end].before < target ? gaps[end] : firstAtOrAbove > 0 ? gaps[firstAtOrAbove - 1] : undefined;
+			end >= 0 && gaps[end].estBelow < target ? gaps[end] : firstAtOrAbove > 0 ? gaps[firstAtOrAbove - 1] : undefined;
 		let nearAbove: Gap | undefined =
-			firstAtOrAbove < end ? gaps[firstAtOrAbove] : end >= 0 && gaps[end].before >= target ? gaps[end] : undefined;
+			firstAtOrAbove < end ? gaps[firstAtOrAbove] : end >= 0 && gaps[end].estBelow >= target ? gaps[end] : undefined;
 		if (nearBelow !== undefined && !resolve(nearBelow)) {
 			nearBelow = undefined;
 		}
@@ -458,9 +461,9 @@ export function planBucketBoundaries(
 		if (nearAbove !== undefined && previous !== undefined && !isAfter(nearAbove, previous)) {
 			// Each gap near the target is at or before the previous boundary.
 			const upper = itemAfter(previous.upper!);
-			pick = upper === null ? undefined : { lower: previous.upper, upper, before: Number.NaN };
+			pick = upper === null ? undefined : { lower: previous.upper, upper, estBelow: Number.NaN };
 		} else if (nearAbove !== undefined) {
-			pick = nearBelow !== undefined && target - nearBelow.before <= nearAbove.before - target ? nearBelow : nearAbove;
+			pick = nearBelow !== undefined && target - nearBelow.estBelow <= nearAbove.estBelow - target ? nearBelow : nearAbove;
 		} else {
 			pick = nearBelow;
 		}
@@ -485,7 +488,7 @@ export function planBucketBoundaries(
 		const kept = chosen.filter((gap) => KeyCodec.compareComposite(gap.lower!, last[0]) < 0);
 		const missing = N - 1 - kept.length;
 		for (let i = N - 1 - missing; i < N - 1; i++) {
-			kept.push({ lower: last[i], upper: last[i + 1], before: Number.NaN });
+			kept.push({ lower: last[i], upper: last[i + 1], estBelow: Number.NaN });
 		}
 		chosen = kept;
 	}

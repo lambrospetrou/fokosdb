@@ -12,7 +12,7 @@ import type { ItemSizeFacts } from "../src/shared/partition/split-planner.js";
  * it: both give the same boundaries when the bucket facts are exact. Production does not use it.
  *
  * Here the items have the numbers 1, 2, 3, ..., and gap `j` is the gap between item `j` and item
- * `j + 1`. `before(j)` is the estimate of items 1 to `j`. `total` is the estimate of the slice, and
+ * `j + 1`. `estBelow(j)` is the estimate of items 1 to `j`. `total` is the estimate of the slice, and
  * target `i` is `i * total / N`. The function reads
  * each item one time: O(items) time, and O(N) memory for the keys of the last `N + 1` items.
  */
@@ -35,10 +35,10 @@ export function planRangeBoundaries(
 	const keyOf = (n: number) => ring[(n - 1) % size];
 	// The number of items read.
 	let count = 0;
-	// before(count): the estimate of the items read.
-	let before = 0;
+	// estBelow(count): the estimate of the items read.
+	let estBelow = 0;
 	// The last gap below the current target, when it is after the previous boundary.
-	let below: { gap: number; before: number } | null = null;
+	let below: { gap: number; estBelow: number } | null = null;
 
 	const choose = (gap: number) => {
 		gaps.push(gap);
@@ -50,18 +50,18 @@ export function planRangeBoundaries(
 		count++;
 		ring[(count - 1) % size] = { hk: item.hk, sk: item.sk };
 		if (count > 1) {
-			// The planner knows gap `count - 1` now, and `before` is before(count - 1).
+			// The planner knows gap `count - 1` now, and `estBelow` is estBelow(count - 1).
 			const gap = count - 1;
 			while (boundaries.length < N - 1) {
 				const target = step * (boundaries.length + 1);
-				if (before < target) {
+				if (estBelow < target) {
 					// The gap is below the target. A later gap can be nearer.
-					below = { gap, before };
+					below = { gap, estBelow };
 					break;
 				}
 				// The gap is at or above the target. The nearer of the two gaps is the boundary.
-				const candidate: { gap: number; before: number } | null = below;
-				if (candidate !== null && target - candidate.before <= before - target) {
+				const candidate: { gap: number; estBelow: number } | null = below;
+				if (candidate !== null && target - candidate.estBelow <= estBelow - target) {
 					// The gap below the target is the boundary. The next target can use this gap.
 					choose(candidate.gap);
 					continue;
@@ -73,7 +73,7 @@ export function planRangeBoundaries(
 				break;
 			}
 		}
-		before += estimate(
+		estBelow += estimate(
 			model,
 			itemFacts(model, { itemBytes: item.itemBytes, keyBytes: item.hk.byteLength + item.sk.byteLength, indexed: item.indexed }),
 		);
@@ -83,7 +83,7 @@ export function planRangeBoundaries(
 	}
 	if (boundaries.length < N - 1) {
 		// The items ended below the next target, so the last gap below it is the nearest gap.
-		const last: { gap: number; before: number } | null = below;
+		const last: { gap: number; estBelow: number } | null = below;
 		if (last !== null) {
 			choose(last.gap);
 		}
