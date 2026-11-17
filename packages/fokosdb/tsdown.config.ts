@@ -50,6 +50,7 @@ const SHARDING_ALLOWED_SHARED = [
 	"src/shared/sql-cursor.ts",
 	"src/shared/cf-utils.ts",
 	"src/shared/bloom-filter.ts",
+	"src/shared/platform.ts",
 ];
 
 /** A `src/shared/` module that is not on the allow list. */

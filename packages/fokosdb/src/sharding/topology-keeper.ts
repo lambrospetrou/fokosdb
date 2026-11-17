@@ -13,6 +13,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigrations, type SQLSchemaMigration } from "durable-utils/sql-migrations";
 import invariant from "../shared/invariant.js";
+import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
 import { one, tryOne } from "../shared/sql-cursor.js";
 import { FokosInternalError, FokosValidationError } from "../shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_VALIDATION_CODES } from "./errors.js";
@@ -56,6 +57,8 @@ const DEFAULT_BUILD_STEP_ROWS = 100_000;
 export type FokosTopologyKeeperOptions = {
 	/** The time from the first report of a shard group to its next build. Default 2,000. */
 	buildDelayMs?: number;
+	/** The clock of the keeper. Default `systemPlatform`. */
+	platform?: FokosPlatform;
 	/**
 	 * The time a build step of one shard group that failed waits until it runs again. A failed group
 	 * waits for its own retry, so it does not block the groups behind it. Default 60,000. Minimum 1.
@@ -264,6 +267,7 @@ export class FokosTopologyKeeper {
 	readonly #promotedListMax: number;
 	readonly #buildStepRows: number;
 	readonly #scheduleBuild: FokosTopologyKeeperOptions["scheduleBuild"];
+	readonly #platform: FokosPlatform;
 	/** The last hash body of each shard group, so a read answers with no SQL. */
 	readonly #hashBodies = new Map<string, { etag: string; body: Uint8Array }>();
 
@@ -280,6 +284,7 @@ export class FokosTopologyKeeper {
 		);
 		this.#buildStepRows = opts.buildStepRows ?? DEFAULT_BUILD_STEP_ROWS;
 		this.#scheduleBuild = opts.scheduleBuild;
+		this.#platform = opts.platform ?? systemPlatform;
 	}
 
 	/** Applies the schema. Call it once, before any other method, inside `blockConcurrencyWhile`. */
@@ -295,7 +300,7 @@ export class FokosTopologyKeeper {
 	 * Stores one report of a completed repartition, in its JSON form. A repeated report, and a report
 	 * that completed before the last reset of its shard group, change nothing.
 	 */
-	async registerRepartition(wire: unknown, now = Date.now()): Promise<void> {
+	async registerRepartition(wire: unknown, now = this.#platform.now()): Promise<void> {
 		const event = topologyEventFromWire(wire);
 		validateTopology({ shardGroup: event.shardGroup, rootTreesN: event.rootTreesN, hashSplitN: event.hashSplitN });
 		const source = this.#checkSource(event);
@@ -368,7 +373,7 @@ export class FokosTopologyKeeper {
 	 * Deletes the reports and the bodies of a shard group, and starts a new epoch. A report that
 	 * completed before now is then ignored.
 	 */
-	resetShardGroup(shardGroup: string, now = Date.now()): void {
+	resetShardGroup(shardGroup: string, now = this.#platform.now()): void {
 		const sql = this.#storage.sql;
 		this.#storage.transactionSync(() => {
 			sql.exec(`INSERT OR IGNORE INTO fokos_topo_groups (shard_group) VALUES (?1)`, shardGroup);
@@ -444,7 +449,7 @@ export class FokosTopologyKeeper {
 	 * A build step that throws defers only its own shard group to `buildErrorRetryMs`, so a group that
 	 * cannot build does not block the groups behind it.
 	 */
-	runDueBuilds(now = Date.now()): void {
+	runDueBuilds(now = this.#platform.now()): void {
 		// The names are read first, because each step writes to the table that the cursor reads.
 		const due: string[] = [];
 		for (const row of this.#storage.sql.exec<{ shard_group: string }>(
@@ -965,11 +970,14 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 	 * alarm re-arms at `INIT_RETRY_ALARM_MS`.
 	 */
 	#initError?: unknown;
+	readonly #platform: FokosPlatform;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.#platform = this.fokosPlatform(ctx);
 		this.keeper = new FokosTopologyKeeper(ctx.storage, {
 			...this.keeperOptions(),
+			platform: this.#platform,
 			scheduleBuild: async (at) => {
 				const existing = await ctx.storage.getAlarm();
 				if (existing === null || at < existing) {
@@ -993,8 +1001,16 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 		});
 	}
 
+	/**
+	 * The clock, the timers, and the random values of this Durable Object. The constructor reads it
+	 * once, before the fields of a subclass exist.
+	 */
+	protected fokosPlatform(_ctx: DurableObjectState): FokosPlatform {
+		return systemPlatform;
+	}
+
 	/** The options of the keeper. The constructor reads them once. */
-	protected keeperOptions(): Omit<FokosTopologyKeeperOptions, "scheduleBuild"> {
+	protected keeperOptions(): Omit<FokosTopologyKeeperOptions, "scheduleBuild" | "platform"> {
 		return {};
 	}
 
@@ -1032,7 +1048,7 @@ export class FokosShardingAutoAdminDO<Env = unknown> extends DurableObject<Env> 
 		// The handler can start before the scheduled time on the clock of this object, and the platform
 		// does not deliver an alarm that its own handler sets at the same time. So the builds that are
 		// due at the scheduled time run now.
-		const now = Math.max(Date.now(), info?.scheduledTime ?? 0);
+		const now = Math.max(this.#platform.now(), info?.scheduledTime ?? 0);
 		if (this.#initError !== undefined) {
 			console.error({
 				actorId: this.ctx.id.toString(),

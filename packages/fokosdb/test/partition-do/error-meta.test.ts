@@ -21,7 +21,7 @@ async function lockItem(node: TestPartition, keys: ItemKeys): Promise<() => Prom
 	const transactionId = crypto.randomUUID();
 	const res = await node.rpc.txPrepare(node.ctx, {
 		transactionId,
-		transactionTimestamp: txOrderTimestampNow(),
+		transactionTimestamp: txOrderTimestampNow(Date.now()),
 		coordinator: testCoordinatorRef(),
 		items: withOpIndex([{ ...keys, operation: "put", data: "pending", kind: "text" }]),
 	});

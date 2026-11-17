@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { systemPlatform } from "./platform.js";
 import { throttleTrailing } from "./tsutils.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -6,7 +7,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe("throttleTrailing", () => {
 	it("calls fn once at the end of the interval for many calls of schedule", async () => {
 		let calls = 0;
-		const throttle = throttleTrailing(() => calls++);
+		const throttle = throttleTrailing(systemPlatform, () => calls++);
 		throttle.schedule(5);
 		throttle.schedule(5);
 		throttle.schedule(5);
@@ -17,7 +18,7 @@ describe("throttleTrailing", () => {
 
 	it("starts a new interval for a schedule while fn runs", async () => {
 		let calls = 0;
-		const throttle = throttleTrailing(() => {
+		const throttle = throttleTrailing(systemPlatform, () => {
 			calls++;
 			if (calls === 1) {
 				throttle.schedule(5);
@@ -30,7 +31,7 @@ describe("throttleTrailing", () => {
 
 	it("does not call fn after cancel", async () => {
 		let calls = 0;
-		const throttle = throttleTrailing(() => calls++);
+		const throttle = throttleTrailing(systemPlatform, () => calls++);
 		throttle.schedule(5);
 		throttle.cancel();
 		await sleep(30);

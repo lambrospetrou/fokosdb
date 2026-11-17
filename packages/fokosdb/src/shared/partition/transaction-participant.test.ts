@@ -975,7 +975,7 @@ describe("TransactionParticipant - commit", () => {
 	});
 
 	it("keeps the copies of a moved key, and asks the owner one time for each hash key", async () => {
-		await withParticipant(({ participant, store }) => {
+		await withParticipant(({ participant, store, clock }) => {
 			const request = prepareReq({
 				items: [
 					{ hashKey: kb("owned"), sortKey: kb("sk"), operation: "put", data: "v1", kind: "text" },
@@ -995,6 +995,7 @@ describe("TransactionParticipant - commit", () => {
 			const source = new TransactionParticipant({
 				store,
 				routingHashForKey: P,
+				now: () => clock.now,
 				maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 				staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 				ownerCheck: () => (key) => {

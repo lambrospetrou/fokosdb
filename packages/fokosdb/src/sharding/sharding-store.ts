@@ -1152,7 +1152,7 @@ export class FokosShardingStore {
 		endBoundary: FokosCompositeKey | null,
 		depth: number,
 		refreshMs: number,
-		now = Date.now(),
+		now: number,
 	): void {
 		const [startHk, startSk] = boundaryColumns(startBoundary);
 		const [endHk, endSk] = boundaryColumns(endBoundary);

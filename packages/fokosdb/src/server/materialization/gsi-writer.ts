@@ -7,6 +7,7 @@ import { classifyBatchFailure } from "../../shared/batch-failure.js";
 import { gsiTableConfig, type FokosDBPolicy, type FokosDBRouteContext, type FokosDBTableConfig } from "../../shared/partition-context.js";
 import { FokosShardingClient } from "../../sharding/client.js";
 import type { RoutingHashSeedResolver } from "../../sharding/hash-primitives.js";
+import type { FokosPlatform } from "../../shared/platform.js";
 import type { GsiWriteEntriesRequest, PartitionOps } from "../do-partition.js";
 import type { GsiEntryOutcome } from "./target-runner.js";
 import type { GsiTargetDefinition } from "./targets.js";
@@ -17,6 +18,7 @@ export type GsiWriterDeps = {
 	stub: (ctx: FokosDBRouteContext, doName: string) => DurableObjectStub;
 	/** The routingHash seed resolver of the host class. */
 	routingHashSeedResolver: RoutingHashSeedResolver;
+	platform: FokosPlatform;
 };
 
 export class GsiWriter {
@@ -65,6 +67,7 @@ export class GsiWriter {
 			...table,
 			stub: this.#deps.stub,
 			routingHashSeedResolver: this.#deps.routingHashSeedResolver,
+			platform: this.#deps.platform,
 		});
 		this.#clients.set(indexName, { policyVersion: table.policyVersion, client });
 		return client;

@@ -13,6 +13,7 @@ import { childDigit } from "../hash-digits.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
+import type { ControlledPartitionDO } from "../controlled-partition-do.js";
 import { testCoordinatorContext, testCoordinatorRef } from "../stub-helpers.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
@@ -274,7 +275,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 	 * thus `coordinator()` makes a new stub for each context: the test, or a `runInDurableObject` callback.
 	 */
 	async function partitionWithCoordinator() {
-		const partition = makeStub({ nsTx: "CONTROLLED_TRANSACTION_COORDINATOR_DO" });
+		const partition = makeStub({ ns: "CONTROLLED_PARTITION_DO", nsTx: "CONTROLLED_TRANSACTION_COORDINATOR_DO" });
 		await partition.rpc.status(partition.ctx);
 		const coordinatorDoName = testCoordinatorContext().doName;
 		const coordinator = () => env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(coordinatorDoName);
@@ -288,7 +289,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 		await coordinator().testRecoverResponse({ value: { state: "COMMITTED" }, hold: true });
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { hashKey: "alice", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			const dispatch = vi.spyOn(instance.fokos, "dispatch");
 
@@ -315,7 +316,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { hashKey: "alice", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			cutOverPromotion(state, "alice");
 
@@ -338,7 +339,7 @@ describe("FokosDBPartitionDO — stale recovery on a promotion source", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { hashKey: "bob", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			insertLock(state, transactionId, { hashKey: "alice", createdAt: now - IDEMPOTENCY_WINDOW_MS - 1, coordinatorDoName });
 			cutOverPromotion(state, "alice");

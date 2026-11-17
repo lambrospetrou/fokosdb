@@ -3,6 +3,8 @@
 Status: **draft**
 Date: 2026-09-26
 
+**Change:** `fokosNow()` is replaced by `fokosPlatform(ctx)`. Refer to [the DST spec](../agent-plans/2026-11-16-protocol-aware-deterministic-simulation-testing.md).
+
 ## Table of Contents
 
 - [1. Overview and context](#1-overview-and-context)

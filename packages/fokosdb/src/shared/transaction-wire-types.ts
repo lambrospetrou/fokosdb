@@ -12,7 +12,7 @@ import type { ConditionCheckImageEncoded, DataKind, FokosMeta, ReturnValuesOnCon
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
-// Transaction order timestamp: Date.now() * TX_ORDER_TS_UNITS_PER_MS (see txOrderTimestampNow in shared/transaction-limits.ts).
+// Transaction order timestamp: the clock in milliseconds * TX_ORDER_TS_UNITS_PER_MS (see txOrderTimestampNow in shared/transaction-limits.ts).
 export type TransactionTimestamp = number;
 
 /**

@@ -29,6 +29,8 @@
  * the class boundary — as do the overrides page they build and apply.
  */
 import { collectBatch } from "./batch-scan.js";
+import type { FokosPlatform } from "../shared/platform.js";
+import { jitterBackoff } from "./retries.js";
 import invariant from "../shared/invariant.js";
 import { KeyCodec, type FokosCompositeKey } from "./key-codec.js";
 
@@ -68,7 +70,6 @@ import type {
 } from "./repartition-types.js";
 import type { FokosRepartitionPlan, FokosShardingHooks, FokosStorageInterval } from "./runtime-types.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfig } from "./runtime-config.js";
-import { jitterBackoff } from "durable-utils/retries";
 
 /** The stored form of an unbounded ancestor edge: the empty hash key, which `KeyCodec` never makes for a real key. */
 const UNBOUNDED_BOUNDARY: FokosCompositeKey = { hk: KeyCodec.encodeOptional(undefined), sk: KeyCodec.encodeOptional(undefined) };
@@ -104,6 +105,7 @@ export type RepartitionCommonDeps = {
 	config: () => FokosRuntimeConfig;
 	/** The routingHash seed resolver of the shard group. See `FokosRuntimeOptions.routingHashSeedResolver`. */
 	routingHashSeedResolver: RoutingHashSeedResolver;
+	platform: FokosPlatform;
 	/** Runs inside the completion transaction, after `beforeComplete`. Synchronous. */
 	onCompleted?: (plan: FokosRepartitionPlan, completedAt: number) => void;
 };
@@ -220,7 +222,10 @@ export class RepartitionSource {
 	 * The transaction also writes the plan head with the host policy and data of this moment, so every
 	 * later hook reads the values of queue time.
 	 */
-	queue(request: { kind: RepartitionKind; routingHash?: RoutingHash; data?: unknown }, now = Date.now()): RepartitionRow | undefined {
+	queue(
+		request: { kind: RepartitionKind; routingHash?: RoutingHash; data?: unknown },
+		now = this.deps.platform.now(),
+	): RepartitionRow | undefined {
 		const { ctx, identity } = this.deps.identity();
 		const row = this.store.transactionSync((): RepartitionRow | undefined => {
 			if (this.store.getSplitRepartition()) {
@@ -320,7 +325,7 @@ export class RepartitionSource {
 	 * `(next_attempt_at, seq)`, so a row that keeps failing falls behind another due row and cannot
 	 * starve it.
 	 */
-	async sourceStep(now = Date.now()): Promise<StepOutcome> {
+	async sourceStep(now = this.deps.platform.now()): Promise<StepOutcome> {
 		const row = this.store.selectDueRepartition(now);
 		if (!row) {
 			return "idle";
@@ -372,7 +377,7 @@ export class RepartitionSource {
 					// A size-triggered split can find fewer than N items in its interval, because each child
 					// needs one. Only a new write can change that, so the retry backs off to `sourceRetryMaxMs`.
 					const { sourceRetryBaseMs, sourceRetryMaxMs } = this.deps.config();
-					this.#deferSource(row, now, jitterBackoff(row.attempts, sourceRetryBaseMs, sourceRetryMaxMs));
+					this.#deferSource(row, now, jitterBackoff(this.deps.platform, row.attempts, sourceRetryBaseMs, sourceRetryMaxMs));
 					return "progressed";
 				}
 				// The children tile [start, end) with these boundaries. A boundary out of order or out of the
@@ -516,7 +521,12 @@ export class RepartitionSource {
 					this.store.setTargetInitialization(row.id, target.partitionId, "initialized", 0, now);
 				} else {
 					const attempts = target.attempts + 1;
-					this.store.setTargetAttempt(row.id, target.partitionId, attempts, now + retryDelay(result.reason, attempts, this.deps.config()));
+					this.store.setTargetAttempt(
+						row.id,
+						target.partitionId,
+						attempts,
+						now + retryDelay(this.deps.platform, result.reason, attempts, this.deps.config()),
+					);
 				}
 				this.store.refreshRepartitionDue(row.id, now);
 			});
@@ -580,7 +590,7 @@ export class RepartitionSource {
 					row.id,
 					target.partitionId,
 					attempts,
-					now + jitterBackoff(attempts, sourceRetryBaseMs, sourceRetryMaxMs),
+					now + jitterBackoff(this.deps.platform, attempts, sourceRetryBaseMs, sourceRetryMaxMs),
 				);
 			}
 			this.store.refreshRepartitionDue(row.id, now);
@@ -612,7 +622,7 @@ export class RepartitionSource {
 	 * step reclaims; a host without the hook keeps its data, so the step finishes at once. The last
 	 * step deletes the plan chain before it writes `cleaned`.
 	 */
-	sourceCleanupStep(now = Date.now()): StepOutcome {
+	sourceCleanupStep(now = this.deps.platform.now()): StepOutcome {
 		const row = this.store.selectDueCleanup(now);
 		if (!row) {
 			return "idle";
@@ -745,7 +755,7 @@ export class RepartitionSource {
 	 * one. Membership is checked before the mark, so an unknown name cannot consume an entry and fail
 	 * the count later.
 	 */
-	acceptAck(req: FokosMigrationAckRequest, now = Date.now()): void {
+	acceptAck(req: FokosMigrationAckRequest, now = this.deps.platform.now()): void {
 		this.store.transactionSync(() => {
 			const { row } = this.#requireTarget(req.repartitionId, req.target);
 			if (row.state === "queued" || row.state === "planned") {
@@ -942,7 +952,7 @@ export class RepartitionTarget {
 	 * prefetches: two decoded 20 MiB pages would not fit beside each other in a 128 MB isolate, and the
 	 * durable cursor stays the only record of progress.
 	 */
-	async importOnePage(now = Date.now()): Promise<StepOutcome> {
+	async importOnePage(now = this.deps.platform.now()): Promise<StepOutcome> {
 		const rec = this.importRecord();
 		if (!rec || rec.state === "imported" || rec.state === "active") {
 			return "idle";
@@ -1133,7 +1143,7 @@ export class RepartitionTarget {
 	 * It restores the fallback alarm every time, including on a retry, because a lost reply leaves the
 	 * source believing the target is initialized while the target may have no alarm to start itself.
 	 */
-	async initAsTarget(req: FokosInitRequest, now = Date.now()): Promise<void> {
+	async initAsTarget(req: FokosInitRequest, now = this.deps.platform.now()): Promise<void> {
 		const existing = this.importRecord();
 		// `applyTargetIdentity` hands back the step that puts the new identity in memory, and this call
 		// takes it only after the transaction commits: a rollback must not leave a partition that
@@ -1197,7 +1207,7 @@ export class RepartitionTarget {
 	}
 
 	/** Asks this target to begin importing now, instead of waiting for its own fallback alarm. */
-	async startImport(req: FokosStartImportRequest, now = Date.now()): Promise<void> {
+	async startImport(req: FokosStartImportRequest, now = this.deps.platform.now()): Promise<void> {
 		const rec = this.importRecord();
 		if (!rec || rec.repartitionId !== req.repartitionId) {
 			throw new FokosInternalError(SHARDING_INTERNAL_CODES.repartition_unknown, {
@@ -1232,7 +1242,7 @@ export class RepartitionTarget {
 	 * One acknowledgement attempt. `imported` is already durable, so a failure here costs nothing: the
 	 * target keeps serving its complete copy and tries again.
 	 */
-	async sendAck(now = Date.now()): Promise<StepOutcome> {
+	async sendAck(now = this.deps.platform.now()): Promise<StepOutcome> {
 		const rec = this.importRecord();
 		if (!rec || rec.state !== "imported") {
 			return "idle";
@@ -1287,7 +1297,15 @@ export class RepartitionTarget {
 	#deferImport(rec: FokosImportRecord, now: number, error: unknown): void {
 		const attempts = rec.attempts + 1;
 		const config = this.deps.config();
-		const delay = retryDelay(error, attempts, config, config.importRetryBaseMs, config.importRetryMaxMs, config.notCutOverRetryMs);
+		const delay = retryDelay(
+			this.deps.platform,
+			error,
+			attempts,
+			config,
+			config.importRetryBaseMs,
+			config.importRetryMaxMs,
+			config.notCutOverRetryMs,
+		);
 		this.store.transactionSync(() => {
 			const current = this.importRecord();
 			if (!current || current.state === "active") {
@@ -1310,6 +1328,7 @@ export class RepartitionTarget {
 }
 
 function retryDelay(
+	platform: FokosPlatform,
 	error: unknown,
 	attempts: number,
 	config: FokosRuntimeConfig,
@@ -1329,7 +1348,7 @@ function retryDelay(
 	) {
 		return config.nonRetryableRetryMs;
 	}
-	return jitterBackoff(attempts, base, max);
+	return jitterBackoff(platform, attempts, base, max);
 }
 
 const PHASE_ORDER: Record<FokosMigrationCursor["phase"], number> = { overrides: 0, host: 1 };

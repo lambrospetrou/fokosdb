@@ -18,6 +18,7 @@ import {
 } from "./topology-codec.js";
 import type { FokosTopology } from "./route-context.js";
 import type { RoutingHash } from "./hash-primitives.js";
+import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
 
 export type FokosTopologyCacheOptions = {
 	/**
@@ -43,6 +44,8 @@ export type FokosTopologyCacheOptions = {
 	 * promise in `waitUntil` does not keep a Durable Object in memory. Default 5,000.
 	 */
 	fetchTimeoutMs?: number;
+	/** The clock and the timers of the caller. Default `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 /** The memory of the topology cache of one isolate, in bytes. */
@@ -154,7 +157,7 @@ export function cutTopologyHint(entry: AnyEntry, position: number): void {
  * `refreshTimeoutMs`. A true answer records the start of the refresh.
  */
 function shouldRefresh(opts: FokosTopologyCacheOptions, key: string, entry: AnyEntry | undefined): boolean {
-	const now = Date.now();
+	const now = (opts.platform ?? systemPlatform).now();
 	if (entry && now - entry.fetchedAt <= (opts.refreshMs ?? DEFAULT_REFRESH_MS)) {
 		return false;
 	}
@@ -173,8 +176,14 @@ async function refresh(
 	parse: (body: Uint8Array) => HashTopologyView | RangeTopologyView,
 	routingHash?: RoutingHash,
 ): Promise<void> {
+	const platform = opts.platform ?? systemPlatform;
 	const startedAt = refreshStartedAt.get(key);
-	const signal = AbortSignal.timeout(opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS);
+	const controller = new AbortController();
+	const signal = controller.signal;
+	const timer = platform.setTimeout(
+		() => controller.abort(new DOMException("the topology fetch timed out", "TimeoutError")),
+		opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
+	);
 	try {
 		const read = async () => {
 			const response = await opts.fetch(path, signal, routingHash);
@@ -192,10 +201,10 @@ async function refresh(
 		const current = cache.get(key);
 		if (current && compareTopologyVersions(view, current.view as TopologyVersion) <= 0) {
 			// The same version keeps its cut set, and an older version changes nothing.
-			current.fetchedAt = Date.now();
+			current.fetchedAt = platform.now();
 			return;
 		}
-		const entry = { key, view, fetchedAt: Date.now(), cut: new Set<number>() } as AnyEntry;
+		const entry = { key, view, fetchedAt: platform.now(), cut: new Set<number>() } as AnyEntry;
 		if (weightOf(entry) > TOPOLOGY_CACHE_BUDGET_BYTES) {
 			throw new Error(`the topology body of ${weightOf(entry)} bytes is larger than the cache budget`);
 		}
@@ -207,6 +216,7 @@ async function refresh(
 			error: String(error),
 		});
 	} finally {
+		platform.clearTimeout(timer);
 		if (refreshStartedAt.get(key) === startedAt) {
 			refreshStartedAt.delete(key);
 		}

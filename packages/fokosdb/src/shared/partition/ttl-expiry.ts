@@ -1,3 +1,4 @@
+import { systemPlatform, type FokosPlatform, type FokosTimer } from "../platform.js";
 import type { PartitionStore, TtlScanPosition } from "./partition-store.js";
 import type { KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
@@ -29,12 +30,15 @@ export type TtlExpiryOptions = {
 	/** Returns the current epoch time in seconds. */
 	nowSec?: () => number;
 	wait?: (ms: number) => Promise<void>;
+	/** The clock and the timers. Default `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 export type TtlSweepResult = { deletedRows: number; deletedBytes: number; more: boolean };
 
 export class TtlExpiry {
-	#timer: ReturnType<typeof setTimeout> | null = null;
+	#timer: FokosTimer | null = null;
+	readonly #platform: FokosPlatform;
 	#running = false;
 	readonly #store: PartitionStore;
 	readonly #canSweep: () => boolean;
@@ -50,8 +54,10 @@ export class TtlExpiry {
 		this.#ownerCheck = deps.ownerCheck;
 		this.#logParams = deps.logParams;
 		this.#config = deps.config;
-		this.#nowSec = deps.nowSec ?? (() => Math.floor(Date.now() / 1000));
-		this.#wait = deps.wait ?? (async (ms) => await scheduler.wait(ms));
+		this.#platform = deps.platform ?? systemPlatform;
+		const platform = this.#platform;
+		this.#nowSec = deps.nowSec ?? (() => Math.floor(platform.now() / 1000));
+		this.#wait = deps.wait ?? (async (ms) => await platform.wait(ms));
 	}
 
 	get armed(): boolean {
@@ -63,7 +69,7 @@ export class TtlExpiry {
 			return;
 		}
 		const delay = delayMs ?? this.#config().ttlSweepDelayMs;
-		this.#timer = setTimeout(() => {
+		this.#timer = this.#platform.setTimeout(() => {
 			this.#timer = null;
 			void this.runCycle()
 				.then((result) => {
@@ -92,7 +98,7 @@ export class TtlExpiry {
 		if (this.#timer === null) {
 			return;
 		}
-		clearTimeout(this.#timer);
+		this.#platform.clearTimeout(this.#timer);
 		this.#timer = null;
 	}
 

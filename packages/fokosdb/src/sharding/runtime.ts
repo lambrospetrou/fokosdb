@@ -105,7 +105,8 @@ import type {
 	FokosStoragePosition,
 } from "./runtime-types.js";
 import { FokosScheduler, INIT_RETRY_ALARM_MS } from "./scheduler.js";
-import { jitterBackoff } from "durable-utils/retries";
+import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
+import { jitterBackoff } from "./retries.js";
 import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
 import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
@@ -222,6 +223,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #topologyCache: FokosRuntimeOptions<TPolicy>["topologyCache"];
 	readonly #hostInitError: FokosRuntimeOptions<TPolicy>["hostInitError"];
 	readonly #routingHashSeedResolver: RoutingHashSeedResolver;
+	readonly #platform: FokosPlatform;
 
 	/**
 	 * The error of the storage step of the constructor, or of a config read. While it stands,
@@ -239,7 +241,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#bloom: PartialRangeTopology | null = null;
 
 	/** Writes the Bloom filter at most once per `promotionBloomFlushMs`, in a timer task of its own. */
-	readonly #bloomFlushThrottled = throttleTrailing(() => this.#flushBloom());
+	readonly #bloomFlushThrottled: ReturnType<typeof throttleTrailing>;
 	/** The plan of every visit `rangeVisits` returned, by the visit object, so `forwardRangeVisit` can fall back. */
 	readonly #plans = new WeakMap<FokosRangeVisit, PlannedVisit>();
 
@@ -255,6 +257,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#topologyCache = opts.topologyCache;
 		this.#hostInitError = opts.hostInitError;
 		this.#routingHashSeedResolver = opts.routingHashSeedResolver ?? defaultRoutingHashSeedResolver;
+		this.#platform = opts.platform ?? systemPlatform;
+		this.#bloomFlushThrottled = throttleTrailing(this.#platform, () => this.#flushBloom());
 		// The config is validated at its first read, not here: a throw degrades the object instead of
 		// bricking the constructor.
 		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: () => this.#config().rangeHierarchyMaxRows });
@@ -267,6 +271,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			logParams: () => this.#logParams(),
 			config: () => this.#config(),
 			routingHashSeedResolver: this.#routingHashSeedResolver,
+			platform: this.#platform,
 			onCompleted: (plan, completedAt) => this.#recordCompletion(plan, completedAt),
 		};
 		this.#source = new RepartitionSource(this.#store, deps);
@@ -278,6 +283,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		});
 		this.#scheduler = new FokosScheduler({
 			storage: opts.ctx.storage,
+			platform: this.#platform,
 			store: this.#store,
 			fallbackAlarmMs: () => this.#config().fallbackAlarmMs,
 			fastPathDelayMs: () => this.#config().fastPathDelayMs,
@@ -378,7 +384,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * the retry time, and the fallback covers a lost alarm. So a request in that time starts no pass.
 	 */
 	async #nudgeImport(): Promise<void> {
-		const now = Date.now();
+		const now = this.#platform.now();
 		if ((this.#target.importRecord()?.nextAttemptAt ?? now) <= now) {
 			this.#scheduler.wake();
 		}
@@ -1281,7 +1287,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (this.#initError !== undefined) {
 			// The interval is the constant: the read of the config that can be the failure does not run.
 			try {
-				await this.#scheduler.ensureAlarmAtMost(Date.now() + INIT_RETRY_ALARM_MS);
+				await this.#scheduler.ensureAlarmAtMost(this.#platform.now() + INIT_RETRY_ALARM_MS);
 			} catch {}
 			try {
 				console.error({
@@ -1461,7 +1467,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// A promotion in flight gets its fallback alarm back and one pass now: a request that asks
 			// about it is the one signal a partition gets when an eviction lost its alarm.
 			if (override.state === "queued" || override.state === "planned" || override.state === "cutover") {
-				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
+				await this.#scheduler.ensureAlarmAtMost(this.#platform.now() + this.#config().fallbackAlarmMs);
 				this.#scheduler.wake();
 			}
 			return { owner, queued: false, reason: "already_promoted", state: override.state };
@@ -1478,7 +1484,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		// The fallback alarm moves earlier BEFORE the queue transaction, so a crash between the two
 		// leaves an alarm that reads the new row. A failed alarm write creates no row.
-		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
+		await this.#scheduler.ensureAlarmAtMost(this.#platform.now() + this.#config().fallbackAlarmMs);
 		const row = this.#source.queue({ kind: "key_promotion", routingHash, data });
 		if (!row) {
 			return { owner, queued: false, reason: "split_in_progress" };
@@ -1585,9 +1591,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		// NOTE: This shouldn't happen in production, but it happens in workerd/miniflare/vitest environments
 		// due to clock discrepancies and going back in time occasionally.
 		try {
-			const earlyMs = Math.min((info?.scheduledTime ?? 0) - Date.now(), this.#config().fallbackAlarmMs);
+			const earlyMs = Math.min((info?.scheduledTime ?? 0) - this.#platform.now(), this.#config().fallbackAlarmMs);
 			if (earlyMs > 0) {
-				await scheduler.wait(earlyMs);
+				await this.#platform.wait(earlyMs);
 			}
 		} catch {
 			// A config throw landed in `#initError`, which `runDueWork` answers. Any other read failure
@@ -2098,6 +2104,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const myDepth = identityDepth(identity);
 		const minRangeDepth = identity.kind === "hash" ? 1 : myDepth + 2;
 		const refreshMs = this.#config().rangeHierarchyRefreshMs;
+		const now = this.#platform.now();
 		const arena = identity.kind === "hash" ? this.#arena() : null;
 		let arenaChanged = false;
 		let bloomChanged = false;
@@ -2119,14 +2126,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(node.ref.partitionId));
 					invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/runtime.learn: a range node has a hash partition ID");
 					routingHash = decoded.routingHash;
-					this.#store.learnRangeBoundary(routingHash, decoded.startBoundary, decoded.endBoundary, node.rangeDepth, refreshMs);
+					this.#store.learnRangeBoundary(routingHash, decoded.startBoundary, decoded.endBoundary, node.rangeDepth, refreshMs, now);
 				} else {
 					// Only the first part of the ID, because the own slice of the node is not stored.
 					routingHash = PartitionIdHelper.rangeRoutingHash(node.ref.partitionId);
 				}
 				for (const ancestor of node._rangeAncestors ?? []) {
 					if (ancestor.depth >= minRangeDepth) {
-						this.#store.learnRangeBoundary(routingHash, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth, refreshMs);
+						this.#store.learnRangeBoundary(routingHash, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth, refreshMs, now);
 					}
 				}
 				if (identity.kind !== "hash") {
@@ -2362,7 +2369,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (!this.#source.canQueue({ kind })) {
 			return;
 		}
-		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
+		await this.#scheduler.ensureAlarmAtMost(this.#platform.now() + this.#config().fallbackAlarmMs);
 		const row = this.#source.queue({ kind, data: decision.data });
 		if (!row) {
 			return;
@@ -2496,15 +2503,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return;
 		}
 		let expired = false;
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timer: number | undefined;
 		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => {
+			timer = this.#platform.setTimeout(() => {
 				expired = true;
 				reject(new Error("fokos/runtime: admin outbox step timed out"));
 			}, ADMIN_OUTBOX_TIMEOUT_MS);
 		});
 		try {
-			for (const row of this.#store.selectDueAdminOutbox(Date.now(), ADMIN_OUTBOX_BATCH)) {
+			for (const row of this.#store.selectDueAdminOutbox(this.#platform.now(), ADMIN_OUTBOX_BATCH)) {
 				if (expired || this.#store.isDestroying()) {
 					return;
 				}
@@ -2524,9 +2531,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					// The base delay plus a jittered backoff, so each retry waits from 1 s to 5 min.
 					const delay =
 						ADMIN_OUTBOX_RETRY_BASE_MS +
-						jitterBackoff(attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS);
+						jitterBackoff(this.#platform, attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS);
 					const updated = this.#store.transactionSync(() =>
-						this.#store.setAdminOutboxAttempt(row.eventType, row.id, attempt, Date.now() + delay, row.eventJson),
+						this.#store.setAdminOutboxAttempt(row.eventType, row.id, attempt, this.#platform.now() + delay, row.eventJson),
 					);
 					if (!updated) {
 						continue;
@@ -2542,7 +2549,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				}
 			}
 		} finally {
-			clearTimeout(timer);
+			this.#platform.clearTimeout(timer);
 		}
 	}
 

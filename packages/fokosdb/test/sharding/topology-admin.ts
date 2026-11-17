@@ -5,7 +5,7 @@ export const TEST_BUILD_DELAY_MS = 50;
 
 /** `FokosShardingAutoAdminDO` with a short build delay. A test reaches the keeper through `runInDurableObject`. */
 export class TestTopologyAdminDO extends FokosShardingAutoAdminDO<Env> {
-	protected keeperOptions(): Omit<FokosTopologyKeeperOptions, "scheduleBuild"> {
+	protected keeperOptions(): Omit<FokosTopologyKeeperOptions, "scheduleBuild" | "platform"> {
 		return { buildDelayMs: TEST_BUILD_DELAY_MS };
 	}
 

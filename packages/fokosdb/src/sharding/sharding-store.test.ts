@@ -55,10 +55,10 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 	//   depth 1: [-∞,("h","m")) , [("h","m"),+∞)
 	//   depth 2 (within [("h","m"),+∞)): [("h","m"),("h","t")) , [("h","t"),+∞)
 	function seedTree(store: FokosShardingStore, hk = ROUTING_HASH) {
-		store.learnRangeBoundary(hk, null, c("m"), 1, REFRESH_MS);
-		store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
-		store.learnRangeBoundary(hk, c("m"), c("t"), 2, REFRESH_MS);
-		store.learnRangeBoundary(hk, c("t"), null, 2, REFRESH_MS);
+		store.learnRangeBoundary(hk, null, c("m"), 1, REFRESH_MS, Date.now());
+		store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS, Date.now());
+		store.learnRangeBoundary(hk, c("m"), c("t"), 2, REFRESH_MS, Date.now());
+		store.learnRangeBoundary(hk, c("t"), null, 2, REFRESH_MS, Date.now());
 	}
 
 	it("returns null when nothing is stored", async () => {
@@ -95,8 +95,8 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		await withStore((store) => {
 			const hk = ROUTING_HASH;
 			// Only a depth-1 ["m",+∞) and a depth-2 ["t",+∞) are known; nothing at depth 2 covers ["m","t").
-			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
-			store.learnRangeBoundary(hk, c("t"), null, 2, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS, Date.now());
+			store.learnRangeBoundary(hk, c("t"), null, 2, REFRESH_MS, Date.now());
 			// "p" is left of "t", so the depth-2 slice does not contain it — fall back to depth 1.
 			expect(store.findDeepestKnownRangeSlice(hk, c("p"))).toEqual({ depth: 1, startBoundary: c("m"), endBoundary: null });
 		});
@@ -105,9 +105,9 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 	it("goes up one depth at a time when the nearest slice at a depth ends before the key", async () => {
 		await withStore((store) => {
 			const hk = ROUTING_HASH;
-			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
-			store.learnRangeBoundary(hk, c("m"), c("t"), 2, REFRESH_MS);
-			store.learnRangeBoundary(hk, c("m"), c("p"), 3, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS, Date.now());
+			store.learnRangeBoundary(hk, c("m"), c("t"), 2, REFRESH_MS, Date.now());
+			store.learnRangeBoundary(hk, c("m"), c("p"), 3, REFRESH_MS, Date.now());
 			// The depth-3 slice ["m","p") is the nearest start for "r" but ends before it; depth 2 covers it.
 			expect(store.findDeepestKnownRangeSlice(hk, c("r"))).toEqual({ depth: 2, startBoundary: c("m"), endBoundary: c("t") });
 			// For "u", neither depth 3 nor depth 2 covers it, so the result is depth 1.
@@ -119,7 +119,7 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		await withStore((store) => {
 			const hk = ROUTING_HASH;
 			// Only the right half is known; "a" is left of every stored start.
-			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS);
+			store.learnRangeBoundary(hk, c("m"), null, 1, REFRESH_MS, Date.now());
 			expect(store.findDeepestKnownRangeSlice(hk, c("a"))).toBeNull();
 		});
 	});
@@ -250,8 +250,8 @@ describe("FokosShardingStore - composite range boundaries", () => {
 		await withStore((store) => {
 			// Two hash keys share the routingHash. A boundary between them has the empty sort key.
 			const split = { hk: kb("b"), sk: UNBOUNDED };
-			store.learnRangeBoundary(ROUTING_HASH, null, split, 1, REFRESH_MS);
-			store.learnRangeBoundary(ROUTING_HASH, split, null, 1, REFRESH_MS);
+			store.learnRangeBoundary(ROUTING_HASH, null, split, 1, REFRESH_MS, Date.now());
+			store.learnRangeBoundary(ROUTING_HASH, split, null, 1, REFRESH_MS, Date.now());
 			expect(store.findDeepestKnownRangeSlice(ROUTING_HASH, { hk: kb("a"), sk: kb("z") })).toEqual({
 				depth: 1,
 				startBoundary: null,

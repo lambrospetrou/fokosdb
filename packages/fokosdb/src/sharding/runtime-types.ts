@@ -17,6 +17,7 @@ import type { FokosRuntimeConfigOverrides } from "./runtime-config.js";
 import type { ScanCursor } from "../shared/partition/partition-store.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { FokosTopologyCacheOptions } from "./topology-cache.js";
+import type { FokosPlatform } from "../shared/platform.js";
 
 export type { RouteKey };
 
@@ -69,6 +70,8 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * `defaultRoutingHashSeedResolver`.
 	 */
 	routingHashSeedResolver?: RoutingHashSeedResolver;
+	/** The clock, the timers, and the random values of the host. Absent: `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 export type FokosAdminOutbox = {
