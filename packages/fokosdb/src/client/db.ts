@@ -112,11 +112,14 @@ import {
 	FokosConflictError,
 	FokosError,
 	FokosInternalError,
+	FokosTransactionPendingError,
 	FokosUnavailableError,
 	FokosValidationError,
 	CORE_INTERNAL_CODES,
 	INTERNAL_CODES,
+	TRANSACTION_PENDING_CODES,
 	VALIDATION_CODES,
+	isRuntimeFault,
 	isRuntimeRetryableError,
 } from "../shared/errors.js";
 import {
@@ -336,9 +339,9 @@ function withMetaSoFar(e: unknown, soFar: FokosMeta): FokosError {
  * participant answers of the request as the own `meta` of the error, and the routing names the
  * coordinator that raised it.
  */
-function coordinatorError(e: unknown): FokosError {
+function coordinatorError(e: unknown, idempotencyToken: string): FokosError {
 	dropCallCost(e);
-	const err = mapInternalErrorToPublic(FokosError.wrap(e));
+	const err = undecidedOnRuntimeFault(mapInternalErrorToPublic(FokosError.wrap(e)), idempotencyToken);
 	const routed = routedError(err);
 	if (!routed) {
 		return err;
@@ -348,6 +351,28 @@ function coordinatorError(e: unknown): FokosError {
 	const participants = (err as { meta?: ParticipantsMeta }).meta ?? NO_META;
 	const raiser = routing.servedBy[0];
 	return Object.assign(err, { meta: { ...participants, ...(raiser ? { txCoordinator: routeNodeMeta(raiser) } : {}) } satisfies FokosMeta });
+}
+
+/**
+ * A runtime fault on the hop to the coordinator (a lost reply, an overload, or a reset of the
+ * coordinator) does not tell whether the coordinator stored the transaction. When it did, the
+ * `tx_recovery` job finishes the transaction. So the answer is `transaction_undecided`: a replay of
+ * `idempotencyToken` returns the final outcome. The error carries the token, because the caller has
+ * no other copy of a token that `db.ts` made. A foreign error with no runtime marker stays as it is.
+ */
+function undecidedOnRuntimeFault(err: FokosError, idempotencyToken: string): FokosError {
+	if (!FokosError.isCode(err, CORE_INTERNAL_CODES.foreign_error) || !isRuntimeFault(err)) {
+		return err;
+	}
+	const undecided = new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
+		message: "a runtime fault hid the transaction outcome, retry with attributes.idempotencyToken as the clientRequestToken",
+		error_id: err.error_id,
+		cause: err,
+		attributes: { idempotencyToken },
+	});
+	// The routing is an own property of the error object, so it moves to the new object.
+	const routed = routedError(err);
+	return routed ? attachRouting(undecided, routed.routing) : undecided;
 }
 
 /** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
@@ -1040,7 +1065,7 @@ export class FokosDB {
 				},
 			);
 		} catch (e) {
-			throw coordinatorError(e);
+			throw coordinatorError(e, idempotencyToken);
 		}
 		const { value: encoded, routing } = answer;
 		// The participant answers of this request, and the coordinator that answered it.

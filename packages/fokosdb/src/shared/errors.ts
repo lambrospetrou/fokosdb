@@ -413,6 +413,18 @@ export function isRuntimeRetryableError(e: unknown): boolean {
 	return markers?.retryable === true && markers.overloaded !== true;
 }
 
+/**
+ * True when the runtime marks `e` as a fault of the platform, not of the code that ran: `retryable`,
+ * `overloaded`, or `durableObjectReset`. It reads the markers as `isRuntimeRetryableError` does.
+ */
+export function isRuntimeFault(e: unknown): boolean {
+	const markers = (FokosError.is(e) ? e.attributes : e) as
+		| { retryable?: unknown; overloaded?: unknown; durableObjectReset?: unknown }
+		| null
+		| undefined;
+	return markers?.retryable === true || markers?.overloaded === true || markers?.durableObjectReset === true;
+}
+
 /** An error of a category that another package defines, as `fromWire` builds it. */
 class OtherCategoryError extends FokosError {}
 
