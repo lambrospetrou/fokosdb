@@ -18,13 +18,20 @@ export type RecoverResponseRule = { value: RecoverTransactionResult; hold?: bool
 
 export class ControlledTransactionCoordinatorDO extends FokosDBTransactionCoordinatorDO {
 	#initiateWriteCalls = 0;
+	#initiateWriteFault: Record<string, unknown> | null = null;
 	#recoverCalls = 0;
 	#recoverRule: (RecoverResponseRule & { held: Promise<void>; release: () => void; parked: boolean }) | null = null;
 	#config: TransactionCoordinatorDOConfigOverrides = {};
 
 	override async initiateWrite(...args: Parameters<FokosDBTransactionCoordinatorDO["initiateWrite"]>) {
 		this.#initiateWriteCalls++;
-		return await super.initiateWrite(...args);
+		const fault = this.#initiateWriteFault;
+		this.#initiateWriteFault = null;
+		const answer = await super.initiateWrite(...args);
+		if (fault) {
+			throw Object.assign(new Error("simulated runtime fault"), fault);
+		}
+		return answer;
 	}
 
 	override async recoverTransactionForParticipant(req: RecoverTransactionRequest): Promise<RecoverTransactionResult> {
@@ -46,6 +53,19 @@ export class ControlledTransactionCoordinatorDO extends FokosDBTransactionCoordi
 
 	async testInitiateWriteCalls(): Promise<number> {
 		return this.#initiateWriteCalls;
+	}
+
+	/**
+	 * Makes the next `initiateWrite` do its work and then throw an error with the own properties
+	 * `fault`, as a reply that the runtime loses after the work. For example `{ retryable: true }`.
+	 */
+	async testInitiateWriteFault(fault: Record<string, unknown>): Promise<void> {
+		this.#initiateWriteFault = fault;
+	}
+
+	/** Resets this instance with `ctx.abort`. Each open call fails, and the next call starts a new instance. */
+	async testReset(): Promise<void> {
+		this.ctx.abort("test reset");
 	}
 
 	/** The number of `recoverTransactionForParticipant` calls that this coordinator received. */

@@ -574,7 +574,8 @@ failure. A row marked "no" for one path is a failure that path cannot have.
 | The premise of an operation does not hold | yes | yes | `FokosTransactionCancelledError` | `transaction_cancelled`. Each rejected `results` entry holds its `RejectionReason`: `condition_failed`, `timestamp_conflict`, `pending_conflict`, `update_not_applicable`, `update_value_is_bytes`, or `item_too_large` |
 | The transaction timestamp is too far ahead of the partition clock | no. The partition takes its own timestamp | yes | `FokosTransactionCancelledError` | `transaction_cancelled`. Each operation of that partition is rejected with `reason.code` `clock_skew` |
 | A partition refuses the work before it applies anything: migration, over-size, mis-route, a range DO that is not initialized, a context mismatch, an expression fault at evaluation, a failed invariant | yes | yes | `FokosTransactionCancelledError` | `transaction_cancelled`. Each operation of that partition is rejected with the code of the raised error, for example `partition_migrating`, and its `error_id`. The operations of the other partitions keep their own answers |
-| The outcome is unknown: a transport or runtime fault on a hop where the reply can be lost after the apply | any hop | the hop from `db.ts` to the coordinator | `FokosInternalError` | `foreign_error` |
+| The outcome is unknown: a transport or runtime fault on a hop where the reply can be lost after the apply | any hop | no. See the next row | `FokosInternalError` | `foreign_error` |
+| The outcome is unknown: a runtime fault on the hop from `db.ts` to the coordinator. The runtime marks it with `retryable`, `overloaded` or `durableObjectReset`. `attributes.idempotencyToken` holds the token, also when `db.ts` made it | no | yes | `FokosTransactionPendingError` | `transaction_undecided` |
 | The decision is not final yet | no | yes | `FokosTransactionPendingError` | `transaction_undecided` or `transaction_commit_pending` |
 | The token was used for another set of operations | no. The fast path takes no token | yes | `FokosValidationError` | `idempotent_parameter_mismatch` |
 | The coordinator is over its storage cap | no | yes | `FokosUnavailableError` | `coordinator_over_size` |
@@ -721,7 +722,7 @@ code. Retry safety belongs to the operation, not to the error: a `transactWriteI
 | --- | --- |
 | `transaction_undecided`, `transaction_commit_pending` | It returns the final outcome once the coordinator reaches it. Retry with the same token. |
 | `transaction_cancelled` | It returns the stored cancellation for `IDEMPOTENCY_WINDOW_MS` (10 minutes). A cancelled transaction applied nothing, so a new attempt with a new token is safe. |
-| `foreign_error` from `transactWriteItems` | The outcome is unknown. With a token, the same token returns the stored outcome. Without a token, a retry can apply the writes twice. |
+| `foreign_error` from `transactWriteItems` | The outcome is unknown. With a token, the same token returns the stored outcome. Without a token, a retry can apply the writes twice. On the hop from `db.ts` to the coordinator, only an error with no runtime marker (a defect) has this code. A runtime fault there is `transaction_undecided`. |
 
 The library keeps the internal retry predicates it has today, with two changes. A code check replaces
 the substring predicate, so prepare still does not retry `partition_over_size`. And
