@@ -6,6 +6,10 @@
 
 **Status:** Nothing is built. "Today" means the code on `main` at the date of this document.
 
+**Later change:** [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) changes the derivation of the seed. The
+seed comes from the seed scope of the shard group, not from its whole name. It changes G1, I1 and Section 4.2.4 of
+this RFC.
+
 ## Table of contents
 
 - [1. Overview and context](#1-overview-and-context)
@@ -149,6 +153,8 @@ duplicate check of `insertItemIfAbsent`). `deleteExpiredItems` deletes its victi
 1. Each shard group has one routingHash function and one seed. The code derives the seed from the shard group
    name. The topology and the requests do not carry it. Each partition stores it in its identity, and refuses all work
    when the stored seed differs from the derived seed.
+   [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) derives the seed from the seed scope of the shard group
+   instead.
 2. The hash tree maps a routingHash to a partition by its digits. Each hash partition computes its node
    interval, depth, root index, and child path from its partition ID and the immutable topology.
 3. `items` is a `WITHOUT ROWID` table with `PRIMARY KEY (routing_hash, hk, sk)`. The other key-ordered tables
@@ -182,7 +188,8 @@ duplicate check of `insertItemIfAbsent`). `deleteExpiredItems` deletes its victi
 - **A configurable base seed in the options of `FokosDB`, `FokosShardingClient`, or the runtime.**
   `routingHashSeedOf` accepts a base seed, so a platform can use its own. FokosDB uses the default. A follow-up
   spec must give one option that reaches the client, the router, the runtime, and the identity check together. The
-  option must not travel in the topology.
+  option must not travel in the topology. [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) gives it in
+  its M2.
 - **Splits below the hash depth limit.** The limit is at most 64 (Section 4.2.5). A hash leaf at the limit can still
   promote a routingHash, but it cannot hash-split. A follow-up spec must define range splits after the hash
   splits reach the limit.
@@ -315,7 +322,8 @@ Each invariant has its rule, then its mechanism, then the milestones that add it
   partition loads its identity, it compares the stored seed with the derived seed. A difference fails the
   initialization: every operation answers `partition_init_failed`, and `fokosStatus` and the destroy RPCs stay
   available. A pinned test of the seed and of one routingHash catches a change of the derivation before a
-  deployment. (M1)
+  deployment. (M1) [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) changes the seed to
+  `routingHashSeedOf(seedScope(shardGroup))`.
 - **I2 — A table has one routingHash width, and a partition never mixes widths.** `routingHashForKey` returns
   exactly `ROUTING_HASH_BYTES` bytes in every partition. (M1, M3)
 - **I3 — The digits are exact up to the depth limit, and no hash partition exists below it.** The limit is
@@ -409,7 +417,8 @@ export function routingHash(hashKey: KeyBytes, seed: bigint): Uint8Array;
 ```
 
 - `routingHashSeedOf` is `hash64(shardGroup, baseSeed)`. The default base seed `GOLDEN_RATIO_BIGINT` must never
-  change.
+  change. [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) passes the seed scope of the shard group in place
+  of its whole name.
 - The seed is a hex string, so it stays JSON-safe in the stored identity. A caller that hashes parses it to a
   `bigint` once for each shard group (M2).
 - The routingHash is `hashers.h64Raw(hashKey, seed)`, written big-endian with
@@ -1620,7 +1629,8 @@ collision among `n` hash keys is about `n^2 / 2^65`.
 No routing step needs the seed in a request: the code derives it from the shard group name. A seed in the topology
 adds bytes to each RPC, a field to the topology event, the keeper, and the topology encodings, and a check that always
 passes, because the client derives the seed with the same function that checks it. It also makes a spread of a
-derived shard group wrong.
+derived shard group wrong. [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) keeps this rule: the seed scope
+also comes from the shard group name.
 
 **Then why does a partition store the seed?**
 The stored rows and the routes of a partition use the seed of the day the partition was written. If a later code
