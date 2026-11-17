@@ -41,6 +41,7 @@ import type { TopologyEntrypointFactory } from "../shared/topology-hooks.js";
 import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
 import { FOKOS_HASH_PARTITIONS_MAX, type FokosPartitionRef } from "../sharding/route-context.js";
 import type { RoutingHash } from "../sharding/hash-primitives.js";
+import { systemPlatform, type FokosPlatform } from "../sharding/platform.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
@@ -610,12 +611,17 @@ export type FokosDBOptions = FokosTableOptions & {
 	topologyRefreshMs?: number;
 	/** The time after which a topology refresh that did not end can start again, in milliseconds. Default: 30,000. */
 	topologyRefreshTimeoutMs?: number;
+	/**
+	 * The clock, the timers, and the random values of the client: its transaction IDs, its deadlines,
+	 * and its retry backoff. Default: `systemPlatform`.
+	 */
+	platform?: FokosPlatform;
 };
 
 /** `FokosDBOptions` with the defaults of the client applied. */
 export type FokosDBResolvedOptions = Omit<
 	FokosDBOptions,
-	"table" | "singlePartitionFastPath" | "retry" | "partitionMigratingRetryDeadlineMs"
+	"table" | "singlePartitionFastPath" | "retry" | "partitionMigratingRetryDeadlineMs" | "platform"
 > & {
 	table: FokosTableIdentity & { readonly coordinatorRootsN: number };
 	singlePartitionFastPath: boolean;
@@ -661,6 +667,7 @@ export class FokosDB {
 	#table: FokosDBTableConfig;
 	/** The key size limits of the table, resolved once from its policy. */
 	#limits: FokosDBLimits;
+	readonly #platform: FokosPlatform;
 	/** The partitions of the table. */
 	#partitions: FokosShardingClient<FokosDBPolicy, PartitionOps>;
 	/** The coordinator group of the table, `fokos.tc.<tableName>.<fp>`. */
@@ -669,6 +676,7 @@ export class FokosDB {
 	#gsis = new Map<string, FokosShardingClient<FokosDBPolicy, PartitionOps>>();
 
 	constructor(options: FokosDBOptions) {
+		this.#platform = options.platform ?? systemPlatform;
 		this.#table = createTableConfig(options);
 		const { topology, rangeConfig, policy, policyVersion } = this.#table;
 		// The default has the same maximum as the check below, so a large `rootTreesN` does not fail.
@@ -733,6 +741,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+			platform: this.#platform,
 			...this.#topologyCache({ topology, policy }, policy.ns),
 		});
 		this.#coordinators = new FokosShardingClient({
@@ -741,6 +750,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
+			platform: this.#platform,
 			...this.#topologyCache({ topology: coordinatorTopology, policy }, policy.nsTx),
 		});
 	}
@@ -760,6 +770,7 @@ export class FokosDB {
 			topologyCache: {
 				fetch: (path, signal, routingHash) => this.#topologyFetch(ctx, binding, path, signal, routingHash),
 				waitUntil,
+				platform: this.#platform,
 				// The scope isolates the entries of each admin. The binding and the shard group name it
 				// without the fingerprint work of the address.
 				scope: JSON.stringify([nsAdmin, ctx.topology.jurisdiction ?? null, binding, ctx.topology.shardGroup]),
@@ -808,6 +819,7 @@ export class FokosDB {
 			client = new FokosShardingClient({
 				...gsiTableConfig(this.#table, indexName),
 				stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+				platform: this.#platform,
 			});
 			this.#gsis.set(indexName, client);
 		}
@@ -1041,12 +1053,12 @@ export class FokosDB {
 		}
 
 		// The token is the route key of the coordinator, so a request always carries one.
-		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
+		const idempotencyToken = opts.clientRequestToken ?? this.#platform.randomId();
 
 		// A coordinator answers `partition_migrating` while it splits: its root forwards the request to
 		// the child that owns the token, and that child refuses it until its import is complete. The
 		// request carries the token, so a retry resumes the same transaction and never starts a second one.
-		const deadline = Date.now() + this.#options.partitionMigratingRetryDeadlineMs;
+		const deadline = this.#platform.now() + this.#options.partitionMigratingRetryDeadlineMs;
 		const { baseDelayMs, maxDelayMs } = this.#options.retry;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
@@ -1058,7 +1070,7 @@ export class FokosDB {
 				{ clientRequestToken: idempotencyToken, table: this.#table, items, executionMode },
 				{
 					retry: {
-						shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
+						shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && this.#platform.now() < deadline,
 						baseDelayMs,
 						maxDelayMs,
 					},
@@ -1100,7 +1112,7 @@ export class FokosDB {
 			return null;
 		}
 
-		const transactionId = crypto.randomUUID().replaceAll("-", "");
+		const transactionId = this.#platform.randomId();
 		const request = { items };
 
 		let answer: FokosCallResult<SingleShotResponse>;
@@ -1233,7 +1245,7 @@ export class FokosDB {
 	}
 
 	async #readTransaction(requestedItems: TransactionReadItem[]): Promise<InitiateReadResponseEncoded> {
-		const transactionId = crypto.randomUUID().replaceAll("-", "");
+		const transactionId = this.#platform.randomId();
 		// Both phases send the same groups.
 		const groups = this.#partitions.resolveAll(requestedItems).map(({ ctx, indexes }) => {
 			const items = indexes.map((i) => requestedItems[i]);
@@ -1770,6 +1782,7 @@ export class FokosDB {
 			const materializations = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 				...materializationTableConfig(this.#table, fp),
 				stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
+				platform: this.#platform,
 			});
 			const indexNames = await this.#fenceMaterializations(materializations);
 			for (const indexName of indexNames) {

@@ -3,6 +3,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
+import type { ControlledPartitionDO } from "../controlled-partition-do.js";
 import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
 import { testCoordinatorContext, testCoordinatorRef, testCoordinatorStubByName, testPartitionStub } from "../stub-helpers.js";
@@ -197,14 +198,14 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("releases a not_found lock at the exact idempotency-window boundary", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { createdAt: now - IDEMPOTENCY_WINDOW_MS });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.listPendingTxKeys(transactionId).length).toBe(0);
@@ -214,7 +215,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("quarantines an over-age owned lock and logs the transition once", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
@@ -223,7 +224,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const hashKey = `guard-${transactionId}`;
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, {
 				coordinatorDoName: coordinator.doName,
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
@@ -257,7 +258,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 	// so the late prepare locks the key again. When the coordinator has swept the transaction, the
 	// stale job must release that lock, and not quarantine it.
 	it("releases, and does not quarantine, the lock that a late prepare of a committed check writes again", async () => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const key = { hashKey: kb("late-check"), sortKey: kb("sk") };
@@ -282,7 +283,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			expect(lock).toBeDefined();
 			// The coordinator answers not_found, as after its sweep, and the lock is older than the window.
 			const now = lock.created_at + IDEMPOTENCY_WINDOW_MS + 1;
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = 0 WHERE transaction_id = ?`, transactionId);
 			// The scheduled time is on the real clock. The mocked clock is ahead of it, and a scheduled
 			// time ahead of the real clock makes the alarm handler wait for it.
@@ -296,13 +297,13 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("releases an over-age not_found check lock of an absent item when max_delete_tx_order_ts already covers it", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, {
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
 				operation: "check",
@@ -321,14 +322,14 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		["a check and a put", true],
 	])("quarantines an over-age not_found lock of %s", async (_name, withPut) => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 		const createdAt = now - IDEMPOTENCY_WINDOW_MS - 1;
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = new PartitionStore(state.storage);
 			const P = partitionRoutingHashOf(state);
 			// The checked item has a stamp of 10. With a put in the request, the check alone is covered.
@@ -359,7 +360,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("does not quarantine or release a lock when the coordinator RPC fails", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		const recoverTransaction = vi.fn(async () => {
 			throw new Error("coordinator unavailable");
@@ -371,7 +372,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.listPendingTxKeys(transactionId).length).toBe(1);
@@ -391,7 +392,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 	// scheduler runs the job again after each pass, with one coordinator call each time.
 	it("asks a coordinator that answers driving one time, and arms the alarm at the next attempt", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		const recoverTransaction = vi.fn(async () => ({ state: "driving" as const }));
 		vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
@@ -400,7 +401,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { createdAt: now - 10_000 });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			// The next pass, as the fast path of the scheduler runs it after a pass that ends with a due job.
@@ -416,12 +417,12 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("stops starting coordinator calls when the budget of the step ends", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		const transactionIds = [crypto.randomUUID(), crypto.randomUUID()];
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			const clock = vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			const clock = vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			// The first call takes the whole budget of the step.
 			const recoverTransaction = vi.fn(async () => {
 				clock.mockReturnValue(now + 10_000);
@@ -454,14 +455,14 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("keeps a lock whose coordinator reference it cannot read, and logs why", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { createdAt: now - 10_000 });
 			// A reference that a later version of the code wrote.
 			state.storage.sql.exec(
@@ -486,13 +487,13 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("keeps a not_found lock whose keys all route away, and quarantines none of it", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = insertLock(state, transactionId, { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			// Every key of the lock now belongs to another partition, which holds the true lock. The
 			// rows here are copies, and the cleanup of the migration deletes them.
@@ -509,14 +510,14 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 	it("quarantined transactions do not starve a younger stale transaction", async () => {
 		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub, rpc } = makeStub({ ns: "CONTROLLED_PARTITION_DO" });
 		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionIds = Array.from({ length: 11 }, () => crypto.randomUUID());
 
 		await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
-			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			vi.spyOn(instance as ControlledPartitionDO, "testNow").mockReturnValue(now);
 			const store = new PartitionStore(state.storage);
 			for (const [index, transactionId] of transactionIds.entries()) {
 				insertLock(state, transactionId, {

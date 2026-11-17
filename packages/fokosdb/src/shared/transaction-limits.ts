@@ -174,8 +174,8 @@ export const TX_ORDER_TS_UNITS_PER_MS = 1_000;
  * for coordinator tie-breaking. `Date.now() * 1_000` stays a safe integer until the year 2255, so the
  * assertion guards a broken clock, not normal operation.
  */
-export function txOrderTimestampNow(): TransactionTimestamp {
-	const ts = Date.now() * TX_ORDER_TS_UNITS_PER_MS;
+export function txOrderTimestampNow(nowMs: number): TransactionTimestamp {
+	const ts = nowMs * TX_ORDER_TS_UNITS_PER_MS;
 	invariant(Number.isSafeInteger(ts), "transaction order timestamp is not a safe integer");
 	return ts;
 }

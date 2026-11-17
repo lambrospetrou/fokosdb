@@ -4,6 +4,7 @@
  * the admin outbox.
  */
 import { env, exports } from "cloudflare:workers";
+import type { FokosPlatform } from "../sharding/platform.js";
 import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
 import { topologyAdminAddress, type DataNamespaceKey, type TopologyAdminAddress } from "./do-stubs.js";
 import type { FokosDBStubContext } from "./partition-context.js";
@@ -22,6 +23,7 @@ export function topologyCacheFor(
 	ctx: FokosDBStubContext,
 	binding: DataNamespaceKey,
 	waitUntil: (promise: Promise<unknown>) => void,
+	platform: FokosPlatform,
 	settings: TopologyRefreshSettings = {},
 ): FokosTopologyCacheOptions | undefined {
 	const { topologyEntrypoint } = ctx.policy;
@@ -40,6 +42,7 @@ export function topologyCacheFor(
 			return await entrypoint({ props }).fetch(`http://fokos-topology${path}`, { signal });
 		},
 		waitUntil,
+		platform,
 		// The entrypoint answers by the admin address, so the isolate cache keys by it too. The key of a
 		// range entry also has its routingHash, which gives the address of the admin of the routingHash.
 		scope: JSON.stringify([address.nsAdmin, address.jurisdiction ?? null, address.name]),
@@ -61,6 +64,7 @@ export class TopologyCacheMemo {
 	constructor(
 		private readonly waitUntil: (promise: Promise<unknown>) => void,
 		private readonly binding: (policy: FokosDBStubContext["policy"]) => DataNamespaceKey,
+		private readonly platform: FokosPlatform,
 	) {}
 
 	get(ctx: FokosDBStubContext, settings: TopologyRefreshSettings): FokosTopologyCacheOptions | undefined {
@@ -71,7 +75,7 @@ export class TopologyCacheMemo {
 		) {
 			this.#policy = ctx.policy;
 			this.#settings = settings;
-			this.#options = topologyCacheFor(ctx, this.binding(ctx.policy), this.waitUntil, settings);
+			this.#options = topologyCacheFor(ctx, this.binding(ctx.policy), this.waitUntil, this.platform, settings);
 		}
 		return this.#options;
 	}

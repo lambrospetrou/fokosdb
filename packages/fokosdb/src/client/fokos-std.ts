@@ -1,4 +1,5 @@
-import { jitterBackoff } from "durable-utils/retries";
+import { systemPlatform, type FokosPlatform } from "../sharding/platform.js";
+import { jitterBackoff } from "../sharding/retries.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type {
 	BatchGetItemKey,
@@ -38,11 +39,13 @@ export class FokosDBStd {
 		db: ItemBatcher,
 		opts: NoInfer<BatchGetItemsOptions<Ts>>,
 		retry?: FokosDBRetryOptions,
+		platform: FokosPlatform = systemPlatform,
 	): Promise<BatchGetItemsResult<Ts>> {
 		const policy = resolveRetryOptions(retry);
 		const { projection, maxResponseBytes } = opts as BatchGetItemsOptions;
 		const { results, unprocessed, meta } = await retryBatch<BatchGetItemKey, BatchGetItemResult>(
 			policy,
+			platform,
 			opts.items as readonly BatchGetItemKey[],
 			async (items) => {
 				const answer = await db.batchGetItems({ items, projection, maxResponseBytes });
@@ -65,10 +68,12 @@ export class FokosDBStd {
 		db: ItemBatcher,
 		opts: BatchWriteItemsOptions,
 		retry?: FokosDBRetryOptions,
+		platform: FokosPlatform = systemPlatform,
 	): Promise<BatchWriteItemsResult> {
 		const policy = resolveRetryOptions(retry);
 		const { results, unprocessed, meta } = await retryBatch<BatchWriteItem, BatchWriteItemResult>(
 			policy,
+			platform,
 			opts.items,
 			async (items) => {
 				const answer = await db.batchWriteItems({ items });
@@ -127,6 +132,7 @@ export class FokosDBStd {
  */
 async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	retry: Required<FokosDBRetryOptions>,
+	platform: FokosPlatform,
 	entries: readonly Entry[],
 	call: (entries: Entry[]) => Promise<{ results: Result[]; meta: FokosMeta }>,
 	again: (result: Result) => boolean,
@@ -154,7 +160,7 @@ async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 			break;
 		}
 		// The first retry is retry 0 of the backoff.
-		await new Promise((resolve) => setTimeout(resolve, jitterBackoff(calls - 1, retry.baseDelayMs, retry.maxDelayMs)));
+		await platform.wait(jitterBackoff(platform, calls - 1, retry.baseDelayMs, retry.maxDelayMs));
 		positions = next;
 	}
 	return {

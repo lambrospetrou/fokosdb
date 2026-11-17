@@ -18,6 +18,7 @@
  * batch was open (`is_batch_open`). On a split child, each call also carries the ancestor fences of
  * its target until the inherited work of the target is done.
  */
+import { systemPlatform, type FokosPlatform, type FokosTimer } from "../../sharding/platform.js";
 import invariant from "../../shared/invariant.js";
 import { decodeItemKeys } from "../../shared/transaction-limits.js";
 import type { DataKind, HashKey, ReadItemValue, SortKey } from "../../shared/types.js";
@@ -117,8 +118,10 @@ export type TargetRunnerDeps = {
 	scheduleRetry: (runAt: number) => void;
 	now: () => number;
 	logParams: () => Record<string, unknown>;
-	/** The yield between two steps of a worker. Default: `scheduler.wait`. */
+	/** The yield between two steps of a worker. Default: `platform.wait`. */
 	wait?: (ms: number) => Promise<void>;
+	/** The timers of the call timeouts. Default `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 /** The in-memory state of one target. */
@@ -172,6 +175,7 @@ type ClaimedBatch = {
 export class TargetRunner {
 	readonly #deps: TargetRunnerDeps;
 	readonly #wait: (ms: number) => Promise<void>;
+	readonly #platform: FokosPlatform;
 	readonly #workers = new Set<Promise<void>>();
 	readonly #states = new Map<string, TargetState>();
 	/** The index of the target that the next pick tries first. */
@@ -179,7 +183,9 @@ export class TargetRunner {
 
 	constructor(deps: TargetRunnerDeps) {
 		this.#deps = deps;
-		this.#wait = deps.wait ?? (async (ms) => await scheduler.wait(ms));
+		this.#platform = deps.platform ?? systemPlatform;
+		const platform = this.#platform;
+		this.#wait = deps.wait ?? (async (ms) => await platform.wait(ms));
 	}
 
 	/** True while a worker runs. */
@@ -700,14 +706,14 @@ export class TargetRunner {
 	/** Waits for `call` up to `callTimeoutMs`. The timer is cleared when the call answers. */
 	async #withTimeout<T>(call: Promise<T>): Promise<T> {
 		const timeoutMs = this.#deps.config().callTimeoutMs;
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timer: FokosTimer | undefined;
 		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new Error(`the call had no answer after ${timeoutMs} ms`)), timeoutMs);
+			timer = this.#platform.setTimeout(() => reject(new Error(`the call had no answer after ${timeoutMs} ms`)), timeoutMs);
 		});
 		try {
 			return await Promise.race([call, timeout]);
 		} finally {
-			clearTimeout(timer);
+			this.#platform.clearTimeout(timer);
 		}
 	}
 

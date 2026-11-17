@@ -1,3 +1,4 @@
+import { systemPlatform, type FokosPlatform } from "../sharding/platform.js";
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
@@ -421,9 +422,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * `partition_init_failed` and `alarm` re-arms at `INIT_RETRY_ALARM_MS`.
 	 */
 	#initError?: unknown;
+	readonly #platform: FokosPlatform;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.#platform = this.fokosPlatform(ctx);
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: ctx.storage,
@@ -432,6 +435,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const topologyCache = new TopologyCacheMemo(
 			(promise) => ctx.waitUntil(promise),
 			(policy) => policy.nsTx,
+			this.#platform,
 		);
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
@@ -441,6 +445,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
 			hostInitError: () => this.#initError,
+			platform: this.#platform,
 			// The table options select both. The runtime asks only after this coordinator has its identity.
 			adminOutbox: () => adminOutboxFor(this.fokos.routeContext(), this.fokos.routeContext().policy.nsTx),
 			topologyCache: () => topologyCache.get(this.fokos.routeContext(), this.topologyRefreshSettings()),
@@ -545,7 +550,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				errorProps: this.#initError,
 			});
 			try {
-				await this.ctx.storage.setAlarm(Date.now() + INIT_RETRY_ALARM_MS);
+				await this.ctx.storage.setAlarm(this.#platform.now() + INIT_RETRY_ALARM_MS);
 			} catch {}
 			return;
 		}
@@ -740,11 +745,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/**
-	 * The clock of this coordinator, in milliseconds. Read at each use, so a test can replace it on one
-	 * instance and avoid global mocks.
+	 * The clock, the timers, and the random values of this Durable Object. The constructor reads it
+	 * once, before the fields of a subclass exist.
 	 */
-	fokosNow(): number {
-		return Date.now();
+	protected fokosPlatform(_ctx: DurableObjectState): FokosPlatform {
+		return systemPlatform;
 	}
 
 	/** The active settings: the overrides of `fokosConfig()` over the defaults, validated. */
@@ -765,7 +770,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 	/** The local handler of `initiateWrite`. The runtime has already resolved this coordinator as the owner of the token. */
 	private async initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
-		const transactionId = crypto.randomUUID().replaceAll("-", "");
+		const transactionId = this.#platform.randomId();
 		const idempotencyToken = request.clientRequestToken;
 		const routingHash = this.routingHashOfToken(idempotencyToken);
 
@@ -790,7 +795,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// receives already-validated, already-encoded operations.
 
 		// The low three decimal digits stay zero; a later change can allocate them to tie-breaking.
-		const transactionTs = txOrderTimestampNow();
+		const transactionTs = txOrderTimestampNow(this.#platform.now());
 
 		// Group the operations by the deepest known partition of each key. The same grouping feeds the tc_items and
 		// tc_participants rows below and the prepare fan-out, so the happy path never reads the rows it has
@@ -822,7 +827,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			),
 		);
 
-		const createdAt = this.fokosNow();
+		const createdAt = this.#platform.now();
 		this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
 				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash)
@@ -870,7 +875,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Durable before the first prepare, so a coordinator that stops after this point still resumes the
 		// transaction. The handler can end with a thrown answer, which drops the signals of a local call,
 		// so these calls do not go through `call.signal`.
-		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow() + this.config().staleTransactionMs);
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.#platform.now() + this.config().staleTransactionMs);
 		this.fokos.requestSplitEvaluation();
 
 		return await this.drivePrepare(
@@ -1041,7 +1046,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
 	): Promise<void> {
 		const expectedState = terminalState === "COMMITTED" ? "COMMITTING" : "CANCELLING";
-		const completedAt = this.fokosNow();
+		const completedAt = this.#platform.now();
 		let transitioned = false;
 		this.transition(idempotencyToken, () => {
 			const transition = this.ctx.storage.sql.exec(
@@ -1325,13 +1330,20 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
 	private partitionClient(ctx: FokosDBTableConfig): FokosShardingClient<FokosDBPolicy, PartitionOps> {
 		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
-		const topologyCache = topologyCacheFor(ctx, ctx.policy.ns, (promise) => this.ctx.waitUntil(promise), this.topologyRefreshSettings());
+		const topologyCache = topologyCacheFor(
+			ctx,
+			ctx.policy.ns,
+			(promise) => this.ctx.waitUntil(promise),
+			this.#platform,
+			this.topologyRefreshSettings(),
+		);
 		return new FokosShardingClient<FokosDBPolicy, PartitionOps>({
 			topology: ctx.topology,
 			rangeConfig: ctx.rangeConfig,
 			policy: ctx.policy,
 			policyVersion: ctx.policyVersion,
 			stub: (c, doName) => partitionStubByName(this.env, c, doName),
+			platform: this.#platform,
 			...(topologyCache === undefined ? {} : { topologyCache }),
 		});
 	}
@@ -1348,7 +1360,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 */
 	private fanoutRetry(deadlineMs: number): FokosRetryPolicy {
 		const { baseDelayMs, maxDelayMs } = this.config().participantRetry;
-		return { shouldRetry: () => this.fokosNow() <= deadlineMs, baseDelayMs, maxDelayMs };
+		return { shouldRetry: () => this.#platform.now() <= deadlineMs, baseDelayMs, maxDelayMs };
 	}
 
 	/** The reference that each participant stores in its lock, and calls back on recovery. */
@@ -1522,7 +1534,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
 		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
 		const keysByPartition = groupByPartition(this.loadItemKeys(routingHash, transactionId));
-		const deadlineMs = this.fokosNow() + requestBudgetMs;
+		const deadlineMs = this.#platform.now() + requestBudgetMs;
 
 		// A participant with a stored 'committed' outcome got its commit from an earlier drive, and this
 		// drive does not send it again.
@@ -1556,7 +1568,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				// Past the request budget, stop dispatching: this participant stays unconfirmed, the
 				// transaction stays in COMMITTING, the caller receives the commit-pending error, and the
 				// `tx_recovery` job finishes the fan-out.
-				if (this.fokosNow() > deadlineMs) {
+				if (this.#platform.now() > deadlineMs) {
 					return null;
 				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
@@ -1628,7 +1640,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
 		const keysByPartition = groupByPartition(this.loadItemKeys(routingHash, transactionId));
-		const deadlineMs = this.fokosNow() + requestBudgetMs;
+		const deadlineMs = this.#platform.now() + requestBudgetMs;
 
 		// Cancel any participant not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
@@ -1656,7 +1668,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				// Past the request budget, stop dispatching: this participant stays unconfirmed, the
 				// transaction stays in CANCELLING, and the `tx_recovery` job finishes the fan-out. The caller
 				// still receives the cancelled outcome, which applied nothing anywhere.
-				if (this.fokosNow() > deadlineMs) {
+				if (this.#platform.now() > deadlineMs) {
 					return;
 				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
@@ -1748,7 +1760,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			(p) => p.prepare_outcome === "rejected" || (p.prepare_outcome === null && isFatalPrepareError(p.error_json)),
 		);
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
-		const heldTooLong = this.fokosNow() - stateRow.created_at > maxPreparingHoldMs(this.config());
+		const heldTooLong = this.#platform.now() - stateRow.created_at > maxPreparingHoldMs(this.config());
 
 		if (allAccepted) {
 			this.markCommitting(routingHash, transactionId, idempotencyToken);
@@ -1774,12 +1786,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * continue.
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
-		const startedAt = this.fokosNow();
+		const startedAt = this.#platform.now();
 		const { staleTransactionMs, recoveryScanRows, recoveryConcurrentDrives, alarmRecoveryBudgetMs, fanoutRequestBudgetMs } = this.config();
 		let claimed = 0;
 		const worker = async (): Promise<void> => {
 			while (claimed < recoveryScanRows) {
-				const remainingMs = startedAt + alarmRecoveryBudgetMs - this.fokosNow();
+				const remainingMs = startedAt + alarmRecoveryBudgetMs - this.#platform.now();
 				if (remainingMs <= 0) {
 					return;
 				}
@@ -1822,7 +1834,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		limit: number,
 		staleTransactionMs: number,
 	): { routingHash: RoutingHash; transaction_id: string; idempotency_token: string; state: TCState }[] {
-		const now = this.fokosNow();
+		const now = this.#platform.now();
 		return this.ctx.storage.transactionSync(() => {
 			const rows = this.ctx.storage.sql
 				.exec<{ routing_hash: ArrayBuffer; transaction_id: string; idempotency_token: string; state: TCState; created_at: number }>(
@@ -1890,7 +1902,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * gives the next expiry.
 	 */
 	private sweepExpiredTransactions(): number | null {
-		const cutoff = this.fokosNow() - IDEMPOTENCY_WINDOW_MS;
+		const cutoff = this.#platform.now() - IDEMPOTENCY_WINDOW_MS;
 		const { sweepBatchRows, sweepDeleteChunkRows } = this.config();
 		// The order is the order of `idx_tc_state_completed_at`, whose entries end with the primary key, so
 		// the read needs no sort. Each row keeps its own routingHash for the deletes.
@@ -1915,7 +1927,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		}
 
 		const hasExpiredRows = exists(this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff));
-		return hasExpiredRows ? this.fokosNow() : null;
+		return hasExpiredRows ? this.#platform.now() : null;
 	}
 
 	private earliestCompletedAt(): number | null {
@@ -1949,7 +1961,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		if (state === "COMMITTED" || state === "CANCELLED") {
 			return { state };
 		}
-		const now = this.fokosNow();
+		const now = this.#platform.now();
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET next_recovery_at = MIN(next_recovery_at, ?) WHERE routing_hash = ? AND transaction_id = ? AND completed_at IS NULL`,
 			now,

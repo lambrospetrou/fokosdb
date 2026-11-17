@@ -8,6 +8,7 @@
  * it knows, and runs at most one pass at a time: a request or an alarm that arrives during a pass waits
  * for it and then gets one more pass.
  */
+import type { FokosPlatform, FokosTimer } from "./platform.js";
 import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 import type { FokosShardingStore } from "./sharding-store.js";
 
@@ -19,6 +20,7 @@ export const INIT_RETRY_ALARM_MS = 300_000;
 
 export type FokosSchedulerDeps = {
 	storage: DurableObjectStorage;
+	platform: FokosPlatform;
 	store: FokosShardingStore;
 	/** How far ahead a pass arms its fallback before its first transition. Read at each use. */
 	fallbackAlarmMs: () => number;
@@ -37,7 +39,7 @@ export class FokosScheduler {
 	readonly #deps: FokosSchedulerDeps;
 	#inFlight: Promise<void> | null = null;
 	#queued: Promise<void> | null = null;
-	#fastPath: ReturnType<typeof setTimeout> | null = null;
+	#fastPath: FokosTimer | null = null;
 
 	constructor(deps: FokosSchedulerDeps) {
 		this.#deps = deps;
@@ -73,7 +75,7 @@ export class FokosScheduler {
 		if (this.#fastPath !== null) {
 			return;
 		}
-		this.#fastPath = setTimeout(() => {
+		this.#fastPath = this.#deps.platform.setTimeout(() => {
 			this.#fastPath = null;
 			void this.runDueWork().catch((error: unknown) => {
 				console.error({
@@ -89,7 +91,7 @@ export class FokosScheduler {
 	/** Stops the fast path. The alarm is the caller's to delete. */
 	stop(): void {
 		if (this.#fastPath !== null) {
-			clearTimeout(this.#fastPath);
+			this.#deps.platform.clearTimeout(this.#fastPath);
 		}
 		this.#fastPath = null;
 	}
@@ -104,7 +106,7 @@ export class FokosScheduler {
 			return;
 		}
 		await this.ensureAlarmAtMost(runAt);
-		if (runAt <= Date.now()) {
+		if (runAt <= this.#deps.platform.now()) {
 			this.wake();
 		}
 	}
@@ -152,7 +154,7 @@ export class FokosScheduler {
 			});
 			try {
 				if (!this.#deps.isFenced()) {
-					await this.ensureAlarmAtMost(Date.now() + this.#deps.fallbackAlarmMs());
+					await this.ensureAlarmAtMost(this.#deps.platform.now() + this.#deps.fallbackAlarmMs());
 				}
 			} catch {
 				// The storage the alarm needs is the same storage the pass just failed on.
@@ -169,7 +171,7 @@ export class FokosScheduler {
 		if (this.#deps.isFenced()) {
 			return;
 		}
-		const now = Date.now();
+		const now = this.#deps.platform.now();
 		// One read of the deadlines before the steps. A deadline can cost a storage query, so the pass
 		// reads them again only after the steps, which can change them.
 		const deadlines = this.#deadlines(this.#runnable());
@@ -203,7 +205,7 @@ export class FokosScheduler {
 					error: String(error),
 					errorProps: error,
 				});
-				nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
+				nextRunAt = this.#deps.platform.now() + this.#deps.fallbackAlarmMs();
 				failed = true;
 			}
 			// Written right after the step, and from a fresh read: a request can call `scheduleJob` for
@@ -240,7 +242,7 @@ export class FokosScheduler {
 			return;
 		}
 		await this.#deps.storage.setAlarm(next);
-		if (next <= Date.now()) {
+		if (next <= this.#deps.platform.now()) {
 			this.wake();
 		}
 	}
@@ -307,7 +309,7 @@ export class FokosScheduler {
 	#failJob(name: string): void {
 		this.#deps.store.transactionSync(() => {
 			const record = this.#deps.store.getJobs();
-			const nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
+			const nextRunAt = this.#deps.platform.now() + this.#deps.fallbackAlarmMs();
 			record[name] = { nextRunAt: Math.min(record[name]?.nextRunAt ?? nextRunAt, nextRunAt), failed: true };
 			this.#deps.store.putJobs(record);
 		});

@@ -314,7 +314,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				hk: KeyCodec.encode(lockKey.hashKey),
 				sk: KeyCodec.encode(lockKey.sortKey),
 				transaction_id: first.transactionId,
-				transaction_ts: txOrderTimestampNow(),
+				transaction_ts: txOrderTimestampNow(Date.now()),
 				operation: "put",
 				op_list: [[0, "put"] as [number, "put"]],
 				data: "recovered",

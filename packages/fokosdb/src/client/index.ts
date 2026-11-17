@@ -11,6 +11,8 @@
 export { FokosDB, isFokosDBError } from "./db.js";
 export type { FokosDBError, FokosDBOptions, FokosDBResolvedOptions, FokosDBRetryOptions } from "./db.js";
 export { FokosDBStd } from "./fokos-std.js";
+export { systemPlatform } from "../sharding/platform.js";
+export type { FokosPlatform, FokosTimer } from "../sharding/platform.js";
 
 // ─── Item data and single-item operations ─────────────────────────────────────
 

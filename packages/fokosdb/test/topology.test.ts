@@ -16,6 +16,7 @@ import { TARGET_WAIT } from "./partition-do/helpers.js";
 import { makeRangeRoot } from "./partition-do/partition-harness.js";
 import { untilAvailable } from "./property-based/harness.js";
 import { testPartitionStub } from "./stub-helpers.js";
+import { systemPlatform } from "../src/sharding/platform.js";
 
 // maxSizeMb 0.25 is 262,144 bytes. The empty schema holds about 100 KB, so a few 50 KB items split a root.
 const ITEM_DATA = "x".repeat(50 * 1024);
@@ -314,7 +315,7 @@ describe("FokosDB — the admin of a promoted routingHash", () => {
 			const read = (await env.FOKOS_ADMIN_DO.getByName(routingHashAdmin).getRangeTopology(shardGroup, routingHash)) as FokosTopologyRead;
 			expect(parseRangeBody((read as { body: Uint8Array }).body).n).toBeGreaterThan(0);
 		}, WAIT);
-		const cache = topologyCacheFor(hashPartition.ctx, "PARTITION_DO", () => {});
+		const cache = topologyCacheFor(hashPartition.ctx, "PARTITION_DO", () => {}, systemPlatform);
 		const response = await cache!.fetch(topologyGetForRangePath(shardGroup, routingHash), AbortSignal.timeout(5_000), routingHash);
 		expect(response.status).toBe(200);
 		expect(parseRangeBody(new Uint8Array(await response.arrayBuffer())).n).toBeGreaterThan(0);

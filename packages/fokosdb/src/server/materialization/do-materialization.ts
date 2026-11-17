@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { baseTableName, type FokosDBPolicy, type FokosDBRouteContext } from "../../shared/partition-context.js";
 import { FokosShardingRuntime } from "../../sharding/runtime.js";
+import { systemPlatform, type FokosPlatform } from "../../sharding/platform.js";
 import { INIT_RETRY_ALARM_MS } from "../../sharding/scheduler.js";
 import type { FokosRuntimeConfigOverrides } from "../../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosLifecycle, FokosLocalCall, FokosOperations, FokosShardingHooks } from "../../sharding/runtime-types.js";
@@ -129,9 +130,11 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	 * entries answer `partition_init_failed` and `alarm` re-arms at `INIT_RETRY_ALARM_MS`.
 	 */
 	#initError?: unknown;
+	readonly #platform: FokosPlatform;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.#platform = this.fokosPlatform(ctx);
 		this.#store = new MaterializationStore(ctx.storage, {
 			promotionFloor: () => promotionFloor(this.fokos.identity(), this.fokos.policy(), this.config()),
 			isRangeLeaf: () => this.fokos.identity().kind === "range",
@@ -189,8 +192,9 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				const limits = resolveLimits(this.fokos.policy().limits);
 				return (image) => desiredGsiEntry(this.#store, plans, image, limits);
 			},
-			now: () => this.fokosNow(),
+			now: () => this.#platform.now(),
 			logParams: () => this.logParams(),
+			platform: this.#platform,
 		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, MaterializationOps>({
@@ -321,7 +325,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				errorProps: this.#initError,
 			});
 			try {
-				await this.ctx.storage.setAlarm(Date.now() + INIT_RETRY_ALARM_MS);
+				await this.ctx.storage.setAlarm(this.#platform.now() + INIT_RETRY_ALARM_MS);
 			} catch {}
 			return;
 		}
@@ -515,7 +519,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 					if (overSize && !item.deleted) {
 						return "over_size";
 					}
-					const keyEstBytes = this.#store.putLatestImage(routingHash, item, this.fokosNow(), current, targets);
+					const keyEstBytes = this.#store.putLatestImage(routingHash, item, this.#platform.now(), current, targets);
 					if (keyEstBytes !== undefined && !item.deleted) {
 						grown.push({ hashKey: item.hashKey, keyEstBytes });
 					}
@@ -623,11 +627,11 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	}
 
 	/**
-	 * The clock of this partition, in milliseconds. Read at each use, so a test can replace it on one
-	 * instance and avoid global mocks.
+	 * The clock, the timers, and the random values of this Durable Object. The constructor reads it
+	 * once, before the fields of a subclass exist.
 	 */
-	fokosNow(): number {
-		return Date.now();
+	protected fokosPlatform(_ctx: DurableObjectState): FokosPlatform {
+		return systemPlatform;
 	}
 }
 

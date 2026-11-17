@@ -4,6 +4,7 @@ import type { FokosDBPartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { FokosScheduler, type FokosSchedulerDeps } from "./scheduler.js";
 import { FokosShardingStore } from "./sharding-store.js";
+import { systemPlatform } from "./platform.js";
 import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 
 const FALLBACK_MS = 60_000;
@@ -37,6 +38,7 @@ async function withScheduler(
 		};
 		const scheduler = new FokosScheduler({
 			storage: state.storage,
+			platform: systemPlatform,
 			store,
 			fallbackAlarmMs: () => FALLBACK_MS,
 			fastPathDelayMs: () => 0,
@@ -163,6 +165,7 @@ describe("FokosScheduler - failure backoff", () => {
 			];
 			const scheduler = new FokosScheduler({
 				storage: state.storage,
+				platform: systemPlatform,
 				store,
 				fallbackAlarmMs: () => FALLBACK_MS,
 				fastPathDelayMs: () => 0,
@@ -225,6 +228,7 @@ describe("FokosScheduler - failure backoff", () => {
 			store.putJobs({ good: { nextRunAt: 0 } });
 			const scheduler = new FokosScheduler({
 				storage: state.storage,
+				platform: systemPlatform,
 				store,
 				fallbackAlarmMs: () => FALLBACK_MS,
 				fastPathDelayMs: () => 0,
@@ -323,6 +327,7 @@ describe("FokosScheduler - lifecycle reads", () => {
 			const jobs = [job("first"), job("second")];
 			const scheduler = new FokosScheduler({
 				storage: state.storage,
+				platform: systemPlatform,
 				store,
 				fallbackAlarmMs: () => FALLBACK_MS,
 				fastPathDelayMs: () => 0,

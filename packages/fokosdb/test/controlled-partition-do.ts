@@ -10,6 +10,7 @@
  * The class adds no behavior of its own: `FokosDBPartitionDO` does all the work, and each override only
  * holds, counts, answers, or fails one call, or replaces one tuning value.
  */
+import { systemPlatform, type FokosPlatform } from "../src/sharding/platform.js";
 import { FokosDBPartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
 import type { FokosRuntimeConfigOverrides } from "../src/sharding/runtime-config.js";
@@ -169,6 +170,17 @@ export class ControlledPartitionDO extends FokosDBPartitionDO {
 	}
 
 	// The constructor of FokosDBPartitionDO reads both methods below, before the fields of this class exist.
+	/** The clock of this instance. A test replaces it with `vi.spyOn(instance, "testNow")`. */
+	testNow(): number {
+		return Date.now();
+	}
+
+	// The constructor of the base class reads it before the fields of this class exist. The clock reads
+	// `testNow` at each call, so a spy on one instance changes only that instance.
+	protected override fokosPlatform(): FokosPlatform {
+		return { ...systemPlatform, now: () => this.testNow() };
+	}
+
 	protected override fokosConfig(): PartitionDOConfigOverrides {
 		return #config in this ? this.#config : super.fokosConfig();
 	}
