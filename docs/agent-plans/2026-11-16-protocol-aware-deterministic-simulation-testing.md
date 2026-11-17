@@ -86,7 +86,7 @@ non-determinism, it reads the protocol state of every node, and it checks invari
 | Item | Reason |
 | --- | --- |
 | Storage faults (a failed `put`, a reset during a storage call) | They need more patches of `ctx.storage`. A later version can add them. |
-| A simulator in Node.js with a copy of the Durable Object platform | It is 3 to 6 weeks of work. Build it only if the workerd simulator is too slow. |
+| A simulator in Node.js with a copy of the Durable Object platform | A lot of custom work. Build it only if the workerd simulator is too slow. |
 | Mutation testing of `src/` | The seeded defects of section 4.2.9 come first. |
 | Cost goldens (RPCs by method, `rowsWritten`, steps to heal) | Add them when the checkers are stable. |
 | Splits, migration and promotion before milestone M6 | The Fork API of workerd replaces the migration flow. Tests of the current flow have a short life. |
@@ -112,7 +112,7 @@ non-determinism, it reads the protocol state of every node, and it checks invari
 | M4 | The topology admin: `fokosInspect` on the admin Durable Object, its checkers and its quiescence. | `src/`, `test/` |
 | M5 | Materialization, GSIs and push targets: `fokosInspect` on the materialization Durable Object, the checkers of guarantee 1f. | `src/`, `test/` |
 | M6 | Splits, migration and promotion, after the Fork API replaces the migration flow. | `test/` |
-| Fix | A runtime fault on the hop to the coordinator, a reset included, answers the retryable `transaction_undecided` (section 4.2.11). | `src/` |
+| Fix (DONE) | A runtime fault on the hop to the coordinator, a reset included, answers the retryable `transaction_undecided` (section 4.2.11). | `src/` |
 
 Each milestone is useful alone. M1 and M2 change no behavior. M3 finds 2PC defects before M4 starts. The fix is
 independent of the other milestones.
