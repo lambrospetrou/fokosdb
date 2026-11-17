@@ -307,6 +307,7 @@ describe("Repartition — initialization and cutover", () => {
 			const participant = new TransactionParticipant({
 				store,
 				routingHashForKey: P,
+				now: () => Date.now(),
 				maxClockSkewMs: () => 0,
 				staleTransactionMs: () => DEFAULT_STALE_TRANSACTION_MS,
 				// The range root owns every key of the promoted hash key.

@@ -1,3 +1,4 @@
+import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
 import { DurableObject } from "cloudflare:workers";
 import type { DataKind, OperationMetrics, QuerySelect, ReturnValuesOnConditionCheckFailure, WirePartitionMeta } from "../shared/types.js";
 import type { ConditionExpression, ProjectionExpression, QueryExpressions } from "../shared/expression/types.js";
@@ -450,6 +451,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * `partition_init_failed` and `alarm` re-arms at `INIT_RETRY_ALARM_MS`.
 	 */
 	#initError?: unknown;
+	readonly #platform: FokosPlatform;
 	/**
 	 * Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
 	 * non-blocking from the constructor, so it may be undefined for the first few
@@ -466,6 +468,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.#platform = this.fokosPlatform(ctx);
 		this.#actorId = ctx.id.toString();
 		// The runtime is created after this store. The callbacks run only when a statement or a
 		// decision needs the answer.
@@ -494,7 +497,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		});
 		this.#participant = new TransactionParticipant({
 			store: this.#store,
-			now: () => this.fokosNow(),
+			now: () => this.#platform.now(),
 			maxClockSkewMs: () => this.config().maxClockSkewMs,
 			staleTransactionMs: () => this.config().staleTransactionMs,
 			ownerCheck: () => this.fokos.ownerCheck(),
@@ -506,6 +509,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			ownerCheck: () => ownsByHashKey(this.fokos.ownerCheck()),
 			logParams: () => this.logParams(),
 			config: () => this.config().ttlSweep,
+			platform: this.#platform,
 		});
 		this.#exporter = new MaterializationExporter({
 			store: this.#store,
@@ -522,12 +526,14 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					});
 				});
 			},
-			now: () => this.fokosNow(),
+			now: () => this.#platform.now(),
 			logParams: () => this.logParams(),
+			platform: this.#platform,
 		});
 		const topologyCache = new TopologyCacheMemo(
 			(promise) => ctx.waitUntil(promise),
 			(policy) => policy.ns,
+			this.#platform,
 		);
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
@@ -539,6 +545,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
 			hostInitError: () => this.#initError,
+			platform: this.#platform,
 			// The table options select both. The runtime asks only after this partition has its identity.
 			adminOutbox: () => adminOutboxFor(this.fokos.routeContext(), this.fokos.routeContext().policy.ns),
 			topologyCache: () =>
@@ -566,7 +573,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
 		// It swallows the errors, because telemetry must never affect the lifecycle of the DO.
-		setTimeout(() => {
+		this.#platform.setTimeout(() => {
 			void this.fokosGetColoInfo()
 				.then((info) => {
 					this.#_coloInfo = info;
@@ -728,7 +735,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			errorProps: this.#initError,
 		});
 		try {
-			await this.ctx.storage.setAlarm(Date.now() + INIT_RETRY_ALARM_MS);
+			await this.ctx.storage.setAlarm(this.#platform.now() + INIT_RETRY_ALARM_MS);
 		} catch {}
 	}
 
@@ -783,6 +790,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			...table,
 			stub: (ctx, doName) => materializationStubByName(this.env, ctx, doName),
 			routingHashSeedResolver: this.#seedResolver,
+			platform: this.#platform,
 		});
 		this.#materialization = { routeCtx: self, client };
 		return client;
@@ -855,11 +863,11 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	/**
-	 * The clock of the transaction locks and of the stale transaction recovery, in milliseconds. Read at
-	 * each use, so a test can replace it on one instance and avoid global mocks.
+	 * The clock, the timers, and the random values of this Durable Object. The constructor reads it
+	 * once, before the fields of a subclass exist.
 	 */
-	fokosNow(): number {
-		return Date.now();
+	protected fokosPlatform(_ctx: DurableObjectState): FokosPlatform {
+		return systemPlatform;
 	}
 
 	/**
@@ -1032,7 +1040,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					const response = this.#participant.prepareLocal(req);
 					// The lock is durable, so its recovery deadline must be too, even when the coordinator never returns.
 					if (response.outcome === "accepted") {
-						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.fokosNow() + this.config().staleTransactionMs }] });
+						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.#platform.now() + this.config().staleTransactionMs }] });
 						return this.ownAnswer(response);
 					}
 					// This partition rejected each rejected operation, and it is the first entry of its own list.
@@ -1147,7 +1155,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 								? await this.fokos.dispatch("txCommit", ctx, {
 										transactionId: req.transactionId,
 										// Prepare writes one timestamp to every row of the transaction.
-										transactionTimestamp: pendingRows[0]?.transaction_ts ?? txOrderTimestampNow(),
+										transactionTimestamp: pendingRows[0]?.transaction_ts ?? txOrderTimestampNow(this.#platform.now()),
 										items,
 									})
 								: await this.fokos.dispatch("txCancel", ctx, { transactionId: req.transactionId, items });
@@ -1366,13 +1374,13 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			data: item.data,
 			kind: item.kind,
 			ttlAt: item.ttlAt ?? null,
-			txOrderTs: txOrderTimestampNow(),
+			txOrderTs: txOrderTimestampNow(this.#platform.now()),
 		});
 	}
 
 	/** The delete stamps the transaction order watermark, as a transactional delete does. */
 	private deleteNow(routingHash: RoutingHash, hashKey: KeyBytes, sortKey: KeyBytes) {
-		return this.#store.deleteItem({ routingHash, hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
+		return this.#store.deleteItem({ routingHash, hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow(this.#platform.now()) });
 	}
 
 	/**
@@ -1833,13 +1841,13 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 * key again in the same synchronous block as the write.
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
-		const startedAt = this.fokosNow();
+		const startedAt = this.#platform.now();
 		const deadline = startedAt + STALE_RECOVERY_STEP_BUDGET_MS;
 		// Each iteration claims one transaction and then asks its coordinator. A transaction that the
 		// step does not reach keeps its place.
 		const { staleLockScanRows } = this.config();
 		for (let claimed = 0; claimed < staleLockScanRows; claimed++) {
-			if (this.fokosNow() >= deadline) {
+			if (this.#platform.now() >= deadline) {
 				return;
 			}
 			// FIXME: claim a batch of transactions in one storage transaction and drive them concurrently,
@@ -1882,7 +1890,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				} else if (result.state === "CANCELLED") {
 					await this.fokos.dispatch("txCancel", ctx, { transactionId: row.transaction_id, items });
 				} else if (result.state === "not_found") {
-					const now = this.fokosNow();
+					const now = this.#platform.now();
 					const lockCreatedAt = Math.min(...ownedRows.map((pending) => pending.created_at));
 					const lockAgeMs = now - lockCreatedAt;
 					if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {

@@ -49,6 +49,7 @@ import type {
 } from "../../src/sharding/repartition-types.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { promotedRoutingHashOf } from "../../src/sharding/repartition-slice.js";
+import { systemPlatform } from "../../src/shared/platform.js";
 
 export const kb = (s: string) => KeyCodec.encode(s);
 
@@ -241,6 +242,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			sharding.getIdentity() ??
 			partitionIdentityFrom(ctx, testRoutingHashSeedResolver, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
 		return {
+			platform: systemPlatform,
 			// A target exists as soon as its source names it, exactly as a real DO does: a Durable Object
 			// is created by the first call that reaches it, not registered in advance.
 			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,

@@ -5,6 +5,7 @@
 **Author:** Lambros Petrou
 **Status:** Not built. The open questions are decided, and the decisions are in the body. The expression compile
 (4.2.1) and the stable sharding API (4.2.14, 4.2.15, 4.2.16, 4.2.18) are later work.
+**Change:** `fokosNow()` is replaced by `fokosPlatform(ctx)`. Refer to [the DST spec](../agent-plans/2026-11-16-protocol-aware-deterministic-simulation-testing.md).
 
 ## Table of Contents
 

@@ -1,3 +1,4 @@
+import type { FokosPlatform, FokosTimer } from "./platform.js";
 import invariant from "./invariant.js";
 
 export function assertExists<T>(val: T | undefined | null): asserts val is T {
@@ -30,8 +31,11 @@ export function isArray(value: unknown): value is readonly unknown[] {
  *
  * It does not read the clock, because the Workers runtime does not advance `Date.now()` while code runs.
  */
-export function throttleTrailing(fn: () => void): { schedule(ms: number): void; cancel(): void; forceRun(): void } {
-	let timer: ReturnType<typeof setTimeout> | undefined;
+export function throttleTrailing(
+	platform: FokosPlatform,
+	fn: () => void,
+): { schedule(ms: number): void; cancel(): void; forceRun(): void } {
+	let timer: FokosTimer | undefined;
 	const run = () => {
 		timer = undefined;
 		fn();
@@ -42,11 +46,11 @@ export function throttleTrailing(fn: () => void): { schedule(ms: number): void; 
 		},
 		schedule(ms: number) {
 			if (timer === undefined) {
-				timer = setTimeout(run, ms);
+				timer = platform.setTimeout(run, ms);
 			}
 		},
 		cancel() {
-			clearTimeout(timer);
+			platform.clearTimeout(timer);
 			timer = undefined;
 		},
 	};

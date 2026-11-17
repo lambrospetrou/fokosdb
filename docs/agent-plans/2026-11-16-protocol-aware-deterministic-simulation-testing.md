@@ -161,11 +161,13 @@ interface FokosPlatform {
   clearTimeout(t: FokosTimer): void;
   wait(ms: number): Promise<void>;
   randomId(): string; // replaces crypto.randomUUID().replaceAll("-", "")
+  random(): number; // replaces Math.random in the retry backoff
 }
 export const systemPlatform: FokosPlatform;
 ```
 
-- `systemPlatform` uses `Date.now`, `setTimeout`, `clearTimeout`, `scheduler.wait` and `crypto.randomUUID`.
+- `systemPlatform` uses `Date.now`, `setTimeout`, `clearTimeout`, `scheduler.wait`, `crypto.randomUUID` and
+  `Math.random`.
 - Each Durable Object class gets an overridable method `fokosPlatform(ctx)` that returns `systemPlatform`. It replaces
   `fokosNow()`. The class keeps the result in a private field: `#platform = this.fokosPlatform(ctx)`.
 - The method reads only `ctx`, because the base constructor calls it before the fields of a subclass exist.
@@ -176,17 +178,38 @@ export const systemPlatform: FokosPlatform;
 - `FokosDB` gets an optional `platform` option. It uses the platform for the transaction ID, the deadlines and the
   retry backoff.
 - `keyPairSeed` in `src/sharding/key-codec.ts` stays as it is, outside the platform. Section 4.2.1.1 tells why.
+- The `error_id` of an error (`newErrorId` in `src/shared/errors.ts`) stays on `crypto.randomUUID`. It is only a
+  name, no decision reads it, and the checkers ignore it.
+- `jitterBackoff` and `tryWhile` of `durable-utils/retries` read `Math.random` and the global `setTimeout`. The
+  library uses its own copies in `src/sharding/retries.ts`, which take the platform. When `durable-utils` accepts
+  these dependencies as arguments, the copies go and the call sites import `durable-utils` again.
 - The platform is one object for each Durable Object, not a module global. Each Durable Object then has its own clock,
   which can be skewed, and each timer belongs to one Durable Object.
+- No wrapper replaces the globals of the runtime (`Date.now`, `setTimeout`, `Math.random`) while a callback runs.
+  In vitest all Durable Objects and the test share one `globalThis`. A callback that awaits lets the requests of other
+  Durable Objects run while the replacement is in place, and they then read the wrong clock, timers and random values.
+- `FokosTimer` is a number, because the Workers runtime returns a number from `setTimeout`. `clearTimeout` accepts
+  `undefined`, as the global does.
+- The topology cache gets its clock and its fetch timeout from the platform of its caller. The timeout is an
+  `AbortController` with a platform timer, in place of `AbortSignal.timeout`.
+- The loop in `fokosDestroy` that clears all timers stays on the globals. It clears the real timers of the isolate,
+  and `ctx.abort` follows it.
+- A test that sets the clock of one instance overrides `fokosPlatform` in a test subclass
+  (`ControlledPartitionDO`, `ControlledTransactionCoordinatorDO`). The returned platform reads `testNow()` of the
+  instance at each call, so `vi.spyOn(instance, "testNow")` changes the clock after the constructor ran.
+- M1 adds only a small sanity test of the platform (`src/sharding/retries.test.ts`). The tests that set the clock
+  through `testNow` show the wiring, and the full suite shows that the behavior did not change.
 
 The call sites today:
 
 | API | Call sites |
 | --- | --- |
-| `Date.now()` | `src/sharding/scheduler.ts`, `src/sharding/sharding-store.ts` (`learnRangeBoundary`), `src/shared/transaction-limits.ts` (`txOrderTimestampNow`), a deadline helper in `src/server/do-transaction-coordinator.ts`, the `setAlarm` calls |
-| `setTimeout` | the scheduler fast path, `TtlExpiry`, `src/server/do-partition.ts` |
+| `Date.now()` | `src/sharding/scheduler.ts`, `src/sharding/sharding-store.ts` (`learnRangeBoundary`), `src/shared/transaction-limits.ts` (`txOrderTimestampNow`), a deadline helper in `src/server/do-transaction-coordinator.ts`, the `setAlarm` calls, `src/sharding/runtime.ts`, `src/sharding/repartition-flow.ts`, `src/sharding/topology-cache.ts`, `src/sharding/topology-keeper.ts`, the deadlines in `src/client/db.ts` |
+| `setTimeout` | the scheduler fast path, `TtlExpiry`, `src/server/do-partition.ts`, `throttleTrailing` in `src/shared/tsutils.ts`, the admin outbox in the runtime, the call timeouts of the exporter and of `TargetRunner`, the batch retry in `src/client/fokos-std.ts` |
+| `AbortSignal.timeout` | the topology fetch in `src/sharding/topology-cache.ts` |
 | `scheduler.wait` | `TtlExpiry`, the materialization exporter, `TargetRunner`, the early start of the alarm in the runtime |
-| `crypto.randomUUID()` | the transaction ID, the `error_id` of each error |
+| `crypto.randomUUID()` | the transaction ID, the `error_id` of each error (which stays as it is) |
+| `Math.random` | `jitterBackoff` and `tryWhile` of `durable-utils/retries`: `FokosShardingClient`, the admin outbox, `RepartitionFlow`, the batch retry |
 | `crypto.getRandomValues` | `keyPairSeed` in `src/sharding/key-codec.ts`, which stays as it is (section 4.2.1.1) |
 
 M1 must find every call site again with a search, because this table can be incomplete.

@@ -1,8 +1,9 @@
-import { tryWhile } from "durable-utils/retries";
 import { isDestroyAbortError } from "../shared/cf-utils.js";
 import { FokosError, type FokosCodeDef } from "../shared/errors.js";
 import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
+import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
+import { tryWhile } from "./retries.js";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
 import { routingHashOf, type RoutingHash, type RoutingHashSeedResolver } from "./hash-primitives.js";
@@ -60,6 +61,8 @@ export type FokosShardingClientOptions<TPolicy> = {
 	 * own its key. Default: `defaultRoutingHashSeedResolver`.
 	 */
 	routingHashSeedResolver?: RoutingHashSeedResolver;
+	/** The clock and the timers of the retry backoff. Default `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 /** The cost of one client call over every attempt. */
@@ -145,6 +148,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	#router: FokosRouter<TPolicy>;
 	#stub: FokosShardingClientOptions<TPolicy>["stub"];
 	#retry: FokosRetryPolicy | undefined;
+	readonly #platform: FokosPlatform;
 	#firstRoot: FokosRouteContext<TPolicy> | undefined;
 	#topologyCache: FokosTopologyCacheOptions | undefined;
 	/** The fallback of each entry that came from the topology, by the context object that `resolve` returned. */
@@ -154,6 +158,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		this.#router = new FokosRouter(opts.topology, opts.rangeConfig, opts.policy, opts.policyVersion, opts.routingHashSeedResolver);
 		this.#stub = opts.stub;
 		this.#retry = opts.retry;
+		this.#platform = opts.platform ?? systemPlatform;
 		this.#topologyCache = opts.topologyCache;
 	}
 
@@ -364,7 +369,10 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		const policy = opts?.retry ?? this.#retry;
 		try {
 			const result = policy
-				? await tryWhile(attempt, policy.shouldRetry, { baseDelayMs: policy.baseDelayMs ?? 100, maxDelayMs: policy.maxDelayMs ?? 2_000 })
+				? await tryWhile(this.#platform, attempt, policy.shouldRetry, {
+						baseDelayMs: policy.baseDelayMs ?? 100,
+						maxDelayMs: policy.maxDelayMs ?? 2_000,
+					})
 				: await attempt();
 			return { ...this.#router.unwrap(result), ...cost };
 		} catch (e) {

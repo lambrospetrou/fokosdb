@@ -1,4 +1,5 @@
-import { jitterBackoff } from "durable-utils/retries";
+import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
+import { jitterBackoff } from "../sharding/retries.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type {
 	BatchGetItemKey,
@@ -27,7 +28,7 @@ export class FokosDBStd {
 	 * Calls `db.batchGetItems` with every key, then again with `unprocessedKeys` and the `projection` and
 	 * `maxResponseBytes` of the request, until no key stays unprocessed or the calls reach
 	 * `retry.maxAttempts`. Before each retry it waits a random time with exponential backoff
-	 * (`retry.baseDelayMs`, `retry.maxDelayMs`).
+	 * (`retry.baseDelayMs`, `retry.maxDelayMs`). The random values and the wait come from `db.platform`.
 	 *
 	 * The result has the positions of the first request: `items[i]` is the last answer for `opts.items[i]`.
 	 * `meta` joins the `meta` of every call. A key that is still unprocessed after the last call stays in
@@ -43,6 +44,7 @@ export class FokosDBStd {
 		const { projection, maxResponseBytes } = opts as BatchGetItemsOptions;
 		const { results, unprocessed, meta } = await retryBatch<BatchGetItemKey, BatchGetItemResult>(
 			policy,
+			db.platform ?? systemPlatform,
 			opts.items as readonly BatchGetItemKey[],
 			async (items) => {
 				const answer = await db.batchGetItems({ items, projection, maxResponseBytes });
@@ -69,6 +71,7 @@ export class FokosDBStd {
 		const policy = resolveRetryOptions(retry);
 		const { results, unprocessed, meta } = await retryBatch<BatchWriteItem, BatchWriteItemResult>(
 			policy,
+			db.platform ?? systemPlatform,
 			opts.items,
 			async (items) => {
 				const answer = await db.batchWriteItems({ items });
@@ -127,6 +130,7 @@ export class FokosDBStd {
  */
 async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	retry: Required<FokosDBRetryOptions>,
+	platform: FokosPlatform,
 	entries: readonly Entry[],
 	call: (entries: Entry[]) => Promise<{ results: Result[]; meta: FokosMeta }>,
 	again: (result: Result) => boolean,
@@ -154,7 +158,7 @@ async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 			break;
 		}
 		// The first retry is retry 0 of the backoff.
-		await new Promise((resolve) => setTimeout(resolve, jitterBackoff(calls - 1, retry.baseDelayMs, retry.maxDelayMs)));
+		await platform.wait(jitterBackoff(platform, calls - 1, retry.baseDelayMs, retry.maxDelayMs));
 		positions = next;
 	}
 	return {

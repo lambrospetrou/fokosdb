@@ -87,7 +87,7 @@ type CoordinatorInternals = {
 	/** The public RPC: it goes through the runtime, admission included. */
 	initiateWrite(ctx: FokosDBRouteContext, request: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>>;
 	fokos: FokosDBTransactionCoordinatorDO["fokos"];
-	fokosNow(): number;
+	testNow(): number;
 	hooks(): FokosShardingHooks<FokosDBPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
 	recoverTransactionLocal(routingHash: RoutingHash, transactionId: string): Promise<unknown>;
@@ -562,7 +562,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	it("drives the due transactions in next_recovery_at order and moves each one forward", async () => {
 		await withCoordinator(async (tc, state) => {
 			const now = Date.now();
-			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			vi.spyOn(tc, "testNow").mockReturnValue(now);
 			state.storage.sql.exec(`DELETE FROM tc_state`);
 			for (const [transactionId, createdAt] of [
 				["tx-later", now - 40_000],
@@ -611,7 +611,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 	it("keeps the place of a due transaction that the step does not reach before its budget ends", async () => {
 		await withCoordinator(async (tc, state) => {
 			const now = Date.now();
-			const clock = vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			const clock = vi.spyOn(tc, "testNow").mockReturnValue(now);
 			state.storage.sql.exec(`DELETE FROM tc_state`);
 			insertState(tc, state, { token: "token-first", transactionId: "tx-first", state: "COMMITTING", createdAt: now - 60_000 });
 			insertState(tc, state, { token: "token-second", transactionId: "tx-second", state: "COMMITTING", createdAt: now - 50_000 });
@@ -654,7 +654,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			seed(tc, state, "PREPARING");
 			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
 			const now = Date.now();
-			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			vi.spyOn(tc, "testNow").mockReturnValue(now);
 
 			await expect(tc.recoverTransactionLocal(P(tc), TX_ID)).resolves.toEqual({ state: "driving" });
 
@@ -1571,7 +1571,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	it("deletes one batch and runs again at once while expired rows remain", async () => {
 		await withCoordinator(async (tc, state) => {
-			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "testNow").mockReturnValue(BASE_TIME);
 			for (let i = 0; i < DEFAULT_COORDINATOR_CONFIG.sweepBatchRows + 3; i++) {
 				insertState(tc, state, {
 					token: `expired-${i}`,
@@ -1595,7 +1595,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	// and unswept.
 	it("deletes the images of every transaction it sweeps, and leaves the rest alone", async () => {
 		await withCoordinator(async (tc, state) => {
-			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "testNow").mockReturnValue(BASE_TIME);
 			insertState(tc, state, {
 				token: "expired-token",
 				transactionId: "tx-expired",
@@ -1629,7 +1629,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	// one transaction ID show that each scan changes only the row it selected.
 	it("uses the full transaction key of each row that the recovery and the sweep scans select", async () => {
 		await withCoordinator(async (tc, state) => {
-			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "testNow").mockReturnValue(BASE_TIME);
 			state.storage.sql.exec(`DELETE FROM tc_state`);
 			const [due, notDue, expired, live] = ["due-token", "not-due-token", "expired-token", "live-token"];
 			expect(new Set([due, notDue, expired, live].map((token) => P(tc, token).join())).size).toBe(4);
@@ -1668,7 +1668,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	it("reports the next expiry as the deadline of the sweep until the last completed row expires", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
-			vi.spyOn(tc, "fokosNow").mockImplementation(() => now);
+			vi.spyOn(tc, "testNow").mockImplementation(() => now);
 			insertState(tc, state, {
 				token: "idle-token",
 				transactionId: "idle-tx",
@@ -1690,7 +1690,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 
 	it("treats a token as a new transaction after its completed row expires", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
-			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "testNow").mockReturnValue(BASE_TIME);
 			const oldTransactionId = "expired-replay-tx";
 			insertState(tc, state, {
 				token: TOKEN,
@@ -1712,7 +1712,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	it("drives up to recoveryConcurrentDrives transactions at the same time, so a drive that waits does not stop the others", async () => {
 		await withCoordinator(async (tc, state) => {
 			const now = Date.now();
-			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			vi.spyOn(tc, "testNow").mockReturnValue(now);
 			state.storage.sql.exec(`DELETE FROM tc_state`);
 			const ids = Array.from({ length: 10 }, (_, i) => `tx-${i}`);
 			ids.forEach((transactionId, i) =>
@@ -1749,7 +1749,7 @@ describe("FokosDBTransactionCoordinatorDO - idempotency sweep", () => {
 	it("runs the sweep job after the recovery job exhausts its budget", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
-			vi.spyOn(tc, "fokosNow").mockImplementation(() => now);
+			vi.spyOn(tc, "testNow").mockImplementation(() => now);
 			insertState(tc, state, {
 				token: "recover-1",
 				transactionId: "recover-tx-1",
