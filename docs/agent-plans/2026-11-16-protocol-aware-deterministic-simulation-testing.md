@@ -240,7 +240,7 @@ These workerd facts set the shape of the wrapper. Scratch tests verified each on
 | A constructor can return a `Proxy`. RPC methods, getters, `fetch`, thrown errors with own properties, and calls between Durable Objects go through its `get` trap. | The wrapper can observe every entry point. |
 | When a base class returns the `Proxy`, the `#private` fields of the subclass go on the `Proxy` and the fields of the base class go on the target. Internal `this.x()` calls also go through the trap. | The `Proxy` must wrap the final class, after the whole object exists, and each method must run with `this` set to the real object. |
 | RPC refuses a method that is an own property of the instance. The vitest plugin refuses a method that exists only in the trap. | Each control method must be a method on the prototype of the wrapper. |
-| A promise that a Durable Object made cannot be resolved from the test context: "Cannot perform I/O on behalf of a different Durable Object". | The simulator releases a held call with an RPC into the Durable Object that holds it. |
+| A promise that a Durable Object made cannot be resolved from the test context. The call does not throw, but the request never continues, and vitest reports "Cannot perform I/O on behalf of a different Durable Object". A later release by RPC gets "Promise will never complete". | The simulator releases a held call only with an RPC into the Durable Object that holds it. This error stops the run with a timeout, and not with a failure. |
 | `super()` refuses a `Proxy` of `ctx`: "constructor parameter 1 is not of type 'DurableObjectState'". | The wrapper patches `setAlarm`, `getAlarm` and `deleteAlarm` on the real `ctx.storage` with `Object.defineProperty`. This also stops the real alarm. |
 | `stub.alarm()` throws "'alarm' is a reserved method". | `__dstAlarm()` calls `alarm()` inside the Durable Object. |
 | `ctx.abort()` from an RPC throws in that call. A new stub then gets a new instance, and the SQLite rows stay. On a coordinator, the full suite passes, with no hang of the workers pool. | `__dstRestart()` is a restart fault for every class. |
@@ -287,6 +287,25 @@ clock fault changes the skew. The clock of one Durable Object never goes back.
 
 **Isolation.** Each run uses new table names. The simulator knows each Durable Object of the run because each wrapper
 registers its name when it starts.
+
+**The registry.** The wrappers write the pending messages, the gates and the counters of the requests into module
+state, and the simulator reads them there. A step ends when the counters show that no request runs. The wrapper can
+also resolve a promise of the simulator, so the simulator can wait for a signal in place of a poll.
+
+**The vitest plugin.** These facts set the shape of the simulator. Scratch tests verified each one on workerd
+1.20260923.1, `@cloudflare/vitest-plugin` 1.2.7 and vitest 4.1.11:
+
+| Fact | Consequence |
+| --- | --- |
+| The test context, each Durable Object, and each call between Durable Objects use one module instance and one `globalThis`. A test that imports the `main` module gets the module of the bindings. | The registry is module state. No RPC reads it. |
+| A Durable Object can resolve a promise that the test context made. | The wrapper can signal the end of a step to the simulator. |
+| A wrapped `env` in `super()` works. A held request and its held reply continue after a release RPC. A virtual timer that a release RPC fires can send an RPC after the release RPC returns. | The wrapper of section 4.2.2 works under the plugin. |
+| After `ctx.abort()`, the gates of the old instance stay in module state, and the new instance uses the same module state. A release of an old gate from the new instance gets "Cannot perform I/O on behalf of a different Durable Object". | The registry keys each gate by the instance. A restart removes the gates of the old instance, and nothing resolves them. |
+| A rejected promise with no handler is an unhandled error for vitest. vitest then exits with code 1, also when each test passes. | The simulator attaches a handler to each promise when it makes it, for example the promise of a client call that a restart rejects. |
+| Each `ctx.abort()` writes `uncaught exception` and `outputGateBroken` from workerd to the log. The run does not fail. | The log capture ignores these lines. They are not the cause of a recovery. |
+| `vi.spyOn(console, "log")` in the test context gets the log lines of each Durable Object. | The log capture of section 4.2.7 needs no change in `src/`. |
+| A request that arrives while a Durable Object waits in a loop of 200 `storage.put` calls runs after the loop. | An `await` on storage is not a point of a switch (section 6, question 2). |
+| Each test file has its own module state, its own Durable Object instances and its own storage, also with `--max-workers=1`. | A DST file shares no state with other files. It needs no vitest project of its own. Other files change only the wall time. |
 
 #### 4.2.4 Faults
 
@@ -427,21 +446,10 @@ with no runtime marker stays `foreign_error`.
 The names `__dstRelease`, `__dstFireTimer`, `__dstAlarm` and `__dstRestart` are placeholders. A name must not clash
 with a method of a Durable Object class.
 
-#### 4.3.2 The pending-message registry
-
-The simulator must see the pending messages of each Durable Object. Option 1: module state that the wrapper writes and
-the test context reads, because both run in one isolate under the vitest plugin. Option 2: an RPC `__dstPending()` on
-each Durable Object. M3 starts with a test of option 1.
-
-#### 4.3.3 The nightly run
+#### 4.3.2 The nightly run
 
 No workflow runs the tests today. Options: add a scheduled GitHub workflow, or run the long run by hand before a
 release.
-
-#### 4.3.4 Parallel test files
-
-The vitest plugin can run test files at the same time. Other files do not use the tables of a DST run, but they share
-the isolate and its timers. M3 checks whether the DST suite needs a vitest project of its own.
 
 ## 5. Alternative options
 
