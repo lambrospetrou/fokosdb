@@ -33,6 +33,7 @@ export type {
 	FokosRangeVisit,
 	FokosRepartitionPlan,
 	FokosRequestPromotionResult,
+	FokosRuntimeInspect,
 	FokosRuntimeOptions,
 	FokosShardingHooks,
 	FokosSignals,

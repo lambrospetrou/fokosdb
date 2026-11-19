@@ -465,3 +465,15 @@ export type FokosRequestPromotionResult = { owner: FokosPartitionRef } & (
 	/** A split row exists on the owner, so the key moves soon. */
 	| { queued: false; reason: "split_in_progress" }
 );
+
+/** The protocol state that the runtime owns, as `FokosShardingRuntime.inspect` gives it. */
+export type FokosRuntimeInspect = {
+	/** `importing` while the import of the partition is not complete, `router` after the split cutover, else `leaf`. */
+	repartition: { role: "leaf" | "router" | "importing"; phase?: "queued" | "planned" | "cutover"; children?: string[] };
+	/** Each job that can run and has a deadline, as the next pass of the scheduler reads it. */
+	jobs: { kind: string; dueAt: number }[];
+	/** The armed alarm, or null. */
+	alarmAt: number | null;
+	/** Empty when the alarm is armed at or before the earliest job. Not checked while a pass runs or after the destroy fence. */
+	alarmViolations: string[];
+};

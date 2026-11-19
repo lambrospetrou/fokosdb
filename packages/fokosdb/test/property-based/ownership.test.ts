@@ -64,6 +64,7 @@ function assertOwnershipAgrees<TPolicy, Ops extends FokosOperationSpec>(
 		config: () => DEFAULT_RUNTIME_CONFIG,
 		routingHashSeedResolver: testRoutingHashSeedResolver,
 		platform: systemPlatform,
+		ensureAlarmSet: notUsed,
 	};
 	const source = new RepartitionSource(new FokosShardingStore(storage), deps);
 	expect(fokos.lifecycle().role).toBe("router");
