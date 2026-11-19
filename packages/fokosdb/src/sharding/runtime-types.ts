@@ -17,6 +17,7 @@ import type { FokosRuntimeConfigOverrides } from "./runtime-config.js";
 import type { ScanCursor } from "../shared/partition/partition-store.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { FokosTopologyCacheOptions } from "./topology-cache.js";
+import type { FokosPlatform } from "./platform.js";
 
 export type { RouteKey };
 
@@ -62,6 +63,8 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * one, a router uses its hash arena only.
 	 */
 	topologyCache?(this: void): FokosTopologyCacheOptions | undefined;
+	/** The clock, the timers, and the random values of the host. Absent: `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 export type FokosAdminOutbox = {
@@ -432,3 +435,15 @@ export type FokosRequestPromotionResult = { owner: FokosPartitionRef } & (
 	/** A split row exists on the owner, so the key moves soon. */
 	| { queued: false; reason: "split_in_progress" }
 );
+
+/** The protocol state that the runtime owns, as `FokosShardingRuntime.inspect` gives it. */
+export type FokosRuntimeInspect = {
+	/** `importing` while the import of the partition is not complete, `router` after the split cutover, else `leaf`. */
+	repartition: { role: "leaf" | "router" | "importing"; phase?: "queued" | "planned" | "cutover"; children?: string[] };
+	/** Each job that can run and has a deadline, as the next pass of the scheduler reads it. */
+	jobs: { kind: string; dueAt: number }[];
+	/** The armed alarm, or null. */
+	alarmAt: number | null;
+	/** Empty when the alarm is armed at or before the earliest job. Not checked while a pass runs or after the destroy fence. */
+	alarmViolations: string[];
+};

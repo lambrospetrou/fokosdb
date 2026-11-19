@@ -300,7 +300,7 @@ export async function holdPendingLock(
 	const res = await rpc.txPrepare(pCtx, {
 		transactionId,
 		coordinator: testCoordinatorRef(),
-		transactionTimestamp: txOrderTimestampNow(),
+		transactionTimestamp: txOrderTimestampNow(Date.now()),
 		items: [{ opIndex: 0, ...keys, ...item }],
 	});
 	expect(res).toMatchObject({ outcome: "accepted" });

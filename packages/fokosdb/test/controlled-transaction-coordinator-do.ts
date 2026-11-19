@@ -6,6 +6,7 @@
  * The class adds no behavior of its own: each override only holds, counts, or answers one call, or
  * replaces one tuning value.
  */
+import { systemPlatform, type FokosPlatform } from "../src/sharding/platform.js";
 import { FokosDBTransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
 import type { TransactionCoordinatorDOConfigOverrides } from "../src/server/host-config.js";
 import type { RecoverTransactionRequest, RecoverTransactionResult } from "../src/shared/transaction-wire-types.js";
@@ -45,6 +46,17 @@ export class ControlledTransactionCoordinatorDO extends FokosDBTransactionCoordi
 			await rule.held;
 		}
 		return rule.value;
+	}
+
+	/** The clock of this instance. A test replaces it with `vi.spyOn(instance, "testNow")`. */
+	testNow(): number {
+		return Date.now();
+	}
+
+	// The constructor of the base class reads it before the fields of this class exist. The clock reads
+	// `testNow` at each call, so a spy on one instance changes only that instance.
+	protected override fokosPlatform(): FokosPlatform {
+		return { ...systemPlatform, now: () => this.testNow() };
 	}
 
 	protected override fokosConfig(): TransactionCoordinatorDOConfigOverrides {

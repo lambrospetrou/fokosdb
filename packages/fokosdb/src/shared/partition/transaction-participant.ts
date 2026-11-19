@@ -245,7 +245,7 @@ function itemStampOf(read: ItemRead): ItemStamp | undefined {
 
 export type TransactionParticipantDeps = {
 	store: PartitionStore;
-	/** Injectable wall clock (epoch milliseconds) for skew/staleness tests; defaults to Date.now. */
+	/** The wall clock in epoch milliseconds. Default `Date.now`. */
 	now?: () => number;
 	/** A prepare whose timestamp is more than this far ahead of the local clock is rejected (clock_skew). Read at each prepare. */
 	maxClockSkewMs: () => number;
@@ -300,7 +300,7 @@ export class TransactionParticipant {
 		this.#now = deps.now ?? (() => Date.now());
 		this.#maxClockSkewMs = deps.maxClockSkewMs;
 		this.#staleTransactionMs = deps.staleTransactionMs;
-		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
+		this.#txOrderTimestamp = deps.txOrderTimestamp ?? (() => txOrderTimestampNow(this.#now()));
 		this.#ownerCheck = deps.ownerCheck;
 		this.#routingHashForKey = deps.routingHashForKey;
 	}

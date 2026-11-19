@@ -12,6 +12,7 @@
  * in flight (`is_call_open`). Two calls with the same epoch never carry the same item, because the
  * claim skips each key of a call in flight.
  */
+import { systemPlatform, type FokosPlatform, type FokosTimer } from "../../sharding/platform.js";
 import type { LatestImage } from "../../server/materialization/do-materialization.js";
 import { KeyCodec, KeyPairMap, type KeyBytes } from "../../sharding/key-codec.js";
 import type { RoutingHash } from "../../sharding/hash-primitives.js";
@@ -67,8 +68,10 @@ export type MaterializationExporterDeps = {
 	scheduleRetry: (runAt: number) => void;
 	now: () => number;
 	logParams: () => Record<string, unknown>;
-	/** The yield between two calls of a worker. Default: `scheduler.wait`. */
+	/** The yield between two calls of a worker. Default: `platform.wait`. */
 	wait?: (ms: number) => Promise<void>;
+	/** The timers of the call timeouts. Default `systemPlatform`. */
+	platform?: FokosPlatform;
 };
 
 /** The code of an item that a receiver refused because of the epoch of the call. */
@@ -85,6 +88,7 @@ type ClaimedCall = { call: ExportCall; keys: KeyPairMap<RoutingHash> };
 export class MaterializationExporter {
 	readonly #deps: MaterializationExporterDeps;
 	readonly #wait: (ms: number) => Promise<void>;
+	readonly #platform: FokosPlatform;
 	/** The running workers. Each worker sends at most one call at a time. */
 	readonly #workers = new Set<Promise<void>>();
 	/** A wake came after the last claim of a worker. A worker that claimed nothing then claims again. */
@@ -98,7 +102,9 @@ export class MaterializationExporter {
 
 	constructor(deps: MaterializationExporterDeps) {
 		this.#deps = deps;
-		this.#wait = deps.wait ?? (async (ms) => await scheduler.wait(ms));
+		this.#platform = deps.platform ?? systemPlatform;
+		const platform = this.#platform;
+		this.#wait = deps.wait ?? (async (ms) => await platform.wait(ms));
 	}
 
 	/** True while a worker runs. */
@@ -167,9 +173,9 @@ export class MaterializationExporter {
 	 */
 	async #send(call: ExportCall): Promise<ExportItemOutcome[] | null> {
 		const timeoutMs = this.#deps.config().callTimeoutMs;
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timer: FokosTimer | undefined;
 		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new Error(`the export call had no answer after ${timeoutMs} ms`)), timeoutMs);
+			timer = this.#platform.setTimeout(() => reject(new Error(`the export call had no answer after ${timeoutMs} ms`)), timeoutMs);
 		});
 		try {
 			const outcomes = await Promise.race([this.#deps.send(call), timeout]);
@@ -179,7 +185,7 @@ export class MaterializationExporter {
 			this.#logError("fokos/partition: a materialization export call has no answer", { epoch: call.epoch, error: String(error) });
 			return null;
 		} finally {
-			clearTimeout(timer);
+			this.#platform.clearTimeout(timer);
 		}
 	}
 

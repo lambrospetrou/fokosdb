@@ -29,6 +29,7 @@ import { makeTriggeredRangeRoot } from "../partition-do/partition-harness.js";
 import type { CounterPartitionDO } from "../sharding/counter-host.js";
 import { makeCounterTable, stub } from "../sharding/counter-table.js";
 import { propertyRuns } from "./harness.js";
+import { systemPlatform } from "../../src/sharding/platform.js";
 
 const PROPERTY_RUNS = propertyRuns(500);
 // A run has no I/O and takes a few milliseconds. The floor keeps the default limit of a test for a
@@ -60,6 +61,8 @@ function assertOwnershipAgrees<TPolicy, Ops extends FokosOperationSpec>(
 		scheduleWork: notUsed,
 		logParams: notUsed,
 		config: () => DEFAULT_RUNTIME_CONFIG,
+		platform: systemPlatform,
+		ensureAlarmSet: notUsed,
 	};
 	const source = new RepartitionSource(new FokosShardingStore(storage), deps);
 	expect(fokos.lifecycle().role).toBe("router");

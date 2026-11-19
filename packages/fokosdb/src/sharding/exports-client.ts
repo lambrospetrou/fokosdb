@@ -115,3 +115,5 @@ export {
 	isRuntimeRetryableError,
 } from "../shared/errors.js";
 export type { FokosErrorOrigin, FokosErrorWire } from "../shared/errors.js";
+export { systemPlatform } from "./platform.js";
+export type { FokosPlatform, FokosTimer } from "./platform.js";

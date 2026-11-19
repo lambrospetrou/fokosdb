@@ -8,6 +8,7 @@
  * it knows, and runs at most one pass at a time: a request or an alarm that arrives during a pass waits
  * for it and then gets one more pass.
  */
+import type { FokosPlatform, FokosTimer } from "./platform.js";
 import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 import type { FokosShardingStore } from "./sharding-store.js";
 
@@ -19,6 +20,7 @@ export const INIT_RETRY_ALARM_MS = 300_000;
 
 export type FokosSchedulerDeps = {
 	storage: DurableObjectStorage;
+	platform: FokosPlatform;
 	store: FokosShardingStore;
 	/** How far ahead a pass arms its fallback before its first transition. Read at each use. */
 	fallbackAlarmMs: () => number;
@@ -37,7 +39,8 @@ export class FokosScheduler {
 	readonly #deps: FokosSchedulerDeps;
 	#inFlight: Promise<void> | null = null;
 	#queued: Promise<void> | null = null;
-	#fastPath: ReturnType<typeof setTimeout> | null = null;
+	#arming = 0;
+	#fastPath: FokosTimer | null = null;
 
 	constructor(deps: FokosSchedulerDeps) {
 		this.#deps = deps;
@@ -73,7 +76,7 @@ export class FokosScheduler {
 		if (this.#fastPath !== null) {
 			return;
 		}
-		this.#fastPath = setTimeout(() => {
+		this.#fastPath = this.#deps.platform.setTimeout(() => {
 			this.#fastPath = null;
 			void this.runDueWork().catch((error: unknown) => {
 				console.error({
@@ -89,9 +92,19 @@ export class FokosScheduler {
 	/** Stops the fast path. The alarm is the caller's to delete. */
 	stop(): void {
 		if (this.#fastPath !== null) {
-			clearTimeout(this.#fastPath);
+			this.#deps.platform.clearTimeout(this.#fastPath);
 		}
 		this.#fastPath = null;
+	}
+
+	/**
+	 * The deadline of each runnable job, as a pass reads it, and whether a pass runs or `ensureAlarmAtMost`
+	 * arms the alarm now. It writes nothing and logs nothing: for a deadline read that throws, only the
+	 * scheduled run of the job counts.
+	 */
+	inspect(): { jobs: { kind: string; dueAt: number }[]; busy: boolean } {
+		const jobs = this.#deadlines(this.#runnable(), false).map(({ job, at }) => ({ kind: job.name, dueAt: at }));
+		return { jobs, busy: this.#inFlight !== null || this.#arming > 0 };
 	}
 
 	/**
@@ -104,7 +117,7 @@ export class FokosScheduler {
 			return;
 		}
 		await this.ensureAlarmAtMost(runAt);
-		if (runAt <= Date.now()) {
+		if (runAt <= this.#deps.platform.now()) {
 			this.wake();
 		}
 	}
@@ -127,11 +140,19 @@ export class FokosScheduler {
 		});
 	}
 
-	/** Sets the alarm to `at` when no alarm exists or the existing one is later. */
+	/**
+	 * Sets the alarm to `at` when no alarm exists or the existing one is later. A caller can store a due
+	 * job before this call, so `inspect` reports the scheduler as busy until the alarm is armed.
+	 */
 	async ensureAlarmAtMost(at: number): Promise<void> {
-		const existing = await this.#deps.storage.getAlarm();
-		if (existing === null || at < existing) {
-			await this.#deps.storage.setAlarm(at);
+		this.#arming++;
+		try {
+			const existing = await this.#deps.storage.getAlarm();
+			if (existing === null || at < existing) {
+				await this.#deps.storage.setAlarm(at);
+			}
+		} finally {
+			this.#arming--;
 		}
 	}
 
@@ -152,7 +173,7 @@ export class FokosScheduler {
 			});
 			try {
 				if (!this.#deps.isFenced()) {
-					await this.ensureAlarmAtMost(Date.now() + this.#deps.fallbackAlarmMs());
+					await this.ensureAlarmAtMost(this.#deps.platform.now() + this.#deps.fallbackAlarmMs());
 				}
 			} catch {
 				// The storage the alarm needs is the same storage the pass just failed on.
@@ -169,7 +190,7 @@ export class FokosScheduler {
 		if (this.#deps.isFenced()) {
 			return;
 		}
-		const now = Date.now();
+		const now = this.#deps.platform.now();
 		// One read of the deadlines before the steps. A deadline can cost a storage query, so the pass
 		// reads them again only after the steps, which can change them.
 		const deadlines = this.#deadlines(this.#runnable());
@@ -203,7 +224,7 @@ export class FokosScheduler {
 					error: String(error),
 					errorProps: error,
 				});
-				nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
+				nextRunAt = this.#deps.platform.now() + this.#deps.fallbackAlarmMs();
 				failed = true;
 			}
 			// Written right after the step, and from a fresh read: a request can call `scheduleJob` for
@@ -240,7 +261,7 @@ export class FokosScheduler {
 			return;
 		}
 		await this.#deps.storage.setAlarm(next);
-		if (next <= Date.now()) {
+		if (next <= this.#deps.platform.now()) {
 			this.wake();
 		}
 	}
@@ -268,7 +289,7 @@ export class FokosScheduler {
 	}
 
 	/** The earliest durable deadline of each runnable job: its scheduled run, or its own durable work. */
-	#deadlines(runnable: readonly FokosJob[]): Array<{ job: FokosJob; at: number }> {
+	#deadlines(runnable: readonly FokosJob[], markFailures = true): Array<{ job: FokosJob; at: number }> {
 		const record = this.#deps.store.getJobs();
 		const out: Array<{ job: FokosJob; at: number }> = [];
 		for (const job of runnable) {
@@ -278,18 +299,21 @@ export class FokosScheduler {
 			// here would rerun the same failing step at once instead of after the backoff the failure
 			// entry sets, so only the scheduled run counts while the `failed` flag stands. A deadline
 			// read that throws marks the job failed the same way: without the mark, one bad job would
-			// end every pass before any step runs.
+			// end every pass before any step runs. A read with no `markFailures` changes nothing and
+			// does not log, because a pass logs the same failure.
 			if (entry?.failed !== true) {
 				try {
 					own = job.deadline?.() ?? null;
 				} catch (error) {
-					console.error({
-						...this.#deps.logParams(),
-						message: `fokos/scheduler: the ${job.name} deadline read failed.`,
-						error: String(error),
-						errorProps: error,
-					});
-					this.#failJob(job.name);
+					if (markFailures) {
+						console.error({
+							...this.#deps.logParams(),
+							message: `fokos/scheduler: the ${job.name} deadline read failed.`,
+							error: String(error),
+							errorProps: error,
+						});
+						this.#failJob(job.name);
+					}
 				}
 			}
 			const at = Math.min(entry?.nextRunAt ?? Infinity, own ?? Infinity);
@@ -307,7 +331,7 @@ export class FokosScheduler {
 	#failJob(name: string): void {
 		this.#deps.store.transactionSync(() => {
 			const record = this.#deps.store.getJobs();
-			const nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
+			const nextRunAt = this.#deps.platform.now() + this.#deps.fallbackAlarmMs();
 			record[name] = { nextRunAt: Math.min(record[name]?.nextRunAt ?? nextRunAt, nextRunAt), failed: true };
 			this.#deps.store.putJobs(record);
 		});

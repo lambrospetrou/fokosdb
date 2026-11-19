@@ -142,6 +142,16 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			expect(rows).toEqual([{ transaction_id: first.transactionId, state: "COMMITTED" }]);
 		});
 
+		// A split source keeps a copy of each moved row until its cleanup. The cleanup has run, so the
+		// test writes such a copy. Only the owner shows the transaction.
+		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) =>
+			insertCommittedToken(instance, state, `tc-split-copy-${crypto.randomUUID()}`),
+		);
+		expect((await coordinatorStub(root.doName).fokosInspect({ what: ["transactions"] })).transactions).toEqual([]);
+		expect((await coordinatorStub(owner.doName).fokosInspect({ what: ["transactions"] })).transactions).toContainEqual(
+			expect.objectContaining({ transactionId: first.transactionId, state: "COMMITTED" }),
+		);
+
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay).toEqual(first);
 		// The root forwarded the replay: the child received the call on its own RPC method.
@@ -314,7 +324,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				hk: KeyCodec.encode(lockKey.hashKey),
 				sk: KeyCodec.encode(lockKey.sortKey),
 				transaction_id: first.transactionId,
-				transaction_ts: txOrderTimestampNow(),
+				transaction_ts: txOrderTimestampNow(Date.now()),
 				operation: "put",
 				op_list: [[0, "put"] as [number, "put"]],
 				data: "recovered",
