@@ -675,6 +675,11 @@ export class FokosDB {
 	/** The client of each GSI table, by index name. */
 	#gsis = new Map<string, FokosShardingClient<FokosDBPolicy, PartitionOps>>();
 
+	/** The clock, the timers, and the random values of this client: `options.platform` or `systemPlatform`. */
+	get platform(): FokosPlatform {
+		return this.#platform;
+	}
+
 	constructor(options: FokosDBOptions) {
 		this.#platform = options.platform ?? systemPlatform;
 		this.#table = createTableConfig(options);

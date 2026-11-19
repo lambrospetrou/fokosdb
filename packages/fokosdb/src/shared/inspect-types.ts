@@ -92,6 +92,15 @@ function isCursorPart(part: unknown, form: CursorPart): boolean {
 }
 const HEX = /^(?:[0-9a-f]{2})*$/;
 
+function isCompositeKey(value: unknown): boolean {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as { hk?: unknown }).hk instanceof Uint8Array &&
+		(value as { sk?: unknown }).sk instanceof Uint8Array
+	);
+}
+
 /** A request that `parseInspect` accepted. */
 export type ParsedInspect = { paged: InspectPagedKind[]; limit: number; after: string[] | null };
 
@@ -115,6 +124,21 @@ export function parseInspect(
 		if (req[filter] !== undefined && !filters.includes(filter)) {
 			throw invalid(`this Durable Object has no ${filter} filter`);
 		}
+	}
+	if (req.hashKey !== undefined && !(req.hashKey instanceof Uint8Array)) {
+		throw invalid("hashKey must be key bytes");
+	}
+	if (req.range !== undefined) {
+		const { start, end, ...rest } = (typeof req.range === "object" && req.range !== null ? req.range : { invalid: true }) as Record<
+			string,
+			unknown
+		>;
+		if (Object.keys(rest).length > 0 || ![start, end].every((edge) => edge === undefined || isCompositeKey(edge))) {
+			throw invalid("range must hold only a start and an end, and each one must have the key bytes hk and sk");
+		}
+	}
+	if (req.transactionId !== undefined && typeof req.transactionId !== "string") {
+		throw invalid("transactionId must be a string");
 	}
 	const paged = PAGED_KINDS.filter((kind) => req.what.includes(kind));
 	for (const kind of paged) {

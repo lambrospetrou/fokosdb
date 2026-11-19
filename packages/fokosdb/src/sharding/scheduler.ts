@@ -98,7 +98,7 @@ export class FokosScheduler {
 	}
 
 	/**
-	 * The deadline of each runnable job, as a pass reads it, and whether a pass runs or `scheduleJob`
+	 * The deadline of each runnable job, as a pass reads it, and whether a pass runs or `ensureAlarmAtMost`
 	 * arms the alarm now. It writes nothing and logs nothing: for a deadline read that throws, only the
 	 * scheduled run of the job counts.
 	 */
@@ -116,13 +116,7 @@ export class FokosScheduler {
 		if (!this.scheduleJobSyncNoAlarm(name, runAt)) {
 			return;
 		}
-		// The job record is stored and the alarm is not armed yet.
-		this.#arming++;
-		try {
-			await this.ensureAlarmAtMost(runAt);
-		} finally {
-			this.#arming--;
-		}
+		await this.ensureAlarmAtMost(runAt);
 		if (runAt <= this.#deps.platform.now()) {
 			this.wake();
 		}
@@ -146,11 +140,19 @@ export class FokosScheduler {
 		});
 	}
 
-	/** Sets the alarm to `at` when no alarm exists or the existing one is later. */
+	/**
+	 * Sets the alarm to `at` when no alarm exists or the existing one is later. A caller can store a due
+	 * job before this call, so `inspect` reports the scheduler as busy until the alarm is armed.
+	 */
 	async ensureAlarmAtMost(at: number): Promise<void> {
-		const existing = await this.#deps.storage.getAlarm();
-		if (existing === null || at < existing) {
-			await this.#deps.storage.setAlarm(at);
+		this.#arming++;
+		try {
+			const existing = await this.#deps.storage.getAlarm();
+			if (existing === null || at < existing) {
+				await this.#deps.storage.setAlarm(at);
+			}
+		} finally {
+			this.#arming--;
 		}
 	}
 

@@ -39,7 +39,7 @@ export class FokosDBStd {
 		db: ItemBatcher,
 		opts: NoInfer<BatchGetItemsOptions<Ts>>,
 		retry?: FokosDBRetryOptions,
-		platform: FokosPlatform = systemPlatform,
+		platform: FokosPlatform = db.platform ?? systemPlatform,
 	): Promise<BatchGetItemsResult<Ts>> {
 		const policy = resolveRetryOptions(retry);
 		const { projection, maxResponseBytes } = opts as BatchGetItemsOptions;
@@ -68,7 +68,7 @@ export class FokosDBStd {
 		db: ItemBatcher,
 		opts: BatchWriteItemsOptions,
 		retry?: FokosDBRetryOptions,
-		platform: FokosPlatform = systemPlatform,
+		platform: FokosPlatform = db.platform ?? systemPlatform,
 	): Promise<BatchWriteItemsResult> {
 		const policy = resolveRetryOptions(retry);
 		const { results, unprocessed, meta } = await retryBatch<BatchWriteItem, BatchWriteItemResult>(

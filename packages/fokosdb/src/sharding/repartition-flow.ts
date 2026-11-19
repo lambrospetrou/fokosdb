@@ -785,11 +785,15 @@ export class RepartitionSource {
 			return true;
 		});
 		// The cleanup is due now. A pass on the fast path can be lost with this instance, so the alarm
-		// must also hold the deadline.
-		if (completed) {
-			await this.deps.ensureAlarmSet(now);
+		// must also hold the deadline. The fast path starts also when the alarm write fails, because a
+		// repeated acknowledgement finds the completion and does not arm the alarm again.
+		try {
+			if (completed) {
+				await this.deps.ensureAlarmSet(now);
+			}
+		} finally {
+			this.deps.scheduleWork();
 		}
-		this.deps.scheduleWork();
 	}
 
 	/**

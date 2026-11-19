@@ -176,7 +176,8 @@ export const systemPlatform: FokosPlatform;
 - The class gives the platform to `TransactionParticipant`, `TtlExpiry`, the materialization exporter,
   `TargetRunner`, and each `setAlarm(…)` call.
 - `FokosDB` gets an optional `platform` option. It uses the platform for the transaction ID, the deadlines and the
-  retry backoff.
+  retry backoff. `FokosDB.platform` gives it, and the retry helpers of `FokosDBStd` wait through the `platform` of
+  their `ItemBatcher` when the call gives no platform.
 - `keyPairSeed` in `src/sharding/key-codec.ts` stays as it is, outside the platform. Section 4.2.1.1 tells why.
 - The `error_id` of an error (`newErrorId` in `src/shared/errors.ts`) stays on `crypto.randomUUID`. It is only a
   name, no decision reads it, and the checkers ignore it.
@@ -191,7 +192,9 @@ export const systemPlatform: FokosPlatform;
 - `FokosTimer` is a number, because the Workers runtime returns a number from `setTimeout`. `clearTimeout` accepts
   `undefined`, as the global does.
 - The topology cache gets its clock and its fetch timeout from the platform of its caller. The timeout is an
-  `AbortController` with a platform timer, in place of `AbortSignal.timeout`.
+  `AbortController` with a platform timer, in place of `AbortSignal.timeout`. The cache is global to the isolate,
+  and its key holds a number for each platform, so an entry is never read with a clock other than the clock that
+  wrote its `fetchedAt`. All callers on `systemPlatform` share their entries.
 - The loop in `fokosDestroy` that clears all timers stays on the globals. It clears the real timers of the isolate,
   and `ctx.abort` follows it.
 - A test that sets the clock of one instance overrides `fokosPlatform` in a test subclass
@@ -391,10 +394,15 @@ fokosInspect(req: {
   can keep copies of keys that another partition owns, and these copies are not its state. A router owns no key, so
   it reads no row.
 - A page of items or locks reads at most 10,000 rows, so a filter that matches few rows (for example a `range` with no
-  `hashKey`) has a bound on its cost. A page can hold no entry and still have a cursor, as in `queryItems`.
+  `hashKey`) has a bound on its cost. The `LIMIT` of the scan has only the cursor and the `hashKey` seek, and the page
+  applies the `range` and `transactionId` filters to the scanned rows, because a `LIMIT` counts only the rows that
+  pass the `WHERE` clause. A page can hold no entry and still have a cursor, as in `queryItems`.
 - A filter that the class does not have (`hashKey` and `range` on the coordinator) and a kind that the class does not
   have fail with `inspect_request_invalid`. The `transactionId` filter of the coordinator reads `tc_state` in key
-  order, because no index has `transaction_id` first.
+  order, because no index has `transaction_id` first. A page of transactions reads at most 10,000 rows in the same
+  way as a page of locks.
+- `transactions` holds only the tokens that the coordinator owns now. A split source keeps the rows of the tokens
+  that moved until its cleanup deletes them, and a router reads no row.
 - `selfCheck` pages the buckets of `item_stats`, because a check of all buckets reads every item and can pass the CPU
   limit of a request. A page also stops before a bucket that takes the stored item count of the page past 50,000, but
   it always checks one bucket. After the last bucket, `selfCheck` finds each routingHash with more than 16 items and no
@@ -408,7 +416,7 @@ fokosInspect(req: {
   the earlier of its scheduled run and its `deadline()`, and only the scheduled run while the job is marked failed.
   `FokosScheduler.inspect()` gives them, and it writes nothing. The alarm check of `selfCheck` compares the earliest one
   with `getAlarm()`. It does not run while a pass runs, because a pass arms a fallback alarm and replaces it at its end.
-  It does not run while `scheduleJob` arms the alarm, while an `alarm` handler runs (`getAlarm()` can then give null),
+  It does not run while a call arms the alarm (`ensureAlarmAtMost`), while an `alarm` handler runs (`getAlarm()` can then give null),
   or after the destroy fence. It reads the jobs before and after `getAlarm()`, and it reports a
   violation only when both reads show a job before the alarm. This check found that the last `fokosMigrationAck` made
   `source_cleanup` due and armed no alarm, so a lost fast-path pass left the cleanup without an alarm. The ack now arms
@@ -420,7 +428,12 @@ fokosInspect(req: {
   `limit` that is not an integer from 1 to 1,000 fail with `inspect_request_invalid`.
 - `locks.op` is the `operation` column. The ordered `op_list` is not in the shape until a checker needs it.
 - The `selfCheck` of the coordinator has the alarm check, and a check that each transaction that is not complete has a
-  `next_recovery_at`. `participants` is empty after a transaction completes, because completion deletes the
+  `next_recovery_at`, for the tokens that it owns.
+- The bucket checks of `selfCheck` skip each routingHash whose first item the partition does not own. A promotion
+  cleanup deletes the rows of the promoted routingHash in batches and deletes its bucket after the last batch, so
+  the facts of that bucket disagree with its items between two batches.
+- A `hashKey` that is not bytes, a `range` with another field or with an edge that has no `hk` and `sk` bytes, and a
+  `transactionId` that is not a string fail with `inspect_request_invalid`. `participants` is empty after a transaction completes, because completion deletes the
   `tc_participants` rows.
 
 #### 4.2.6 Public guarantees

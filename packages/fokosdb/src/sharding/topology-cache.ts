@@ -44,7 +44,7 @@ export type FokosTopologyCacheOptions = {
 	 * promise in `waitUntil` does not keep a Durable Object in memory. Default 5,000.
 	 */
 	fetchTimeoutMs?: number;
-	/** The clock and the timers of the caller. Default `systemPlatform`. */
+	/** The clock and the timers of the caller. The cache keeps the entries of each platform apart. Default `systemPlatform`. */
 	platform?: FokosPlatform;
 };
 
@@ -96,9 +96,25 @@ export function topologyGetForRangePath(shardGroup: string, routingHash: Routing
 	return `${topologyGetPath(shardGroup).replace("topology.Get", "topology.GetForRange")}&rh=${routingHash.toHex()}`;
 }
 
-/** The scope part of a cache key. A JSON string ends at its closing quote, so no two scopes give the same prefix. */
+/**
+ * A number for each platform. The cache of the isolate keys each entry by the platform of its caller,
+ * because each platform has its own clock: an entry stores `fetchedAt` from the clock of its writer.
+ */
+const platformIds = new WeakMap<FokosPlatform, number>([[systemPlatform, 0]]);
+let nextPlatformId = 1;
+
+/**
+ * The scope part of a cache key: the platform number and the scope. A JSON string ends at its closing
+ * quote, so no two scopes give the same prefix.
+ */
 function scopeOf(opts: FokosTopologyCacheOptions): string {
-	return opts.scope ? JSON.stringify(opts.scope) : '""';
+	const platform = opts.platform ?? systemPlatform;
+	let id = platformIds.get(platform);
+	if (id === undefined) {
+		id = nextPlatformId++;
+		platformIds.set(platform, id);
+	}
+	return `${id}|${opts.scope ? JSON.stringify(opts.scope) : '""'}`;
 }
 
 /**

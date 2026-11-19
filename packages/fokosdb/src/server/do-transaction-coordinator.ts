@@ -1,9 +1,11 @@
 import {
 	answerInspect,
 	INSPECT_CHECK_LIMIT,
+	INSPECT_SCAN_ROWS,
 	parseInspect,
 	type FokosInspectRequest,
 	type FokosInspectResponse,
+	type FokosInspectTransaction,
 } from "../shared/inspect-types.js";
 import { systemPlatform, type FokosPlatform } from "../sharding/platform.js";
 import { DurableObject } from "cloudflare:workers";
@@ -535,56 +537,74 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		const parsed = parseInspect(req, ["transactions"], ["transactionId"]);
 		const runtime = await this.fokos.inspect();
 		const sql = this.ctx.storage.sql;
+		const router = runtime?.repartition.role === "router";
+		const owns = this.fokos.ownerCheck();
 		return answerInspect(
 			req,
 			parsed,
 			runtime,
 			{
 				transactions: (after, limit) => {
-					const conds: string[] = [];
-					const params: unknown[] = [];
+					// A split source keeps the rows of the tokens that moved until its cleanup deletes them.
+					// They are not the state of this coordinator. A router owns no token, so it reads no row.
+					if (router) {
+						return { entries: [], next: null };
+					}
+					const params: unknown[] = [req.transactionId ?? null];
 					if (after !== null) {
-						conds.push("(s.routing_hash, s.transaction_id) > (?, ?)");
 						params.push(Uint8Array.fromHex(after[0]), after[1]);
 					}
-					if (req.transactionId !== undefined) {
-						conds.push("s.transaction_id = ?");
-						params.push(req.transactionId);
+					// The scan reads at most INSPECT_SCAN_ROWS rows in key order, also when the transactionId
+					// filter matches few of them, because no index has transaction_id first.
+					type Row = { routing_hash: ArrayBuffer; transaction_id: string; idempotency_token: string; state: string; matches: number };
+					const page: Row[] = [];
+					let scanned = 0;
+					let last: Row | null = null;
+					let more = false;
+					for (const row of sql.exec<Row>(
+						`SELECT routing_hash, transaction_id, idempotency_token, state, (?1 IS NULL OR transaction_id = ?1) AS matches
+						   FROM tc_state ${after === null ? "" : "WHERE (routing_hash, transaction_id) > (?2, ?3)"}
+						  ORDER BY routing_hash, transaction_id LIMIT ${INSPECT_SCAN_ROWS + 1}`,
+						...params,
+					)) {
+						if (page.length === limit || scanned === INSPECT_SCAN_ROWS) {
+							more = true;
+							break;
+						}
+						scanned++;
+						last = row;
+						if (row.matches === 1 && owns(tokenKey(row.idempotency_token))) {
+							page.push(row);
+						}
 					}
-					// One statement for the page. Each participant list is one seek of the primary key of tc_participants.
-					const rows = sql
-						.exec<{ routing_hash: ArrayBuffer; transaction_id: string; state: string; participants: string }>(
-							`SELECT s.routing_hash, s.transaction_id, s.state,
-							        (SELECT json_group_array(partition_do_name) FROM (
-							            SELECT p.partition_do_name FROM tc_participants p
-							             WHERE p.routing_hash = s.routing_hash AND p.transaction_id = s.transaction_id
-							             ORDER BY p.partition_do_name)) AS participants
-							   FROM tc_state s ${conds.length === 0 ? "" : `WHERE ${conds.join(" AND ")}`}
-							  ORDER BY s.routing_hash, s.transaction_id LIMIT ?`,
-							...params,
-							limit + 1,
-						)
-						.toArray();
-					const page = rows.slice(0, limit);
-					const last = page[page.length - 1];
-					return {
-						entries: page.map((row) => ({
+					// One seek of the primary key of tc_participants for each transaction of the page.
+					const entries = page.map(
+						(row): FokosInspectTransaction => ({
 							transactionId: row.transaction_id,
 							state: row.state,
-							participants: (JSON.parse(row.participants) as string[]).sort(),
-						})),
-						next: rows.length > limit ? [new Uint8Array(last.routing_hash).toHex(), last.transaction_id] : null,
-					};
+							participants: sql
+								.exec<{ partition_do_name: string }>(
+									`SELECT partition_do_name FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name`,
+									row.routing_hash,
+									row.transaction_id,
+								)
+								.toArray()
+								.map((p) => p.partition_do_name),
+						}),
+					);
+					return { entries, next: more && last !== null ? [new Uint8Array(last.routing_hash).toHex(), last.transaction_id] : null };
 				},
 				selfCheck: () => ({ entries: [], next: null }),
 			},
 			() =>
 				sql
-					.exec<{ transaction_id: string; state: string }>(
-						`SELECT transaction_id, state FROM tc_state WHERE completed_at IS NULL AND next_recovery_at IS NULL LIMIT ?`,
+					.exec<{ transaction_id: string; idempotency_token: string; state: string }>(
+						`SELECT transaction_id, idempotency_token, state FROM tc_state WHERE completed_at IS NULL AND next_recovery_at IS NULL LIMIT ?`,
 						INSPECT_CHECK_LIMIT,
 					)
 					.toArray()
+					// The rows of the tokens that moved in a split are not the state of this coordinator.
+					.filter((row) => owns(tokenKey(row.idempotency_token)))
 					.map((row) => `the transaction ${row.transaction_id} in ${row.state} is not complete and has no next_recovery_at`),
 		);
 	}

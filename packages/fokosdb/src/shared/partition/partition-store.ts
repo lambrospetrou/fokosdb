@@ -534,32 +534,48 @@ function hexOf(value: ArrayBuffer): string {
 	return new Uint8Array(value).toHex();
 }
 
-/** The `WHERE` clause of an inspect page over a table whose key is `keys`, strictly after `after`. */
-function inspectTerms(keys: string, after: string[] | null, filter: InspectFilter): { conds: string; params: unknown[] } {
-	const conds: string[] = [];
-	const params: unknown[] = [];
+/**
+ * The terms of an inspect page over a table whose key is `keys`. `seek` is the `WHERE` clause of the
+ * scan in key order, strictly after `after`: it holds only a prefix of the key, so a `LIMIT` on the
+ * scan bounds the rows that SQLite reads. `match` is the expression of the other filters, which the
+ * page applies to each scanned row.
+ */
+function inspectTerms(
+	keys: string,
+	after: string[] | null,
+	filter: InspectFilter,
+): { seek: string; seekParams: unknown[]; match: string; matchParams: unknown[] } {
+	const seek: string[] = [];
+	const seekParams: unknown[] = [];
 	if (after !== null) {
-		conds.push(`(${keys}) > (${after.map(() => "?").join(", ")})`);
+		seek.push(`(${keys}) > (${after.map(() => "?").join(", ")})`);
 		// The last part of a lock position is the transaction ID, as text.
-		params.push(...after.map((part, i) => (i < 3 ? Uint8Array.fromHex(part) : part)));
+		seekParams.push(...after.map((part, i) => (i < 3 ? Uint8Array.fromHex(part) : part)));
 	}
 	if (filter.hashKey !== undefined && filter.routingHash !== undefined) {
-		conds.push("routing_hash = ? AND hk = ?");
-		params.push(filter.routingHash, filter.hashKey);
+		seek.push("routing_hash = ? AND hk = ?");
+		seekParams.push(filter.routingHash, filter.hashKey);
 	}
+	const match: string[] = [];
+	const matchParams: unknown[] = [];
 	if (filter.start !== undefined) {
-		conds.push("(hk, sk) >= (?, ?)");
-		params.push(filter.start.hk, filter.start.sk);
+		match.push("(hk, sk) >= (?, ?)");
+		matchParams.push(filter.start.hk, filter.start.sk);
 	}
 	if (filter.end !== undefined) {
-		conds.push("(hk, sk) < (?, ?)");
-		params.push(filter.end.hk, filter.end.sk);
+		match.push("(hk, sk) < (?, ?)");
+		matchParams.push(filter.end.hk, filter.end.sk);
 	}
 	if (filter.transactionId !== undefined) {
-		conds.push("transaction_id = ?");
-		params.push(filter.transactionId);
+		match.push("transaction_id = ?");
+		matchParams.push(filter.transactionId);
 	}
-	return { conds: conds.length === 0 ? "" : `WHERE ${conds.join(" AND ")}`, params };
+	return {
+		seek: seek.length === 0 ? "" : `WHERE ${seek.join(" AND ")}`,
+		seekParams,
+		match: match.length === 0 ? "1" : match.join(" AND "),
+		matchParams,
+	};
 }
 
 /** The select list that sums the facts of `items` rows. The model does not change, so it is built one time. */
@@ -1668,7 +1684,8 @@ export class PartitionStore implements ItemSource {
 	 * One page of the committed items that `owns` accepts, in key order, strictly after `after` (the hex
 	 * of a routingHash, a hash key and a sort key). The page holds at most `limit` items and `maxBytes`
 	 * (two bytes for each item byte, plus the keys), but always one item. It reads at most `scanRows`
-	 * rows, and it reads the data of the items of the page only.
+	 * rows in key order, also when the filter matches few of them, and it reads the data of the items
+	 * of the page only.
 	 */
 	inspectItems(
 		after: string[] | null,
@@ -1678,27 +1695,33 @@ export class PartitionStore implements ItemSource {
 		scanRows: number,
 		owns: (row: { hk: KeyBytes; sk: KeyBytes }) => boolean,
 	): { entries: FokosInspectItem[]; next: string[] | null } {
-		const { conds, params } = inspectTerms("routing_hash, hk, sk", after, filter);
+		const { seek, seekParams, match, matchParams } = inspectTerms("routing_hash, hk, sk", after, filter);
 		type Row = { routing_hash: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer; v: number; ttl_epoch_utc_seconds: number | null };
 		const page: Row[] = [];
 		let bytes = 0;
 		let scanned = 0;
 		let last: Row | null = null;
 		let more = false;
-		for (const row of this.#storage.sql.exec<Row & { item_bytes: number }>(
-			`SELECT routing_hash, hk, sk, v, ttl_epoch_utc_seconds, item_bytes FROM items ${conds}
+		for (const row of this.#storage.sql.exec<Row & { item_bytes: number; matches: number }>(
+			`SELECT routing_hash, hk, sk, v, ttl_epoch_utc_seconds, item_bytes, (${match}) AS matches FROM items ${seek}
 			  ORDER BY routing_hash, hk, sk LIMIT ?`,
-			...params,
+			...matchParams,
+			...seekParams,
 			scanRows + 1,
 		)) {
+			if (page.length === limit || scanned === scanRows) {
+				more = true;
+				break;
+			}
+			const take = row.matches === 1 && owns({ hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk) });
 			const size = 2 * row.item_bytes + row.hk.byteLength + row.sk.byteLength;
-			if (page.length === limit || scanned === scanRows || (page.length > 0 && bytes + size > maxBytes)) {
+			if (take && page.length > 0 && bytes + size > maxBytes) {
 				more = true;
 				break;
 			}
 			scanned++;
 			last = row;
-			if (owns({ hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk) })) {
+			if (take) {
 				bytes += size;
 				page.push(row);
 			}
@@ -1725,7 +1748,8 @@ export class PartitionStore implements ItemSource {
 
 	/**
 	 * One page of the lock rows that `owns` accepts, in key order, strictly after `after` (the hex of the
-	 * key and the transaction ID). It reads at most `scanRows` rows.
+	 * key and the transaction ID). It reads at most `scanRows` rows in key order, also when the filter
+	 * matches few of them.
 	 */
 	inspectLocks(
 		after: string[] | null,
@@ -1734,16 +1758,17 @@ export class PartitionStore implements ItemSource {
 		scanRows: number,
 		owns: (row: { hk: KeyBytes; sk: KeyBytes }) => boolean,
 	): { entries: FokosInspectLock[]; next: string[] | null } {
-		const { conds, params } = inspectTerms("routing_hash, hk, sk, transaction_id", after, filter);
+		const { seek, seekParams, match, matchParams } = inspectTerms("routing_hash, hk, sk, transaction_id", after, filter);
 		type Row = { routing_hash: ArrayBuffer; hk: ArrayBuffer; sk: ArrayBuffer; transaction_id: string; operation: string };
 		const entries: FokosInspectLock[] = [];
 		let scanned = 0;
 		let last: Row | null = null;
 		let more = false;
-		for (const row of this.#storage.sql.exec<Row>(
-			`SELECT routing_hash, hk, sk, transaction_id, operation FROM pending_transactions ${conds}
+		for (const row of this.#storage.sql.exec<Row & { matches: number }>(
+			`SELECT routing_hash, hk, sk, transaction_id, operation, (${match}) AS matches FROM pending_transactions ${seek}
 			  ORDER BY routing_hash, hk, sk, transaction_id LIMIT ?`,
-			...params,
+			...matchParams,
+			...seekParams,
 			scanRows + 1,
 		)) {
 			if (entries.length === limit || scanned === scanRows) {
@@ -1754,7 +1779,7 @@ export class PartitionStore implements ItemSource {
 			last = row;
 			const hk = fromSqlKey(row.hk);
 			const sk = fromSqlKey(row.sk);
-			if (owns({ hk, sk })) {
+			if (row.matches === 1 && owns({ hk, sk })) {
 				entries.push({ transactionId: row.transaction_id, hashKey: hk, sortKey: sk, op: row.operation });
 			}
 		}

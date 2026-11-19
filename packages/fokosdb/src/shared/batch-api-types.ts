@@ -9,6 +9,7 @@ import type { ConditionExpression, ProjectionExpression } from "./expression/typ
 import type { JsonComposite } from "./json-types.js";
 import type { ConditionFailedReason } from "./transaction-api-types.js";
 import type { FokosMeta, HashKey, ItemKey, ReadItem, ReturnValuesOnConditionCheckFailure, SortKey } from "./types.js";
+import type { FokosPlatform } from "../sharding/platform.js";
 
 /** One key of `batchGetItems`. Its projection replaces the projection of the request. */
 export type BatchGetItemKey = ItemKey & { projection?: readonly ProjectionExpression[] };
@@ -130,6 +131,8 @@ export type BatchWriteItemsResult = {
 
 /** The batch half of the FokosDB contract. Neither method retries, and neither throws after I/O starts. */
 export interface ItemBatcher {
+	/** The clock, the timers, and the random values of the batcher. `FokosDBStd` waits through it by default. */
+	readonly platform?: FokosPlatform;
 	batchGetItems<Ts extends readonly unknown[] = never[]>(opts: NoInfer<BatchGetItemsOptions<Ts>>): Promise<BatchGetItemsResult<Ts>>;
 	batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult>;
 }
