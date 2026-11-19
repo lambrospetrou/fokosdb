@@ -208,35 +208,69 @@ const GSI_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}gsiv1.`;
  */
 export function fokosDBSeedScopeOf(shardGroup: string): string {
 	if (shardGroup.startsWith(PARTITION_SHARD_GROUP_PREFIX)) {
-		return `${RESERVED_SHARD_GROUP_PREFIX}p`;
+		return PARTITION_SEED_SCOPE;
 	}
 	if (shardGroup.startsWith(COORDINATOR_SHARD_GROUP_PREFIX)) {
-		return `${RESERVED_SHARD_GROUP_PREFIX}tc`;
+		return COORDINATOR_SEED_SCOPE;
 	}
 	if (shardGroup.startsWith(MATERIALIZATION_SHARD_GROUP_PREFIX)) {
-		return `${RESERVED_SHARD_GROUP_PREFIX}m`;
+		return MATERIALIZATION_SEED_SCOPE;
 	}
-	if (shardGroup.startsWith(GSI_SHARD_GROUP_PREFIX)) {
-		const rest = shardGroup.slice(GSI_SHARD_GROUP_PREFIX.length);
-		const dot = rest.indexOf(".");
-		const n = /^[0-9]+$/.test(rest.slice(0, dot)) ? Number(rest.slice(0, dot)) : NaN;
-		// `<n>.<tableName>.` comes before the index name.
-		const indexStart = dot + 1 + n + 1;
-		invariant(
-			dot > 0 && Number.isSafeInteger(n) && rest[indexStart - 1] === "." && indexStart < rest.length,
-			`fokos/partition-context: "${shardGroup}" is not the shard group of a GSI`,
-		);
-		const indexName = rest.slice(indexStart);
-		return `${GSI_SHARD_GROUP_PREFIX}${indexName.length}.${indexName}`;
-	}
-	invariant(false, `fokos/partition-context: "${shardGroup}" is not a FokosDB shard group`);
+	invariant(shardGroup.startsWith(GSI_SHARD_GROUP_PREFIX), () => `fokos/partition-context: "${shardGroup}" is not a FokosDB shard group`);
+	const start = gsiIndexNameStart(shardGroup);
+	return `${GSI_SHARD_GROUP_PREFIX}${shardGroup.length - start}.${shardGroup.slice(start)}`;
 }
+
+const PARTITION_SEED_SCOPE = `${RESERVED_SHARD_GROUP_PREFIX}p`;
+const COORDINATOR_SEED_SCOPE = `${RESERVED_SHARD_GROUP_PREFIX}tc`;
+const MATERIALIZATION_SEED_SCOPE = `${RESERVED_SHARD_GROUP_PREFIX}m`;
+/**
+ * The index of the index name in `fokos.gsiv1.<n>.<tableName>.<indexName>`, with `<n>` the length
+ * of the table name. It reads the characters in place, so it allocates nothing: a one-character
+ * ASCII string comes from the shared table of the engine.
+ */
+function gsiIndexNameStart(shardGroup: string): number {
+	const digits = GSI_SHARD_GROUP_PREFIX.length;
+	const dot = shardGroup.indexOf(".", digits);
+	let valid = dot > digits;
+	let n = 0;
+	for (let i = digits; valid && i < dot; i++) {
+		const c = shardGroup[i];
+		valid = c >= "0" && c <= "9";
+		n = n * 10 + +c;
+	}
+	// `<n>.<tableName>.` comes before the index name. A length that is too large puts `start` after the end.
+	const start = dot + 1 + n + 1;
+	invariant(
+		valid && start < shardGroup.length && shardGroup[start - 1] === ".",
+		() => `fokos/partition-context: "${shardGroup}" is not the shard group of a GSI`,
+	);
+	return start;
+}
+
+const PARTITION_SEED = routingHashSeedOf(PARTITION_SEED_SCOPE);
+const COORDINATOR_SEED = routingHashSeedOf(COORDINATOR_SEED_SCOPE);
+const MATERIALIZATION_SEED = routingHashSeedOf(MATERIALIZATION_SEED_SCOPE);
 
 /**
  * The routingHash seed resolver of FokosDB: the seed of a shard group comes from its seed scope
- * (`fokosDBSeedScopeOf`). Every client and every Durable Object class of FokosDB uses it.
+ * (`fokosDBSeedScopeOf`). Every client and every Durable Object class of FokosDB uses it. The seeds of the
+ * partition, coordinator, and materialization scopes are computed once, so only a GSI group
+ * allocates: its scope and its seed.
  */
-export const fokosDBRoutingHashSeedResolver: RoutingHashSeedResolver = (shardGroup) => routingHashSeedOf(fokosDBSeedScopeOf(shardGroup));
+export const fokosDBRoutingHashSeedResolver: RoutingHashSeedResolver = (shardGroup) => {
+	const scope = fokosDBSeedScopeOf(shardGroup);
+	switch (scope) {
+		case PARTITION_SEED_SCOPE:
+			return PARTITION_SEED;
+		case COORDINATOR_SEED_SCOPE:
+			return COORDINATOR_SEED;
+		case MATERIALIZATION_SEED_SCOPE:
+			return MATERIALIZATION_SEED;
+		default:
+			return routingHashSeedOf(scope);
+	}
+};
 
 /** The table name, from the partition group or the materialization group of the table. */
 export function baseTableName(topology: FokosTopology): string {

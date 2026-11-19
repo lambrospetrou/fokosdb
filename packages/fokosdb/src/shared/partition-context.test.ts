@@ -214,7 +214,9 @@ describe("fokosDBSeedScopeOf", () => {
 		expect(fokosDBRoutingHashSeedResolver(groups.tc)).toBe("17f7bf58eb10db2a");
 		expect(fokosDBRoutingHashSeedResolver(groups.m)).toBe("fa2a455af9df18bf");
 		expect(fokosDBRoutingHashSeedResolver(groups.gsi)).toBe("f423259f28661323");
-		expect(fokosDBRoutingHashSeedResolver(groups.p)).toBe(routingHashSeedOf("fokos.p"));
+		for (const kind of ["p", "tc", "m", "gsi"] as const) {
+			expect(fokosDBRoutingHashSeedResolver(groups[kind])).toBe(routingHashSeedOf(fokosDBSeedScopeOf(groups[kind])));
+		}
 	});
 
 	it("gives two tables the same seed for each kind of group", () => {
@@ -251,6 +253,9 @@ describe("fokosDBSeedScopeOf", () => {
 			"fokos.gsiv1.",
 			"fokos.gsiv1.x.orders.i",
 			"fokos.gsiv1.6.orders",
+			"fokos.gsiv1.6.orders.",
+			"fokos.gsiv1.6orders.i",
+			"fokos.gsiv1.99999999999999999999.orders.i",
 		]) {
 			expect(() => fokosDBSeedScopeOf(group), group).toThrow(invariantFailure(/shard group/));
 		}
