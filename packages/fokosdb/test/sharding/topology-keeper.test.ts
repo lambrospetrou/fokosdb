@@ -29,6 +29,7 @@ import type { FokosCompositeKey } from "../../src/sharding/key-codec.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
 import { fokosErrorWith, invariantFailure } from "../errors-matchers.js";
 import { promotedSectionRoutingHashes } from "../../src/sharding/topology-encode.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 const LATER = Number.MAX_SAFE_INTEGER;
 
@@ -192,7 +193,7 @@ describe("topology keeper — reports", () => {
 					}
 					for (const [key, rank] of promoted) {
 						// Each shard group has its own seed, so both groups get the routingHash of one fixed group.
-						const routingHash = routingHashOf(k(`p${key}`), "fixed");
+						const routingHash = routingHashOf(k(`p${key}`), "fixed", testRoutingHashSeedResolver);
 						reports.push({ rank, report: (sg) => routingHashPromotionReport(sg, routingHash, 0, 3, 2) });
 					}
 					reports.sort((a, b) => a.rank - b.rank);
@@ -223,8 +224,8 @@ describe("topology keeper — reports", () => {
 			await keeper.registerRepartition(promotionReport(sg, KeyCodec.encode("u42"), 0, 2, 2));
 			keeper.runDueBuilds(LATER);
 			const view = parseHashBody(body(keeper.getTopology(sg)));
-			expect(isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode("u42"), sg))).toBe("exact");
-			expect(isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode("u43"), sg))).toBe(false);
+			expect(isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode("u42"), sg, testRoutingHashSeedResolver))).toBe("exact");
+			expect(isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode("u43"), sg, testRoutingHashSeedResolver))).toBe(false);
 		});
 	});
 
@@ -351,7 +352,7 @@ const HK = k("u42");
 const c = (s: string): FokosCompositeKey => ({ hk: HK, sk: k(s) });
 /** The range body of the routingHash of `hashKey`. */
 const rangeBody = (keeper: FokosTopologyKeeper, sg: string, hashKey: KeyBytes = HK) =>
-	body(keeper.getRangeTopology(sg, routingHashOf(hashKey, sg)));
+	body(keeper.getRangeTopology(sg, routingHashOf(hashKey, sg, testRoutingHashSeedResolver)));
 
 function rangeOf(view: RangeTopologyView, target: RangeTarget | null) {
 	if (!target) {
@@ -400,7 +401,7 @@ describe("topology keeper — range build", () => {
 			expect(rangeOf(view, rangePointLookup(view, c("h"), new Set()))).toEqual(["g", null, 1]);
 			expect(storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_hash_nodes").one().n).toBe(0);
 			const hash = parseHashBody(body(keeper.getTopology(sg)));
-			expect([...promotedSectionRoutingHashes(hash.promoted!)]).toEqual([routingHashOf(HK, sg)]);
+			expect([...promotedSectionRoutingHashes(hash.promoted!)]).toEqual([routingHashOf(HK, sg, testRoutingHashSeedResolver)]);
 		});
 	});
 
@@ -438,7 +439,7 @@ describe("topology keeper — range build", () => {
 		await withKeeper(
 			async (keeper, { sg, storage }) => {
 				const dirty = () => storage.sql.exec("SELECT COUNT(*) AS n FROM fokos_topo_range_dirty").one().n;
-				const rangeEtag = (key: KeyBytes) => keeper.getRangeTopology(sg, routingHashOf(key, sg)).etag;
+				const rangeEtag = (key: KeyBytes) => keeper.getRangeTopology(sg, routingHashOf(key, sg, testRoutingHashSeedResolver)).etag;
 				const keys = [k("u1"), k("u2"), k("u3")];
 				for (const key of keys) {
 					await keeper.registerRepartition(promotionReport(sg, key));

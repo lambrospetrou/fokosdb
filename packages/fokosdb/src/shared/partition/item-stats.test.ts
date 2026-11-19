@@ -29,9 +29,10 @@ import {
 import { addFacts, ItemStats } from "./item-stats.js";
 import { PartitionStore, type ItemLinkId, type KeyRange } from "./partition-store.js";
 import { SplitPlanner } from "./split-planner.js";
+import { testRoutingHashSeedResolver } from "../../../test/routing-hash.js";
 
 const GROUP = "fokos.p.item-stats-test";
-const P = (hk: KeyBytes) => routingHashOf(hk, GROUP);
+const P = (hk: KeyBytes) => routingHashOf(hk, GROUP, testRoutingHashSeedResolver);
 const kb = (v: string | Uint8Array) => KeyCodec.encode(v);
 const NO_SK = KeyCodec.encodeOptional(undefined);
 const ALL: KeyRange = { start: { routingHash: new Uint8Array() }, end: null };

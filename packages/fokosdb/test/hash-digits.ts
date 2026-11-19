@@ -1,12 +1,18 @@
-import { hash64, routingHashDigits, routingHashOf } from "../src/sharding/hash-primitives.js";
+import { routingHashDigits, routingHashOf } from "../src/sharding/hash-primitives.js";
 import type { KeyBytes } from "../src/sharding/key-codec.js";
 import type { FokosTopology } from "../src/sharding/route-context.js";
+import { testRoutingHashSeedResolver } from "./routing-hash.js";
 
 export type DigitTopology = Pick<FokosTopology, "shardGroup" | "rootTreesN" | "hashSplitN">;
 
 /** The digits of a hash key in a topology: the root index, then the child index of each level, `depth` levels. */
 export function hashDigits(topology: DigitTopology, hashKey: KeyBytes, depth: number): { root: number; path: number[] } {
-	return routingHashDigits(routingHashOf(hashKey, topology.shardGroup), topology.rootTreesN, topology.hashSplitN, depth);
+	return routingHashDigits(
+		routingHashOf(hashKey, topology.shardGroup, testRoutingHashSeedResolver),
+		topology.rootTreesN,
+		topology.hashSplitN,
+		depth,
+	);
 }
 
 /** The child index of a hash key below a hash partition at `parentDepth`. */
@@ -65,7 +71,7 @@ const xxhLane = (state: bigint, lane: bigint) => (mul64(rotl64(state ^ xxhRound(
  * the state of the first key. The last byte and the end steps are then the same.
  */
 export function collidingHashKeys(shardGroup: string): [Uint8Array, Uint8Array] {
-	const seed = hash64(shardGroup);
+	const seed = BigInt(`0x${testRoutingHashSeedResolver(shardGroup)}`);
 	const a = new Uint8Array(17);
 	a[0] = 0xff;
 	crypto.getRandomValues(a.subarray(1));

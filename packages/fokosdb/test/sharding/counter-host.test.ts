@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { FokosError, FokosShardingStore, HashTopology, KeyCodec, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/index-server.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 describe.concurrent("Sharding runtime — counter host", () => {
 	it("splits the root on request volume and routes the next write through it", async () => {
@@ -147,7 +148,7 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		const key = KeyCodec.encode("k-1");
 		await runInDurableObject(stub(table.root.doName), (_instance, state) => {
 			const arena = HashTopology.create(1, 4, 0);
-			arena.updateFromHint(routingHashOf(key, table.root.topology.shardGroup), 2);
+			arena.updateFromHint(routingHashOf(key, table.root.topology.shardGroup, testRoutingHashSeedResolver), 2);
 			new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
 		});
 		// The next instance reads the hint from storage.
@@ -211,7 +212,7 @@ describe.concurrent("Sharding runtime — the collect failure policy", () => {
 		// part of `k-1` falls back to the child. The child is behind the destroy fence and refuses it.
 		await runInDurableObject(stub(table.root.doName), (_instance, state) => {
 			const arena = HashTopology.create(1, 4, 0);
-			arena.updateFromHint(routingHashOf(KeyCodec.encode("k-1"), table.root.topology.shardGroup), 2);
+			arena.updateFromHint(routingHashOf(KeyCodec.encode("k-1"), table.root.topology.shardGroup, testRoutingHashSeedResolver), 2);
 			new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
 		});
 		await stub(table.root.doName)

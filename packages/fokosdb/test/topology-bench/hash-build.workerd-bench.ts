@@ -17,6 +17,7 @@ import { FokosTopologyKeeper, KeyCodec } from "../../src/sharding/index-server.j
 import { parseHashBody } from "../../src/sharding/topology-codec.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { hashSplitReport, promotionReport } from "../sharding/topology-events.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 const R = 16;
 const K = 2;
@@ -81,7 +82,7 @@ it("hash body build", async () => {
 							`INSERT INTO fokos_topo_range_intervals (shard_group, routing_hash, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
 							 VALUES (?1, ?2, x'', x'', 1, x'', x'', 1)`,
 							sg,
-							routingHashOf(KeyCodec.encode(`user-${i}`), sg),
+							routingHashOf(KeyCodec.encode(`user-${i}`), sg, testRoutingHashSeedResolver),
 						);
 					}
 					sql.exec(

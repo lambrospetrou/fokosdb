@@ -394,7 +394,7 @@ pre-fence bookmark in the same way.
 The seed of each routingHash comes from the seed scope of its shard group: `fokos.p`, `fokos.tc`, `fokos.m`, and
 `fokos.gsiv1.<n'>.<indexName>` for a GSI. The table name and the namespace fingerprint are not in the seed scope.
 [The seed-scope RFC](2026-11-17-routing-hash-seed-scope.md) holds the problem, the reasons, the rule, the option
-`routingSeedOf` of the sharding library, what the change breaks, and the tests. Its M2 adds an optional base seed for
+`routingHashSeedResolver` of the sharding library, what the change breaks, and the tests. Its M2 adds an optional base seed for
 a deployment, `routingHashBaseSeed`, which this RFC does not need.
 
 The groups of one table keep different seeds, and two tables get the same seed for each kind of group. So the

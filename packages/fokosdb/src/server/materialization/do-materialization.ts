@@ -1,5 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
-import { baseTableName, type FokosDBPolicy, type FokosDBRouteContext } from "../../shared/partition-context.js";
+import {
+	baseTableName,
+	fokosDBRoutingHashSeedResolver,
+	type FokosDBPolicy,
+	type FokosDBRouteContext,
+} from "../../shared/partition-context.js";
 import { FokosShardingRuntime } from "../../sharding/runtime.js";
 import { INIT_RETRY_ALARM_MS } from "../../sharding/scheduler.js";
 import type { FokosRuntimeConfigOverrides } from "../../sharding/runtime-config.js";
@@ -196,6 +201,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, MaterializationOps>({
 			ctx,
 			stub: (routeCtx, doName) => materializationStubByName(env, routeCtx, doName),
+			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),

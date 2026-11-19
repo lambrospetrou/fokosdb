@@ -9,6 +9,7 @@ import { FokosShardingClient } from "../../src/sharding/client.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosOperationSpec } from "../../src/sharding/runtime-types.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 // The table options of examples/http-api/src/shared.ts.
 const TABLE_OPTIONS = {
@@ -27,12 +28,21 @@ const stub = (): DurableObjectStub => {
 
 export const CASES: [string, () => unknown][] = [
 	["createTableConfig", () => createTableConfig(TABLE_OPTIONS)],
-	["new FokosRouter", () => new FokosRouter(table.topology, table.rangeConfig, table.policy)],
-	["new FokosShardingClient", () => new FokosShardingClient<FokosDBPolicy, FokosOperationSpec>({ ...table, stub })],
+	["new FokosRouter", () => new FokosRouter(table.topology, table.rangeConfig, table.policy, undefined, testRoutingHashSeedResolver)],
+	[
+		"new FokosShardingClient",
+		() =>
+			new FokosShardingClient<FokosDBPolicy, FokosOperationSpec>({ ...table, stub, routingHashSeedResolver: testRoutingHashSeedResolver }),
+	],
 	[
 		// The router of a new client caches no root context, so the first request of each client builds one.
 		"new FokosShardingClient + first resolve",
-		() => new FokosShardingClient<FokosDBPolicy, FokosOperationSpec>({ ...table, stub }).resolve(key),
+		() =>
+			new FokosShardingClient<FokosDBPolicy, FokosOperationSpec>({
+				...table,
+				stub,
+				routingHashSeedResolver: testRoutingHashSeedResolver,
+			}).resolve(key),
 	],
 	// The path of examples/http-api/src/shared.ts for each request.
 	["new FokosDB", () => new FokosDB(TABLE_OPTIONS)],

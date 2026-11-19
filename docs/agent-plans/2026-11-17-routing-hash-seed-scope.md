@@ -98,7 +98,7 @@ resource, and each table splits by its own data.
 **Requirements.**
 
 - R1. The topology and the requests must not carry the seed, the seed scope or `routingHashBaseSeed`.
-- R2. `fokosSeedScope` must throw for a shard group of an unknown format.
+- R2. `fokosDBSeedScopeOf` must throw for a shard group of an unknown format.
 - R3. The derivation must stay fixed after the release: a pinned test guards each seed scope, and each seed for a
   fixed `routingHashBaseSeed`.
 - R4. Every client and every Durable Object class of a deployment must get the same `routingHashBaseSeed`, or none.
@@ -107,7 +107,7 @@ resource, and each table splits by its own data.
 
 | Milestone | Delivers | Changes stored data |
 | --- | --- | --- |
-| M1 — The seed scope | The seed comes from the seed scope. The option `routingSeedOf` of the sharding library. | Yes: it deploys to new namespaces. |
+| M1 — The seed scope | The seed comes from the seed scope. The option `routingHashSeedResolver` of the sharding library. | Yes: it deploys to new namespaces. |
 | M2 — A base seed for a deployment | The option `routingHashBaseSeed` of FokosDB. Opt-in. | Only for a deployment that sets it, which then starts on new namespaces. |
 
 M1 is M1 of `docs/agent-plans/2026-11-17-consistent-backup-and-restore.md`, and it ships before the other
@@ -127,30 +127,36 @@ The seed of a shard group comes from a short scope string instead of the whole n
 | `fokos.m.<tableName>.<fp(ns)>` | `fokos.m` |
 | `fokos.gsiv1.<n>.<tableName>.<indexName>` | `fokos.gsiv1.<n'>.<indexName>`, with `n'` the length of the index name |
 
-M1: the seed is `routingHashSeedOf(fokosSeedScope(shardGroup))`, with the public base seed. M2: a deployment can set
-`routingHashBaseSeed`, and the seed is then `routingHashSeedOf(fokosSeedScope(shardGroup), baseSeedOf(value))`. The
+M1: the seed is `routingHashSeedOf(fokosDBSeedScopeOf(shardGroup))`, with the public base seed. M2: a deployment can set
+`routingHashBaseSeed`, and the seed is then `routingHashSeedOf(fokosDBSeedScopeOf(shardGroup), baseSeedOf(value))`. The
 name `routingHashSeed` stays the derived seed of one shard group, as in the stored identity. The rest of the
 routing-hash RFC does not change: the hash function, the width, the identity check and the storage layout stay.
 
 ### 4.2 M1 — The seed scope
 
 **The option.** The sharding library does not know the formats of the FokosDB shard groups. `FokosShardingClient`,
-`FokosRouter` and `FokosShardingRuntime` take the option `routingSeedOf: (shardGroup: string) => string`. It returns
-the seed as 16 hex characters. The default is `routingHashSeedOf(shardGroup)`, so a user of the library alone sees no
-change. The option is code, not data, so it does not travel in the topology or in a request (R1). M2 changes only the
-function that FokosDB passes, not the library.
+`FokosRouter` and `FokosShardingRuntime` take the option
+`routingHashSeedResolver?: RoutingHashSeedResolver`, with `RoutingHashSeedResolver = (shardGroup: string) => string`.
+It returns the seed as 16 hex characters. The default is `defaultRoutingHashSeedResolver`, which gives
+`routingHashSeedOf(shardGroup)`, so a user of the library alone sees no change. The option is code, not data, so it
+does not travel in the topology or in a request (R1). M2 changes only the resolver that FokosDB passes, not the
+library.
 
-FokosDB passes `(shardGroup) => routingHashSeedOf(fokosSeedScope(shardGroup))` from `src/shared/partition-context.ts`
-to all three. `fokosSeedScope` reads the format with the same parsers as `baseTableName` and `gsiShardGroup`, and it
-throws for an unknown format (R2).
+**The names.** A `…Of` function computes a value from its arguments: `routingHashSeedOf(seedScope, baseSeed)` and
+`fokosDBSeedScopeOf(shardGroup)`. A `…Resolver` is the function that a host injects to give the seed of a shard group.
+A parameter of this type has the name `seedResolver`.
 
-**The derivation.** Each caller of `routingHashSeedOf(shardGroup)` calls `routingSeedOf(shardGroup)`: the router, the
-client, the runtime, `routingHashForShardGroup` in `src/sharding/hash-primitives.ts`, and `partitionIdentityFrom` in
-`src/sharding/partition-id.ts`. The cache of seeds in `src/sharding/hash-primitives.ts` keys by the function and by the
-shard group, so two functions in one isolate never share a cached seed.
+FokosDB passes `fokosDBRoutingHashSeedResolver` from `src/shared/partition-context.ts` to all three. It gives
+`routingHashSeedOf(fokosDBSeedScopeOf(shardGroup))`. `fokosDBSeedScopeOf` reads the format with the same parsers as
+`baseTableName` and `gsiShardGroup`, and it throws for an unknown format (R2).
 
-**The identity check.** The runtime compares the stored seed with `routingSeedOf(shardGroup)` when it loads the
-identity. A difference raises `partition_context_mismatch`, as today.
+**The derivation.** Each caller of `routingHashSeedOf(shardGroup)` calls `routingHashSeedResolver(shardGroup)`: the
+router, the client, the runtime, `routingHashOf` in `src/sharding/hash-primitives.ts`, and `partitionIdentityFrom` in
+`src/sharding/partition-id.ts`. The cache of seeds in `src/sharding/hash-primitives.ts` keys by the resolver and by
+the shard group, so two resolvers in one isolate never share a cached seed.
+
+**The identity check.** The runtime compares the stored seed with `routingHashSeedResolver(shardGroup)` when it loads
+the identity. A difference raises `partition_context_mismatch`, as today.
 
 **What breaks.** The seed of every existing shard group changes. So the stored data of an existing table cannot be
 read with the new code:
@@ -174,8 +180,8 @@ read with the new code:
 - Two namespaces give the same coordinator seed and the same materialization seed.
 - The partition, coordinator, materialization and GSI groups of one table get four different seeds. Two GSIs of one
   table with different index names get different seeds.
-- `fokosSeedScope` throws for a shard group of an unknown format.
-- Two seed functions in one isolate do not share a cached seed.
+- `fokosDBSeedScopeOf` throws for a shard group of an unknown format.
+- Two seed resolvers in one isolate do not share a cached seed.
 - The existing tests of the routing-hash RFC pass with the new pinned values.
 
 ### 4.3 M2 — A base seed for a deployment
@@ -191,7 +197,7 @@ does not protect data, and it does not encrypt anything.
   Worker.
 
 The base seed is `baseSeedOf(value) = hash64(value, GOLDEN_RATIO_BIGINT)`. FokosDB passes
-`(shardGroup) => routingHashSeedOf(fokosSeedScope(shardGroup), baseSeedOf(value))` as `routingSeedOf`. An empty string
+`(shardGroup) => routingHashSeedOf(fokosDBSeedScopeOf(shardGroup), baseSeedOf(value))` as `routingHashSeedResolver`. An empty string
 fails the validation of the options. The value does not go in the route context, the topology or a request (R1).
 
 **Two places that must agree (R4).** The client computes the routingHash to choose a root, and each Durable Object

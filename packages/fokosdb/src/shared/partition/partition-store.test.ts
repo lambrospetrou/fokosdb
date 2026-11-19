@@ -32,11 +32,12 @@ import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
 import { routingHashOf } from "../../sharding/hash-primitives.js";
 import { rangeStorageInterval } from "../../sharding/repartition-slice.js";
+import { testRoutingHashSeedResolver } from "../../../test/routing-hash.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 /** The routingHash of a hash key. The store treats it as opaque bytes, so the shard group of the helper does not matter. */
 const STORE_TEST_GROUP = "fokos.p.store-test";
-const P = (hk: KeyBytes) => routingHashOf(hk, STORE_TEST_GROUP);
+const P = (hk: KeyBytes) => routingHashOf(hk, STORE_TEST_GROUP, testRoutingHashSeedResolver);
 /**
  * The storage interval of the sort keys `[start, end)` of one hash key: a composite interval of its
  * routingHash. With no end, it stops at `hk || 0x00`, the first key above every key of `hk`.

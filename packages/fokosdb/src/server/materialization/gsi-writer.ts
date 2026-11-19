@@ -4,7 +4,13 @@
  * to one outcome. It does not use `FokosDB`.
  */
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
-import { gsiTableConfig, type FokosDBPolicy, type FokosDBRouteContext, type FokosDBTableConfig } from "../../shared/partition-context.js";
+import {
+	fokosDBRoutingHashSeedResolver,
+	gsiTableConfig,
+	type FokosDBPolicy,
+	type FokosDBRouteContext,
+	type FokosDBTableConfig,
+} from "../../shared/partition-context.js";
 import { FokosShardingClient } from "../../sharding/client.js";
 import type { GsiWriteEntriesRequest, PartitionOps } from "../do-partition.js";
 import type { GsiEntryOutcome } from "./target-runner.js";
@@ -58,7 +64,11 @@ export class GsiWriter {
 		if (cached !== undefined && cached.policyVersion === table.policyVersion) {
 			return cached.client;
 		}
-		const client = new FokosShardingClient<FokosDBPolicy, PartitionOps>({ ...table, stub: this.#deps.stub });
+		const client = new FokosShardingClient<FokosDBPolicy, PartitionOps>({
+			...table,
+			stub: this.#deps.stub,
+			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+		});
 		this.#clients.set(indexName, { policyVersion: table.policyVersion, client });
 		return client;
 	}

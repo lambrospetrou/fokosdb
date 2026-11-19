@@ -28,6 +28,7 @@ import {
 	storedBloom,
 	useSmallBloom,
 } from "./partition-harness.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 describe.concurrent("FokosDBPartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and cuts it over to 'promoting'", async () => {
@@ -574,7 +575,7 @@ describe.concurrent("FokosDBPartitionDO — a transaction through a hash jump to
 			const root = TestPartition.at(partition.ctx);
 			await runInDurableObject(root.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
 				const arena = HashTopology.create(partition.ctx.topology.rootTreesN, hashSplitN, 0);
-				arena.updateFromHint(routingHashOf(kb(h1), partition.ctx.topology.shardGroup), 2);
+				arena.updateFromHint(routingHashOf(kb(h1), partition.ctx.topology.shardGroup, testRoutingHashSeedResolver), 2);
 				new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
 			});
 			await runInDurableObject(root.stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {

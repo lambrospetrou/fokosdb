@@ -48,12 +48,12 @@ export function hash64(data: string | Uint8Array, seed?: bigint): bigint {
 }
 
 /**
- * The xxHash64 seed of the routingHashes of a shard group, as 16 lowercase hex characters: xxh64
- * of its UTF-8 name with `baseSeed`. A platform can give its own `baseSeed`, and must then keep it for
- * the life of its data.
+ * The routingHash seed of a seed scope, as 16 lowercase hex characters: xxh64 of the UTF-8 scope
+ * with `baseSeed`. A platform can give its own `baseSeed`, and must then keep it for the life of its
+ * data.
  */
-export function routingHashSeedOf(shardGroup: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string {
-	return hash64(shardGroup, baseSeed).toString(16).padStart(16, "0");
+export function routingHashSeedOf(seedScope: string, baseSeed: bigint = GOLDEN_RATIO_BIGINT): string {
+	return hash64(seedScope, baseSeed).toString(16).padStart(16, "0");
 }
 
 /** The routingHash of an encoded hash key: xxh64(hashKey, seed), as 8 bytes, most significant byte first. */
@@ -61,20 +61,42 @@ export function routingHash(hashKey: KeyBytes, seed: bigint): RoutingHash {
 	return routingHashBytes(hashers.h64Raw(hashKey, seed));
 }
 
-/** The seed of each shard group that this isolate hashed for. A shard group is a table, a GSI, or a derived group. */
-const shardGroupSeeds = new Map<string, bigint>();
+/**
+ * The routingHash seed resolver of a host: it gives the routingHash seed of a shard group, as 16
+ * lowercase hex characters. The client, the router, and the runtime of one deployment must use the
+ * same resolver. The default is `defaultRoutingHashSeedResolver`.
+ */
+export type RoutingHashSeedResolver = (shardGroup: string) => string;
+
+/** The default routingHash seed resolver: the seed scope of a shard group is its full name. */
+export const defaultRoutingHashSeedResolver: RoutingHashSeedResolver = (shardGroup) => routingHashSeedOf(shardGroup);
+
+const SEED_HEX = /^[0-9a-f]{16}$/;
+
+/**
+ * The seeds that this isolate computed, for each resolver and each shard group. Two resolvers
+ * never share a seed. A shard group is a table, a GSI, or a derived group.
+ */
+const shardGroupSeeds = new WeakMap<RoutingHashSeedResolver, Map<string, bigint>>();
 const SHARD_GROUP_SEEDS_MAX = 1024;
 
-/** The routingHash of an encoded hash key in `shardGroup`, with the seed `routingHashSeedOf(shardGroup)`. */
-export function routingHashOf(hashKey: KeyBytes, shardGroup: string): RoutingHash {
-	let seed = shardGroupSeeds.get(shardGroup);
+/** The routingHash of an encoded hash key in `shardGroup`, with the seed `seedResolver(shardGroup)`. */
+export function routingHashOf(hashKey: KeyBytes, shardGroup: string, seedResolver: RoutingHashSeedResolver): RoutingHash {
+	let seeds = shardGroupSeeds.get(seedResolver);
+	if (seeds === undefined) {
+		seeds = new Map();
+		shardGroupSeeds.set(seedResolver, seeds);
+	}
+	let seed = seeds.get(shardGroup);
 	if (seed === undefined) {
+		const hex = seedResolver(shardGroup);
+		invariant(SEED_HEX.test(hex), "fokos/hash-primitives: a routingHash seed is 16 lowercase hex characters");
 		// The oldest seed goes. A hit stays one lookup, and a seed is cheap to compute again.
-		if (shardGroupSeeds.size >= SHARD_GROUP_SEEDS_MAX) {
-			shardGroupSeeds.delete(shardGroupSeeds.keys().next().value!);
+		if (seeds.size >= SHARD_GROUP_SEEDS_MAX) {
+			seeds.delete(seeds.keys().next().value!);
 		}
-		seed = hash64(shardGroup);
-		shardGroupSeeds.set(shardGroup, seed);
+		seed = BigInt(`0x${hex}`);
+		seeds.set(shardGroup, seed);
 	}
 	return routingHash(hashKey, seed);
 }

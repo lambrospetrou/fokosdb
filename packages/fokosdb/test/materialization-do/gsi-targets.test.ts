@@ -10,6 +10,7 @@ import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { MaterializationStore } from "../../src/server/materialization/materialization-store.js";
 import { captureConsoleError, kb, makeStub, materializationOf, TARGET_WAIT } from "../partition-do/helpers.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 type Entry = { sortKey?: string; baseHashKey: string; baseSortKey?: string; data: unknown };
 
@@ -21,7 +22,13 @@ async function gsiEntries(base: FokosDBRouteContext, indexName: string, hashKey:
 		{ topology: base.topology, rangeConfig: base.rangeConfig, policy: base.policy, policyVersion: base.policyVersion },
 		indexName,
 	);
-	const ctx = new FokosRouter(table.topology, table.rangeConfig, table.policy, table.policyVersion).rootContext(kb(hashKey));
+	const ctx = new FokosRouter(
+		table.topology,
+		table.rangeConfig,
+		table.policy,
+		table.policyVersion,
+		testRoutingHashSeedResolver,
+	).rootContext(kb(hashKey));
 	const stub = partitionStubByName(env, ctx, ctx.doName);
 	const rows = await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) =>
 		state.storage.sql

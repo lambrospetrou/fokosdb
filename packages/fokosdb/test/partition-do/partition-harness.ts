@@ -35,6 +35,7 @@ import {
 	makeStub,
 	openedRpc,
 } from "./helpers.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 type PartitionWriter = {
 	apiPutItem(ctx: FokosDBRouteContext, req: PutItemRpcRequest): Promise<{ meta: { partitions: [{ databaseSize: number }] } }>;
@@ -194,7 +195,7 @@ export class TestPartition {
 
 	/** The routingHash of `hashKey` in the shard group of this partition. */
 	routingHashOf(hashKey: string): RoutingHash {
-		return routingHashOf(kb(hashKey), this.ctx.topology.shardGroup);
+		return routingHashOf(kb(hashKey), this.ctx.topology.shardGroup, testRoutingHashSeedResolver);
 	}
 
 	/** The range root of `hashKey`: the partition a promotion of that key creates. */
@@ -293,7 +294,7 @@ export class TestPartition {
 		const prefix = `_split_${crypto.randomUUID()}`;
 		const depth = PartitionIdHelper.depth(Uint8Array.fromHex(this.ctx.partitionId));
 		const { hashSplitN } = this.ctx.topology;
-		const router = new FokosRouter(this.ctx.topology, this.ctx.rangeConfig, this.ctx.policy);
+		const router = new FokosRouter(this.ctx.topology, this.ctx.rangeConfig, this.ctx.policy, undefined, testRoutingHashSeedResolver);
 		let emitted = 0;
 		for (let i = 0; i < 1_000_000; i++) {
 			const key = `${prefix}_${i}`;

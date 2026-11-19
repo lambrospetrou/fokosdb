@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
-import { routingHashSeedOf } from "../../src/sharding/hash-primitives.js";
+import { fokosDBRoutingHashSeedResolver } from "../../src/shared/partition-context.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
@@ -43,7 +43,7 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 				childIndex: PartitionIdHelper.lastChildIdx(idBytes),
 				depth: PartitionIdHelper.depth(idBytes),
 			};
-			expect(sliceIncludesHashKey(slice, kb(hashKey), child.ctx.topology)).toBe(child.doName === ownerName);
+			expect(sliceIncludesHashKey(slice, kb(hashKey), child.ctx.topology, fokosDBRoutingHashSeedResolver)).toBe(child.doName === ownerName);
 		}
 	});
 
@@ -59,7 +59,7 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 			// One root: its interval is the whole routingHash space.
 			hash: { rootIndex: 0, path: [], depth: 0, start: new Uint8Array(8), end: null },
 			topology: partition.ctx.topology,
-			routingHashSeed: routingHashSeedOf(partition.ctx.topology.shardGroup),
+			routingHashSeed: fokosDBRoutingHashSeedResolver(partition.ctx.topology.shardGroup),
 		});
 
 		// Split so children are initialized through fokosInit. splitHash drains the whole tree, rather

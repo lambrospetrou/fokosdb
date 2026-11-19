@@ -5,7 +5,7 @@ import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
-import { routingHashOf, type RoutingHash } from "./hash-primitives.js";
+import { routingHashOf, type RoutingHash, type RoutingHashSeedResolver } from "./hash-primitives.js";
 import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
 import { isRangePartition, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
@@ -53,6 +53,12 @@ export type FokosShardingClientOptions<TPolicy> = {
 	 * partition of its key. Absent: every request enters at a root.
 	 */
 	topologyCache?: FokosTopologyCacheOptions;
+	/**
+	 * The seed of the routingHashes of a shard group, as 16 lowercase hex characters. It must be the
+	 * `routingHashSeedResolver` of the runtime of the shard group, or a request goes to a partition that does not
+	 * own its key. Default: `defaultRoutingHashSeedResolver`.
+	 */
+	routingHashSeedResolver?: RoutingHashSeedResolver;
 };
 
 /** The cost of one client call over every attempt. */
@@ -144,7 +150,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	#fallbacks = new WeakMap<FokosRouteContext<TPolicy>, { root: FokosRouteContext<TPolicy>; next: MissFallback<TPolicy> }>();
 
 	constructor(opts: FokosShardingClientOptions<TPolicy>) {
-		this.#router = new FokosRouter(opts.topology, opts.rangeConfig, opts.policy, opts.policyVersion);
+		this.#router = new FokosRouter(opts.topology, opts.rangeConfig, opts.policy, opts.policyVersion, opts.routingHashSeedResolver);
 		this.#stub = opts.stub;
 		this.#retry = opts.retry;
 		this.#topologyCache = opts.topologyCache;
@@ -193,7 +199,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		}
 		// A promotion moves the whole routingHash of a key, so the promoted set and the range
 		// entries are by routingHash.
-		const routingHash = routingHashOf(hashKey, topology.shardGroup);
+		const routingHash = routingHashOf(hashKey, topology.shardGroup, this.#router.routingHashSeedResolver);
 		const hit = bloom ? isPromotedRoutingHash(hash.view, routingHash) : false;
 		if (hit) {
 			const cached = cachedRangeTopology(opts, topology.shardGroup, routingHash);

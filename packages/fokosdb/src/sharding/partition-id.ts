@@ -5,9 +5,9 @@ import {
 	asRoutingHash,
 	ROUTING_HASH_BYTES,
 	routingHashInterval,
-	routingHashSeedOf,
 	maxHashDepth,
 	type RoutingHash,
+	type RoutingHashSeedResolver,
 } from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
@@ -236,11 +236,13 @@ export function resolveDescendantHashPartitionContext<P>(parent: FokosRouteConte
 }
 
 /**
- * Decodes the stored identity of a partition from its route context. A range partition also needs
- * the depth and the ancestors that only its `fokosInit` carries.
+ * Decodes the stored identity of a partition from its route context. `seedResolver` gives the stored
+ * routingHash seed. A range partition also needs the depth and the ancestors that only its
+ * `fokosInit` carries.
  */
 export function partitionIdentityFrom(
 	ctx: FokosRouteContext<unknown>,
+	seedResolver: RoutingHashSeedResolver,
 	range?: { depth: number; ancestors: RangeAncestorInfo[] },
 ): FokosPartitionIdentity {
 	const bytes = PartitionIdHelper.partitionIdToBytes(ctx.partitionId);
@@ -262,7 +264,7 @@ export function partitionIdentityFrom(
 			kind: "hash",
 			hash: { rootIndex: decoded.rootIdx, path, depth: decoded.depth, ...interval },
 			topology: ctx.topology,
-			routingHashSeed: routingHashSeedOf(ctx.topology.shardGroup),
+			routingHashSeed: seedResolver(ctx.topology.shardGroup),
 		};
 	}
 	invariant(range, "fokos/topology.partitionIdentityFrom: a range partition needs its depth and ancestors");
@@ -272,7 +274,7 @@ export function partitionIdentityFrom(
 		kind: "range",
 		range: { routingHash: decoded.routingHash, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
 		topology: ctx.topology,
-		routingHashSeed: routingHashSeedOf(ctx.topology.shardGroup),
+		routingHashSeed: seedResolver(ctx.topology.shardGroup),
 	};
 }
 

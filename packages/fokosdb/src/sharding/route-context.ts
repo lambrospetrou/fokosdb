@@ -29,8 +29,8 @@ import { SHARD_GROUP_SEPARATOR } from "./partition-id.js";
 export type FokosTopology = {
 	/**
 	 * The name of the shard group, for example a table, a GSI, or a coordinator group. It names the
-	 * Durable Objects of the group and gives the seed of its routingHash
-	 * (`routingHashSeedOf`). It must not be empty and must not contain `SHARD_GROUP_SEPARATOR`.
+	 * Durable Objects of the group, and the routingHash seed resolver of the host gives the seed of its
+	 * routingHash from it (`FokosRuntimeOptions.routingHashSeedResolver`). It must not be empty and must not contain `SHARD_GROUP_SEPARATOR`.
 	 */
 	shardGroup: string;
 	/**
@@ -110,7 +110,7 @@ export type FokosPartitionIdentity = {
 	};
 	topology: FokosTopology;
 	/**
-	 * `routingHashSeedOf(topology.shardGroup)` when the identity was written. A partition whose
+	 * `routingHashSeedResolver(topology.shardGroup)` of the host when the identity was written. A partition whose
 	 * stored seed differs from the seed that the code computes now refuses all work, because its
 	 * stored rows and its routes use the stored seed.
 	 */

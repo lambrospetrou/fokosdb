@@ -1,4 +1,10 @@
-import { compareRoutingHashes, routingHashOf, RoutingHashDigitCursor, type RoutingHash } from "./hash-primitives.js";
+import {
+	compareRoutingHashes,
+	routingHashOf,
+	RoutingHashDigitCursor,
+	type RoutingHash,
+	type RoutingHashSeedResolver,
+} from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosTopology } from "./route-context.js";
 import type { FokosStorageInterval } from "./runtime-types.js";
@@ -51,16 +57,27 @@ export function compositeInInterval(key: FokosCompositeKey, start: FokosComposit
  * Says whether one stored item belongs to the slice. Migration filters its source rows with it, so a
  * target receives exactly the rows it owns and nothing a sibling owns.
  */
-export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey: KeyBytes, topology: SliceTopology): boolean {
-	if (!sliceIncludesRoutingHash(slice, routingHashOf(hashKey, topology.shardGroup), topology)) {
+export function sliceIncludesItem(
+	slice: FokosSlice,
+	hashKey: KeyBytes,
+	sortKey: KeyBytes,
+	topology: SliceTopology,
+	seedResolver: RoutingHashSeedResolver,
+): boolean {
+	if (!sliceIncludesRoutingHash(slice, routingHashOf(hashKey, topology.shardGroup, seedResolver), topology)) {
 		return false;
 	}
 	return slice.kind !== "range" || compositeInInterval({ hk: hashKey, sk: sortKey }, slice.start, slice.end);
 }
 
 /** Says whether one hash key belongs to the slice, ignoring the sort-key axis. */
-export function sliceIncludesHashKey(slice: FokosSlice, hashKey: KeyBytes, topology: SliceTopology): boolean {
-	return sliceIncludesRoutingHash(slice, routingHashOf(hashKey, topology.shardGroup), topology);
+export function sliceIncludesHashKey(
+	slice: FokosSlice,
+	hashKey: KeyBytes,
+	topology: SliceTopology,
+	seedResolver: RoutingHashSeedResolver,
+): boolean {
+	return sliceIncludesRoutingHash(slice, routingHashOf(hashKey, topology.shardGroup, seedResolver), topology);
 }
 
 /** The one routingHash of a promotion plan: its single target carries a `promoted_routing_hash` slice. */

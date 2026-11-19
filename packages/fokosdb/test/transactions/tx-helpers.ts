@@ -29,6 +29,7 @@ import type {
 	TransactWriteItemsResult,
 	TransactWriteOperationResult,
 } from "../../src/shared/transaction-api-types.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 export type Key = { hashKey: string; sortKey: string };
 
@@ -166,7 +167,7 @@ export function makeDB(opts?: MakeDBOptions) {
 /** The router of the partitions of a table, built from the options of the client as FokosDB builds it. */
 export function partitionRouter(db: FokosDB): FokosRouter<FokosDBPolicy> {
 	const { topology, rangeConfig, policy } = createTableConfig(db.options());
-	return new FokosRouter(topology, rangeConfig, policy);
+	return new FokosRouter(topology, rangeConfig, policy, undefined, testRoutingHashSeedResolver);
 }
 
 export function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {
@@ -271,7 +272,13 @@ export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDBPolicy> {
 	const { coordinatorRootsN } = db.options().table;
 	const { topology, rangeConfig, policy } = createTableConfig(db.options());
 	const shardGroup = coordinatorShardGroup(topology, tableFingerprint(env, { topology, policy }));
-	return new FokosRouter({ ...topology, shardGroup, rootTreesN: coordinatorRootsN }, rangeConfig, policy);
+	return new FokosRouter(
+		{ ...topology, shardGroup, rootTreesN: coordinatorRootsN },
+		rangeConfig,
+		policy,
+		undefined,
+		testRoutingHashSeedResolver,
+	);
 }
 
 /** The test controls of the one root coordinator of a `controlled` table. */

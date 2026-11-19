@@ -1,6 +1,15 @@
-import { routingHashOf, type RoutingHash } from "../src/sharding/hash-primitives.js";
+import { routingHashOf, routingHashSeedOf, type RoutingHash } from "../src/sharding/hash-primitives.js";
+import { fokosDBRoutingHashSeedResolver, RESERVED_SHARD_GROUP_PREFIX } from "../src/shared/partition-context.js";
 import type { KeyBytes } from "../src/sharding/key-codec.js";
 import type { FokosStorageInterval } from "../src/sharding/runtime-types.js";
+
+/**
+ * The routingHash seed resolver of the host of `shardGroup` in the tests. A FokosDB Durable Object serves each
+ * `fokos.` group, and a test host of the sharding library serves every other group with the default.
+ */
+export function testRoutingHashSeedResolver(shardGroup: string): string {
+	return shardGroup.startsWith(RESERVED_SHARD_GROUP_PREFIX) ? fokosDBRoutingHashSeedResolver(shardGroup) : routingHashSeedOf(shardGroup);
+}
 
 /**
  * The routingHash of a hash key in the shard group `shardGroup`. A store treats the routingHash as opaque
@@ -8,7 +17,7 @@ import type { FokosStorageInterval } from "../src/sharding/runtime-types.js";
  * use the group of that partition.
  */
 export function routingHashFor(hashKey: KeyBytes, shardGroup = "fokos.p.store-test"): RoutingHash {
-	return routingHashOf(hashKey, shardGroup);
+	return routingHashOf(hashKey, shardGroup, testRoutingHashSeedResolver);
 }
 
 /** The storage interval of every row of a table. */
@@ -25,5 +34,5 @@ export function partitionRoutingHashOf(state: DurableObjectState): (hashKey: Key
 		throw new Error(`partitionRoutingHashOf: ${String(name)} is not the DO name of a partition`);
 	}
 	const shardGroup = name.slice(0, name.indexOf("~"));
-	return (hashKey) => routingHashOf(hashKey, shardGroup);
+	return (hashKey) => routingHashOf(hashKey, shardGroup, testRoutingHashSeedResolver);
 }

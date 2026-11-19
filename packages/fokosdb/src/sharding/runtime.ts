@@ -21,9 +21,10 @@ import {
 	RoutingHashDigitCursor,
 	routingHashDigits,
 	routingHashOf,
-	routingHashSeedOf,
+	defaultRoutingHashSeedResolver,
 	inRoutingHashInterval,
 	type RoutingHash,
+	type RoutingHashSeedResolver,
 } from "./hash-primitives.js";
 import { HashTopology } from "./hash-topology.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
@@ -214,6 +215,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #adminOutbox: FokosRuntimeOptions<TPolicy>["adminOutbox"];
 	readonly #topologyCache: FokosRuntimeOptions<TPolicy>["topologyCache"];
 	readonly #hostInitError: FokosRuntimeOptions<TPolicy>["hostInitError"];
+	readonly #routingHashSeedResolver: RoutingHashSeedResolver;
 
 	/**
 	 * The error of the storage step of the constructor, or of a config read. While it stands,
@@ -246,6 +248,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#adminOutbox = opts.adminOutbox;
 		this.#topologyCache = opts.topologyCache;
 		this.#hostInitError = opts.hostInitError;
+		this.#routingHashSeedResolver = opts.routingHashSeedResolver ?? defaultRoutingHashSeedResolver;
 		// The config is validated at its first read, not here: a throw degrades the object instead of
 		// bricking the constructor.
 		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: () => this.#config().rangeHierarchyMaxRows });
@@ -257,6 +260,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			scheduleWork: () => this.#scheduler.wake(),
 			logParams: () => this.#logParams(),
 			config: () => this.#config(),
+			routingHashSeedResolver: this.#routingHashSeedResolver,
 			onCompleted: (plan, completedAt) => this.#recordCompletion(plan, completedAt),
 		};
 		this.#source = new RepartitionSource(this.#store, deps);
@@ -286,7 +290,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				if (identity && stored) {
 					this.#setIdentity(identity, stored);
 					// The identity stays in memory, so `fokosStatus` and the destroy RPCs still work.
-					const seed = routingHashSeedOf(identity.topology.shardGroup);
+					const seed = this.#routingHashSeedResolver(identity.topology.shardGroup);
 					if (identity.routingHashSeed !== seed) {
 						throw contextMismatch({ doName: identity.ref.doName, routingHashSeed: identity.routingHashSeed, expected: seed });
 					}
@@ -1352,7 +1356,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		if (descriptor.shape === "point") {
 			const key = descriptor.key(req.request);
-			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, topology)) {
+			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, topology, this.#routingHashSeedResolver)) {
 				throw misrouted(req.op, "key outside the caller slice");
 			}
 			// A promoted key's rows live in the range tree; the local copies are stale or already
@@ -1376,7 +1380,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const groups: Groups = { local: [], remote: new Map() };
 			for (const entry of descriptor.items(req.request)) {
 				const { hashKey, sortKey } = entry.key;
-				if (!sliceIncludesItem(slice, hashKey, sortKey, topology)) {
+				if (!sliceIncludesItem(slice, hashKey, sortKey, topology, this.#routingHashSeedResolver)) {
 					throw misrouted(req.op, "key outside the caller slice");
 				}
 				const routingHash = this.#routingHash(hashKey);
@@ -1390,7 +1394,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		invariant(descriptor.shape === "range", "fokos/runtime: read_source is allowed for point, group and range operations only");
 		const input = descriptor.range(req.request);
-		if (!sliceIncludesHashKey(slice, input.hashKey, topology)) {
+		if (!sliceIncludesHashKey(slice, input.hashKey, topology, this.#routingHashSeedResolver)) {
 			throw misrouted(req.op, "hash key outside the caller slice");
 		}
 		let request = req.request;
@@ -1670,7 +1674,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	#writeIdentity(routeCtx: FokosRouteContext<TPolicy>, range?: { depth: number; ancestors: RangeAncestorInfo[] }): () => void {
 		validateTopology(routeCtx.topology);
-		const identity = partitionIdentityFrom(routeCtx, range);
+		const identity = partitionIdentityFrom(routeCtx, this.#routingHashSeedResolver, range);
 		const stored = storedPolicyOf(routeCtx);
 		this.#store.transactionSync(() => {
 			this.#store.putIdentity(identity);
@@ -1761,7 +1765,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** The routingHash of a hash key in the shard group of this partition. It is not kept after the call. */
 	#routingHash(hashKey: KeyBytes): RoutingHash {
-		return routingHashOf(hashKey, this.identity().topology.shardGroup);
+		return routingHashOf(hashKey, this.identity().topology.shardGroup, this.#routingHashSeedResolver);
 	}
 
 	/** `view` is read here when the caller does not give one. A hash key with a cut-over override does not need it. */

@@ -32,8 +32,9 @@ export {
 	routingHash,
 	routingHashDigits,
 	routingHashSeedOf,
+	defaultRoutingHashSeedResolver,
 } from "./hash-primitives.js";
-export type { RoutingHash } from "./hash-primitives.js";
+export type { RoutingHash, RoutingHashSeedResolver } from "./hash-primitives.js";
 
 // ─── Identity and context ─────────────────────────────────────────────────────
 

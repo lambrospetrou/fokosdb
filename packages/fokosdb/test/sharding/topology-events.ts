@@ -1,6 +1,7 @@
 import { PartitionIdHelper, topologyEventToJson, type FokosTopologyEvent, type KeyBytes } from "../../src/sharding/index-server.js";
 import { routingHashOf, type RoutingHash } from "../../src/sharding/hash-primitives.js";
 import type { FokosCompositeKey } from "../../src/sharding/key-codec.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 /**
  * Topology reports as a partition sends them, in their JSON form. A test registers them with a keeper
@@ -56,7 +57,13 @@ function rangeRef(shardGroup: string, routingHash: RoutingHash, start: FokosComp
 
 /** The report of the promotion of the routingHash of `hashKey` from the hash root 0. */
 export function promotionReport(shardGroup: string, hashKey: KeyBytes, completedAt = Date.now(), rootTreesN = 1, hashSplitN = 4): unknown {
-	return routingHashPromotionReport(shardGroup, routingHashOf(hashKey, shardGroup), completedAt, rootTreesN, hashSplitN);
+	return routingHashPromotionReport(
+		shardGroup,
+		routingHashOf(hashKey, shardGroup, testRoutingHashSeedResolver),
+		completedAt,
+		rootTreesN,
+		hashSplitN,
+	);
 }
 
 /** The report of the promotion of `routingHash` from the hash root 0. */
@@ -86,7 +93,7 @@ export function rangeSplitReport(
 	boundaries: FokosCompositeKey[],
 	completedAt = Date.now(),
 ): unknown {
-	const routingHash = routingHashOf(hashKey, shardGroup);
+	const routingHash = routingHashOf(hashKey, shardGroup, testRoutingHashSeedResolver);
 	const source = rangeRef(shardGroup, routingHash, start, end);
 	const edges = [start, ...boundaries, end];
 	return wire({

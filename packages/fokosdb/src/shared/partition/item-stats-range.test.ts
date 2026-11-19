@@ -12,6 +12,7 @@ import { ItemStats } from "./item-stats.js";
 import { PartitionStore, type ItemLinkId } from "./partition-store.js";
 import { SplitPlanner } from "./split-planner.js";
 import { planRangeBoundaries } from "../../../test/range-planner-reference.js";
+import { testRoutingHashSeedResolver } from "../../../test/routing-hash.js";
 
 const GROUP = "fokos.p.item-stats-range-test";
 const DEFECT = "fokos/partition: the facts of a bucket disagree with its items, so they are counted again";
@@ -20,7 +21,7 @@ const kb = (v: string | Uint8Array) => KeyCodec.encode(v);
 // The two hash keys of the range leaf. They have one routingHash, as two hash keys of one promoted
 // routingHash do.
 const [HK_A, HK_B] = collidingHashKeys(GROUP).map((raw) => KeyCodec.encode(raw));
-const RH: RoutingHash = routingHashOf(HK_A, GROUP);
+const RH: RoutingHash = routingHashOf(HK_A, GROUP, testRoutingHashSeedResolver);
 const [HK_LOW, HK_HIGH] = KeyCodec.compare(HK_A, HK_B) < 0 ? [HK_A, HK_B] : [HK_B, HK_A];
 
 // Each test of this file fails when the defect log appears, except a test that breaks a bucket on

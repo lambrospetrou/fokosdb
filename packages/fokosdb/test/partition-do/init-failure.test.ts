@@ -8,7 +8,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
-import { routingHashSeedOf } from "../../src/sharding/hash-primitives.js";
+import { fokosDBRoutingHashSeedResolver } from "../../src/shared/partition-context.js";
 import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
 import { isDestroyAbortError } from "../../src/shared/cf-utils.js";
@@ -124,7 +124,7 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 
 		const broken = await breakAndRestart(partition, (state) => {
 			const identity = state.storage.kv.get<FokosPartitionIdentity>(FOKOS_KV_KEYS.IDENTITY)!;
-			expect(identity.routingHashSeed).toBe(routingHashSeedOf(partition.ctx.topology.shardGroup));
+			expect(identity.routingHashSeed).toBe(fokosDBRoutingHashSeedResolver(partition.ctx.topology.shardGroup));
 			state.storage.kv.put(FOKOS_KV_KEYS.IDENTITY, { ...identity, routingHashSeed: "0000000000000000" });
 		});
 

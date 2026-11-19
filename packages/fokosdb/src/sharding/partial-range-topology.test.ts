@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { AddResult } from "../shared/bloom-filter.js";
-import { routingHashOf } from "./hash-primitives.js";
+import { routingHashOf, defaultRoutingHashSeedResolver } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
 
 /** The routingHash of a hash key in one test shard group. */
-const kb = (s: string) => routingHashOf(KeyCodec.encode(s), "fokos.p.bloom-test");
+const kb = (s: string) => routingHashOf(KeyCodec.encode(s), "fokos.p.bloom-test", defaultRoutingHashSeedResolver);
 
 function createSmall() {
 	return PartialRangeTopology.create({ maxSizeBytes: 1024 * 1024, errorRate: 0.01, initialCapacityN: 100 });

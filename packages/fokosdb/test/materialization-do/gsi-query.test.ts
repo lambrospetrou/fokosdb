@@ -8,6 +8,7 @@ import { FokosShardingClient } from "../../src/sharding/client.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { TARGET_WAIT } from "../partition-do/helpers.js";
+import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
 function makeDB() {
 	return new FokosDB({
@@ -119,10 +120,15 @@ describe("db.gsi(indexName).queryItems", () => {
 		// materialization partitions are fenced, and only the byStatus GSI table is gone.
 		const { topology, rangeConfig, policy, policyVersion } = createTableConfig({ table: db.options().table });
 		const table = { topology, rangeConfig, policy, policyVersion };
-		await new FokosShardingClient({ ...table, stub: (ctx, doName) => partitionStubByName(env, ctx, doName) }).destroy();
+		await new FokosShardingClient({
+			...table,
+			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+			routingHashSeedResolver: testRoutingHashSeedResolver,
+		}).destroy();
 		const materializations = new FokosShardingClient({
 			...materializationTableConfig(table, tableFingerprint(env, table)),
 			stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
+			routingHashSeedResolver: testRoutingHashSeedResolver,
 		});
 		for await (const node of materializations.walk()) {
 			await materializationStubByName(env, node.ctx, node.ctx.doName).fokosPrepareDestroy({
@@ -132,6 +138,7 @@ describe("db.gsi(indexName).queryItems", () => {
 		await new FokosShardingClient({
 			...gsiTableConfig(table, "byStatus"),
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+			routingHashSeedResolver: testRoutingHashSeedResolver,
 		}).destroy();
 		expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toEqual([]);
 		expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(1);
@@ -150,7 +157,7 @@ describe("db.gsi(indexName).queryItems — sort key encodings", () => {
 			table: db.options().table,
 		});
 		const table = gsiTableConfig({ topology, rangeConfig, policy, policyVersion }, "idx");
-		const router = new FokosRouter(table.topology, table.rangeConfig, table.policy, table.policyVersion);
+		const router = new FokosRouter(table.topology, table.rangeConfig, table.policy, table.policyVersion, testRoutingHashSeedResolver);
 		for (const [opIndex, e] of entries.entries()) {
 			const ctx = router.rootContext(KeyCodec.encode(e.gsiHK));
 			await partitionStubByName(env, ctx, ctx.doName).gsiWriteEntries(ctx, {

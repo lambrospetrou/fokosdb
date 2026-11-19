@@ -14,7 +14,7 @@ import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-c
 import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
-import type { RoutingHash } from "../sharding/hash-primitives.js";
+import { routingHashSeedOf, type RoutingHash, type RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
@@ -159,7 +159,7 @@ export function gsiShardGroup(topology: FokosTopology, indexName: string): strin
 
 /** True for the shard group of a GSI. */
 export function isGsiShardGroup(shardGroup: string): boolean {
-	return shardGroup.startsWith(`${RESERVED_SHARD_GROUP_PREFIX}gsiv1.`);
+	return shardGroup.startsWith(GSI_SHARD_GROUP_PREFIX);
 }
 
 /**
@@ -186,6 +186,57 @@ export function gsiTableConfig(table: FokosDBTableConfig, indexName: string): Fo
 		policy: { ...policy, limits: gsiLimits(resolveLimits(table.policy.limits)) },
 	};
 }
+
+const COORDINATOR_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}tc.`;
+const GSI_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}gsiv1.`;
+
+/**
+ * The seed scope of a FokosDB shard group: the part of its name that its routingHash seed comes
+ * from. The scope has the kind of the group, and the index name for a GSI. It has no table name and
+ * no namespace fingerprint, so the stored routingHashes of a table stay valid in another table or in
+ * another namespace.
+ *
+ * | Shard group | Seed scope |
+ * | --- | --- |
+ * | `fokos.p.<tableName>` | `fokos.p` |
+ * | `fokos.tc.<tableName>.<fp>` | `fokos.tc` |
+ * | `fokos.m.<tableName>.<fp>` | `fokos.m` |
+ * | `fokos.gsiv1.<n>.<tableName>.<indexName>` | `fokos.gsiv1.<length of indexName>.<indexName>` |
+ *
+ * Every stored routingHash depends on the scope, so the scope of a shard group must never change.
+ * Throws for a shard group of an unknown format.
+ */
+export function fokosDBSeedScopeOf(shardGroup: string): string {
+	if (shardGroup.startsWith(PARTITION_SHARD_GROUP_PREFIX)) {
+		return `${RESERVED_SHARD_GROUP_PREFIX}p`;
+	}
+	if (shardGroup.startsWith(COORDINATOR_SHARD_GROUP_PREFIX)) {
+		return `${RESERVED_SHARD_GROUP_PREFIX}tc`;
+	}
+	if (shardGroup.startsWith(MATERIALIZATION_SHARD_GROUP_PREFIX)) {
+		return `${RESERVED_SHARD_GROUP_PREFIX}m`;
+	}
+	if (shardGroup.startsWith(GSI_SHARD_GROUP_PREFIX)) {
+		const rest = shardGroup.slice(GSI_SHARD_GROUP_PREFIX.length);
+		const dot = rest.indexOf(".");
+		const n = /^[0-9]+$/.test(rest.slice(0, dot)) ? Number(rest.slice(0, dot)) : NaN;
+		// `<n>.<tableName>.` comes before the index name.
+		const indexStart = dot + 1 + n + 1;
+		invariant(
+			dot > 0 && Number.isSafeInteger(n) && rest[indexStart - 1] === "." && indexStart < rest.length,
+			`fokos/partition-context: "${shardGroup}" is not the shard group of a GSI`,
+		);
+		const indexName = rest.slice(indexStart);
+		return `${GSI_SHARD_GROUP_PREFIX}${indexName.length}.${indexName}`;
+	}
+	invariant(false, `fokos/partition-context: "${shardGroup}" is not a FokosDB shard group`);
+}
+
+/**
+ * The routingHash seed resolver of FokosDB: the seed of a shard group comes from its seed scope
+ * (`fokosDBSeedScopeOf`). Every client and every Durable Object class of FokosDB uses it.
+ */
+export const fokosDBRoutingHashSeedResolver: RoutingHashSeedResolver = (shardGroup) => routingHashSeedOf(fokosDBSeedScopeOf(shardGroup));
 
 /** The table name, from the partition group or the materialization group of the table. */
 export function baseTableName(topology: FokosTopology): string {
