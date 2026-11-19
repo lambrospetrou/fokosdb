@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { HashTopology } from "./hash-topology.js";
-import { routingHashDigits, routingHashOf } from "./hash-primitives.js";
+import { routingHashDigits, routingHashOf, routingHashSeedOf } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 
 // The arena walks the digits of a routingHash. Each test hashes its keys in one shard group with one root.
 const R = 1;
-const rh = (s: string) => routingHashOf(KeyCodec.encode(s), "arena-test");
+const rh = (s: string) => routingHashOf(KeyCodec.encode(s), "arena-test", routingHashSeedOf);
 
 // Compute the relative path (sequence of child-slot indices) that a hashKey takes
 // through the cache starting from ownerAbsDepth, for `depth` levels.

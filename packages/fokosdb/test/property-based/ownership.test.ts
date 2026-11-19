@@ -12,6 +12,7 @@
 // The tree of each property is built once. The check only reads the router, so every run shares it.
 import { runInDurableObject } from "cloudflare:test";
 import fc from "fast-check";
+import { testRoutingSeedOf } from "../routing-hash.js";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import {
@@ -60,6 +61,7 @@ function assertOwnershipAgrees<TPolicy, Ops extends FokosOperationSpec>(
 		scheduleWork: notUsed,
 		logParams: notUsed,
 		config: () => DEFAULT_RUNTIME_CONFIG,
+		routingSeedOf: testRoutingSeedOf,
 	};
 	const source = new RepartitionSource(new FokosShardingStore(storage), deps);
 	expect(fokos.lifecycle().role).toBe("router");

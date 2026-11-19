@@ -35,7 +35,7 @@ import type { FokosMigrationPageBudget } from "../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosShardingHooks, FokosStorageInterval } from "../sharding/runtime-types.js";
 import { asRoutingHash, compareRoutingHashes, type RoutingHash } from "../sharding/hash-primitives.js";
 import { hashStorageInterval } from "../sharding/repartition-slice.js";
-import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
+import { fokosRoutingSeedOf, type FokosDBPolicy, type FokosDBRouteContext } from "../shared/partition-context.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -395,7 +395,7 @@ describe("FokosDBTransactionCoordinatorDO - participant resolution", () => {
 			const topology = { ...ctx.topology, rootTreesN: 8 };
 			// A policy that is not the policy of the coordinator: each participant must receive the policy of the table.
 			const policy = { ...ctx.policy, hashSplitConditions: { ...ctx.policy.hashSplitConditions, maxSizeMb: 123 } };
-			const table = new FokosRouter(topology, ctx.rangeConfig, policy);
+			const table = new FokosRouter(topology, ctx.rangeConfig, policy, undefined, fokosRoutingSeedOf);
 			// Keys under two different roots.
 			const hashKeys = Array.from({ length: 16 }, (_, i) => KeyCodec.encode(`hk-${i}`));
 			const first = table.rootContext(hashKeys[0]);

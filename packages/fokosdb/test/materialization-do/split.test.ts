@@ -9,6 +9,7 @@ import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
 import { kb, makeStub, type PartitionOptions } from "../partition-do/helpers.js";
 import type { ReceivedPush } from "./push-target-host.js";
+import { testRoutingSeedOf } from "../routing-hash.js";
 
 /** The producer of the test exports. */
 const PRODUCER_ID = "dd".repeat(32);
@@ -23,7 +24,7 @@ function materializationRoot(opts: PartitionOptions): Mat {
 		{ topology: base.topology, rangeConfig: base.rangeConfig, policy: base.policy, policyVersion: base.policyVersion },
 		tableFingerprint(env, base),
 	);
-	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion).rootContext(kb("any"));
+	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion, testRoutingSeedOf).rootContext(kb("any"));
 	return { ctx, stub: materializationStubByName(env, ctx, ctx.doName), ref: { partitionId: ctx.partitionId, doName: ctx.doName } };
 }
 

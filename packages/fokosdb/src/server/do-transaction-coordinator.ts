@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
+import { fokosRoutingSeedOf, type FokosDBPolicy, type FokosDBRouteContext, type FokosDBTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { asRoutingHash, maxHashDepth, type RoutingHash } from "../sharding/hash-primitives.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
@@ -437,6 +437,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
 			ctx,
 			stub: (routeCtx, doName) => txCoordinatorStubByName(env, routeCtx, doName),
+			routingSeedOf: fokosRoutingSeedOf,
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
@@ -1332,6 +1333,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			policy: ctx.policy,
 			policyVersion: ctx.policyVersion,
 			stub: (c, doName) => partitionStubByName(this.env, c, doName),
+			routingSeedOf: fokosRoutingSeedOf,
 			...(topologyCache === undefined ? {} : { topologyCache }),
 		});
 	}

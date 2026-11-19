@@ -179,8 +179,8 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 			);
 			return { ...makeRouter().allRoots()[0], topology, partitionId: opaque, doName };
 		};
-		expect(partitionIdentityFrom(at(6)).hash!.depth).toBe(6);
-		expect(() => partitionIdentityFrom(at(7))).toThrow(
+		expect(partitionIdentityFrom(at(6), routingHashSeedOf).hash!.depth).toBe(6);
+		expect(() => partitionIdentityFrom(at(7), routingHashSeedOf)).toThrow(
 			fokosErrorWith("partition_context_options_invalid", { option: "partitionId", value: 7, limit: 6 }),
 		);
 		expect(PartitionIdHelper.hashDescendantId(at(5), [254]).doName).toBe(`${base}~h.0.0.0.0.0.0.254`);
@@ -381,7 +381,7 @@ describe("PartitionIdHelper — range ID base64url parts", () => {
 
 	it("partitionIdentityFrom decodes both parts of a range ID", () => {
 		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], ROUTING_HASH, c("alice", "b1"), null);
-		const identity = partitionIdentityFrom(ctx, { depth: 1, ancestors: [] });
+		const identity = partitionIdentityFrom(ctx, routingHashSeedOf, { depth: 1, ancestors: [] });
 		expect(identity.range).toEqual({ routingHash: ROUTING_HASH, start: c("alice", "b1"), end: null, depth: 1, ancestors: [] });
 	});
 
@@ -693,7 +693,7 @@ describe("partitionIdentityFrom", () => {
 		const root = makeRouter().allRoots()[2];
 		const child = resolveDescendantHashPartitionContext(root, [3, 1]);
 
-		const identity = partitionIdentityFrom(child);
+		const identity = partitionIdentityFrom(child, routingHashSeedOf);
 		expect(identity).toEqual({
 			schema: 1,
 			ref: { partitionId: child.partitionId, doName: `${base}~h.2.3.1` },
@@ -710,12 +710,12 @@ describe("partitionIdentityFrom", () => {
 			routingHashSeed: routingHashSeedOf(base),
 		});
 		expect(identityDepth(identity)).toBe(2);
-		expect(identityDepth(partitionIdentityFrom(root))).toBe(0);
+		expect(identityDepth(partitionIdentityFrom(root, routingHashSeedOf))).toBe(0);
 	});
 
 	it("rejects a hash identity whose DO name does not match its partition ID", () => {
 		const root = makeRouter().allRoots()[2];
-		expect(() => partitionIdentityFrom({ ...root, doName: `${base}~h.3` })).toThrow(
+		expect(() => partitionIdentityFrom({ ...root, doName: `${base}~h.3` }, routingHashSeedOf)).toThrow(
 			invariantFailure(/the DO name does not match the partition ID/),
 		);
 	});
@@ -725,12 +725,12 @@ describe("partitionIdentityFrom", () => {
 		const range = resolveRangePartitionContext(root, ROUTING_HASH, c("alice", "b1"), null);
 		const ancestors = [{ depth: 0, startBoundary: c("alice", "a"), endBoundary: c("alice", "z") }];
 
-		const identity = partitionIdentityFrom(range, { depth: 1, ancestors });
+		const identity = partitionIdentityFrom(range, routingHashSeedOf, { depth: 1, ancestors });
 		expect(identity.kind).toBe("range");
 		expect(identity.hash).toBeUndefined();
 		expect(identity.range).toEqual({ routingHash: ROUTING_HASH, start: c("alice", "b1"), end: null, depth: 1, ancestors });
 		expect(identity.routingHashSeed).toBe(routingHashSeedOf(base));
 		expect(identityDepth(identity)).toBe(1);
-		expect(() => partitionIdentityFrom(range)).toThrow(invariantFailure(/needs its depth and ancestors/));
+		expect(() => partitionIdentityFrom(range, routingHashSeedOf)).toThrow(invariantFailure(/needs its depth and ancestors/));
 	});
 });

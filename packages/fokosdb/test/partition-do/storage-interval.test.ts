@@ -14,6 +14,7 @@ import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../.
 import { collidingHashKeys } from "../hash-digits.js";
 import { kb, makeStub } from "./helpers.js";
 import { drainUntil, makePartition, TestPartition } from "./partition-harness.js";
+import { testRoutingSeedOf } from "../routing-hash.js";
 
 /** A query of every row of `hashKey`, with every budget wide open. */
 const queryAll = (hashKey: KeyBytes): QueryItemsRpcRequest => ({
@@ -68,7 +69,7 @@ async function localRows(partition: TestPartition, hashKey: KeyBytes): Promise<n
 					n: number;
 				}>(
 					`SELECT COUNT(*) AS n FROM items WHERE routing_hash = ? AND hk = ?`,
-					routingHashOf(hashKey, partition.ctx.topology.shardGroup),
+					routingHashOf(hashKey, partition.ctx.topology.shardGroup, testRoutingSeedOf),
 					hashKey,
 				)
 				.one().n,
@@ -105,7 +106,7 @@ describe("FokosDBPartitionDO — storage intervals", () => {
 		{ timeout: 120_000 },
 		async () => {
 			const { ctx } = makeStub({ rootTreesN: 2, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const [root0, root1] = new FokosRouter(ctx.topology, ctx.rangeConfig, ctx.policy, ctx.policyVersion)
+			const [root0, root1] = new FokosRouter(ctx.topology, ctx.rangeConfig, ctx.policy, ctx.policyVersion, testRoutingSeedOf)
 				.allRoots()
 				.map((root) => TestPartition.at(root));
 			const [child00] = await splitAndCheckChildren(root0);
@@ -122,7 +123,7 @@ describe("FokosDBPartitionDO — storage intervals", () => {
 		const partition = makePartition();
 		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		const rangeRoot = await partition.awaitPromoted("alice");
-		const routingHash = routingHashOf(kb("alice"), partition.ctx.topology.shardGroup);
+		const routingHash = routingHashOf(kb("alice"), partition.ctx.topology.shardGroup, testRoutingSeedOf);
 		const interval = rangeStorageInterval(routingHash, null, null);
 		expect(await intervalsOf(rangeRoot)).toEqual({ scope: interval, owned: interval });
 		// The interval starts at the routingHash and ends at the start of the next routingHash.
@@ -142,8 +143,8 @@ describe("FokosDBPartitionDO — storage intervals", () => {
 			const [lower, upper] = collidingHashKeys(group)
 				.map((raw) => KeyCodec.encode(raw))
 				.sort(KeyCodec.compare);
-			const routingHash = routingHashOf(lower, group);
-			expect(routingHashOf(upper, group)).toEqual(routingHash);
+			const routingHash = routingHashOf(lower, group, testRoutingSeedOf);
+			expect(routingHashOf(upper, group, testRoutingSeedOf)).toEqual(routingHash);
 			for (const hashKey of [lower, upper]) {
 				for (const sk of ["s1", "s2", "s3"]) {
 					await partition.put({ hashKey, sortKey: kb(sk), data: "d", kind: "text" });

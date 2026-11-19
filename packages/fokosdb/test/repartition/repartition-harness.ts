@@ -19,7 +19,7 @@ import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "../../src/sharding/key-codec.js";
 import type { RoutingHash } from "../../src/sharding/hash-primitives.js";
-import { ALL_ROWS, routingHashFor } from "../routing-hash.js";
+import { ALL_ROWS, routingHashFor, testRoutingSeedOf } from "../routing-hash.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import {
 	isRangePartition,
@@ -132,7 +132,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
-	const base = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy).allRoots()[0];
+	const base = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy, undefined, testRoutingSeedOf).allRoots()[0];
 	const runtimeConfig = resolveRuntimeConfig(opts.runtimeConfig);
 
 	const nodes = new Map<string, Node>();
@@ -159,7 +159,9 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			return cluster.node({ ...base, doName: doName!, partitionId: opaque });
 		},
 		rangeNode(from, hashKey, start, end) {
-			return cluster.node(resolveRangePartitionContext(from, routingHashOf(hashKey, from.topology.shardGroup), start, end));
+			return cluster.node(
+				resolveRangePartitionContext(from, routingHashOf(hashKey, from.topology.shardGroup, testRoutingSeedOf), start, end),
+			);
 		},
 		scheduled: (doName) => scheduled.get(doName) ?? 0,
 		alarms: (doName) => alarms.get(doName) ?? [],
@@ -236,7 +238,8 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		ctx: FokosDBRouteContext,
 	): RepartitionSourceDeps & RepartitionTargetDeps {
 		const identity = (): FokosPartitionIdentity =>
-			sharding.getIdentity() ?? partitionIdentityFrom(ctx, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
+			sharding.getIdentity() ??
+			partitionIdentityFrom(ctx, testRoutingSeedOf, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
 		return {
 			// A target exists as soon as its source names it, exactly as a real DO does: a Durable Object
 			// is created by the first call that reaches it, not registered in advance.
@@ -248,7 +251,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					logParams: () => ({ doName, partitionId: ctx.partitionId }),
 					captureChanges: () => false,
 					selfId: () => doName,
-					routingHashForKey: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup),
+					routingHashForKey: (hashKey) => routingHashOf(hashKey, ctx.topology.shardGroup, testRoutingSeedOf),
 				}),
 				computeRangeBoundaries: ({ routingHash, start, end, childCount }) =>
 					new SplitPlanner({
@@ -290,13 +293,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			applyTargetIdentity: (req: FokosInitRequest) => {
 				const target = req.target as FokosDBRouteContext;
 				const range = isRangePartition(target) ? { depth: req.rangeDepth ?? 0, ancestors: req.rangeAncestors ?? [] } : undefined;
-				sharding.putIdentity(partitionIdentityFrom(target, range));
+				sharding.putIdentity(partitionIdentityFrom(target, testRoutingSeedOf, range));
 				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy, policyVersion: target.policyVersion });
 				// This harness keeps its identity in the store only, so it has no in-memory step to take.
 				return () => {};
 			},
 			scheduleWork: () => scheduled.set(doName, (scheduled.get(doName) ?? 0) + 1),
 			config: () => runtimeConfig,
+			routingSeedOf: testRoutingSeedOf,
 			ensureAlarmSet: async (targetMs) => {
 				alarms.set(doName, [...(alarms.get(doName) ?? []), targetMs]);
 			},

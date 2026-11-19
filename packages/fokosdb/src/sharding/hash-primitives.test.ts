@@ -16,6 +16,7 @@ import {
 	type RoutingHash,
 } from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
+import { invariantFailure } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -133,7 +134,7 @@ describe("the digits of a routingHash", () => {
 		const R = 8;
 		const counts = Array.from({ length: R }, () => 0);
 		for (const k of KEYS) {
-			counts[new RoutingHashDigitCursor(routingHashOf(k, "fokos.p.spread"), R).root]++;
+			counts[new RoutingHashDigitCursor(routingHashOf(k, "fokos.p.spread", routingHashSeedOf), R).root]++;
 		}
 		const expected = KEYS.length / R;
 		// Loose chi-square-free bound: no root should be wildly off (within 2.5x of expected).
@@ -160,7 +161,23 @@ describe("routingHash", () => {
 
 	it("routingHashOf uses the seed of the shard group", () => {
 		const seed = BigInt(`0x${routingHashSeedOf("fokos.p.orders")}`);
-		expect(routingHashOf(kb("user#42"), "fokos.p.orders")).toEqual(routingHash(kb("user#42"), seed));
+		expect(routingHashOf(kb("user#42"), "fokos.p.orders", routingHashSeedOf)).toEqual(routingHash(kb("user#42"), seed));
+	});
+
+	it("does not share a cached seed between two seed functions", () => {
+		const group = "fokos.p.orders";
+		const other = () => routingHashSeedOf("other");
+		const first = routingHashOf(kb("user#42"), group, routingHashSeedOf);
+		const second = routingHashOf(kb("user#42"), group, other);
+		expect(second).toEqual(routingHash(kb("user#42"), BigInt(`0x${routingHashSeedOf("other")}`)));
+		expect(second).not.toEqual(first);
+		expect(routingHashOf(kb("user#42"), group, routingHashSeedOf)).toEqual(first);
+	});
+
+	it("refuses a seed that is not 16 lowercase hex characters", () => {
+		for (const seed of ["", "abc", "3291CF945F451BEB", "3291cf945f451beb0"]) {
+			expect(() => routingHashOf(kb("user#42"), "fokos.p.orders", () => seed)).toThrow(invariantFailure(/16 lowercase hex characters/));
+		}
 	});
 
 	it("gives 8 bytes, most significant byte first, equal to xxh64 of the key bytes", () => {

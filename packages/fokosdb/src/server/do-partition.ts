@@ -26,7 +26,13 @@ import type {
 	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
-import { isGsiShardGroup, materializationTableConfig, type FokosDBPolicy, type FokosDBRouteContext } from "../shared/partition-context.js";
+import {
+	fokosRoutingSeedOf,
+	isGsiShardGroup,
+	materializationTableConfig,
+	type FokosDBPolicy,
+	type FokosDBRouteContext,
+} from "../shared/partition-context.js";
 import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { RoutingHash } from "../sharding/hash-primitives.js";
@@ -484,6 +490,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			ctx,
 			// Host code: it reads the binding and the location hint from the policy and applies the jurisdiction.
 			stub: (routeCtx, doName) => partitionStubByName(env, routeCtx, doName),
+			routingSeedOf: fokosRoutingSeedOf,
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
@@ -728,6 +735,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const client = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 			...table,
 			stub: (ctx, doName) => materializationStubByName(this.env, ctx, doName),
+			routingSeedOf: fokosRoutingSeedOf,
 		});
 		this.#materialization = { routeCtx: self, client };
 		return client;

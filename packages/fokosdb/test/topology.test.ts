@@ -16,6 +16,7 @@ import { TARGET_WAIT } from "./partition-do/helpers.js";
 import { makeRangeRoot } from "./partition-do/partition-harness.js";
 import { untilAvailable } from "./property-based/harness.js";
 import { testPartitionStub } from "./stub-helpers.js";
+import { testRoutingSeedOf } from "./routing-hash.js";
 
 // maxSizeMb 0.25 is 262,144 bytes. The empty schema holds about 100 KB, so a few 50 KB items split a root.
 const ITEM_DATA = "x".repeat(50 * 1024);
@@ -134,7 +135,7 @@ describe("FokosDB — encoded topology", () => {
 						`INSERT INTO fokos_topo_range_intervals (shard_group, routing_hash, start_hk, start_sk, end_is_max, end_hk, end_sk, seq)
 							 VALUES (?1, ?2, x'', x'', 1, x'', x'', 1)`,
 						shardGroup,
-						routingHashOf(KeyCodec.encode(`promoted-${i}`), shardGroup),
+						routingHashOf(KeyCodec.encode(`promoted-${i}`), shardGroup, testRoutingSeedOf),
 					);
 				}
 				state.storage.sql.exec(
@@ -150,9 +151,13 @@ describe("FokosDB — encoded topology", () => {
 		const view = parseHashBody((read as { body: Uint8Array }).body);
 		// A key that no repartition promoted, and that the Bloom filter holds: a false positive.
 		const candidates = Array.from({ length: 5_000 }, (_, i) => `fp-${i}`);
-		const falsePositive = candidates.find((key) => isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode(key), shardGroup)));
+		const falsePositive = candidates.find((key) =>
+			isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode(key), shardGroup, testRoutingSeedOf)),
+		);
 		expect(falsePositive).toBeDefined();
-		const plain = candidates.find((key) => !isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode(key), shardGroup)))!;
+		const plain = candidates.find(
+			(key) => !isPromotedRoutingHash(view, routingHashOf(KeyCodec.encode(key), shardGroup, testRoutingSeedOf)),
+		)!;
 
 		// The client reads no topology, so only the coordinator and the partitions read it.
 		const db = new FokosDB(options(tableName, { useTopologyCache: false, singlePartitionFastPath: false }));

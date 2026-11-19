@@ -157,6 +157,7 @@ import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expre
 import {
 	coordinatorShardGroup,
 	createTableConfig,
+	fokosRoutingSeedOf,
 	gsiShardGroup,
 	gsiTableConfig,
 	materializationShardGroup,
@@ -733,6 +734,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+			routingSeedOf: fokosRoutingSeedOf,
 			...this.#topologyCache({ topology, policy }, policy.ns),
 		});
 		this.#coordinators = new FokosShardingClient({
@@ -741,6 +743,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
+			routingSeedOf: fokosRoutingSeedOf,
 			...this.#topologyCache({ topology: coordinatorTopology, policy }, policy.nsTx),
 		});
 	}
@@ -808,6 +811,7 @@ export class FokosDB {
 			client = new FokosShardingClient({
 				...gsiTableConfig(this.#table, indexName),
 				stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+				routingSeedOf: fokosRoutingSeedOf,
 			});
 			this.#gsis.set(indexName, client);
 		}
@@ -1770,6 +1774,7 @@ export class FokosDB {
 			const materializations = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 				...materializationTableConfig(this.#table, fp),
 				stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
+				routingSeedOf: fokosRoutingSeedOf,
 			});
 			const indexNames = await this.#fenceMaterializations(materializations);
 			for (const indexName of indexNames) {

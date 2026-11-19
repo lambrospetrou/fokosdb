@@ -1,5 +1,5 @@
 import { PartitionIdHelper } from "./partition-id.js";
-import { RoutingHashDigitCursor, routingHashOf } from "./hash-primitives.js";
+import { RoutingHashDigitCursor, routingHashOf, routingHashSeedOf, type RoutingSeedOf } from "./hash-primitives.js";
 import type { KeyBytes } from "./key-codec.js";
 import {
 	validatePolicyVersion,
@@ -24,6 +24,8 @@ export class FokosRouter<TPolicy> {
 		readonly rangeConfig: FokosRangeConfig,
 		readonly policy: TPolicy,
 		readonly policyVersion: number = 0,
+		/** The seed function of the routingHashes. See `FokosShardingClientOptions.routingSeedOf`. */
+		readonly routingSeedOf: RoutingSeedOf = routingHashSeedOf,
 	) {
 		validateTopology(topology);
 		validateRangeConfig(rangeConfig);
@@ -32,7 +34,7 @@ export class FokosRouter<TPolicy> {
 
 	/** The root partition that owns `hashKey`. Keys arrive already encoded. */
 	rootContext(hashKey: KeyBytes): FokosRouteContext<TPolicy> {
-		const routingHash = routingHashOf(hashKey, this.topology.shardGroup);
+		const routingHash = routingHashOf(hashKey, this.topology.shardGroup, this.routingSeedOf);
 		return this.#root(new RoutingHashDigitCursor(routingHash, this.topology.rootTreesN).root);
 	}
 

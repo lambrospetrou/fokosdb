@@ -7,7 +7,7 @@
  * of another does not compile.
  */
 import type { FokosCompositeKey, KeyBytes } from "./key-codec.js";
-import type { RoutingHash } from "./hash-primitives.js";
+import type { RoutingHash, RoutingSeedOf } from "./hash-primitives.js";
 import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosImportState, MigrationHost, RouteKey } from "./repartition-types.js";
@@ -62,6 +62,13 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * one, a router uses its hash arena only.
 	 */
 	topologyCache?(this: void): FokosTopologyCacheOptions | undefined;
+	/**
+	 * Host code. The seed of the routingHashes of a shard group, as 16 lowercase hex characters. The
+	 * runtime stores it in the identity of a new partition and refuses a stored identity with another
+	 * seed. Every client and every runtime of the shard group must use the same function. Default:
+	 * `routingHashSeedOf`.
+	 */
+	routingSeedOf?: RoutingSeedOf;
 };
 
 export type FokosAdminOutbox = {

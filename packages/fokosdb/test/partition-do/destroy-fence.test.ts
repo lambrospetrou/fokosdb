@@ -15,6 +15,7 @@ import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
+import { testRoutingSeedOf } from "../routing-hash.js";
 
 /** Every entry of every promotions page, so a test reads the whole listing the traversal would walk. */
 async function allPromotionEntries(partition: TestPartition) {
@@ -92,7 +93,7 @@ describe.concurrent("FokosDBPartitionDO — fokosStatus", () => {
 		const entries = await allPromotionEntries(partition);
 		expect(entries).toHaveLength(1);
 		expect(entries[0].repartition.kind).toBe("key_promotion");
-		expect(entries[0].repartition.routingHash).toEqual(routingHashOf(kb("alice"), partition.ctx.topology.shardGroup));
+		expect(entries[0].repartition.routingHash).toEqual(routingHashOf(kb("alice"), partition.ctx.topology.shardGroup, testRoutingSeedOf));
 		expect(entries[0].target?.ref.doName).toBe(rangeRoot.doName);
 	});
 

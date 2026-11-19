@@ -1,6 +1,13 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { asRoutingHash, compareRoutingHashes, routingHashDigits, routingHashOf, type RoutingHash } from "./hash-primitives.js";
+import {
+	asRoutingHash,
+	compareRoutingHashes,
+	routingHashDigits,
+	routingHashOf,
+	type RoutingHash,
+	routingHashSeedOf,
+} from "./hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 import { findLeaf, isPromotedRoutingHash, parseHashBody, parseRangeBody, HASH_BODY_MAGIC } from "./topology-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
@@ -48,7 +55,7 @@ function positions(forest: Forest): Map<string, number> {
 }
 
 /** The routingHash of a test key. */
-const rh = (key: string) => routingHashOf(KeyCodec.encode(key), "codec-test");
+const rh = (key: string) => routingHashOf(KeyCodec.encode(key), "codec-test", routingHashSeedOf);
 
 /** The reference walk: follow the digits of the routingHash through the split nodes, and stop before a cut node. */
 function referenceLeaf(forest: Forest, routingHash: RoutingHash, cut: ReadonlySet<string>): { node: string; path: number[] } {

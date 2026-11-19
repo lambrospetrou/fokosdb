@@ -15,6 +15,7 @@ import { FokosRouter } from "../src/sharding/router.js";
 import { COORDINATOR_REF_VERSION, type CoordinatorRef } from "../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO } from "./controlled-partition-do.js";
 import type { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
+import { testRoutingSeedOf } from "./routing-hash.js";
 
 /** A name is a string and an id is an object, so one function serves both. */
 export function testPartitionStub(
@@ -45,7 +46,7 @@ export function testCoordinatorContext(nsTx: TransactionCoordinatorNamespaceKey 
 		table: { name: `tc-test.${crypto.randomUUID()}`, ns: "PARTITION_DO", nsTx, rootTreesN: 1, hashSplitN: 2 },
 		hashSplitConditions: { maxSizeMb: 100 },
 	});
-	return new FokosRouter(table.topology, table.rangeConfig, table.policy).allRoots()[0];
+	return new FokosRouter(table.topology, table.rangeConfig, table.policy, undefined, testRoutingSeedOf).allRoots()[0];
 }
 
 /**

@@ -8,7 +8,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import { testCoordinatorContext, testPartitionStub } from "../stub-helpers.js";
-import { partitionRoutingHashOf } from "../routing-hash.js";
+import { partitionRoutingHashOf, testRoutingSeedOf } from "../routing-hash.js";
 import { DEFAULT_STALE_TRANSACTION_MS } from "../../src/shared/transaction-limits.js";
 export { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import {
@@ -133,7 +133,9 @@ export function makeStub(opts?: PartitionOptions) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 		...rest,
 	});
-	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy, base.policyVersion).rootContext(kb("dummyHashKey"));
+	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy, base.policyVersion, testRoutingSeedOf).rootContext(
+		kb("dummyHashKey"),
+	);
 	const stub = testPartitionStub(ctx.doName, ctx.policy.ns);
 	return { ctx, stub, rpc: openedRpc(stub) };
 }
@@ -175,7 +177,7 @@ export function materializationOf(base: FokosDBRouteContext, hashKey: string): D
 		{ topology: base.topology, rangeConfig: base.rangeConfig, policy: base.policy, policyVersion: base.policyVersion },
 		tableFingerprint(env, base),
 	);
-	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion).rootContext(kb(hashKey));
+	const ctx = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion, testRoutingSeedOf).rootContext(kb(hashKey));
 	return materializationStubByName(env, ctx, ctx.doName);
 }
 

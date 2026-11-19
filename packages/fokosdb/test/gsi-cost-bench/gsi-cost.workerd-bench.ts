@@ -11,6 +11,7 @@ import { gsiTableConfig, type FokosDBRouteContext } from "../../src/shared/parti
 import { FokosRouter } from "../../src/sharding/router.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { kb, makeStub, materializationOf } from "../partition-do/helpers.js";
+import { testRoutingSeedOf } from "../routing-hash.js";
 
 const ROWS = 20_000;
 
@@ -33,7 +34,9 @@ function gsiRoot(base: FokosDBRouteContext, indexName: string, hashKey: string) 
 		{ topology: base.topology, rangeConfig: base.rangeConfig, policy: base.policy, policyVersion: base.policyVersion },
 		indexName,
 	);
-	const ctx = new FokosRouter(table.topology, table.rangeConfig, table.policy, table.policyVersion).rootContext(kb(hashKey));
+	const ctx = new FokosRouter(table.topology, table.rangeConfig, table.policy, table.policyVersion, testRoutingSeedOf).rootContext(
+		kb(hashKey),
+	);
 	return { ctx, stub: partitionStubByName(env, ctx, ctx.doName) };
 }
 
@@ -57,7 +60,7 @@ it("row sizes", async () => {
 		gsi_tombstone: await bytesPerRow(base.stub, (sql, i) =>
 			sql.exec(
 				`INSERT INTO items (routing_hash, hk, sk, item_id, data_kind, v, item_bytes, data) VALUES (?, ?, ?, ?, 0, 1, 0, x'')`,
-				routingHashOf(kb("OPEN"), base.ctx.topology.shardGroup),
+				routingHashOf(kb("OPEN"), base.ctx.topology.shardGroup, testRoutingSeedOf),
 				kb("OPEN"),
 				gsiItemSortKey(kb(`2026-10-24T17:46:00.${String(i).padStart(6, "0")}Z`), kb(`order-${String(i).padStart(8, "0")}`), kb("s")),
 				i,

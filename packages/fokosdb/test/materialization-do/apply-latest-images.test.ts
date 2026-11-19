@@ -13,6 +13,7 @@ import { FokosRouter } from "../../src/sharding/router.js";
 import { DATA_KINDS } from "../../src/shared/types.js";
 import { MaterializationStore } from "../../src/server/materialization/materialization-store.js";
 import { kb } from "../partition-do/helpers.js";
+import { testRoutingSeedOf } from "../routing-hash.js";
 
 type StoredImage = {
 	revision: number;
@@ -42,7 +43,7 @@ function makeMaterialization(opts: { rootTreesN?: number; maxSizeMb?: number; ke
 		hashSplitConditions: { maxSizeMb: opts.maxSizeMb ?? 100 },
 	});
 	const mat = materializationTableConfig(table, tableFingerprint(env, table));
-	const router = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion);
+	const router = new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, mat.policyVersion, testRoutingSeedOf);
 	const at = (hashKey: string) => {
 		const ctx = router.rootContext(kb(hashKey));
 		return { ctx, stub: materializationStubByName(env, ctx, ctx.doName) };

@@ -3,6 +3,8 @@ import {
 	baseTableName,
 	coordinatorShardGroup,
 	createTableConfig,
+	fokosRoutingSeedOf,
+	fokosSeedScope,
 	gsiShardGroup,
 	gsiTableConfig,
 	materializationShardGroup,
@@ -15,7 +17,9 @@ import {
 import { structurallyEqual } from "../sharding/route-context.js";
 import { asRoutingHash, routingHashSeedOf } from "../sharding/hash-primitives.js";
 import { FokosRouter } from "../sharding/router.js";
+import { invariantFailure } from "../../test/errors-matchers.js";
 import { KeyCodec } from "../sharding/key-codec.js";
+import { testRoutingSeedOf } from "../../test/routing-hash.js";
 
 type FlatOptions = Partial<Omit<FokosTableIdentity, "name"> & Omit<FokosTableOptions, "table"> & { tableName: string }>;
 
@@ -94,12 +98,14 @@ describe("createTableConfig — the shard groups of a table", () => {
 		expect(cfg.topology.shardGroup).toBe("fokos.p.orders");
 		expect(coordinatorShardGroup(cfg.topology, FP)).toBe(`fokos.tc.orders.${FP}`);
 		const hk = KeyCodec.encode("hk");
-		const partitions = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy);
+		const partitions = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy, undefined, testRoutingSeedOf);
 		expect(partitions.rootContext(hk).doName).toMatch(/^fokos\.p\.orders~h\.\d+$/);
 		const coordinators = new FokosRouter(
 			{ ...cfg.topology, shardGroup: coordinatorShardGroup(cfg.topology, FP) },
 			cfg.rangeConfig,
 			cfg.policy,
+			undefined,
+			testRoutingSeedOf,
 		);
 		expect(coordinators.rootContext(hk).doName).toBe(`fokos.tc.orders.${FP}~h.0`);
 	});
@@ -110,9 +116,9 @@ describe("createTableConfig — the shard groups of a table", () => {
 		const mat = materializationTableConfig(cfg, FP);
 		expect(mat).toEqual({ ...cfg, topology: { ...cfg.topology, shardGroup: `fokos.m.orders.${FP}` } });
 		expect(mat.policy).toMatchObject({ nsMat: "MATERIALIZATION_DO", captureChanges: true });
-		expect(new FokosRouter(mat.topology, mat.rangeConfig, mat.policy).rootContext(KeyCodec.encode("hk")).doName).toMatch(
-			new RegExp(`^fokos\\.m\\.orders\\.${FP}~h\\.\\d+$`),
-		);
+		expect(
+			new FokosRouter(mat.topology, mat.rangeConfig, mat.policy, undefined, testRoutingSeedOf).rootContext(KeyCodec.encode("hk")).doName,
+		).toMatch(new RegExp(`^fokos\\.m\\.orders\\.${FP}~h\\.\\d+$`));
 	});
 
 	it("needs nsMat when captureChanges is true, and sends no capture field when it is false", () => {
@@ -139,7 +145,7 @@ describe("createTableConfig — the shard groups of a table", () => {
 			materializationTableConfig(cfg, FP).topology.shardGroup,
 			gsiTableConfig(cfg, "byStatus").topology.shardGroup,
 		];
-		expect(new Set(groups.map((group) => routingHashSeedOf(group))).size).toBe(4);
+		expect(new Set(groups.map((group) => fokosRoutingSeedOf(group))).size).toBe(4);
 	});
 
 	it("reads the table name of a materialization group with a fingerprint", () => {
@@ -174,6 +180,79 @@ describe("createTableConfig — the shard groups of a table", () => {
 		];
 		expect(new Set(names).size).toBe(names.length);
 		expect(() => routingHashTopologyAdminName(shardGroup, "short", a)).toThrow(/invariant_failed/);
+	});
+});
+
+describe("fokosSeedScope", () => {
+	const FP_A = "a".repeat(43);
+	const FP_B = "b".repeat(43);
+	const groupsOf = (tableName: string, fp: string) => {
+		const cfg = createTableConfig(makeOpts({ tableName }));
+		return {
+			p: cfg.topology.shardGroup,
+			tc: coordinatorShardGroup(cfg.topology, fp),
+			m: materializationShardGroup(cfg.topology, fp),
+			gsi: gsiShardGroup(cfg.topology, "byStatus"),
+		};
+	};
+
+	it("pins the seed scope of each kind of shard group", () => {
+		const groups = groupsOf("orders", FP_A);
+		expect(fokosSeedScope(groups.p)).toBe("fokos.p");
+		expect(fokosSeedScope(groups.tc)).toBe("fokos.tc");
+		expect(fokosSeedScope(groups.m)).toBe("fokos.m");
+		expect(fokosSeedScope(groups.gsi)).toBe("fokos.gsiv1.8.byStatus");
+		// A dot in the table name or in the index name does not move the index name.
+		expect(fokosSeedScope(gsiShardGroup(createTableConfig(makeOpts({ tableName: "a.b" })).topology, "c"))).toBe("fokos.gsiv1.1.c");
+		expect(fokosSeedScope(gsiShardGroup(createTableConfig(makeOpts({ tableName: "a" })).topology, "b.c"))).toBe("fokos.gsiv1.3.b.c");
+	});
+
+	it("pins the seed of each seed scope", () => {
+		const groups = groupsOf("orders", FP_A);
+		expect(fokosRoutingSeedOf(groups.p)).toBe("592ff9f0c00ea9c3");
+		expect(fokosRoutingSeedOf(groups.tc)).toBe("17f7bf58eb10db2a");
+		expect(fokosRoutingSeedOf(groups.m)).toBe("fa2a455af9df18bf");
+		expect(fokosRoutingSeedOf(groups.gsi)).toBe("f423259f28661323");
+		expect(fokosRoutingSeedOf(groups.p)).toBe(routingHashSeedOf("fokos.p"));
+	});
+
+	it("gives two tables the same seed for each kind of group", () => {
+		const a = groupsOf("orders", FP_A);
+		const b = groupsOf("orders-restored", FP_A);
+		for (const kind of ["p", "tc", "m", "gsi"] as const) {
+			expect(a[kind]).not.toBe(b[kind]);
+			expect(fokosRoutingSeedOf(a[kind])).toBe(fokosRoutingSeedOf(b[kind]));
+		}
+	});
+
+	it("gives two namespaces the same coordinator seed and the same materialization seed", () => {
+		const a = groupsOf("orders", FP_A);
+		const b = groupsOf("orders", FP_B);
+		expect(a.tc).not.toBe(b.tc);
+		expect(fokosRoutingSeedOf(a.tc)).toBe(fokosRoutingSeedOf(b.tc));
+		expect(a.m).not.toBe(b.m);
+		expect(fokosRoutingSeedOf(a.m)).toBe(fokosRoutingSeedOf(b.m));
+	});
+
+	it("gives two GSIs of one table with different index names different seeds", () => {
+		const cfg = createTableConfig(makeOpts({ tableName: "orders" }));
+		expect(fokosRoutingSeedOf(gsiShardGroup(cfg.topology, "byStatus"))).not.toBe(
+			fokosRoutingSeedOf(gsiShardGroup(cfg.topology, "byOwner")),
+		);
+	});
+
+	it("throws for a shard group of an unknown format", () => {
+		for (const group of [
+			"orders",
+			"fokos.",
+			"fokos.x.orders",
+			"fokos.topo.p.orders",
+			"fokos.gsiv1.",
+			"fokos.gsiv1.x.orders.i",
+			"fokos.gsiv1.6.orders",
+		]) {
+			expect(() => fokosSeedScope(group), group).toThrow(invariantFailure(/shard group/));
+		}
 	});
 });
 

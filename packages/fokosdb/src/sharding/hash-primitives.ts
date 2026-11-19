@@ -61,20 +61,39 @@ export function routingHash(hashKey: KeyBytes, seed: bigint): RoutingHash {
 	return routingHashBytes(hashers.h64Raw(hashKey, seed));
 }
 
-/** The seed of each shard group that this isolate hashed for. A shard group is a table, a GSI, or a derived group. */
-const shardGroupSeeds = new Map<string, bigint>();
+/**
+ * The seed function of a host: it gives the routingHash seed of a shard group, as 16 lowercase hex
+ * characters. The client, the router, and the runtime of one deployment must use the same function.
+ * The default is `routingHashSeedOf`.
+ */
+export type RoutingSeedOf = (shardGroup: string) => string;
+
+const SEED_HEX = /^[0-9a-f]{16}$/;
+
+/**
+ * The seeds that this isolate computed, for each seed function and each shard group. Two functions
+ * never share a seed. A shard group is a table, a GSI, or a derived group.
+ */
+const shardGroupSeeds = new WeakMap<RoutingSeedOf, Map<string, bigint>>();
 const SHARD_GROUP_SEEDS_MAX = 1024;
 
-/** The routingHash of an encoded hash key in `shardGroup`, with the seed `routingHashSeedOf(shardGroup)`. */
-export function routingHashOf(hashKey: KeyBytes, shardGroup: string): RoutingHash {
-	let seed = shardGroupSeeds.get(shardGroup);
+/** The routingHash of an encoded hash key in `shardGroup`, with the seed `seedOf(shardGroup)`. */
+export function routingHashOf(hashKey: KeyBytes, shardGroup: string, seedOf: RoutingSeedOf): RoutingHash {
+	let seeds = shardGroupSeeds.get(seedOf);
+	if (seeds === undefined) {
+		seeds = new Map();
+		shardGroupSeeds.set(seedOf, seeds);
+	}
+	let seed = seeds.get(shardGroup);
 	if (seed === undefined) {
+		const hex = seedOf(shardGroup);
+		invariant(SEED_HEX.test(hex), "fokos/hash-primitives: a routingHash seed is 16 lowercase hex characters");
 		// The oldest seed goes. A hit stays one lookup, and a seed is cheap to compute again.
-		if (shardGroupSeeds.size >= SHARD_GROUP_SEEDS_MAX) {
-			shardGroupSeeds.delete(shardGroupSeeds.keys().next().value!);
+		if (seeds.size >= SHARD_GROUP_SEEDS_MAX) {
+			seeds.delete(seeds.keys().next().value!);
 		}
-		seed = hash64(shardGroup);
-		shardGroupSeeds.set(shardGroup, seed);
+		seed = BigInt(`0x${hex}`);
+		seeds.set(shardGroup, seed);
 	}
 	return routingHash(hashKey, seed);
 }

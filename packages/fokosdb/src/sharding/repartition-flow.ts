@@ -49,7 +49,7 @@ import type {
 } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import { hashStorageInterval, rangeStorageInterval, sliceIncludesRoutingHash, sliceIncludesItem } from "./repartition-slice.js";
-import { compareRoutingHashes, routingHashOf, type RoutingHash } from "./hash-primitives.js";
+import { compareRoutingHashes, routingHashOf, type RoutingHash, type RoutingSeedOf } from "./hash-primitives.js";
 import type {
 	FokosImportRecord,
 	FokosImportState,
@@ -102,6 +102,8 @@ export type RepartitionCommonDeps = {
 	logParams: () => Record<string, unknown>;
 	/** The active runtime settings: the retry intervals and the page budgets. Read at each use. */
 	config: () => FokosRuntimeConfig;
+	/** The seed function of the routingHashes of the shard group. See `FokosRuntimeOptions.routingSeedOf`. */
+	routingSeedOf: RoutingSeedOf;
 	/** Runs inside the completion transaction, after `beforeComplete`. Synchronous. */
 	onCompleted?: (plan: FokosRepartitionPlan, completedAt: number) => void;
 };
@@ -385,7 +387,8 @@ export class RepartitionSource {
 					);
 					// A boundary of the routingHash must hold a hash key of it, or a child would own no key.
 					invariant(
-						compareRoutingHashes(routingHashOf(b.hk, ctx.topology.shardGroup), rp.routingHash) === 0 || b.sk.length === 0,
+						compareRoutingHashes(routingHashOf(b.hk, ctx.topology.shardGroup, this.deps.routingSeedOf), rp.routingHash) === 0 ||
+							b.sk.length === 0,
 						() =>
 							`fokos/repartition.plan: boundary ${i} (${KeyCodec.compositeForLog(b)}) has a hash key of another routingHash and a sort key`,
 					);
@@ -884,9 +887,10 @@ export class RepartitionSource {
 	 */
 	belongsToTarget(slice: FokosSlice): (key: RouteKey) => boolean {
 		const topology = this.deps.identity().ctx.topology;
+		const seedOf = this.deps.routingSeedOf;
 		return (key) =>
-			sliceIncludesItem(slice, key.hashKey, key.sortKey, topology) &&
-			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(routingHashOf(key.hashKey, topology.shardGroup)));
+			sliceIncludesItem(slice, key.hashKey, key.sortKey, topology, seedOf) &&
+			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(routingHashOf(key.hashKey, topology.shardGroup, seedOf)));
 	}
 
 	/**
@@ -993,7 +997,7 @@ export class RepartitionTarget {
 					requested.inner,
 					page.page,
 					page.nextCursor?.phase === "host" ? page.nextCursor.inner : null,
-					(key) => sliceIncludesItem(rec.slice, key.hashKey, key.sortKey, topology),
+					(key) => sliceIncludesItem(rec.slice, key.hashKey, key.sortKey, topology, this.deps.routingSeedOf),
 				);
 			} catch (error) {
 				this.#deferImport(rec, now, error);
