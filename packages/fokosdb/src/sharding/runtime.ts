@@ -95,6 +95,7 @@ import type {
 	FokosShardingHooks,
 	FokosSignals,
 	FokosStorageInterval,
+	FokosRuntimeInspect,
 } from "./runtime-types.js";
 import { FokosScheduler, INIT_RETRY_ALARM_MS } from "./scheduler.js";
 import { systemPlatform, type FokosPlatform } from "./platform.js";
@@ -231,6 +232,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#rangeAncestors: RangeAncestorInfo[] = [];
 	#hashArena: HashTopology | null = null;
 	#bloom: PartialRangeTopology | null = null;
+	/** The number of `alarm` handlers that run now. While one runs, `getAlarm` can give null. */
+	#alarmHandlers = 0;
 
 	/** Writes the Bloom filter at most once per `promotionBloomFlushMs`, in a timer task of its own. */
 	readonly #bloomFlushThrottled: ReturnType<typeof throttleTrailing>;
@@ -262,6 +265,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			logParams: () => this.#logParams(),
 			config: () => this.#config(),
 			platform: this.#platform,
+			ensureAlarmSet: async (targetMs) => await this.#scheduler.ensureAlarmAtMost(targetMs),
 			onCompleted: (plan, completedAt) => this.#recordCompletion(plan, completedAt),
 		};
 		this.#source = new RepartitionSource(this.#store, deps);
@@ -269,7 +273,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			...deps,
 			hasIdentity: () => this.#identity !== undefined,
 			applyTargetIdentity: (req) => this.#applyTargetIdentity(req),
-			ensureAlarmSet: async (targetMs) => await this.#scheduler.ensureAlarmAtMost(targetMs),
 		});
 		this.#scheduler = new FokosScheduler({
 			storage: opts.ctx.storage,
@@ -1321,7 +1324,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** Records that one target holds a complete copy of its slice. */
 	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return await this.#guard("fokosMigrationAck", async () => this.#source.acceptAck(req));
+		return await this.#guard("fokosMigrationAck", async () => await this.#source.acceptAck(req));
 	}
 
 	/**
@@ -1534,6 +1537,55 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
+	 * The repartition state, the jobs and the alarm of this partition, or null when it has no identity.
+	 * It reads only, and it does not create an identity.
+	 */
+	async inspect(): Promise<FokosRuntimeInspect | null> {
+		return await this.#guard("fokosInspect", async () => {
+			if (!this.#identity) {
+				return null;
+			}
+			const lifecycle = this.lifecycle();
+			const importState = lifecycle.import?.state;
+			const role =
+				importState === "awaiting_data" || importState === "importing" ? "importing" : lifecycle.role === "router" ? "router" : "leaf";
+			const children = this.#source.splitEntries().flatMap((entry) => (entry.target ? [entry.target.ref.doName] : []));
+			// Another request can change the jobs and the alarm while `getAlarm` waits. The alarm that it
+			// gives is the alarm of the view before it or of the view after it, so only a violation in
+			// both views is real.
+			const before = this.#scheduler.inspect();
+			const alarmAt = await this.#ctx.storage.getAlarm();
+			const after = this.#scheduler.inspect();
+			const alarmViolations: string[] = [];
+			const earliestBefore = earliestJob(before.jobs);
+			const earliestAfter = earliestJob(after.jobs);
+			// A pass arms a fallback alarm and replaces it at its end, an alarm handler that runs can have no
+			// alarm armed, and a fenced object arms no alarm.
+			if (
+				!before.busy &&
+				!after.busy &&
+				this.#alarmHandlers === 0 &&
+				!this.#store.isDestroying() &&
+				earliestBefore !== null &&
+				earliestAfter !== null &&
+				(alarmAt === null || (alarmAt > earliestBefore.dueAt && alarmAt > earliestAfter.dueAt))
+			) {
+				alarmViolations.push(`the alarm (${alarmAt}) is not armed at or before the job ${earliestAfter.kind} (${earliestAfter.dueAt})`);
+			}
+			return {
+				repartition: {
+					role,
+					...(lifecycle.activeRepartition ? { phase: lifecycle.activeRepartition.state } : {}),
+					...(children.length > 0 ? { children } : {}),
+				},
+				jobs: after.jobs,
+				alarmAt,
+				alarmViolations,
+			};
+		});
+	}
+
+	/**
 	 * Fences this partition for destroy. Every background transition stops, and no new target appears.
 	 * One transaction writes the fence and the optional root bootstrap. The call then waits for the
 	 * pass in flight, which re-reads the fence before each remaining step, and deletes the alarm after
@@ -1587,16 +1639,21 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		//
 		// NOTE: This shouldn't happen in production, but it happens in workerd/miniflare/vitest environments
 		// due to clock discrepancies and going back in time occasionally.
+		this.#alarmHandlers++;
 		try {
-			const earlyMs = Math.min((info?.scheduledTime ?? 0) - this.#platform.now(), this.#config().fallbackAlarmMs);
-			if (earlyMs > 0) {
-				await this.#platform.wait(earlyMs);
+			try {
+				const earlyMs = Math.min((info?.scheduledTime ?? 0) - this.#platform.now(), this.#config().fallbackAlarmMs);
+				if (earlyMs > 0) {
+					await this.#platform.wait(earlyMs);
+				}
+			} catch {
+				// A config throw landed in `#initError`, which `runDueWork` answers. Any other read failure
+				// meets the pass-level catch of the scheduler and its fallback re-arm.
 			}
-		} catch {
-			// A config throw landed in `#initError`, which `runDueWork` answers. Any other read failure
-			// meets the pass-level catch of the scheduler and its fallback re-arm.
+			await this.runDueWork();
+		} finally {
+			this.#alarmHandlers--;
 		}
-		await this.runDueWork();
 	}
 
 	// ═══ identity ═══════════════════════════════════════════════════════════
@@ -2520,6 +2577,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const allowedWhileDestroying =
 				name === "fokosStatus" ||
 				name === "fokosPromotions" ||
+				name === "fokosInspect" ||
 				name === "fokosPrepareDestroy" ||
 				name === "fokosDestroy" ||
 				(descriptor?.shape === "local" && descriptor.allowedWhileDestroying === true);
@@ -2723,4 +2781,8 @@ function rangeForLog(identity: FokosPartitionIdentity | undefined): Record<strin
 		end: KeyCodec.compositeForLog(range.end),
 		depth: range.depth,
 	};
+}
+
+function earliestJob(jobs: readonly { kind: string; dueAt: number }[]): { kind: string; dueAt: number } | null {
+	return jobs.reduce<{ kind: string; dueAt: number } | null>((a, b) => (a === null || b.dueAt < a.dueAt ? b : a), null);
 }

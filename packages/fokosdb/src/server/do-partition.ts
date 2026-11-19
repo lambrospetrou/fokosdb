@@ -1,3 +1,15 @@
+import {
+	answerInspect,
+	INSPECT_CHECK_ITEMS,
+	INSPECT_CHECK_LIMIT,
+	INSPECT_CHECK_ROUTING_HASHES,
+	INSPECT_PAGE_BYTES,
+	INSPECT_SCAN_ROWS,
+	parseInspect,
+	type FokosInspectRequest,
+	type FokosInspectResponse,
+} from "../shared/inspect-types.js";
+import type { InspectFilter } from "../shared/partition/partition-store.js";
 import { systemPlatform, type FokosPlatform } from "../sharding/platform.js";
 import { DurableObject } from "cloudflare:workers";
 import type { DataKind, OperationMetrics, QuerySelect, ReturnValuesOnConditionCheckFailure, WirePartitionMeta } from "../shared/types.js";
@@ -624,6 +636,48 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
 		return await this.fokos.fokosPromotions(req);
 	}
+	/** A read of the committed items, the locks, the repartition state, the jobs and the local invariants. */
+	async fokosInspect(req: FokosInspectRequest): Promise<FokosInspectResponse> {
+		const parsed = parseInspect(req, ["items", "locks", "selfCheck"], ["hashKey", "range", "transactionId"]);
+		const runtime = await this.fokos.inspect();
+		const filter = (): InspectFilter => ({
+			...(req.hashKey !== undefined ? { routingHash: this.fokos.routingHashForKey(req.hashKey), hashKey: req.hashKey } : {}),
+			...req.range,
+		});
+		// A router and a promotion source can hold copies of keys that another partition owns now. They
+		// are not the state of this partition. A router owns no key, so it reads no row.
+		const router = runtime?.repartition.role === "router";
+		return answerInspect(
+			req,
+			parsed,
+			runtime,
+			{
+				items: (after, limit) =>
+					router
+						? { entries: [], next: null }
+						: this.#store.inspectItems(
+								after,
+								limit,
+								filter(),
+								INSPECT_PAGE_BYTES,
+								INSPECT_SCAN_ROWS,
+								ownsByHashKey(this.fokos.ownerCheck()),
+							),
+				locks: (after, limit) =>
+					router
+						? { entries: [], next: null }
+						: this.#store.inspectLocks(
+								after,
+								limit,
+								{ ...filter(), ...(req.transactionId !== undefined ? { transactionId: req.transactionId } : {}) },
+								INSPECT_SCAN_ROWS,
+								ownsByHashKey(this.fokos.ownerCheck()),
+							),
+				selfCheck: (after, limit) => this.#store.itemStats.check(after, limit, INSPECT_CHECK_ITEMS, INSPECT_CHECK_ROUTING_HASHES),
+			},
+			() => this.#store.locksWithoutInfo(INSPECT_CHECK_LIMIT),
+		);
+	}
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		await this.fokos.fokosPrepareDestroy(req);
 		// After the pass the fence waited for, never before it: the pass can arm the sweep.
@@ -973,10 +1027,12 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 					if (req.items.length === 0) {
 						return this.ownAnswer({ outcome: "accepted" });
 					}
+					// Read before the prepare, so the run is not later than the deadline that the prepare stores.
+					const now = this.#platform.now();
 					const response = this.#participant.prepareLocal(req);
 					// The lock is durable, so its recovery deadline must be too, even when the coordinator never returns.
 					if (response.outcome === "accepted") {
-						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.#platform.now() + this.config().staleTransactionMs }] });
+						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: now + this.config().staleTransactionMs }] });
 						return this.ownAnswer(response);
 					}
 					// This partition rejected each rejected operation, and it is the first entry of its own list.

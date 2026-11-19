@@ -9,6 +9,15 @@ export type { PartitionOps, PartitionRpc } from "./do-partition.js";
 /** The clock, the timers, and the random values that a Durable Object class reads through `fokosPlatform`. */
 export { systemPlatform } from "../sharding/platform.js";
 export type { FokosPlatform, FokosTimer } from "../sharding/platform.js";
+/** The read of the protocol state that `fokosInspect` gives. */
+export type {
+	FokosInspectItem,
+	FokosInspectKind,
+	FokosInspectLock,
+	FokosInspectRequest,
+	FokosInspectResponse,
+	FokosInspectTransaction,
+} from "../shared/inspect-types.js";
 
 export { FokosDBTransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 

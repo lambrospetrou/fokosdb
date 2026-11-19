@@ -1,3 +1,10 @@
+import {
+	answerInspect,
+	INSPECT_CHECK_LIMIT,
+	parseInspect,
+	type FokosInspectRequest,
+	type FokosInspectResponse,
+} from "../shared/inspect-types.js";
 import { systemPlatform, type FokosPlatform } from "../sharding/platform.js";
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
@@ -523,6 +530,64 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	fokosStatus(req: FokosStatusRequest) {
 		return this.fokos.fokosStatus(req);
 	}
+	/** A read of the transactions, the repartition state, the jobs and the local invariants. */
+	async fokosInspect(req: FokosInspectRequest): Promise<FokosInspectResponse> {
+		const parsed = parseInspect(req, ["transactions"], ["transactionId"]);
+		const runtime = await this.fokos.inspect();
+		const sql = this.ctx.storage.sql;
+		return answerInspect(
+			req,
+			parsed,
+			runtime,
+			{
+				transactions: (after, limit) => {
+					const conds: string[] = [];
+					const params: unknown[] = [];
+					if (after !== null) {
+						conds.push("(s.routing_hash, s.transaction_id) > (?, ?)");
+						params.push(Uint8Array.fromHex(after[0]), after[1]);
+					}
+					if (req.transactionId !== undefined) {
+						conds.push("s.transaction_id = ?");
+						params.push(req.transactionId);
+					}
+					// One statement for the page. Each participant list is one seek of the primary key of tc_participants.
+					const rows = sql
+						.exec<{ routing_hash: ArrayBuffer; transaction_id: string; state: string; participants: string }>(
+							`SELECT s.routing_hash, s.transaction_id, s.state,
+							        (SELECT json_group_array(partition_do_name) FROM (
+							            SELECT p.partition_do_name FROM tc_participants p
+							             WHERE p.routing_hash = s.routing_hash AND p.transaction_id = s.transaction_id
+							             ORDER BY p.partition_do_name)) AS participants
+							   FROM tc_state s ${conds.length === 0 ? "" : `WHERE ${conds.join(" AND ")}`}
+							  ORDER BY s.routing_hash, s.transaction_id LIMIT ?`,
+							...params,
+							limit + 1,
+						)
+						.toArray();
+					const page = rows.slice(0, limit);
+					const last = page[page.length - 1];
+					return {
+						entries: page.map((row) => ({
+							transactionId: row.transaction_id,
+							state: row.state,
+							participants: (JSON.parse(row.participants) as string[]).sort(),
+						})),
+						next: rows.length > limit ? [new Uint8Array(last.routing_hash).toHex(), last.transaction_id] : null,
+					};
+				},
+				selfCheck: () => ({ entries: [], next: null }),
+			},
+			() =>
+				sql
+					.exec<{ transaction_id: string; state: string }>(
+						`SELECT transaction_id, state FROM tc_state WHERE completed_at IS NULL AND next_recovery_at IS NULL LIMIT ?`,
+						INSPECT_CHECK_LIMIT,
+					)
+					.toArray()
+					.map((row) => `the transaction ${row.transaction_id} in ${row.state} is not complete and has no next_recovery_at`),
+		);
+	}
 	fokosPromotions(req: FokosPromotionsRequest) {
 		return this.fokos.fokosPromotions(req);
 	}
@@ -875,7 +940,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Durable before the first prepare, so a coordinator that stops after this point still resumes the
 		// transaction. The handler can end with a thrown answer, which drops the signals of a local call,
 		// so these calls do not go through `call.signal`.
-		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.#platform.now() + this.config().staleTransactionMs);
+		// The deadline that the insert stored. A second clock read can be later than it.
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, createdAt + this.config().staleTransactionMs);
 		this.fokos.requestSplitEvaluation();
 
 		return await this.drivePrepare(

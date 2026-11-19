@@ -104,6 +104,7 @@ export type RepartitionCommonDeps = {
 	/** The active runtime settings: the retry intervals and the page budgets. Read at each use. */
 	config: () => FokosRuntimeConfig;
 	platform: FokosPlatform;
+	ensureAlarmSet: (targetMs: number) => Promise<void>;
 	/** Runs inside the completion transaction, after `beforeComplete`. Synchronous. */
 	onCompleted?: (plan: FokosRepartitionPlan, completedAt: number) => void;
 };
@@ -119,7 +120,6 @@ export type RepartitionTargetDeps = RepartitionCommonDeps & {
 	 * after that transaction commits.
 	 */
 	applyTargetIdentity: (req: FokosInitRequest) => () => void;
-	ensureAlarmSet: (targetMs: number) => Promise<void>;
 };
 
 /** What one source or target step did, so the caller can decide whether to keep going. */
@@ -752,8 +752,8 @@ export class RepartitionSource {
 	 * one. Membership is checked before the mark, so an unknown name cannot consume an entry and fail
 	 * the count later.
 	 */
-	acceptAck(req: FokosMigrationAckRequest, now = this.deps.platform.now()): void {
-		this.store.transactionSync(() => {
+	async acceptAck(req: FokosMigrationAckRequest, now = this.deps.platform.now()): Promise<void> {
+		const completed = this.store.transactionSync(() => {
 			const { row } = this.#requireTarget(req.repartitionId, req.target);
 			if (row.state === "queued" || row.state === "planned") {
 				throw notCutOver(row.id);
@@ -761,13 +761,13 @@ export class RepartitionSource {
 			// A repeated acknowledgement in cutover, completed or cleaned is a success: the target retries
 			// until the source answers, and it cannot know which attempt landed.
 			if (row.state !== "cutover") {
-				return;
+				return false;
 			}
 
 			this.store.setTargetAcknowledged(row.id, req.target.partitionId);
 			const counts = this.store.countRepartitionTargets(row.id);
 			if (counts.acknowledged < counts.total) {
-				return;
+				return false;
 			}
 			// The cutover needs every target initialized. The completion lets the source drop the state it
 			// kept for its targets, so a target that was never initialized loses its slice.
@@ -782,7 +782,13 @@ export class RepartitionSource {
 			this.deps.hooks.beforeComplete?.(plan);
 			this.deps.onCompleted?.(plan, now);
 			this.store.setRepartitionAttempt(row.id, 0, now);
+			return true;
 		});
+		// The cleanup is due now. A pass on the fast path can be lost with this instance, so the alarm
+		// must also hold the deadline.
+		if (completed) {
+			await this.deps.ensureAlarmSet(now);
+		}
 		this.deps.scheduleWork();
 	}
 

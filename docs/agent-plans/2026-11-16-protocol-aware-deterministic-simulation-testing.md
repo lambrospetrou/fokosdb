@@ -374,11 +374,54 @@ fokosInspect(req: {
 - `items` holds committed state only.
 - `transactions` is for the coordinator. `locks` is for the partition.
 - `selfCheck` runs the invariants that need the schema inside the Durable Object, and returns only the violations.
-  The first checks: the facts of each `item_stats` bucket agree with its items, each lock row has its
+  The first checks: the facts of each `item_stats` bucket agree with its items, no routingHash has more than 16 items
+  and no bucket, each lock row has its
   `pending_tx_info` row, and an alarm is armed at or before the earliest due job.
 - `fokosInspect` answers on an object with no identity, and it does not create one, as `fokosStatus` does.
 - A filter can be added later. A field can be added later. A field is not removed while a test reads it.
 - Each page must stay below the RPC limit of 32 MiB.
+- `items`, `locks`, `transactions` and `selfCheck` are paged. `repartition` and `jobs` are small, so they are not paged.
+  A request with `cursor` or `limit` names exactly one paged kind. A request with more than one paged kind and no
+  cursor gets the first page of each, and it fails when a page is not the last one. The default `limit` is 100 and
+  the maximum is 1,000. A page of items also stops before 16 MiB, counted as two bytes for each `item_bytes` byte
+  plus the keys, because a string can go on the wire as two bytes for each character. A page always holds one item.
+  A page of items reads the data of its own items only. A bad request fails with `inspect_request_invalid`, before
+  any read.
+- `items` and `locks` hold only the keys that the partition owns now (`ownerCheck`). A router and a promotion source
+  can keep copies of keys that another partition owns, and these copies are not its state. A router owns no key, so
+  it reads no row.
+- A page of items or locks reads at most 10,000 rows, so a filter that matches few rows (for example a `range` with no
+  `hashKey`) has a bound on its cost. A page can hold no entry and still have a cursor, as in `queryItems`.
+- A filter that the class does not have (`hashKey` and `range` on the coordinator) and a kind that the class does not
+  have fail with `inspect_request_invalid`. The `transactionId` filter of the coordinator reads `tc_state` in key
+  order, because no index has `transaction_id` first.
+- `selfCheck` pages the buckets of `item_stats`, because a check of all buckets reads every item and can pass the CPU
+  limit of a request. A page also stops before a bucket that takes the stored item count of the page past 50,000, but
+  it always checks one bucket. After the last bucket, `selfCheck` finds each routingHash with more than 16 items and no
+  bucket. It seeks from one routingHash to the next, counts at most 17 items only for a routingHash with no bucket, and
+  checks at most 1,000 routingHashes on a page. Its cursor position is the hex of the last routingHash. The checks that are not paged (the alarm, and the lock rows) go on the first page only, with at
+  most 100 violations each.
+- `repartition.role` is `importing` while the import of the partition is not complete (`awaiting_data` or
+  `importing`), `router` after the split cutover, and `leaf` in all other cases. `phase` is the state of the active
+  repartition (`queued`, `planned` or `cutover`). `children` holds the Durable Object names of the split targets.
+- `jobs` holds each runtime job and host job that can run, with the deadline that the next pass of the scheduler reads:
+  the earlier of its scheduled run and its `deadline()`, and only the scheduled run while the job is marked failed.
+  `FokosScheduler.inspect()` gives them, and it writes nothing. The alarm check of `selfCheck` compares the earliest one
+  with `getAlarm()`. It does not run while a pass runs, because a pass arms a fallback alarm and replaces it at its end.
+  It does not run while `scheduleJob` arms the alarm, while an `alarm` handler runs (`getAlarm()` can then give null),
+  or after the destroy fence. It reads the jobs before and after `getAlarm()`, and it reports a
+  violation only when both reads show a job before the alarm. This check found that the last `fokosMigrationAck` made
+  `source_cleanup` due and armed no alarm, so a lost fast-path pass left the cleanup without an alarm. The ack now arms
+  the alarm at the cleanup deadline. The check is correct only when the object is quiet: a
+  request that writes a job and arms the alarm in two steps can be between them. A simulator calls it when no request
+  runs. The runtime gives this state with `FokosShardingRuntime.inspect()`.
+- A cursor holds the paged kind and the position after the page: a list of the hex of each key part, and the text of
+  a transaction ID. A cursor of another kind, a cursor that does not parse, a position with the wrong parts, and a
+  `limit` that is not an integer from 1 to 1,000 fail with `inspect_request_invalid`.
+- `locks.op` is the `operation` column. The ordered `op_list` is not in the shape until a checker needs it.
+- The `selfCheck` of the coordinator has the alarm check, and a check that each transaction that is not complete has a
+  `next_recovery_at`. `participants` is empty after a transaction completes, because completion deletes the
+  `tc_participants` rows.
 
 #### 4.2.6 Public guarantees
 

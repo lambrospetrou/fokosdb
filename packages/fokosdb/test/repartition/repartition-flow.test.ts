@@ -318,11 +318,14 @@ describe("Repartition — initialization and cutover", () => {
 			expect([...store.queryPendingTxPage(null, 10, ALL_ROWS)]).toEqual([lockRow("alice", "s1")]);
 		});
 
-		// The completion keeps the copies, and the cleanup deletes them.
+		// The completion keeps the copies, and the cleanup deletes them. The completion arms the alarm
+		// for the cleanup.
+		const alarmsBefore = c.alarms(root.doName).length;
 		await sendAck(rangeRoot);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			expect(lockCount(store, "alice")).toBe(2);
+			expect(c.alarms(root.doName).slice(alarmsBefore)).toEqual([sharding.earliestCleanupDeadline()]);
 		});
 		await cleanUpSource(root);
 		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(0));
@@ -548,11 +551,11 @@ describe("Repartition — the migration protocol", () => {
 		await cutOver(root, { kind: "hash_split" });
 		const targetRow = await root.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split")[0]);
 
-		await root.enter(({ source }) => {
+		await root.enter(async ({ source }) => {
 			expect(() => source.servePage({ repartitionId: "nope", target: targetRow, cursor: null })).toThrow(
 				fokosErrorWith("repartition_unknown"),
 			);
-			expect(() => source.acceptAck({ repartitionId: "nope", target: targetRow })).toThrow(fokosErrorWith("repartition_unknown"));
+			await expect(source.acceptAck({ repartitionId: "nope", target: targetRow })).rejects.toThrow(fokosErrorWith("repartition_unknown"));
 
 			// Both halves of the identity must match: a name alone is a value the caller chose.
 			const wrongId = { partitionId: "00ff", doName: targetRow.doName };
@@ -560,7 +563,9 @@ describe("Repartition — the migration protocol", () => {
 			expect(() => source.servePage({ repartitionId: "r1", target: wrongId, cursor: null })).toThrow(
 				fokosErrorWith("repartition_target_unknown"),
 			);
-			expect(() => source.acceptAck({ repartitionId: "r1", target: wrongName })).toThrow(fokosErrorWith("repartition_target_unknown"));
+			await expect(source.acceptAck({ repartitionId: "r1", target: wrongName })).rejects.toThrow(
+				fokosErrorWith("repartition_target_unknown"),
+			);
 		});
 	});
 

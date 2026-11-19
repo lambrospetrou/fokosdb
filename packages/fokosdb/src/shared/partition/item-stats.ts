@@ -163,6 +163,8 @@ export type ItemSource = {
 	): FokosCompositeKey | undefined;
 	/** The hash key of the first item of `routingHash`, or undefined when it has no item. */
 	firstHashKey(routingHash: RoutingHash): KeyBytes | undefined;
+	/** The first routingHash with items after `after`, or undefined when none follows. One primary-key seek. */
+	nextRoutingHash(after: RoutingHash | null): RoutingHash | undefined;
 };
 
 export type ItemStatsOptions = {
@@ -420,6 +422,88 @@ export class ItemStats {
 			)
 			.toArray()
 			.map((row) => ({ bound: boundOf(row), facts: factsOfRow(row) }));
+	}
+
+	/**
+	 * One page of the self-check of the buckets. First it checks the buckets (`checkBuckets`), then the
+	 * routingHashes with no bucket (`checkUnbucketed`). A position of the first part has 3 parts, and a
+	 * position of the second part has 1. When the first part ends on a page, the second part starts on
+	 * the same page.
+	 */
+	check(after: string[] | null, limit: number, maxItems: number, maxRoutingHashes: number): { entries: string[]; next: string[] | null } {
+		if (after !== null && after.length === 1) {
+			return this.checkUnbucketed(after, maxRoutingHashes);
+		}
+		const buckets = this.checkBuckets(after, limit, maxItems);
+		if (buckets.next !== null) {
+			return buckets;
+		}
+		const unbucketed = this.checkUnbucketed(null, maxRoutingHashes);
+		return { entries: [...buckets.entries, ...unbucketed.entries], next: unbucketed.next };
+	}
+
+	/**
+	 * Checks at most `limit` buckets, in key order, strictly after `after` (the hex of a routingHash and
+	 * of a bound). It counts the items of each bucket and returns a violation for each bucket whose facts
+	 * disagree with them. It stops before a bucket that takes the stored item count of the page past
+	 * `maxItems`, but it always checks one bucket.
+	 */
+	checkBuckets(after: string[] | null, limit: number, maxItems: number): { entries: string[]; next: string[] | null } {
+		const rows = this.#storage.sql
+			.exec<BucketRow & { routing_hash: ArrayBuffer }>(
+				`SELECT routing_hash, lower_hk, lower_sk, ${COLUMNS} FROM item_stats
+				  ${after === null ? "" : "WHERE (routing_hash, lower_hk, lower_sk) > (?, ?, ?)"}
+				  ORDER BY routing_hash, lower_hk, lower_sk LIMIT ?`,
+				...(after === null ? [] : after.map((hex) => Uint8Array.fromHex(hex))),
+				limit + 1,
+			)
+			.toArray();
+		const hex = (value: ArrayBuffer) => new Uint8Array(value).toHex();
+		const entries: string[] = [];
+		const count = Math.min(rows.length, limit);
+		let checked = 0;
+		let items = 0;
+		for (; checked < count; checked++) {
+			const row = rows[checked];
+			const stored = factsOfRow(row);
+			if (checked > 0 && items + stored.itemCount > maxItems) {
+				break;
+			}
+			items += stored.itemCount;
+			const following = rows[checked + 1];
+			const end = following && hex(following.routing_hash) === hex(row.routing_hash) ? boundOf(following) : null;
+			const counted = this.#opts.items.countFacts(asRoutingHash(new Uint8Array(row.routing_hash)), boundOf(row), end);
+			if ((Object.keys(stored) as (keyof ItemFacts)[]).some((key) => stored[key] !== counted[key])) {
+				entries.push(
+					`the facts of the bucket ${hex(row.routing_hash)}/${hex(row.lower_hk)}/${hex(row.lower_sk)} disagree with its items: ${JSON.stringify({ stored, counted })}`,
+				);
+			}
+		}
+		const last = rows[checked - 1];
+		return { entries, next: checked < rows.length ? [hex(last.routing_hash), hex(last.lower_hk), hex(last.lower_sk)] : null };
+	}
+
+	/**
+	 * Checks at most `maxRoutingHashes` routingHashes with items, in order, strictly after `after` (the hex
+	 * of a routingHash). It returns a violation for each one that has more than `BUCKET_THRESHOLD_MAX`
+	 * items and no bucket. For each routingHash it does one seek, and it counts at most
+	 * `BUCKET_THRESHOLD_MAX + 1` items only when there is no bucket.
+	 */
+	checkUnbucketed(after: string[] | null, maxRoutingHashes: number): { entries: string[]; next: string[] | null } {
+		const entries: string[] = [];
+		let routingHash = after === null ? null : asRoutingHash(Uint8Array.fromHex(after[0]));
+		for (let i = 0; i < maxRoutingHashes; i++) {
+			const nextHash = this.#opts.items.nextRoutingHash(routingHash);
+			if (nextHash === undefined) {
+				return { entries, next: null };
+			}
+			routingHash = nextHash;
+			const bucketed = tryOne(this.#storage.sql.exec(`SELECT 1 FROM item_stats WHERE routing_hash = ? LIMIT 1`, routingHash)) !== undefined;
+			if (!bucketed && this.#opts.items.countItems(routingHash, null, null, BUCKET_THRESHOLD_MAX + 1) > BUCKET_THRESHOLD_MAX) {
+				entries.push(`the routingHash ${routingHash.toHex()} has more than ${BUCKET_THRESHOLD_MAX} items and no bucket`);
+			}
+		}
+		return { entries, next: routingHash === null ? null : [routingHash.toHex()] };
 	}
 
 	/**
