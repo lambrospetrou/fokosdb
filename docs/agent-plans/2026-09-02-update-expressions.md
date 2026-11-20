@@ -112,7 +112,7 @@ That spec lists update expressions as future work and states the required behavi
 | `merge`, `list_append`, and array and object values | Each needs composite literals. Section 5 gives the reason. |
 | Element removal by value (`array_difference`) | It needs a predicate over elements. Section 6.4 gives the reason. |
 | A computed target path | It removes the overlap and required-column analysis. Section 6.7 gives the reason. |
-| An action on `hashKey`, `sortKey`, `v`, or `ttlAt` | Keys are immutable. `ttlAt` stays an operation field. |
+| An action on `hashKey`, `sortKey`, `v`, or `ttlAt` | Keys are immutable. `ttlAt` stays an operation field. `docs/agent-plans/2026-11-20-update-sets-ttl.md` replaces this for `ttlAt`. |
 | A change of `data_kind` | An update needs a JSON document. A kind change is a `put`. |
 
 ### 2.3 Requirements that constrain the solution
