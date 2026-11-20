@@ -324,6 +324,60 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
+	it("refuses an update with the ttlAt field and an action on ttlAt, also from a caller that skips the client", async () => {
+		await withParticipant(({ participant, store }) => {
+			const hk = kb("ttl-two-sources");
+			const sk = KeyCodec.encodeOptional(undefined);
+			const plan = updateTree([{ action: "set", target: { ref: "ttlAt" }, value: { val: 2_000_000_000 } }]);
+			const item = { hashKey: hk, sortKey: sk, operation: "update" as const, update: plan, ttlAt: 1_900_000_000 };
+			const fieldsInvalid = fokosErrorWith("transact_operation_fields_invalid");
+
+			const request = prepareReq({ items: [item] });
+			expect(() => participant.prepareLocal(request)).toThrow(fieldsInvalid);
+			expect(() => participant.executeSingleShot({ items: withOpIndex([item]) })).toThrow(fieldsInvalid);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
+			expect(store.getItem(P(hk), hk, sk).row).toBeUndefined();
+		});
+	});
+
+	it.each(["prepare", "single-shot"] as const)("keeps the item stats facts of a TTL that an update sets and removes (%s)", async (path) => {
+		await withParticipant(({ participant, store, clock }) => {
+			const hk = kb(`ttl-facts-${path}`);
+			const sk = KeyCodec.encodeOptional(undefined);
+			store.upsertItem({ routingHash: P(hk), hk, sk, data: JSON.stringify({ n: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			const run = (plan: ReturnType<typeof updateTree>) => {
+				const items = [{ hashKey: hk, sortKey: sk, operation: "update" as const, update: plan }];
+				if (path === "single-shot") {
+					expect(participant.executeSingleShot({ items: withOpIndex(items) }).response).toMatchObject({ outcome: "committed" });
+					return;
+				}
+				clock.now += 1_000;
+				const request = prepareReq({ items, transactionTimestamp: clock.now * TX_ORDER_TS_UNITS_PER_MS });
+				expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+				const commit = participant.commitLocal({
+					transactionId: request.transactionId,
+					transactionTimestamp: request.transactionTimestamp,
+					items: request.items,
+				});
+				expect(commit.response).toEqual({ outcome: "committed" });
+			};
+
+			run(updateTree([{ action: "set", target: { ref: "ttlAt" }, value: { val: 2_000_000_000 } }]));
+			expect(store.getItem(P(hk), hk, sk).row?.ttl_epoch_utc_seconds).toBe(2_000_000_000);
+			expect(store.itemStats.factsOf(P(hk))).toMatchObject({ itemCount: 1, indexedItemCount: 1 });
+
+			run(updateTree([{ action: "remove", target: { ref: "ttlAt" } }]));
+			expect(store.getItem(P(hk), hk, sk).row?.ttl_epoch_utc_seconds).toBeNull();
+			expect(store.itemStats.factsOf(P(hk))).toMatchObject({ itemCount: 1, indexedItemCount: 0 });
+
+			const defects = errors.mock.calls.filter(([entry]) =>
+				(entry as { message?: string }).message?.includes("the facts of a bucket disagree with its items"),
+			);
+			expect(defects).toHaveLength(0);
+		});
+	});
+
 	it("materializes update document in pending_transactions at prepare and applies it at commit", async () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);

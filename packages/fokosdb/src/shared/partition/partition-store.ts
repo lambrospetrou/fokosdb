@@ -1888,10 +1888,11 @@ export class PartitionStore implements ItemSource {
 		const tail = new StatementTail(plan);
 		const transactionIdParam = tail.param(opts.tx.transaction_id);
 		const opListParam = tail.param(JSON.stringify(opts.opList));
-		// The TTL of the pre-image survives unless the operation sets one. WHICH branch applies is known
-		// here, so the statement carries the branch it needs instead of testing a flag at run time. The
-		// VALUE still binds — see StatementTail for why a per-call value must not be interpolated.
-		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
+		// The TTL of the pre-image survives unless the plan or the operation sets one. WHICH branch
+		// applies is known here, so the statement carries the branch it needs instead of testing a flag at
+		// run time. A literal VALUE still binds — see StatementTail for why a per-call value must not be
+		// interpolated.
+		const ttlExpr = this.#updateTtlSql(plan, opts.ttlAt, tail);
 
 		const res = this.#storage.sql.exec(
 			`INSERT OR IGNORE INTO pending_transactions (routing_hash, hk, sk, transaction_id, operation, op_list, data_kind, ttl_epoch_utc_seconds, data)
@@ -1929,8 +1930,8 @@ export class PartitionStore implements ItemSource {
 		const tail = new StatementTail(plan);
 		const txOrderTsParam = tail.param(opts.txOrderTs);
 		// WHICH TTL branch applies is known here, so the statement carries the branch it needs instead
-		// of testing a flag at run time. The value still binds.
-		const ttlSql = opts.ttlAt === undefined ? UPDATE_STORED_TTL_SQL : tail.param(opts.ttlAt);
+		// of testing a flag at run time. A literal value still binds.
+		const ttlSql = this.#updateTtlSql(plan, opts.ttlAt, tail);
 		// The rules of the id of a new row are the same as in upsertItem.
 		const itemIdParam = tail.param(old === undefined ? this.#nextItemId() : -1);
 		const limitParam = tail.param(MAX_ITEM_BYTES);
@@ -1959,6 +1960,19 @@ export class PartitionStore implements ItemSource {
 			rowsRead: writeRes.rowsRead,
 			rowsWritten: writeRes.rowsWritten,
 		};
+	}
+
+	/**
+	 * The TTL fragment of a statement that runs an update plan: the TTL value of the plan, the `ttlAt`
+	 * field of the operation, or the TTL of the pre-image. `validateUpdateTtlSources` refuses a plan
+	 * value and a field together before any statement runs.
+	 */
+	#updateTtlSql(plan: CompiledUpdatePlan, ttlAt: number | undefined, tail: StatementTail): string {
+		invariant(plan.ttlSql === undefined || ttlAt === undefined, "fokos/partition-store: an update sets ttlAt in its plan and in its field");
+		if (plan.ttlSql !== undefined) {
+			return plan.ttlSql;
+		}
+		return ttlAt === undefined ? UPDATE_STORED_TTL_SQL : tail.param(ttlAt);
 	}
 
 	/** Does this partition hold any pending lock? */

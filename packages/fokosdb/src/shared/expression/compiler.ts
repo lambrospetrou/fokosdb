@@ -186,7 +186,12 @@ export function compileConditionExpression(
 
 export function compileUpdateExpression(update: UpdateExpression): CompiledUpdatePlan {
 	const analysis = validateUpdateExpression(update);
-	const orderedActions = orderUpdateActions(update);
+	// validateUpdateExpression allows at most one action on ttlAt. An update with no such action
+	// holds data actions only, so it needs no filtered copy.
+	const ttlAction = update.find((action) => action.target.ref === "ttlAt");
+	const orderedActions = orderUpdateActions(
+		ttlAction === undefined ? (update as readonly DataUpdateAction[]) : update.filter(isDataAction),
+	);
 	// The keys take ?1 and ?2 and the routingHash ?3 in every statement that runs this plan, as they do for a condition.
 	const context = createContext("update-value", UPDATE_PRE_IMAGE, "direct", UPDATE_FIXED_BINDING_COUNT);
 
@@ -220,6 +225,29 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		}
 	}
 
+	// The TTL value reads the pre-image, as every other `set` value does. Its own test is a term of
+	// applicableSql and a fragment of its own, for the same reason as the type test below.
+	let rawTtlSql: string | undefined;
+	let rawTtlValidSql = "1";
+	if (ttlAction?.action === "remove") {
+		rawTtlSql = "NULL";
+	} else if (ttlAction?.action === "set") {
+		const valueSql = renderValue(ttlAction.value, "logical", context);
+		rawTtlSql = valueSql;
+		const presentSql = renderPresent(ttlAction.value, context);
+		if (presentSql !== "1") {
+			applicableTerms.push(`(${presentSql})`);
+		}
+		const typeTermSql = valueTypeGuardSql(ttlAction.value, context);
+		if (typeTermSql !== "1") {
+			valueTypeTerms.push(typeTermSql);
+		}
+		rawTtlValidSql = ttlValidSql(ttlAction.value, valueSql, presentSql, context);
+		if (rawTtlValidSql !== "1") {
+			applicableTerms.push(`(${rawTtlValidSql})`);
+		}
+	}
+
 	// The type test is a term of applicableSql AND a fragment of its own, because the two answers are
 	// not the same rejection: a value that is bytes for this item names a cause the caller can fix,
 	// while everything else applicableSql tests is "the update does not apply". The probe reads the
@@ -233,22 +261,26 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 
 	const rawApplicableSql = `(CASE WHEN ${joinBalanced(applicableTerms, " AND ")} THEN 1 ELSE 0 END)`;
 
-	const [documentSql, applicableSql, valueTypeSql] = compactPlanParameters([rawDocumentSql, rawApplicableSql, rawValueTypeSql], context);
+	const [documentSql, applicableSql, valueTypeSql, ttlValidSqlText, ttlSql] = compactPlanParameters(
+		[rawDocumentSql, rawApplicableSql, rawValueTypeSql, rawTtlValidSql, rawTtlSql ?? "NULL"],
+		context,
+	);
 
 	const completeBindingCount = UPDATE_FIXED_BINDING_COUNT + context.bindings.length;
 	// The SQL limit belongs to each statement that runs this plan, and a statement holds a fragment
 	// more than one time. The probe and the write are the two longest. The write is longest when it
-	// keeps the stored TTL, and the lock row statement holds `documentSql` one time only.
+	// holds the TTL value of the plan, or else when it keeps the stored TTL. The lock row statement
+	// holds `documentSql` one time only.
 	const widestWrite = composeUpdateWriteStatement(
 		{ documentSql },
 		{
 			txOrderTsParam: `?${completeBindingCount + 1}`,
-			ttlSql: UPDATE_STORED_TTL_SQL,
+			ttlSql: rawTtlSql === undefined ? UPDATE_STORED_TTL_SQL : ttlSql,
 			itemIdParam: `?${completeBindingCount + 2}`,
 			limitParam: `?${completeBindingCount + 3}`,
 		},
 	);
-	const probeSql = composeUpdateProbeStatement({ documentSql, applicableSql, valueTypeSql });
+	const probeSql = composeUpdateProbeStatement({ documentSql, applicableSql, valueTypeSql, ttlValidSql: ttlValidSqlText });
 	if (!utf8WithinLimit(probeSql, EXPRESSION_LIMITS.compiledSqlBytes) || !utf8WithinLimit(widestWrite, EXPRESSION_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
@@ -266,6 +298,8 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		documentSql,
 		applicableSql,
 		valueTypeSql,
+		...(rawTtlSql === undefined ? {} : { ttlSql }),
+		ttlValidSql: ttlValidSqlText,
 		probeSql,
 		bindings: context.bindings,
 		bindingCount: context.bindings.length,
@@ -428,11 +462,39 @@ function assertPoolWithinLimit(context: CompileContext): void {
 	}
 }
 
-function orderUpdateActions(actions: readonly UpdateAction[]): readonly UpdateAction[] {
+type DataUpdateAction = UpdateAction & { target: DataUpdateTarget };
+type DataUpdateTarget = Extract<UpdateTarget, { ref: "data" }>;
+
+function isDataAction(action: UpdateAction): action is DataUpdateAction {
+	return action.target.ref === "data";
+}
+
+/**
+ * The per-item test that a `set` value of `ttlAt` is a whole number greater than zero, the rule of
+ * `validateTtlAt` for the literal field. A missing value passes, because the present test of the
+ * value rejects it as `update_not_applicable`.
+ *
+ * The test compares the value with its integer cast and does not test `typeof(...) = 'integer'`:
+ * Workers SQLite binds every JS number as a real, so a literal 1700000000 is a real. The TTL
+ * columns have INTEGER affinity, so they store a whole real as an integer. The type test keeps out
+ * a JSON boolean, which json_extract reads as the integer 1 or 0.
+ *
+ * `v = MAX(CAST(v AS INTEGER), 1)` is `v > 0 AND v = CAST(v AS INTEGER)` with one copy of the value
+ * SQL less. A whole v is equal to its cast, so the test passes only when the cast is 1 or more. A v
+ * that is not whole is not equal to its cast, and it is not 1, so the test fails.
+ */
+function ttlValidSql(value: ExpressionValue, valueSql: string, presentSql: string, context: CompileContext): string {
+	const typeSql = renderType(value, context);
+	const typeTerm = constTypeName(typeSql) === "number" ? "" : `${typeSql} = 'number' AND `;
+	const validSql = `${typeTerm}${valueSql} = MAX(CAST(${valueSql} AS INTEGER), 1)`;
+	return presentSql === "1" ? `(${validSql})` : `(CASE WHEN ${presentSql} THEN (${validSql}) ELSE 1 END)`;
+}
+
+function orderUpdateActions(actions: readonly DataUpdateAction[]): readonly DataUpdateAction[] {
 	type PlainIndexRemoval = {
 		index: number;
 		actionIndex: number;
-		action: UpdateAction;
+		action: DataUpdateAction;
 	};
 	const groups = new Map<string, PlainIndexRemoval[]>();
 
@@ -487,7 +549,7 @@ function orderUpdateActions(actions: readonly UpdateAction[]): readonly UpdateAc
 	return result;
 }
 
-function targetGuardSql(target: UpdateTarget, context: CompileContext): string {
+function targetGuardSql(target: DataUpdateTarget, context: CompileContext): string {
 	const segments = validateWriteJsonPath(target.path, { allowAppend: true });
 	const last = segments[segments.length - 1];
 	if (last.kind === "member") {

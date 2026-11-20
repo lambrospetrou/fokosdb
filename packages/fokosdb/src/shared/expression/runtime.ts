@@ -32,6 +32,8 @@ export type UpdateProbeResult = {
 	applicable: boolean;
 	/** False when a `set` value evaluated to bytes for this item, which a JSON document cannot hold. */
 	valueTypeOk: boolean;
+	/** False when a `set` value of `ttlAt` is present and is not a whole number greater than zero. */
+	ttlOk: boolean;
 	newSize: number | null;
 	lastReadTs: number | null;
 	lastWriteTs: number | null;
@@ -139,6 +141,7 @@ export function probeUpdatePlan(
 			item_present: number;
 			applicable: number;
 			value_type_ok: number;
+			ttl_ok: number;
 			new_size: number | null;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
@@ -148,6 +151,7 @@ export function probeUpdatePlan(
 			itemPresent: row.item_present === 1,
 			applicable: row.applicable === 1,
 			valueTypeOk: row.value_type_ok === 1,
+			ttlOk: row.ttl_ok === 1,
 			newSize: row.new_size,
 			lastReadTs: row.last_read_ts,
 			lastWriteTs: row.last_write_ts,

@@ -514,6 +514,7 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	item_too_large: "ynzx4p",
 	update_not_applicable: "yysds3",
 	update_value_is_bytes: "z9ar7e",
+	update_ttl_invalid: "r4tm8w",
 	batch_items_too_many: "wy5f9g",
 	batch_duplicate_key: "eqs978",
 	batch_operation_fields_invalid: "bfvz4s",

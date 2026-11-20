@@ -31,6 +31,7 @@ import {
 	nextRecoveryAt,
 	txOrderTimestampNow,
 	TX_ORDER_TS_UNITS_PER_MS,
+	validateUpdateTtlSources,
 	validateVersionReferences,
 } from "../transaction-limits.js";
 
@@ -147,6 +148,9 @@ function sequencePlanOf(items: readonly TransactionItem[], routingHashForKey: (h
 	});
 	for (const seq of sequences.values()) {
 		seq.lastWrite = seq.ops.length > 1 ? seq.ops.findLast((op) => isWrite(op.operation)) : undefined;
+	}
+	for (const op of ops) {
+		validateUpdateTtlSources(op, op.opIndex);
 	}
 	validateVersionReferences(ops);
 	return { ops, seqs, sequences, repeated: sequences.size < ops.length };
@@ -357,10 +361,10 @@ export class TransactionParticipant {
 			invariant(item.update, "fokos/partition.precheck: update item missing update plan");
 			const probe = this.#store.probeUpdate(item.update, routingHash, hk, sk);
 			if (!probe.applicable) {
-				// A value that evaluated to bytes is the one cause the probe separates out, because the
-				// caller can act on it. Every other cause — a non-json item, a missing target path, a
-				// missing operand — is reported as one answer, as DynamoDB reports its own.
-				const code = probe.valueTypeOk ? "update_not_applicable" : "update_value_is_bytes";
+				// A value that evaluated to bytes and an invalid TTL value are the causes the probe separates
+				// out, because the caller can act on them. Every other cause — a non-json item, a missing
+				// target path, a missing operand — is reported as one answer, as DynamoDB reports its own.
+				const code = !probe.valueTypeOk ? "update_value_is_bytes" : !probe.ttlOk ? "update_ttl_invalid" : "update_not_applicable";
 				return { reason: { code, ...decodeItemKeys(hk, sk) }, read: probe };
 			}
 			// An applicable update always measured its result; the probe returns NULL only when it is not.

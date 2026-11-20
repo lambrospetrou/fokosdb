@@ -412,6 +412,7 @@ export function validateTransactWriteOperations(
 		if (op.operation !== "update" && op.update) {
 			throw invalidFields(`transactWriteItems "${op.operation}" operation must not carry an update plan`);
 		}
+		validateUpdateTtlSources(op, opIndex);
 		validateReturnValuesOnConditionCheckFailure(op.returnValuesOnConditionCheckFailure);
 		// KeyPairMap is the ONE identity primitive for a (hashKey, sortKey) pair: two keys are the same
 		// item only when their canonical bytes are equal.
@@ -447,6 +448,40 @@ export function validateTransactWriteOperations(
 	}
 	validateVersionReferences(ops.map((op, opIndex) => ({ ...op, ...encodedKeys[opIndex], opIndex })));
 	return encodedKeys;
+}
+
+/**
+ * Refuses an update that sets the TTL in two places: the `ttlAt` field and an action on `ttlAt`. The
+ * client and the partition both run it, so the partition refuses such an operation also from a
+ * caller that skips the client checks.
+ */
+export function validateUpdateTtlSources(
+	op: {
+		operation: string;
+		hashKey: string | Uint8Array;
+		sortKey?: string | Uint8Array;
+		ttlAt?: number;
+		update?: UpdateExpression;
+	},
+	opIndex: number,
+): void {
+	if (op.ttlAt === undefined || !Array.isArray(op.update)) {
+		return;
+	}
+	const update: readonly unknown[] = op.update;
+	const hasTtlAction = update.some(
+		(action) =>
+			typeof action === "object" &&
+			action !== null &&
+			typeof (action as { target?: unknown }).target === "object" &&
+			(action as { target: { ref?: unknown } | null }).target?.ref === "ttlAt",
+	);
+	if (hasTtlAction) {
+		throw new FokosValidationError(VALIDATION_CODES.transact_operation_fields_invalid, {
+			message: `transactWriteItems "update" operation must not carry ttlAt and an action on ttlAt`,
+			attributes: { opIndex, operation: op.operation, hashKey: op.hashKey, sortKey: op.sortKey },
+		});
+	}
 }
 
 /**

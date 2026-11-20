@@ -47,7 +47,11 @@ export type ProjectionExpression = {
 	as?: string;
 };
 
-export type UpdateTarget = { ref: "data"; path: string };
+/**
+ * What an update action writes: a JSON path of the item data, or the TTL of the item. A `set` of
+ * `ttlAt` needs an integer greater than zero, and a `remove` of `ttlAt` clears the TTL.
+ */
+export type UpdateTarget = { ref: "data"; path: string } | { ref: "ttlAt" };
 
 export type UpdateAction = { action: "set"; target: UpdateTarget; value: ExpressionValue } | { action: "remove"; target: UpdateTarget };
 

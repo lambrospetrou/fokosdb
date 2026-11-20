@@ -65,15 +65,19 @@ LEFT JOIN items AS i
  * update plan.
  *
  * value_type_ok names ONE cause of an inapplicable update, so a caller learns that its value was
- * bytes for this item instead of only that the update did not apply. It runs over a JSON pre-image
+ * bytes for this item instead of only that the update did not apply. ttl_ok names one more cause:
+ * a `set` value of `ttlAt` that is present and is not a whole number greater than zero. It runs over a JSON pre-image
  * only: the fragment can read a JSON path, and json_type over a text or bytes row raises. An absent
  * row has a JSON pre-image, because an update creates the item.
  */
-export function composeUpdateProbeStatement(plan: Pick<CompiledUpdatePlan, "documentSql" | "applicableSql" | "valueTypeSql">): string {
+export function composeUpdateProbeStatement(
+	plan: Pick<CompiledUpdatePlan, "documentSql" | "applicableSql" | "valueTypeSql" | "ttlValidSql">,
+): string {
 	return `WITH requested(requested_hk, requested_sk, requested_prefix) AS (VALUES (?1, ?2, ?3))
 SELECT i.hk IS NOT NULL AS item_present,
        i.applicable,
        CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
+       ${plan.ttlValidSql === "1" ? "1" : `CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.ttlValidSql}) ELSE 1 END`} AS ttl_ok,
        CASE WHEN i.applicable = 1 THEN (${itemBytesExpr(plan.documentSql, "?1", "?2")}) ELSE NULL END AS new_size,
        i.last_read_ts,
        i.last_write_ts
@@ -92,8 +96,9 @@ export const UPDATE_STORED_TTL_SQL = "i.ttl_epoch_utc_seconds";
  * ?1 and ?2 are the keys, and ?3 is the routingHash. `txOrderTsParam`, `itemIdParam`, and
  * `limitParam` are parameters of the statement tail. `itemIdParam` is the `item_id` of a row that
  * the statement creates.
- * `ttlSql` is a tail parameter for an operation that sets a TTL, and UPDATE_STORED_TTL_SQL for one
- * that does not: the TTL of the pre-image then survives. The insert carries the TTL of the joined
+ * `ttlSql` is the `ttlSql` of the plan when the plan has an action on `ttlAt`, a tail parameter for
+ * an operation that sets the `ttlAt` field, and UPDATE_STORED_TTL_SQL for one that does neither:
+ * the TTL of the pre-image then survives. The insert carries the TTL of the joined
  * row, which is NULL for an item that this statement creates, and the conflict branch assigns that
  * same value back.
  *
@@ -256,6 +261,17 @@ export type CompiledUpdatePlan = {
 	 * which a single applicability bit cannot do. `1` when no value needs the test.
 	 */
 	valueTypeSql: string;
+	/**
+	 * The SQL value of the TTL that the plan writes: the `set` value of `ttlAt`, read from the
+	 * pre-image, or `NULL` for a `remove` of `ttlAt`. Absent when the plan has no action on `ttlAt`.
+	 */
+	ttlSql?: string;
+	/**
+	 * SQL boolean expression checking that a present `set` value of `ttlAt` is a whole number greater
+	 * than zero. It is also a term of `applicableSql`, and the probe reads it separately, as it reads
+	 * `valueTypeSql`. `1` when the plan sets no TTL value.
+	 */
+	ttlValidSql: string;
 	/**
 	 * The statement of `composeUpdateProbeStatement` for this plan. The compile composes it to count
 	 * its bytes, and the count makes its text flat. The probe runs this same text, so that SQLite gets

@@ -192,6 +192,40 @@ describe("update expression validation", () => {
 		expect(() => validateUpdateExpression(update)).toThrow(/invalid update target/i);
 	});
 
+	it("accepts set and remove actions on ttlAt", () => {
+		expect(() =>
+			validateUpdateExpression([
+				{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } },
+				{ action: "set", target: { ref: "ttlAt" }, value: { fn: "+", args: [{ ref: "ttlAt" }, { val: 3600 }] } },
+			]),
+		).not.toThrow();
+		expect(() => validateUpdateExpression([{ action: "remove", target: { ref: "ttlAt" } }])).not.toThrow();
+		expect(() =>
+			validateUpdateExpression([{ action: "set", target: { ref: "ttlAt" }, value: { ref: "data", path: "$.exp" } }]),
+		).not.toThrow();
+	});
+
+	it("rejects a second action on ttlAt", () => {
+		const update = [
+			{ action: "set", target: { ref: "ttlAt" }, value: { val: 1 } },
+			{ action: "remove", target: { ref: "ttlAt" } },
+		];
+		expect(() => validateUpdateExpression(update)).toThrow(/at most one action on ttlAt/i);
+	});
+
+	it("rejects a ttlAt target with a path", () => {
+		const update = [{ action: "set", target: { ref: "ttlAt", path: "$.a" }, value: { val: 1 } }];
+		expect(() => validateUpdateExpression(update)).toThrow(/invalid.*fields/i);
+	});
+
+	it.each([{ val: "1700000000" }, { val: true }, { val: null }, { b64: "AQI=" }, { ref: "hashKey" }])(
+		"rejects a ttlAt value that can never be a number: %j",
+		(value) => {
+			const update = [{ action: "set", target: { ref: "ttlAt" }, value }];
+			expect(() => validateUpdateExpression(update)).toThrow(/ttlAt value must be a number/i);
+		},
+	);
+
 	it("tracks required columns from set values", () => {
 		const update: readonly UpdateAction[] = [
 			{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } },

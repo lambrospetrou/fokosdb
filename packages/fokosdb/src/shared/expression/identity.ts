@@ -107,6 +107,15 @@ class IdentityWriter {
 	}
 
 	#writeTarget(target: UpdateTarget, allowAppend: boolean): void {
+		if (typeof target === "object" && target !== null && target.ref === "ttlAt") {
+			for (const field in target) {
+				if (field !== "ref") {
+					throw new ExpressionError("invalid_ast", "invalid update target fields");
+				}
+			}
+			this.#out += '{"ref":"ttlAt"}';
+			return;
+		}
 		if (typeof target !== "object" || target === null || target.ref !== "data" || typeof target.path !== "string") {
 			throw new ExpressionError("invalid_ast", "invalid update target");
 		}

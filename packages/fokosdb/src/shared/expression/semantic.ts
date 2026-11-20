@@ -350,6 +350,7 @@ function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
 		segments: readonly PathSegment[];
 	};
 	const targets: ParsedTarget[] = [];
+	let ttlTargets = 0;
 
 	for (const item of expression) {
 		assertNode(item, "invalid update action");
@@ -369,6 +370,21 @@ function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
 			assertFields(item, "action", "target");
 		}
 		assertNode(item.target, "invalid update target");
+		if (item.target.ref === "ttlAt") {
+			assertFields(item.target, "ref");
+			ttlTargets++;
+			if (ttlTargets > 1) {
+				throw new ExpressionError("invalid_ast", "an update must have at most one action on ttlAt");
+			}
+			if (actionDef.hasValue) {
+				// The TTL column holds a number only. A value with no possible number type can never apply.
+				const facts = analyzeValue(item.value, 1, context);
+				if (!facts.types.has("number")) {
+					throw new ExpressionError("invalid_type", "a ttlAt value must be a number");
+				}
+			}
+			continue;
+		}
 		assertFields(item.target, "ref", "path");
 		if (item.target.ref !== "data" || typeof item.target.path !== "string") {
 			throw new ExpressionError("invalid_ast", "invalid update target");

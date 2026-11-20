@@ -59,6 +59,11 @@ export type RejectionReasonOf<I = ConditionCheckImage> =
 	 * can return a blob for one item and text for the next.
 	 */
 	| { code: "update_value_is_bytes"; hashKey: HashKey; sortKey?: SortKey }
+	/**
+	 * A `set` value of `ttlAt` evaluated to a value that is not a whole number greater than zero for
+	 * this item. A missing value is `update_not_applicable`.
+	 */
+	| { code: "update_ttl_invalid"; hashKey: HashKey; sortKey?: SortKey }
 	| { code: "item_too_large"; hashKey: HashKey; sortKey?: SortKey }
 	/**
 	 * The partition that owns the operation could not run it: the error it raised, or no answer at all.
@@ -75,6 +80,7 @@ export type PremiseRejectionCode =
 	| "clock_skew"
 	| "update_not_applicable"
 	| "update_value_is_bytes"
+	| "update_ttl_invalid"
 	| "item_too_large";
 
 /** The codes of the errors that stop the partition of an operation from running it. */
@@ -157,6 +163,10 @@ export type TransactWriteItem =
 			hashKey: HashKey;
 			sortKey?: SortKey;
 			update: UpdateExpression;
+			/**
+			 * Sets the TTL to this literal. An action on `{ ref: "ttlAt" }` in `update` can set the TTL with
+			 * an expression, or remove it. An operation with both is refused.
+			 */
 			ttlAt?: number;
 			condition?: ConditionExpression;
 			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;

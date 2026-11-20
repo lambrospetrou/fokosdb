@@ -1,6 +1,6 @@
 # RFC — An update action sets or removes the TTL of an item
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-11-20
 **Author:** Lambros
 
@@ -69,11 +69,11 @@ an operation field"). This RFC replaces that line.
 2. `set ttlAt` evaluates its value on the pre-image, the same as every other `set` value. Thus
    `set ttlAt = ttlAt + 3600` reads the stored TTL.
 3. `remove ttlAt` writes `NULL` to `ttl_epoch_utc_seconds`. On an item with no TTL, it makes no change to the TTL.
-4. The value of `set ttlAt` must be an integer greater than zero. This is the rule of `validateTtlAt` for the
+4. The value of `set ttlAt` must be a whole number greater than zero. This is the rule of `validateTtlAt` for the
    literal field.
 5. When the value is `missing`, the update rejects with `update_not_applicable`. This is the current rule for a
    `set` value with a missing operand. The caller can write `if_not_exists(ttlAt, :now) + :d` instead.
-6. When the value is present and is not an integer greater than zero, the update rejects with the new code
+6. When the value is present and is not a whole number greater than zero, the update rejects with the new code
    `update_ttl_invalid`. The update never removes the TTL silently, and never keeps the old TTL silently.
 7. Both write paths support the action: the single-shot path and the two-phase path.
 
@@ -108,7 +108,7 @@ An update action can now set or remove the TTL of the item. The partition compil
 fragment and puts it into the slot that holds the literal `ttlAt` today. The value reads the stored item before
 the update, as every other `set` value does.
 
-The fragment checks its own value. When the value is an integer greater than zero, the write stores it. When the
+The fragment checks its own value. When the value is a whole number greater than zero, the write stores it. When the
 value is missing or is not valid, the update does not apply, and the probe tells the two causes apart. A `remove`
 action puts `NULL` into the slot.
 
@@ -199,15 +199,27 @@ await db.transactWriteItems({
 For `set ttlAt`, two terms join `applicableSql`:
 
 1. The present test of the value (`renderPresent`), as for every `set` value. It fails for a missing value.
-2. `ttlValidSql`: `CASE WHEN <present> THEN typeof(<value>) = 'integer' AND <value> > 0 ELSE 1 END`.
+2. `ttlValidSql`:
+   `CASE WHEN <present> THEN <type> = 'number' AND <value> = MAX(CAST(<value> AS INTEGER), 1) ELSE 1 END`.
    It fails only for a present value. A missing value passes it, so the present test alone rejects a missing value.
-   A JSON `null` is present, and its `typeof` is `'null'`, so `ttlValidSql` rejects it.
+   A JSON `null` is present, and its type is `'null'`, so `ttlValidSql` rejects it.
 
-The `typeof` test also catches these cases:
+The test compares the value with its integer cast, and does not test `typeof(<value>) = 'integer'`. Workers SQLite
+binds every JS number as a `real`, so a literal `1700000000` is a `real`. A whole `real` such as `1.7e9` is
+therefore valid, as it is for `Number.isInteger` in `validateTtlAt`. The TTL columns have `INTEGER` affinity, so
+they store a whole `real` as an integer.
 
-- A JSON number with a fraction or an exponent, for example `1.7e9`. SQLite reads it as `real`.
-- An integer overflow in `+` or `*`. SQLite gives a `real` result.
-- `text`, `boolean`, `null`, `array`, and `object` values.
+`<value> = MAX(CAST(<value> AS INTEGER), 1)` is the same test as `<value> > 0 AND <value> = CAST(<value> AS INTEGER)`,
+with one copy of the value SQL less. A whole value is equal to its cast, so the test passes only when the cast is 1
+or more. A value that is not whole is not equal to its cast, and it is not 1, so the test fails.
+
+The test catches these cases:
+
+- A number with a fraction, for example `1700000000.5`.
+- A number above the integer range, for example `1e300`, and an integer overflow in `+` or `*`. The cast clamps
+  the value, so the comparison fails.
+- `text`, `boolean`, `null`, `array`, and `object` values. The type test is necessary for a JSON boolean, because
+  `json_extract` reads `true` as the integer `1`.
 
 The probe reads `ttlValidSql` separately, as it reads `valueTypeSql`. When the update does not apply,
 `TransactionParticipant.precheck` answers with the first failed cause in this order:
@@ -255,8 +267,9 @@ Each case runs on the single-shot path and on the two-phase path.
 2. `set ttlAt = ttlAt + 3600` adds 3600 to the stored TTL.
 3. `set ttlAt = ttlAt + 3600` on an item with no TTL rejects with `update_not_applicable`.
 4. `set ttlAt = if_not_exists(ttlAt, :now) + 3600` works on an item with no TTL and on an item with a TTL.
-5. `set ttlAt = data.expiresAt` copies the attribute. A value of `1.7e9`, `"1700000000"`, `0`, `-1`, or `null`
-   rejects with `update_ttl_invalid`. A value that is bytes rejects with `update_value_is_bytes`.
+5. `set ttlAt = data.expiresAt` copies the attribute. A value of `1700000000.5`, `"1700000000"`, `0`, `-1`,
+   `null`, `true`, or `1e300` rejects with `update_ttl_invalid`. A value that is bytes rejects with
+   `update_value_is_bytes`.
 6. `remove ttlAt` clears the TTL. On an item with no TTL, it makes no change to the TTL, and `v` increments.
 7. An update on an absent item: `set ttlAt = :literal` creates the item with that TTL, and a value that reads
    `ttlAt` rejects.

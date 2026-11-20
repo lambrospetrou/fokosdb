@@ -143,6 +143,18 @@ describe("update identity", () => {
 		expect(canonicalUpdateIdentity(reordered)).toBe(canonicalUpdateIdentity(regular));
 	});
 
+	it("writes a ttlAt target with no path, and rejects a ttlAt target with other fields", () => {
+		const update: readonly UpdateAction[] = [
+			{ action: "set", target: { ref: "ttlAt" }, value: { val: 1700000000 } },
+			{ action: "remove", target: { ref: "ttlAt" } },
+		];
+		expect(canonicalUpdateIdentity(update)).toBe(
+			'[{"action":"set","target":{"ref":"ttlAt"},"value":{"val":1700000000}},{"action":"remove","target":{"ref":"ttlAt"}}]',
+		);
+		const withPath = [{ action: "remove", target: { ref: "ttlAt", path: "$.a" } }] as unknown as readonly UpdateAction[];
+		expect(() => canonicalUpdateIdentity(withPath)).toThrow(/invalid update target fields/);
+	});
+
 	it("rejects an empty update action list", () => {
 		expect(() => canonicalUpdateIdentity([])).toThrow(/at least one action/);
 	});

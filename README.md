@@ -211,7 +211,7 @@ npx wrangler dev
 ## Features
 
 - **Strong consistency.** FokosDB stores each item, identified by a hash key and an optional sort key, in one partition. Each read and each write of that item is strongly consistent.
-- **All the item operations you need.** Use `putItem`, `getItem`, and `deleteItem` for one item, and `batchGetItems` and `batchWriteItems` for up to 100 items in one call. Use `queryItems` to read the items of a hash key in sort-key order, and set `ttlAt` to delete an item automatically.
+- **All the item operations you need.** Use `putItem`, `getItem`, and `deleteItem` for one item, and `batchGetItems` and `batchWriteItems` for up to 100 items in one call. Use `queryItems` to read the items of a hash key in sort-key order, and set `ttlAt` to delete an item automatically. An update can set, extend, or remove the TTL with an expression, for example `{ action: "set", target: { ref: "ttlAt" }, value: { fn: "+", args: [{ ref: "ttlAt" }, { val: 3600 }] } }`.
 - **Expressions with the power of SQLite.** Conditions, updates, query filters, and projections read any JSON path of an item. They use arithmetic, `LIKE`, `GLOB`, `IIF`, `COALESCE`, and the other SQLite string and math functions. The partition runs each expression as SQL, next to the data.
 - **ACID transactions across partitions.** `transactWriteItems` writes items in different partitions atomically, with the two-phase commit of the DynamoDB papers. `transactGetItems` reads them as one consistent snapshot. A client request token makes a retry safe.
 - **Ordered operations on one item.** With `executionMode: "ordered_per_item"`, one transaction can write the same item more than one time, in the order that you give. DynamoDB does not let you do this.

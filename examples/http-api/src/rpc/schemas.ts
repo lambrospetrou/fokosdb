@@ -88,10 +88,10 @@ export const DeleteItemBodySchema = v.strictObject({
 	partitionOptions: PartitionOptionsSchema,
 });
 
-const UpdateTargetSchema: v.GenericSchema<UpdateTarget> = v.strictObject({
-	ref: v.literal("data"),
-	path: v.string(),
-});
+const UpdateTargetSchema: v.GenericSchema<UpdateTarget> = v.union([
+	v.strictObject({ ref: v.literal("data"), path: v.string() }),
+	v.strictObject({ ref: v.literal("ttlAt") }),
+]);
 
 const UpdateActionSchema: v.GenericSchema<UpdateAction> = v.variant("action", [
 	v.strictObject({
