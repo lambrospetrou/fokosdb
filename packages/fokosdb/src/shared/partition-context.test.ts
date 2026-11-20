@@ -4,9 +4,11 @@ import {
 	coordinatorShardGroup,
 	createTableConfig,
 	fokosDBRoutingHashSeedResolver,
+	fokosDBRoutingHashSeedResolverOf,
 	fokosDBSeedScopeOf,
 	gsiShardGroup,
 	gsiTableConfig,
+	isValidRoutingHashBaseSeed,
 	materializationShardGroup,
 	materializationTableConfig,
 	routingHashTopologyAdminName,
@@ -15,7 +17,7 @@ import {
 	type FokosTableOptions,
 } from "./partition-context.js";
 import { structurallyEqual } from "../sharding/route-context.js";
-import { asRoutingHash, routingHashSeedOf } from "../sharding/hash-primitives.js";
+import { asRoutingHash, GOLDEN_RATIO_BIGINT, hash64, routingHashSeedOf } from "../sharding/hash-primitives.js";
 import { FokosRouter } from "../sharding/router.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
 import { KeyCodec } from "../sharding/key-codec.js";
@@ -217,6 +219,44 @@ describe("fokosDBSeedScopeOf", () => {
 		for (const kind of ["p", "tc", "m", "gsi"] as const) {
 			expect(fokosDBRoutingHashSeedResolver(groups[kind])).toBe(routingHashSeedOf(fokosDBSeedScopeOf(groups[kind])));
 		}
+	});
+
+	it("pins the seed of each seed scope with a routingHashBaseSeed", () => {
+		const groups = groupsOf("orders", FP_A);
+		const resolver = fokosDBRoutingHashSeedResolverOf("deployment-a");
+		expect(resolver(groups.p)).toBe("3a71e027910afedb");
+		expect(resolver(groups.tc)).toBe("42030ea8d880ad62");
+		expect(resolver(groups.m)).toBe("7588a568d55b65d1");
+		expect(resolver(groups.gsi)).toBe("c4022c9871ff24f1");
+		const baseSeed = hash64("deployment-a", GOLDEN_RATIO_BIGINT);
+		for (const kind of ["p", "tc", "m", "gsi"] as const) {
+			expect(resolver(groups[kind])).toBe(routingHashSeedOf(fokosDBSeedScopeOf(groups[kind]), baseSeed));
+		}
+	});
+
+	it("keeps the seeds with no routingHashBaseSeed, and gives other seeds for each value", () => {
+		expect(fokosDBRoutingHashSeedResolverOf(undefined)).toBe(fokosDBRoutingHashSeedResolver);
+		// One resolver for each value, so the clients of all requests share one seed cache.
+		expect(fokosDBRoutingHashSeedResolverOf("deployment-a")).toBe(fokosDBRoutingHashSeedResolverOf("deployment-a"));
+		const groups = groupsOf("orders", FP_A);
+		const restored = groupsOf("orders-restored", FP_B);
+		const a = fokosDBRoutingHashSeedResolverOf("deployment-a");
+		const b = fokosDBRoutingHashSeedResolverOf("deployment-b");
+		for (const kind of ["p", "tc", "m", "gsi"] as const) {
+			expect(a(groups[kind])).not.toBe(fokosDBRoutingHashSeedResolver(groups[kind]));
+			expect(a(groups[kind])).not.toBe(b(groups[kind]));
+			// A restore into another table or namespace of the deployment keeps the seeds.
+			expect(a(restored[kind])).toBe(a(groups[kind]));
+		}
+		expect(new Set((["p", "tc", "m", "gsi"] as const).map((kind) => a(groups[kind]))).size).toBe(4);
+	});
+
+	it("accepts no routingHashBaseSeed or a string that is not empty", () => {
+		expect(isValidRoutingHashBaseSeed(undefined)).toBe(true);
+		expect(isValidRoutingHashBaseSeed("x")).toBe(true);
+		expect(isValidRoutingHashBaseSeed("")).toBe(false);
+		expect(isValidRoutingHashBaseSeed(42)).toBe(false);
+		expect(isValidRoutingHashBaseSeed(null)).toBe(false);
 	});
 
 	it("gives two tables the same seed for each kind of group", () => {

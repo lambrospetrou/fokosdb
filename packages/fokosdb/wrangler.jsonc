@@ -37,6 +37,10 @@
 			"new_sqlite_classes": ["FokosDBAutoAdminDO"],
 			"tag": "v3",
 		},
+		{
+			"new_sqlite_classes": ["BaseSeedPartitionDO"],
+			"tag": "v4",
+		},
 	],
 	"durable_objects": {
 		"bindings": [
@@ -91,6 +95,10 @@
 			{
 				"class_name": "FokosDBAutoAdminDO",
 				"name": "FOKOS_ADMIN_DO",
+			},
+			{
+				"class_name": "BaseSeedPartitionDO",
+				"name": "BASE_SEED_PARTITION_DO",
 			},
 		],
 	},

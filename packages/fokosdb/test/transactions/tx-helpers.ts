@@ -139,6 +139,7 @@ export type MakeDBOptions = {
 	controlled?: boolean;
 	retry?: FokosDBRetryOptions;
 	partitionMigratingRetryDeadlineMs?: number;
+	routingHashBaseSeed?: string;
 	/** The key size limits of the table. */
 	limits?: FokosDBLimitOverrides;
 };

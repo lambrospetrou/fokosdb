@@ -92,6 +92,9 @@ the same values, and the values must never change after the table has data.
 > `partition_context_mismatch`.
 > In both cases the data stays in the old Durable Objects.
 
+`routingHashBaseSeed` is outside `table`, but it must never change either. See
+[A base seed for the routing of a deployment](#a-base-seed-for-the-routing-of-a-deployment).
+
 All other options are outside `table` and can change: `rangeSplitN`, `hashSplitConditions`,
 `rangeSplitConditions`, `rangeAncestorsConfig`, `locationHint`, `limits`, `singlePartitionFastPath`,
 `retry` and `partitionMigratingRetryDeadlineMs`. A change to `rangeSplitN` applies only to the range
@@ -139,6 +142,39 @@ The jurisdiction restricts all partition and transaction coordinator objects of 
 > - The table connects to empty Durable Objects.
 > - The previous data remains in the old Durable Objects and becomes unreachable.
 > - The library cannot detect this change because the two sets of objects do not share context.
+
+### A base seed for the routing of a deployment
+
+FokosDB puts each key in a partition by a hash of the key. By default, every deployment uses the
+same public seeds for this hash. Thus, a caller who can choose the keys of a table can build one set
+of keys that makes a lopsided partition tree in the tables of every deployment that uses the default.
+
+`routingHashBaseSeed` gives a deployment its own seeds. It is not a secret and it does not protect
+data. Give the same value to every `FokosDB` client and to every Durable Object class of the deployment:
+
+```ts
+const db = new FokosDB({
+	table: { name: "my-table", ns: "FOKOSDB_PARTITION_DO", nsTx: "FOKOSDB_TRANSACTION_COORDINATOR_DO", rootTreesN: 10, hashSplitN: 4 },
+	routingHashBaseSeed: env.FOKOSDB_ROUTING_HASH_BASE_SEED,
+});
+
+export class MyPartitionDO extends FokosDBPartitionDO {
+	protected override fokosConfig() {
+		return { routingHashBaseSeed: this.env.FOKOSDB_ROUTING_HASH_BASE_SEED };
+	}
+}
+```
+
+Do the same in `fokosConfig()` of your `FokosDBTransactionCoordinatorDO` and
+`FokosDBMaterializationDO` subclasses.
+
+> [!WARNING]
+> Every stored partition depends on `routingHashBaseSeed`, so the value must never change. A
+> deployment that wants another value starts on new Durable Object namespaces.
+>
+> - A client with another value than the Durable Objects gets `partition_misrouted` for most keys.
+> - A Durable Object class with another value than the one its data was written with answers
+>   `partition_init_failed` to all requests.
 
 ## Getting started with FokosDB
 

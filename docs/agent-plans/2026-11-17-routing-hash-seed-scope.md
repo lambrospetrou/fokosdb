@@ -1,10 +1,10 @@
 # RFC — The seed of a routingHash comes from the seed scope of its shard group
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-11-17
 **Author:** Lambros Petrou
 
-**Status:** Nothing is built. "Today" means the code on `main` at the date of this document.
+**Status:** All milestones are built. Section 1 and the word "today" describe the code before this spec.
 
 ## Table of contents
 
@@ -191,14 +191,19 @@ does not protect data, and it does not encrypt anything.
 
 **The setting.** FokosDB gets the option `routingHashBaseSeed?: string`:
 
-- in the options of `FokosDB` and `FokosDBAdmin`;
+- in the options of `FokosDB`. `FokosDBAdmin` (`docs/agent-plans/2026-11-17-consistent-backup-and-restore.md`, M7)
+  takes the same option when it is built;
 - in `fokosConfig()` of `FokosDBPartitionDO`, `FokosDBTransactionCoordinatorDO` and `FokosDBMaterializationDO`. A
   `fokosConfig()` can read `this.env` (`src/server/host-config.ts`), so the value can come from a variable of the
   Worker.
 
-The base seed is `baseSeedOf(value) = hash64(value, GOLDEN_RATIO_BIGINT)`. FokosDB passes
-`(shardGroup) => routingHashSeedOf(fokosDBSeedScopeOf(shardGroup), baseSeedOf(value))` as `routingHashSeedResolver`. An empty string
-fails the validation of the options. The value does not go in the route context, the topology or a request (R1).
+The base seed is `baseSeedOf(value) = hash64(value, GOLDEN_RATIO_BIGINT)`. `fokosDBRoutingHashSeedResolverOf(value)`
+in `src/shared/partition-context.ts` gives `(shardGroup) => routingHashSeedOf(fokosDBSeedScopeOf(shardGroup),
+baseSeedOf(value))`, and FokosDB passes it as `routingHashSeedResolver`. With no value it gives
+`fokosDBRoutingHashSeedResolver`, so the seeds of M1 stay. It keeps one resolver for each value, so the clients of
+all requests share one seed cache. A Durable Object class reads the value from its `fokosConfig()` when it computes a
+seed. An empty string fails the validation of the options and of `fokosConfig()`. The value does not go in the route
+context, the topology or a request (R1).
 
 **Two places that must agree (R4).** The client computes the routingHash to choose a root, and each Durable Object
 computes it to store and to route. A Durable Object always uses the `routingHashBaseSeed` of its own class, so a

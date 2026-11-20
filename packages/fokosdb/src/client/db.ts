@@ -40,7 +40,7 @@ import type { MaterializationOps } from "../server/materialization/do-materializ
 import type { TopologyEntrypointFactory } from "../shared/topology-hooks.js";
 import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
 import { FOKOS_HASH_PARTITIONS_MAX, type FokosPartitionRef } from "../sharding/route-context.js";
-import type { RoutingHash } from "../sharding/hash-primitives.js";
+import type { RoutingHash, RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
@@ -157,7 +157,8 @@ import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expre
 import {
 	coordinatorShardGroup,
 	createTableConfig,
-	fokosDBRoutingHashSeedResolver,
+	fokosDBRoutingHashSeedResolverOf,
+	isValidRoutingHashBaseSeed,
 	gsiShardGroup,
 	gsiTableConfig,
 	materializationShardGroup,
@@ -611,6 +612,17 @@ export type FokosDBOptions = FokosTableOptions & {
 	topologyRefreshMs?: number;
 	/** The time after which a topology refresh that did not end can start again, in milliseconds. Default: 30,000. */
 	topologyRefreshTimeoutMs?: number;
+
+	/**
+	 * The base seed of the routingHashes of the deployment. It changes the seed of each shard group, so
+	 * a set of keys that someone built for the default seeds does not fit this deployment. It is not a
+	 * secret and it does not protect data. Every client and every Durable Object class of the
+	 * deployment (`fokosConfig()`) must give the same value, or none. Every stored routingHash depends
+	 * on it, so it must never change: a deployment that wants another value starts on new namespaces or
+	 * will get new DOs for the new seed and manual data transfer would be required.
+	 * It must not be an empty string. Default: none.
+	 */
+	routingHashBaseSeed?: string;
 };
 
 /** `FokosDBOptions` with the defaults of the client applied. */
@@ -668,6 +680,8 @@ export class FokosDB {
 	#coordinators: FokosShardingClient<FokosDBPolicy, CoordinatorOps>;
 	/** The client of each GSI table, by index name. */
 	#gsis = new Map<string, FokosShardingClient<FokosDBPolicy, PartitionOps>>();
+	/** The routingHash seed resolver of the deployment, from `routingHashBaseSeed`. */
+	#seedResolver: RoutingHashSeedResolver;
 
 	constructor(options: FokosDBOptions) {
 		this.#table = createTableConfig(options);
@@ -701,6 +715,14 @@ export class FokosDB {
 				attributes: { coordinatorRootsN },
 			});
 		}
+		if (!isValidRoutingHashBaseSeed(options.routingHashBaseSeed)) {
+			throw invalidOption(
+				"routingHashBaseSeed",
+				String(options.routingHashBaseSeed),
+				"routingHashBaseSeed must be a string that is not empty",
+			);
+		}
+		this.#seedResolver = fokosDBRoutingHashSeedResolverOf(options.routingHashBaseSeed);
 		for (const option of ["topologyRefreshMs", "topologyRefreshTimeoutMs"] as const) {
 			const value = options[option];
 			const min = option === "topologyRefreshMs" ? 0 : 1;
@@ -734,7 +756,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 			...this.#topologyCache({ topology, policy }, policy.ns),
 		});
 		this.#coordinators = new FokosShardingClient({
@@ -743,7 +765,7 @@ export class FokosDB {
 			policy,
 			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 			...this.#topologyCache({ topology: coordinatorTopology, policy }, policy.nsTx),
 		});
 	}
@@ -811,7 +833,7 @@ export class FokosDB {
 			client = new FokosShardingClient({
 				...gsiTableConfig(this.#table, indexName),
 				stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
-				routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+				routingHashSeedResolver: this.#seedResolver,
 			});
 			this.#gsis.set(indexName, client);
 		}
@@ -1774,7 +1796,7 @@ export class FokosDB {
 			const materializations = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 				...materializationTableConfig(this.#table, fp),
 				stub: (ctx, doName) => materializationStubByName(env, ctx, doName),
-				routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+				routingHashSeedResolver: this.#seedResolver,
 			});
 			const indexNames = await this.#fenceMaterializations(materializations);
 			for (const indexName of indexNames) {

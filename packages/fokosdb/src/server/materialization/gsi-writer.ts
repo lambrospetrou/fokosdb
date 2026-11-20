@@ -4,14 +4,9 @@
  * to one outcome. It does not use `FokosDB`.
  */
 import { classifyBatchFailure } from "../../shared/batch-failure.js";
-import {
-	fokosDBRoutingHashSeedResolver,
-	gsiTableConfig,
-	type FokosDBPolicy,
-	type FokosDBRouteContext,
-	type FokosDBTableConfig,
-} from "../../shared/partition-context.js";
+import { gsiTableConfig, type FokosDBPolicy, type FokosDBRouteContext, type FokosDBTableConfig } from "../../shared/partition-context.js";
 import { FokosShardingClient } from "../../sharding/client.js";
+import type { RoutingHashSeedResolver } from "../../sharding/hash-primitives.js";
 import type { GsiWriteEntriesRequest, PartitionOps } from "../do-partition.js";
 import type { GsiEntryOutcome } from "./target-runner.js";
 import type { GsiTargetDefinition } from "./targets.js";
@@ -20,6 +15,8 @@ export type GsiWriterDeps = {
 	/** The table configuration of this materialization partition. */
 	table: () => FokosDBTableConfig;
 	stub: (ctx: FokosDBRouteContext, doName: string) => DurableObjectStub;
+	/** The routingHash seed resolver of the host class. */
+	routingHashSeedResolver: RoutingHashSeedResolver;
 };
 
 export class GsiWriter {
@@ -67,7 +64,7 @@ export class GsiWriter {
 		const client = new FokosShardingClient<FokosDBPolicy, PartitionOps>({
 			...table,
 			stub: this.#deps.stub,
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#deps.routingHashSeedResolver,
 		});
 		this.#clients.set(indexName, { policyVersion: table.policyVersion, client });
 		return client;

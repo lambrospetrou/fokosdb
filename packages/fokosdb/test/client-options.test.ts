@@ -26,6 +26,7 @@ describe("FokosDB — client options", () => {
 		[{ retry: { maxDelayMs: 0 } }, "retry.maxDelayMs"],
 		[{ retry: { baseDelayMs: 2_000 } }, "retry.baseDelayMs"],
 		[{ partitionMigratingRetryDeadlineMs: 0 }, "partitionMigratingRetryDeadlineMs"],
+		[{ routingHashBaseSeed: "" }, "routingHashBaseSeed"],
 	])("rejects %o", (options, option) => {
 		expect(() => makeDB(options)).toThrow(fokosErrorWith("fokosdb_options_invalid", { option }));
 	});

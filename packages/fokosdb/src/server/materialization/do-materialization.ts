@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
+import type { RoutingHashSeedResolver } from "../../sharding/hash-primitives.js";
 import {
 	baseTableName,
-	fokosDBRoutingHashSeedResolver,
+	fokosDBRoutingHashSeedResolverOf,
 	type FokosDBPolicy,
 	type FokosDBRouteContext,
 } from "../../shared/partition-context.js";
@@ -135,6 +136,13 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 	 */
 	#initError?: unknown;
 
+	/**
+	 * The routingHash seed resolver of this class, from `routingHashBaseSeed` of `fokosConfig()`. It
+	 * reads the setting when it computes a seed, so a subclass can read it from `this.env`.
+	 */
+	readonly #seedResolver: RoutingHashSeedResolver = (shardGroup) =>
+		fokosDBRoutingHashSeedResolverOf(this.config().routingHashBaseSeed)(shardGroup);
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new MaterializationStore(ctx.storage, {
@@ -165,6 +173,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 				return { topology, rangeConfig, policy, policyVersion };
 			},
 			stub: (routeCtx, doName) => partitionStubByName(env, routeCtx, doName),
+			routingHashSeedResolver: this.#seedResolver,
 		});
 		this.#runner = new TargetRunner({
 			store: this.#store,
@@ -201,7 +210,7 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, MaterializationOps>({
 			ctx,
 			stub: (routeCtx, doName) => materializationStubByName(env, routeCtx, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),

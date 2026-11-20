@@ -8,11 +8,12 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FokosDBPartitionDO } from "../../src/server/do-partition.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
-import { fokosDBRoutingHashSeedResolver } from "../../src/shared/partition-context.js";
+import { fokosDBRoutingHashSeedResolver, fokosDBRoutingHashSeedResolverOf } from "../../src/shared/partition-context.js";
 import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
 import { INIT_RETRY_ALARM_MS } from "../../src/sharding/scheduler.js";
 import { isDestroyAbortError } from "../../src/shared/cf-utils.js";
 import { fokosErrorWith } from "../errors-matchers.js";
+import { TEST_ROUTING_HASH_BASE_SEED } from "../routing-hash.js";
 import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
@@ -126,6 +127,33 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 			const identity = state.storage.kv.get<FokosPartitionIdentity>(FOKOS_KV_KEYS.IDENTITY)!;
 			expect(identity.routingHashSeed).toBe(fokosDBRoutingHashSeedResolver(partition.ctx.topology.shardGroup));
 			state.storage.kv.put(FOKOS_KV_KEYS.IDENTITY, { ...identity, routingHashSeed: "0000000000000000" });
+		});
+
+		await runInDurableObject(broken.stub, async (instance: FokosDBPartitionDO) => {
+			await expect(instance.apiGetItem(broken.ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).rejects.toThrow(
+				fokosErrorWith("partition_init_failed"),
+			);
+			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true, destroying: false });
+			await instance.fokosPrepareDestroy({});
+		});
+		const err = await broken.stub.fokosDestroy().then(
+			() => null,
+			(e) => e,
+		);
+		expect(isDestroyAbortError(err)).toBe(true);
+	});
+
+	it("refuses all work when the stored seed comes from another routingHashBaseSeed than its class", async ({ expect }) => {
+		const partition = makePartition({ ns: "BASE_SEED_PARTITION_DO" });
+		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" });
+		const shardGroup = partition.ctx.topology.shardGroup;
+
+		const broken = await breakAndRestart(partition, (state) => {
+			const identity = state.storage.kv.get<FokosPartitionIdentity>(FOKOS_KV_KEYS.IDENTITY)!;
+			// The class stores the seed of its own routingHashBaseSeed.
+			expect(identity.routingHashSeed).toBe(fokosDBRoutingHashSeedResolverOf(TEST_ROUTING_HASH_BASE_SEED)(shardGroup));
+			// The seed that a class with no routingHashBaseSeed stores.
+			state.storage.kv.put(FOKOS_KV_KEYS.IDENTITY, { ...identity, routingHashSeed: fokosDBRoutingHashSeedResolver(shardGroup) });
 		});
 
 		await runInDurableObject(broken.stub, async (instance: FokosDBPartitionDO) => {

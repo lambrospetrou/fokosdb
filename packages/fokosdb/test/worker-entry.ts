@@ -10,6 +10,8 @@ import { FokosDBPartitionDO } from "../src/server/do-partition.js";
 import { FOKOS_ERROR_CATEGORIES, FokosError, FokosInternalError, type FokosCodeDef } from "../src/shared/errors.js";
 import { FOKOS_LIBRARY_CODE_TABLES, type FokosErrorCode } from "../src/shared/errors-operations.js";
 import { SHARDING_INTERNAL_CODES } from "../src/sharding/errors.js";
+import type { PartitionDOConfigOverrides } from "../src/server/host-config.js";
+import { TEST_ROUTING_HASH_BASE_SEED } from "./routing-hash.js";
 
 /** Every code definition of the library by its code. */
 export const CODE_DEFS: Record<FokosErrorCode, FokosCodeDef> = Object.assign({}, ...FOKOS_LIBRARY_CODE_TABLES);
@@ -27,6 +29,14 @@ export { FokosDBTopologyCache } from "../src/server/topology-entrypoint.js";
 // db.test.ts runs its whole suite over CUSTOM_PARTITION_DO as well, so that a
 // subclassed FokosDBPartitionDO stays covered.
 export class CustomPartitionDO extends FokosDBPartitionDO {}
+
+// The partition class of a deployment with its own `routingHashBaseSeed`. The value lives in the
+// code, so it stays the same after a restart, as a value from a Worker variable does.
+export class BaseSeedPartitionDO extends FokosDBPartitionDO {
+	protected override fokosConfig(): PartitionDOConfigOverrides {
+		return { routingHashBaseSeed: TEST_ROUTING_HASH_BASE_SEED };
+	}
+}
 
 // Partition tests that must hold, count, answer, or fail one call use this class. The module lists its test controls.
 export { ControlledPartitionDO } from "./controlled-partition-do.js";

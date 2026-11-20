@@ -5,6 +5,7 @@
  * identity or the policy of the partition, and a changed value applies at its next read.
  */
 import invariant from "../shared/invariant.js";
+import { isValidRoutingHashBaseSeed } from "../shared/partition-context.js";
 import { validateTtlSweepConfig, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
 import { validateMaterializationExportConfig, type MaterializationExportConfig } from "../shared/partition/materialization-export.js";
 import { validateTargetRunnerConfig, type TargetRunnerConfig } from "./materialization/target-runner.js";
@@ -96,6 +97,12 @@ export type PartitionDOConfig = Readonly<{
 	topologyRefreshMs: number;
 	/** The time after which a topology refresh that did not end can start again, in milliseconds. */
 	topologyRefreshTimeoutMs: number;
+	/**
+	 * The base seed of the routingHashes of the deployment: `FokosDBOptions.routingHashBaseSeed`. Every
+	 * client and every Durable Object class of the deployment must give the same value, or none. It
+	 * must never change, because every stored routingHash depends on it. Default: none.
+	 */
+	routingHashBaseSeed: string | undefined;
 }>;
 
 export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSweep" | "materializationExport">> & {
@@ -118,6 +125,12 @@ export type MaterializationDOConfig = Readonly<{
 	targetRunner: Readonly<TargetRunnerConfig>;
 	/** The cleanup of the finished change positions and of the tombstones that no target needs. */
 	cleanup: Readonly<MaterializationCleanupConfig>;
+	/**
+	 * The base seed of the routingHashes of the deployment: `FokosDBOptions.routingHashBaseSeed`. Every
+	 * client and every Durable Object class of the deployment must give the same value, or none. It
+	 * must never change, because every stored routingHash depends on it. Default: none.
+	 */
+	routingHashBaseSeed: string | undefined;
 }>;
 
 export type MaterializationDOConfigOverrides = {
@@ -125,6 +138,7 @@ export type MaterializationDOConfigOverrides = {
 	promotionIndexFraction?: number;
 	targetRunner?: Partial<TargetRunnerConfig>;
 	cleanup?: Partial<MaterializationCleanupConfig>;
+	routingHashBaseSeed?: string;
 };
 
 export type ParticipantRetryConfig = Readonly<{
@@ -184,6 +198,12 @@ export type TransactionCoordinatorDOConfig = Readonly<{
 	topologyRefreshMs: number;
 	/** The time after which a topology refresh that did not end can start again, in milliseconds. */
 	topologyRefreshTimeoutMs: number;
+	/**
+	 * The base seed of the routingHashes of the deployment: `FokosDBOptions.routingHashBaseSeed`. Every
+	 * client and every Durable Object class of the deployment must give the same value, or none. It
+	 * must never change, because every stored routingHash depends on it. Default: none.
+	 */
+	routingHashBaseSeed: string | undefined;
 }>;
 
 export type TransactionCoordinatorDOConfigOverrides = Partial<Omit<TransactionCoordinatorDOConfig, "participantRetry">> & {
@@ -222,6 +242,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 	},
 	topologyRefreshMs: 10_000,
 	topologyRefreshTimeoutMs: 30_000,
+	routingHashBaseSeed: undefined,
 });
 
 export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreeze({
@@ -244,6 +265,7 @@ export const DEFAULT_MATERIALIZATION_CONFIG: MaterializationDOConfig = deepFreez
 	// A step deletes a bounded number of rows, because one large delete holds each request of the
 	// partition until its write is durable.
 	cleanup: { deleteRows: 500, scanRows: 1_000 },
+	routingHashBaseSeed: undefined,
 });
 
 export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFreeze({
@@ -258,6 +280,7 @@ export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFr
 	maxDatabaseBytes: 5 * 1024 * 1024 * 1024,
 	topologyRefreshMs: 10_000,
 	topologyRefreshTimeoutMs: 30_000,
+	routingHashBaseSeed: undefined,
 });
 
 /** Merges `overrides` with the defaults of `FokosDBPartitionDO` and validates the result. */
@@ -283,6 +306,7 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 	checkInteger(c, "cleanupTxLockCopyRows", 1);
 	checkInteger(c, "topologyRefreshMs", 0);
 	checkInteger(c, "topologyRefreshTimeoutMs", 1);
+	checkRoutingHashBaseSeed(c.routingHashBaseSeed);
 	validateTtlSweepConfig(c.ttlSweep);
 	validateMaterializationExportConfig(c.materializationExport);
 	return c;
@@ -299,6 +323,7 @@ export function resolveMaterializationConfig(overrides: MaterializationDOConfigO
 		c.promotionIndexFraction > 0 && c.promotionIndexFraction <= 1,
 		() => `promotionIndexFraction must be in (0, 1], got ${c.promotionIndexFraction}`,
 	);
+	checkRoutingHashBaseSeed(c.routingHashBaseSeed);
 	validateTargetRunnerConfig(c.targetRunner);
 	validateMaterializationCleanupConfig(c.cleanup);
 	return c;
@@ -335,6 +360,7 @@ export function resolveCoordinatorConfig(overrides: TransactionCoordinatorDOConf
 	);
 	checkInteger(c, "recoveryScanRows", 1);
 	checkInteger(c, "recoveryConcurrentDrives", 1);
+	checkRoutingHashBaseSeed(c.routingHashBaseSeed);
 	checkInteger(c, "maxDatabaseBytes", 1);
 	checkInteger(c, "topologyRefreshMs", 0);
 	checkInteger(c, "topologyRefreshTimeoutMs", 1);
@@ -403,6 +429,10 @@ function checkInteger<T extends object>(config: T, key: keyof T & string, min: n
 		typeof value === "number" && Number.isSafeInteger(value) && value >= min,
 		() => `${prefix}${key} must be an integer of at least ${min}, got ${String(value)}`,
 	);
+}
+
+function checkRoutingHashBaseSeed(value: string | undefined): void {
+	check(isValidRoutingHashBaseSeed(value), () => `routingHashBaseSeed must be a string that is not empty, got ${JSON.stringify(value)}`);
 }
 
 function check(condition: boolean, message: () => string): asserts condition {

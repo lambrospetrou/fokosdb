@@ -14,7 +14,13 @@ import type { FokosDBTransactionCoordinatorDO } from "../server/do-transaction-c
 import type { FokosDBMaterializationDO } from "../server/materialization/do-materialization.js";
 import type { FokosDBAutoAdminDO } from "../server/do-auto-admin.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
-import { routingHashSeedOf, type RoutingHash, type RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
+import {
+	GOLDEN_RATIO_BIGINT,
+	hash64,
+	routingHashSeedOf,
+	type RoutingHash,
+	type RoutingHashSeedResolver,
+} from "../sharding/hash-primitives.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
@@ -253,8 +259,8 @@ const COORDINATOR_SEED = routingHashSeedOf(COORDINATOR_SEED_SCOPE);
 const MATERIALIZATION_SEED = routingHashSeedOf(MATERIALIZATION_SEED_SCOPE);
 
 /**
- * The routingHash seed resolver of FokosDB: the seed of a shard group comes from its seed scope
- * (`fokosDBSeedScopeOf`). Every client and every Durable Object class of FokosDB uses it. The seeds of the
+ * The routingHash seed resolver of FokosDB with no `routingHashBaseSeed`: the seed of a shard group
+ * comes from its seed scope (`fokosDBSeedScopeOf`) and the default base seed. The seeds of the
  * partition, coordinator, and materialization scopes are computed once, so only a GSI group
  * allocates: its scope and its seed.
  */
@@ -271,6 +277,38 @@ export const fokosDBRoutingHashSeedResolver: RoutingHashSeedResolver = (shardGro
 			return routingHashSeedOf(scope);
 	}
 };
+
+/** The resolver of each `routingHashBaseSeed`, so the clients of all requests share one seed cache. */
+const baseSeedResolvers = new Map<string, RoutingHashSeedResolver>();
+const BASE_SEED_RESOLVERS_MAX = 16;
+
+/**
+ * The routingHash seed resolver of FokosDB for a deployment. With no `routingHashBaseSeed`, it is
+ * `fokosDBRoutingHashSeedResolver`. With a value, the base seed is `hash64(routingHashBaseSeed)`, and
+ * the seed of a shard group is `routingHashSeedOf(fokosDBSeedScopeOf(shardGroup), baseSeed)`. Every
+ * stored routingHash depends on the value, so it must never change in a deployment.
+ */
+export function fokosDBRoutingHashSeedResolverOf(routingHashBaseSeed: string | undefined): RoutingHashSeedResolver {
+	if (routingHashBaseSeed === undefined) {
+		return fokosDBRoutingHashSeedResolver;
+	}
+	let resolver = baseSeedResolvers.get(routingHashBaseSeed);
+	if (resolver === undefined) {
+		const baseSeed = hash64(routingHashBaseSeed, GOLDEN_RATIO_BIGINT);
+		resolver = (shardGroup) => routingHashSeedOf(fokosDBSeedScopeOf(shardGroup), baseSeed);
+		// The oldest resolver goes. A deployment has one value, so this happens only on a misuse.
+		if (baseSeedResolvers.size >= BASE_SEED_RESOLVERS_MAX) {
+			baseSeedResolvers.delete(baseSeedResolvers.keys().next().value!);
+		}
+		baseSeedResolvers.set(routingHashBaseSeed, resolver);
+	}
+	return resolver;
+}
+
+/** True when `value` is a valid `routingHashBaseSeed`: absent, or a string that is not empty. */
+export function isValidRoutingHashBaseSeed(value: unknown): boolean {
+	return value === undefined || (typeof value === "string" && value.length > 0);
+}
 
 /** The table name, from the partition group or the materialization group of the table. */
 export function baseTableName(topology: FokosTopology): string {

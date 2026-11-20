@@ -27,7 +27,7 @@ import type {
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
 import {
-	fokosDBRoutingHashSeedResolver,
+	fokosDBRoutingHashSeedResolverOf,
 	isGsiShardGroup,
 	materializationTableConfig,
 	type FokosDBPolicy,
@@ -35,7 +35,7 @@ import {
 } from "../shared/partition-context.js";
 import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
-import type { RoutingHash } from "../sharding/hash-primitives.js";
+import type { RoutingHash, RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import type { SplitType } from "../sharding/types.js";
 import invariant from "../shared/invariant.js";
 import {
@@ -420,6 +420,13 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	 */
 	#_coloInfo?: ColoInfo;
 
+	/**
+	 * The routingHash seed resolver of this class, from `routingHashBaseSeed` of `fokosConfig()`. It
+	 * reads the setting when it computes a seed, so a subclass can read it from `this.env`.
+	 */
+	readonly #seedResolver: RoutingHashSeedResolver = (shardGroup) =>
+		fokosDBRoutingHashSeedResolverOf(this.config().routingHashBaseSeed)(shardGroup);
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#actorId = ctx.id.toString();
@@ -490,7 +497,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			ctx,
 			// Host code: it reads the binding and the location hint from the policy and applies the jurisdiction.
 			stub: (routeCtx, doName) => partitionStubByName(env, routeCtx, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
@@ -735,7 +742,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const client = new FokosShardingClient<FokosDBPolicy, MaterializationOps>({
 			...table,
 			stub: (ctx, doName) => materializationStubByName(this.env, ctx, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 		});
 		this.#materialization = { routeCtx: self, client };
 		return client;

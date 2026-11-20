@@ -3,9 +3,11 @@ import { invariantFailure } from "../../test/errors-matchers.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
 import {
 	DEFAULT_COORDINATOR_CONFIG,
+	DEFAULT_MATERIALIZATION_CONFIG,
 	DEFAULT_PARTITION_CONFIG,
 	maxPreparingHoldMs,
 	resolveCoordinatorConfig,
+	resolveMaterializationConfig,
 	resolvePartitionConfig,
 	type PartitionDOConfigOverrides,
 	type TransactionCoordinatorDOConfigOverrides,
@@ -44,6 +46,7 @@ describe("resolvePartitionConfig", () => {
 		[{ staleLockScanRows: 0 }, /staleLockScanRows must be an integer of at least 1/],
 		[{ cleanupPromotedKeyRows: 2.5 }, /cleanupPromotedKeyRows must be an integer/],
 		[{ ttlSweep: { chunkSize: 0 } }, /chunkSize must be an integer greater than zero/],
+		[{ routingHashBaseSeed: "" }, /routingHashBaseSeed must be a string that is not empty/],
 	])("rejects %o", (overrides, detail) => {
 		expect(() => resolvePartitionConfig(overrides)).toThrow(invariantFailure(detail));
 	});
@@ -75,6 +78,7 @@ describe("resolveCoordinatorConfig", () => {
 		[{ recoveryScanRows: 0 }, /recoveryScanRows must be an integer of at least 1/],
 		[{ recoveryConcurrentDrives: 0 }, /recoveryConcurrentDrives must be an integer of at least 1/],
 		[{ maxDatabaseBytes: 10_000_000_001 }, /maxDatabaseBytes must be at most 9000000000/],
+		[{ routingHashBaseSeed: "" }, /routingHashBaseSeed must be a string that is not empty/],
 	])("rejects %o", (overrides, detail) => {
 		expect(() => resolveCoordinatorConfig(overrides)).toThrow(invariantFailure(detail));
 	});
@@ -82,5 +86,22 @@ describe("resolveCoordinatorConfig", () => {
 	it("derives the longest PREPARING hold from the stale time, and caps it at the idempotency window", () => {
 		expect(maxPreparingHoldMs(DEFAULT_COORDINATOR_CONFIG)).toBe(5 * DEFAULT_COORDINATOR_CONFIG.staleTransactionMs);
 		expect(maxPreparingHoldMs(resolveCoordinatorConfig({ staleTransactionMs: IDEMPOTENCY_WINDOW_MS }))).toBe(IDEMPOTENCY_WINDOW_MS);
+	});
+});
+
+describe("routingHashBaseSeed", () => {
+	it("has no default, and each class takes a value", () => {
+		expect(DEFAULT_PARTITION_CONFIG.routingHashBaseSeed).toBeUndefined();
+		expect(DEFAULT_COORDINATOR_CONFIG.routingHashBaseSeed).toBeUndefined();
+		expect(DEFAULT_MATERIALIZATION_CONFIG.routingHashBaseSeed).toBeUndefined();
+		expect(resolvePartitionConfig({ routingHashBaseSeed: "d" }).routingHashBaseSeed).toBe("d");
+		expect(resolveCoordinatorConfig({ routingHashBaseSeed: "d" }).routingHashBaseSeed).toBe("d");
+		expect(resolveMaterializationConfig({ routingHashBaseSeed: "d" }).routingHashBaseSeed).toBe("d");
+	});
+
+	it("rejects an empty string in the materialization config", () => {
+		expect(() => resolveMaterializationConfig({ routingHashBaseSeed: "" })).toThrow(
+			invariantFailure(/routingHashBaseSeed must be a string that is not empty/),
+		);
 	});
 });

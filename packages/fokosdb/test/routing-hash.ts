@@ -3,6 +3,9 @@ import { fokosDBRoutingHashSeedResolver, RESERVED_SHARD_GROUP_PREFIX } from "../
 import type { KeyBytes } from "../src/sharding/key-codec.js";
 import type { FokosStorageInterval } from "../src/sharding/runtime-types.js";
 
+/** The `routingHashBaseSeed` of `BaseSeedPartitionDO`. */
+export const TEST_ROUTING_HASH_BASE_SEED = "fokos-test-deployment";
+
 /**
  * The routingHash seed resolver of the host of `shardGroup` in the tests. A FokosDB Durable Object serves each
  * `fokos.` group, and a test host of the sharding library serves every other group with the default.

@@ -1,13 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import {
-	fokosDBRoutingHashSeedResolver,
+	fokosDBRoutingHashSeedResolverOf,
 	type FokosDBPolicy,
 	type FokosDBRouteContext,
 	type FokosDBTableConfig,
 } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
-import { asRoutingHash, maxHashDepth, type RoutingHash } from "../sharding/hash-primitives.js";
+import { asRoutingHash, maxHashDepth, type RoutingHash, type RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import { INIT_RETRY_ALARM_MS } from "../sharding/scheduler.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
@@ -427,6 +427,13 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 */
 	#initError?: unknown;
 
+	/**
+	 * The routingHash seed resolver of this class, from `routingHashBaseSeed` of `fokosConfig()`. It
+	 * reads the setting when it computes a seed, so a subclass can read it from `this.env`.
+	 */
+	readonly #seedResolver: RoutingHashSeedResolver = (shardGroup) =>
+		fokosDBRoutingHashSeedResolverOf(this.config().routingHashBaseSeed)(shardGroup);
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#migrations = new SQLSchemaMigrations({
@@ -442,7 +449,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
 			ctx,
 			stub: (routeCtx, doName) => txCoordinatorStubByName(env, routeCtx, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 			hooks: this.hooks(),
 			operations: this.operations(),
 			config: () => this.fokosRuntimeConfig(),
@@ -1338,7 +1345,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			policy: ctx.policy,
 			policyVersion: ctx.policyVersion,
 			stub: (c, doName) => partitionStubByName(this.env, c, doName),
-			routingHashSeedResolver: fokosDBRoutingHashSeedResolver,
+			routingHashSeedResolver: this.#seedResolver,
 			...(topologyCache === undefined ? {} : { topologyCache }),
 		});
 	}
