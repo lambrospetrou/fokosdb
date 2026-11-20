@@ -46,19 +46,25 @@ another namespace, cannot use the stored rows: the client of the new table compu
 partition refuses its stored seed. `docs/agent-plans/2026-11-17-consistent-backup-and-restore.md` (M8) needs such a
 restore.
 
-**The reasons for a different seed for each group and each table.** The author gave two reasons:
+**The reasons for a different seed for each group and each table**:
 
-1. **The GSI load must differ from the load of the base partitions.** A GSI that keys by the same values as its base
-   table must not put each key at the same tree position as the base table.
+1. **The hash mapping of each group stays independent.** A different seed makes the routingHash of each group an
+   independent function of the key. A GSI that keys by the same values as its base table then puts each key at a
+   different tree position, so the trees are not mirrors. A routingHash also has no meaning outside its group: one
+   passed to another group gives wrong owners.
 2. **Crafted keys must not fit every table.** A caller that can choose keys must not build one set of keys that makes a
    lopsided tree in every table.
 
 The evaluation of each reason:
 
-- **Reason 1 holds, and this RFC keeps it.** The groups of one table keep four different seeds. The routing-hash RFC
-  also needs it: its test "The partition, coordinator, materialization, and GSI groups of one table get four different
-  seeds" checks it, and its materialization storage forbids a host to pass the routingHash of the base partition
-  through unchanged (Section 4.2.10). With different seeds, such a defect gives wrong owners, and the tests find it.
+- **Reason 1 holds as a benefit, not as a requirement.** A single seed for all groups would be correct too: the same
+  key would land at the same tree position in each group, and a routingHash passed between groups would be a valid
+  value. The four seeds buy independence instead. A GSI that keys by the same values as its base table gets an
+  uncorrelated tree, so the splits and the migrations of the two groups do not coincide, and a collision pair of one
+  group does not collide in another. A routingHash also keeps no meaning outside its group, so the materialization
+  rule of the routing-hash RFC — a host must not pass the routingHash of the base partition through unchanged
+  (Section 4.2.10) — stays checkable: a foreign routingHash gives wrong owners. The independence costs nothing,
+  because the seed scopes already differ.
 - **Reason 2 holds only while the table name is not known.** The base seed is public, so anyone who knows the table name
   computes the seed. xxHash64 is not a keyed hash, and with a known seed a caller can construct keys for a chosen
   output (`docs/agent-plans/2026-11-01-routing-hash.md`, Section 4.2.13). A seed for each table therefore makes a
@@ -157,8 +163,8 @@ read with the new code:
 **What does not break.**
 
 - Routing stays correct: the client, the router and the runtime use the same function (G4).
-- The groups of one table keep different seeds, so reason 1 of [1](#1-overview-and-context) and the materialization
-  rule of the routing-hash RFC hold (G3).
+- The groups of one table keep different seeds, so the mappings stay independent and a routingHash keeps no meaning
+  outside its group (G3, reason 1 of [1](#1-overview-and-context)).
 - No property of a table depends on a seed of its own ([1](#1-overview-and-context)).
 
 **Tests.**
@@ -247,9 +253,11 @@ it with one more round trip from each new isolate. Rejected.
 A client then needs a setting for each table to know which seed to use, and a restore can copy only a table with the
 new seeds. Rejected: the package has no released data to keep.
 
-**One seed for all groups.** It works for routing, but the groups of one table then share a seed, and a defect that
-passes a routingHash from one group to another gives correct owners and stays hidden. It also loses reason 1 of
-[1](#1-overview-and-context). Rejected.
+**One seed for all groups.** It works for routing and stays correct: the same key lands at the same tree position in
+each group, and a routingHash is a valid value in every group. But the four mappings collapse into one mirrored
+mapping where key domains overlap, and a cross-group routingHash becomes undetectable rather than wrong. It loses
+reason 1 of [1](#1-overview-and-context). Rejected: the independence costs nothing, because the seed scopes already
+differ.
 
 **A required `routingHashBaseSeed`.** Every deployment must set one. Rejected: most deployments do not let untrusted
 callers choose keys, and a required value adds a setting that must never change and that every client must get.
