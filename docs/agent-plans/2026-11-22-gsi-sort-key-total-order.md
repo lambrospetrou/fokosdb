@@ -58,7 +58,9 @@ prefix. The trailer breaks this assumption. A scan can then return a resume key 
 `a = … "order#01"` and `S = … "order#0101"`, the key `… "order#01" 4 : 1` is after `S`, and also after the entry
 `"order#0101"`.
 
-The same assumption holds for `queryItems` key pagination (`2026-11-21-query-items-key-pagination.md`).
+The draft idea for `queryItems` key pagination (`docs/ideas/2026-11-21-query-items-key-pagination.md`, section
+4.2.7) uses the same `smallestValidAtOrAfter` of `scanItems` for a GSI. It gets the fix through `scanItems`, and it
+adds no requirement to this RFC.
 
 ### 1.3 What the reader must know about the current system
 
@@ -286,6 +288,6 @@ with a clear error. An online change needs a new GSI shard group and a backfill.
   (`shortestSeparator`, `shortestCompositeSeparator`)
 - `docs/agent-plans/2026-10-17-coalesced-materialization-and-gsis.md`
 - `docs/agent-plans/2026-11-20-scan-items.md`
-- `docs/agent-plans/2026-11-21-query-items-key-pagination.md`
+- `docs/ideas/2026-11-21-query-items-key-pagination.md`
 - CockroachDB `pkg/util/encoding` (the key encoding of bytes) and `pkg/keys` (`MakeFamilyKey`,
   `GetRowPrefixLength`, `EnsureSafeSplitKey`)
