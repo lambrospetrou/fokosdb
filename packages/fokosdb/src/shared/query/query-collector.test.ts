@@ -45,7 +45,6 @@ function collect(
 	opts: { select: "count" | "projection"; budget?: Budget; estimateResponseBytes?: (item: StoredItem | ProjectedWireRow) => number },
 ) {
 	const collector = createQueryPageCollector({
-		hashKey: hk,
 		select: opts.select,
 		budget: opts.budget ?? budget(),
 		estimateResponseBytes: opts.estimateResponseBytes ?? (() => 5),
@@ -61,7 +60,7 @@ function collect(
 			}
 			return c.payload;
 		};
-		if (!collector.consume(KeyCodec.encode(c.sk), c.itemBytes, c.matched, decode)) {
+		if (!collector.consume(hk, KeyCodec.encode(c.sk), c.itemBytes, c.matched, decode)) {
 			break;
 		}
 	}

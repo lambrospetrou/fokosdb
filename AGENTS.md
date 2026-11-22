@@ -69,6 +69,12 @@ The repartition flow runs as the runtime job `source_repartition`. It initialize
 
 Four budgets bound one page: evaluated items (`limit`), evaluated bytes, response bytes (`maxResponseBytes`), and partition visits. `QueryPageBudget` (`shared/query/page-budget.ts`) carries them across the sub-queries in `FokosDB` and across the planned visits of `walkRangeVisits` in `do-partition.ts`.
 
+## scanItems
+
+`db.scanItems` and `db.gsi(indexName).scanItems` return one bounded page of a table or a GSI, in the storage order `(routingHash, hk, sk)`. A caller follows the opaque `cursor` until it is absent. `exclusiveStartKey` starts the first page after a key, and it is not valid with `cursor`. `segment` and `totalSegments` split the routingHash space into fixed intervals that the caller scans in parallel. The cursor (`shared/query/scan-cursor.ts`) holds a position and a fingerprint of the shard group and the segment, so `limit`, `select`, `filter`, and `projection` can change between pages.
+
+`FokosDB` walks from one owned slice to the next. Each step is the `point` operation `apiScanItems`, whose route key is the position (`FokosStorageKey`) and not a key. The owner reads the slice from `call.ownedSlice(pos)` and answers with `next`, the start of the next slice. A hash slice ends at the first routingHash whose promotion has cut over, so the step after it goes to the range tree. During a read-through, the scope of the slice is the caller slice. A page visits at most `MAX_PARTITION_VISITS_PER_PAGE` partitions, and a run of empty partitions ends the page with a cursor at the next slice.
+
 ## Transactions (2PC)
 
 The model follows the DynamoDB papers: [ATC 2023, Idziorek et al.](https://www.usenix.org/system/files/atc23-idziorek.pdf) and [ATC 2022, Elhemali et al.](https://www.usenix.org/system/files/atc22-elhemali.pdf)

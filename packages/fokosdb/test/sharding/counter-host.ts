@@ -10,6 +10,7 @@ import {
 	type FokosMigrationPage,
 	type FokosMigrationPullRequest,
 	type FokosOperations,
+	type FokosOwnedSlice,
 	type FokosPrepareDestroyRequest,
 	type FokosPromotionsPage,
 	type FokosPromotionsRequest,
@@ -54,12 +55,12 @@ export type CounterOps = {
 	 * that starts with `throw-`.
 	 */
 	/**
-	 * Reads nothing at a position in the storage order, so a test can see which partition owns it.
-	 * Admission refuses it when it gets a key, because a position names no item.
+	 * Answers the owned slice of a position in the storage order, so a test can see which partition owns
+	 * it and where its slice ends. Admission refuses it when it gets a key, because a position names no item.
 	 */
 	locate: {
 		req: { routingHash: Uint8Array };
-		res: null;
+		res: FokosOwnedSlice;
 	};
 	incrementMany: {
 		req: { items: Array<{ hashKey: KeyBytes; amount: number }> };
@@ -283,7 +284,7 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 				whileMigrating: "throw",
 				admissionTag: "locate",
 				key: (req) => ({ routingHash: req.routingHash }),
-				local: () => null,
+				local: (req, call) => call.ownedSlice({ routingHash: req.routingHash }),
 			},
 			incrementMany: {
 				shape: "group",

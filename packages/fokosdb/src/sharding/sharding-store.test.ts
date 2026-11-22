@@ -343,3 +343,36 @@ describe("FokosShardingStore - KV records", () => {
 		});
 	});
 });
+
+describe("FokosShardingStore - firstCutOverRouteOverride", () => {
+	const rh = (hex: string) => asRoutingHash(Uint8Array.fromHex(hex));
+	/** One promotion of `routingHash` in `state`, with its override. */
+	function promotion(
+		store: FokosShardingStore,
+		routingHash: ReturnType<typeof rh>,
+		state: "queued" | "planned" | "cutover" | "completed" | "cleaned",
+	) {
+		const seq = store.nextRepartitionSeq();
+		const id = `r${seq}`;
+		store.insertRepartition({ id, seq, kind: "key_promotion", state, routingHash, queuedAt: 0, cutoverAt: null, nextAttemptAt: 0 });
+		store.insertRouteOverride(routingHash, id);
+	}
+
+	it("gives the first cut-over override in [start, end), and skips an override that has not cut over", async () => {
+		await withStore((store) => {
+			expect(store.firstCutOverRouteOverride(rh("0000000000000000"), null)).toBeNull();
+			promotion(store, rh("1000000000000000"), "planned");
+			promotion(store, rh("2000000000000000"), "cutover");
+			promotion(store, rh("3000000000000000"), "completed");
+			promotion(store, rh("4000000000000000"), "cleaned");
+			const first = (start: string, end: string | null) =>
+				store.firstCutOverRouteOverride(rh(start), end === null ? null : rh(end))?.toHex() ?? null;
+			expect(first("0000000000000000", null)).toBe("2000000000000000");
+			expect(first("2000000000000000", null)).toBe("2000000000000000");
+			expect(first("2000000000000001", null)).toBe("3000000000000000");
+			expect(first("3000000000000001", "4000000000000000")).toBeNull();
+			expect(first("3000000000000001", "4000000000000001")).toBe("4000000000000000");
+			expect(first("0000000000000000", "2000000000000000")).toBeNull();
+		});
+	});
+});

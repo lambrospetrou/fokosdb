@@ -138,9 +138,13 @@ WHERE i.routing_hash = ?4 AND i.hk = ?2 AND i.sk = ?3
 LIMIT 1`;
 }
 
+/**
+ * `storageOrder` true orders the rows by `(routing_hash, hk, sk)`, for a read across hash keys, and gives the
+ * hash key of each row as `key_hk`. Else the rows are of one hash key and in `sk` order.
+ */
 export function composeQueryStatement(
 	plan: Pick<CompiledQueryPlan, "filterSql" | "projection">,
-	opts: { select: QuerySelect; direction: "asc" | "desc"; scanConditions: readonly string[] },
+	opts: { select: QuerySelect; direction: "asc" | "desc"; scanConditions: readonly string[]; storageOrder?: boolean },
 ): string {
 	// SQLite numbers an unnumbered ? as one above the largest number seen so far, so a bare ? here
 	// would take ?2 only when the pool ?1 precedes it in the text. A filter reads the pool in the
@@ -150,12 +154,14 @@ export function composeQueryStatement(
 	const conds = opts.scanConditions.map((condition) => condition.replace(/\?/g, () => `?${nextParam++}`)).join(" AND ");
 	const limitParam = `?${nextParam}`;
 	const order = opts.direction === "asc" ? "ASC" : "DESC";
+	const orderBy = opts.storageOrder ? `routing_hash ${order}, hk ${order}, sk ${order}` : `sk ${order}`;
+	const keyHk = opts.storageOrder ? "hk AS key_hk, " : "";
 	const matchedSql = plan.filterSql === null ? "1 AS matched" : `CASE WHEN (${plan.filterSql}) THEN 1 ELSE 0 END AS matched`;
 	if (opts.select === "count") {
-		return `SELECT sk, item_bytes, ${matchedSql}
+		return `SELECT ${keyHk}sk, item_bytes, ${matchedSql}
 FROM items AS i
 WHERE ${conds}
-ORDER BY sk ${order}
+ORDER BY ${orderBy}
 LIMIT ${limitParam}`;
 	}
 	const projection = plan.projection;
@@ -175,14 +181,14 @@ LIMIT ${limitParam}`;
 					`CASE WHEN matched THEN ${projection.typeSql[index]} END AS t${index}`,
 				]);
 	return `WITH candidates AS (
-SELECT hk, sk, item_bytes, v, ttl_epoch_utc_seconds, data_kind, data, last_read_ts, last_write_ts, ${matchedSql}
+SELECT ${opts.storageOrder ? "routing_hash, " : ""}hk, sk, item_bytes, v, ttl_epoch_utc_seconds, data_kind, data, last_read_ts, last_write_ts, ${matchedSql}
 FROM items AS i
 WHERE ${conds}
-ORDER BY sk ${order}
+ORDER BY ${orderBy}
 LIMIT ${limitParam})
-SELECT sk, item_bytes, matched, ${outerColumns.join(", ")}
+SELECT ${keyHk}sk, item_bytes, matched, ${outerColumns.join(", ")}
 FROM candidates AS i
-ORDER BY sk ${order}`;
+ORDER BY ${orderBy}`;
 }
 
 export type ExpressionBindingDescriptor =

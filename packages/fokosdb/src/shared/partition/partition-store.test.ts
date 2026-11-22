@@ -93,7 +93,7 @@ function scanRows(
 	take = Number.POSITIVE_INFINITY,
 ): { rows: ScanRow[]; metrics: SqlMetrics } {
 	const rows: ScanRow[] = [];
-	const metrics = store.scanQueryPage(opts, (sk, itemBytes, matched, decodePayload) => {
+	const metrics = store.scanQueryPage(opts, (_hk, sk, itemBytes, matched, decodePayload) => {
 		rows.push({ sk, itemBytes, matched, payload: matched && opts.select === "projection" ? decodePayload() : null });
 		return rows.length < take;
 	});

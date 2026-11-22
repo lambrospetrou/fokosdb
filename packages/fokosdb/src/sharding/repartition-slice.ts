@@ -7,8 +7,11 @@ import {
 } from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosTopology } from "./route-context.js";
-import type { FokosStorageInterval } from "./runtime-types.js";
+import type { FokosStorageInterval, FokosStorageKey } from "./runtime-types.js";
 import invariant from "../shared/invariant.js";
+
+/** The empty key: the minimum `hk` or `sk` of a position. */
+const NO_KEY = KeyCodec.encodeOptional(undefined);
 
 /**
  * The part of a source partition's keyspace that one repartition target owns.
@@ -98,6 +101,15 @@ export function promotedRoutingHashOf(plan: { targets: ReadonlyArray<{ slice: Fo
 	const slice = plan.targets[0]?.slice;
 	invariant(slice?.kind === "promoted_routing_hash", "fokos/repartition: a promotion plan carries one promoted_routing_hash slice");
 	return slice.routingHash;
+}
+
+/** The order of two positions in the storage order `(routingHash, hk, sk)`. An absent `hk` or `sk` is the empty key. */
+export function compareStorageKeys(a: FokosStorageKey, b: FokosStorageKey): number {
+	return (
+		compareRoutingHashes(a.routingHash as RoutingHash, b.routingHash as RoutingHash) ||
+		KeyCodec.compare(a.hk ?? NO_KEY, b.hk ?? NO_KEY) ||
+		KeyCodec.compare(a.sk ?? NO_KEY, b.sk ?? NO_KEY)
+	);
 }
 
 /** The storage interval of a hash node interval `[start, end)`. A null `end` has no upper bound. */

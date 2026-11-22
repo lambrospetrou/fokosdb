@@ -26,6 +26,7 @@ export type {
 	FokosJob,
 	FokosLifecycle,
 	FokosLocalCall,
+	FokosOwnedSlice,
 	FokosOperation,
 	FokosOperationBase,
 	FokosOperations,

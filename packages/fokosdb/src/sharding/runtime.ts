@@ -20,6 +20,7 @@ import {
 	asRoutingHash,
 	compareRoutingHashes,
 	RoutingHashDigitCursor,
+	routingHashInterval,
 	routingHashDigits,
 	routingHashOf,
 	defaultRoutingHashSeedResolver,
@@ -47,6 +48,7 @@ import {
 	sliceIncludesHashKey,
 	sliceIncludesItem,
 	sliceIncludesPosition,
+	type FokosSlice,
 } from "./repartition-slice.js";
 import type {
 	FokosExecuteLocalRequest,
@@ -84,6 +86,7 @@ import type {
 	FokosJob,
 	FokosLifecycle,
 	FokosLocalCall,
+	FokosOwnedSlice,
 	FokosOperation,
 	FokosOperationSpec,
 	FokosOperations,
@@ -111,7 +114,6 @@ import { topologyEventToJson } from "./topology-encode.js";
 import type { RangeAncestorInfo } from "./types.js";
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
-const NOOP_CALL: FokosLocalCall = { signal: () => {} };
 const LOCAL: OwnedResolution = { kind: "local" };
 /** The in-memory step of an identity check that changed nothing. */
 const NO_COMMIT = (): void => {};
@@ -1370,7 +1372,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				return envelope(value, collector.build());
 			}
 			collector.add(this.#selfNode("executed"));
-			const value = await this.#runLocal(descriptor, req.request, NOOP_CALL);
+			// A read-through applies no signal, and its scope is the caller slice.
+			const value = await this.#runLocal(descriptor, req.request, this.#localCall(slice).call);
 			return envelope(value, collector.build());
 		}
 
@@ -1421,7 +1424,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return envelope(value, collector.build());
 		}
 		collector.add(this.#selfNode("executed"));
-		const value = await this.#runLocal(descriptor, request, NOOP_CALL);
+		const value = await this.#runLocal(descriptor, request, this.#localCall(slice).call);
 		return envelope(value, collector.build());
 	}
 
@@ -2001,7 +2004,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					const fallback = again[0];
 					if (fallback.visit.target === "local") {
 						collector.add(this.#selfNode("executed"));
-						return await this.#runLocal(descriptor, req, NOOP_CALL);
+						return await this.#runLocal(descriptor, req, this.#localCall().call);
 					}
 					target = fallback.visit.target;
 					plan = fallback;
@@ -2203,10 +2206,50 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	// ═══ local execution, admission, signals ════════════════════════════════
 
-	/** A `local` or `beforeForward` call collects its signals; the caller applies them after a success. */
-	#localCall(): { call: FokosLocalCall; signals: FokosSignals[] } {
+	/**
+	 * A `local` or `beforeForward` call collects its signals; the caller applies them after a success.
+	 * `slice` is the caller slice of a read-through, which is the scope of the call. Else the scope is the
+	 * owned interval of this partition.
+	 */
+	#localCall(slice: FokosSlice | null = null): { call: FokosLocalCall; signals: FokosSignals[] } {
 		const signals: FokosSignals[] = [];
-		return { call: { signal: (s) => signals.push(s) }, signals };
+		return { call: { signal: (s) => signals.push(s), ownedSlice: (pos) => this.#ownedSlice(pos, slice) }, signals };
+	}
+
+	/**
+	 * The end of the slice of the scope that holds `pos`, and the start of the next slice. They are the same
+	 * position. The kind of the scope decides the end, not the kind of this partition: a hash source can
+	 * serve a range caller slice. Only a hash scope ends at a promoted routingHash, because a range scope is
+	 * inside the range tree of its promoted routingHash.
+	 */
+	#ownedSlice(pos: FokosStorageKey, slice: FokosSlice | null): FokosOwnedSlice {
+		const identity = this.identity();
+		invariant(slice !== null || !this.#source.routerRole(), "fokos/runtime.ownedSlice: a router owns no slice");
+		if (slice?.kind === "range" || slice?.kind === "promoted_routing_hash" || (slice === null && identity.kind === "range")) {
+			const range = slice === null ? identity.range! : slice.kind === "range" ? slice : { routingHash: slice.routingHash, end: null };
+			const end = rangeStorageInterval(range.routingHash, null, range.end).end;
+			return { end, next: end };
+		}
+		const hash = identity.hash;
+		invariant(hash, "fokos/runtime.ownedSlice: hash identity must exist for hash scope");
+		const { rootTreesN, hashSplitN } = identity.topology;
+		// A hash child of a split is one level below its source.
+		invariant(
+			slice === null || slice.depth === hash.path.length + 1,
+			"fokos/runtime.ownedSlice: the caller slice is not a child of this partition",
+		);
+		const hashEnd =
+			slice === null ? hash.end : routingHashInterval(rootTreesN, hashSplitN, hash.rootIndex, [...hash.path, slice.childIndex]).end;
+		const routingHash = asRoutingHash(pos.routingHash);
+		const promoted = this.#store.firstCutOverRouteOverride(routingHash, hashEnd);
+		// The routing sends each position of a promoted routingHash to its range tree.
+		invariant(
+			promoted === null || compareRoutingHashes(promoted, routingHash) !== 0,
+			"fokos/runtime.ownedSlice: a position of a promoted routingHash reached its hash scope",
+		);
+		const endHash = promoted ?? hashEnd;
+		const end = endHash === null ? null : { routingHash: endHash };
+		return { end, next: end };
 	}
 
 	#runLocal(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown, call: FokosLocalCall): unknown {

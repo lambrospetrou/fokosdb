@@ -198,7 +198,18 @@ export type FokosSignals = {
  * knows facts its response does not carry. The runtime applies the signals after the handler returns
  * without throwing. `fokosExecuteLocal` passes one whose `signal` is a no-op.
  */
-export type FokosLocalCall = { signal(signals: FokosSignals): void };
+/** The end of the slice that holds a position, and the start of the next slice. A null value is the end of the table. */
+export type FokosOwnedSlice = { end: FokosStorageKey | null; next: FokosStorageKey | null };
+
+export type FokosLocalCall = {
+	signal(signals: FokosSignals): void;
+	/**
+	 * The slice of the scope of this call that holds `pos`: the owned interval of this partition, or the
+	 * caller slice during a read-through. The slice of a hash scope ends at the first routingHash after
+	 * `pos` whose promotion has cut over. It throws on a router, which owns no slice.
+	 */
+	ownedSlice(pos: FokosStorageKey): FokosOwnedSlice;
+};
 
 export type FokosOperationWhileMigrating = "throw" | "read_source";
 

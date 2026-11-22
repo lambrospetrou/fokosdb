@@ -1,6 +1,6 @@
 # RFC — `scanItems`: a paginated scan of a table or a GSI
 
-**State:** Draft
+**State:** Implemented on 2026-11-22
 **Date:** 2026-11-20
 **Author:** Lambros
 

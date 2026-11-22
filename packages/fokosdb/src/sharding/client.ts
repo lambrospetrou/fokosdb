@@ -179,7 +179,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	/** The deepest known partition that holds the whole interval. That partition plans the range frontier. */
 	resolveRange(input: FokosRangeInput): FokosRouteContext<TPolicy> {
 		return this.#resolveKey(
-			this.#routingHashOf(input.hashKey),
+			this.routingHashOf(input.hashKey),
 			(view, cut) => rangeIntervalLookup(view, input.hashKey, input.interval, cut),
 			true,
 			true,
@@ -191,11 +191,17 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		if ("routingHash" in key) {
 			return { routingHash: asRoutingHash(key.routingHash), hk: key.hk ?? NO_KEY, sk: key.sk ?? NO_KEY };
 		}
-		return { routingHash: this.#routingHashOf(key.hashKey), hk: key.hashKey, sk: key.sortKey };
+		return { routingHash: this.routingHashOf(key.hashKey), hk: key.hashKey, sk: key.sortKey };
 	}
 
-	#routingHashOf(hashKey: KeyBytes): RoutingHash {
+	/** The routingHash of a hash key in the shard group of this client: the first part of its position. */
+	routingHashOf(hashKey: KeyBytes): RoutingHash {
 		return routingHashOf(hashKey, this.#router.topology.shardGroup, this.#router.routingHashSeedResolver);
+	}
+
+	/** The shard group of this client. */
+	get shardGroup(): string {
+		return this.#router.topology.shardGroup;
 	}
 
 	/**
