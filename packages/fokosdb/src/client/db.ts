@@ -924,6 +924,10 @@ export class FokosDB {
 	}
 
 	/**
+	 * WARNING: This operation is experimental, incomplete, destructive, and irreversible.
+	 *
+	 * A proper exhaustive delete workflow will be provided in a future version.
+	 *
 	 * Deletes all the Durable Objects of the table, and resets its topology in the admin Durable Objects.
 	 * Stops at the first failure. A partial destroy stays partial, and a later call continues it.
 	 *
