@@ -973,6 +973,25 @@ export class FokosShardingStore {
 	}
 
 	/**
+	 * The first routingHash in `[start, end)` whose promotion has cut over: `cutover`, `completed`, or
+	 * `cleaned`. A null `end` has no upper bound. One seek on the primary key of the overrides.
+	 */
+	firstCutOverRouteOverride(start: RoutingHash, end: RoutingHash | null): RoutingHash | null {
+		if (!this.#anyRouteOverride()) {
+			return null;
+		}
+		const row = tryOne(
+			this.#storage.sql.exec<{ routing_hash: ArrayBuffer }>(
+				`SELECT o.routing_hash FROM fokos_route_overrides o JOIN fokos_repartitions r ON r.id = o.repartition_id
+				  WHERE o.routing_hash >= ?1 ${end === null ? "" : "AND o.routing_hash < ?2"}
+				    AND r.state IN ('cutover', 'completed', 'cleaned') ORDER BY o.routing_hash LIMIT 1`,
+				...(end === null ? [start] : [start, end]),
+			),
+		);
+		return row ? asRoutingHash(fromSqlBytes(row.routing_hash)) : null;
+	}
+
+	/**
 	 * Pages the terminal overrides in the routingHash interval `[start, end)`, in `routing_hash` order,
 	 * strictly after `cursor`. A null `end` has no upper bound. The primary key seeks to the first row
 	 * of the interval, so the overrides outside it cost no row read.

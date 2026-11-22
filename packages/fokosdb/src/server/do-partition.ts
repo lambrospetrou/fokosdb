@@ -57,6 +57,7 @@ import {
 import { TtlExpiry } from "../shared/partition/ttl-expiry.js";
 import { promotionFloor, SplitPlanner } from "../shared/partition/split-planner.js";
 import { promotedRoutingHashOf } from "../sharding/repartition-slice.js";
+import { compareStorageKeys } from "../sharding/storage-position.js";
 import { resolvePartitionConfig, type PartitionDOConfig, type PartitionDOConfigOverrides } from "./host-config.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
@@ -71,6 +72,7 @@ import type {
 	FokosOperations,
 	FokosRangeVisit,
 	FokosShardingHooks,
+	FokosStorageKey,
 } from "../sharding/runtime-types.js";
 import type {
 	FokosExecuteLocalRequest,
@@ -310,6 +312,40 @@ export type QueryItemsRpcResponse = {
 	partitions: LeafMetrics[];
 };
 
+/** One step of a scan: the read of the owned slice that holds `start`, up to `end`. */
+export type ScanItemsRpcRequest = {
+	start: FokosStorageKey;
+	/** True for a slice boundary. False for the position after a start key or after the last evaluated row. */
+	startInclusive: boolean;
+	/** The end of the segment. Null when the request has no upper bound. */
+	end: FokosStorageKey | null;
+	remainingEvaluatedItems: number;
+	remainingEvaluatedBytes: number;
+	remainingResponseBytes: number;
+	allowOversizedFirstItem: boolean;
+	select: QuerySelect;
+	plan: QueryExpressions | null;
+};
+
+export type ScanItemsRpcResponse = {
+	items: Array<StoredItem | ProjectedWireRow>;
+	count: number;
+	scannedCount: number;
+	/** Stored bytes of the evaluated items, charged to the evaluated-byte budget. */
+	evaluatedBytes: number;
+	/** Estimated RPC bytes of the materialized items, charged to the response-byte budget. */
+	responseBytes: number;
+	rowsReturned: number;
+	/** The entry of the partition that read the slice. */
+	partitions: LeafMetrics[];
+	/** The key of the last row that this step evaluated. Null when the step evaluated no row. */
+	lastEvaluated: { hk: KeyBytes; sk: KeyBytes } | null;
+	/** True when the step read its slice to the end. False when a budget stopped it. */
+	sliceComplete: boolean;
+	/** When `sliceComplete` is true: the start of the next slice, or null at the end of the table or the segment. */
+	next: FokosStorageKey | null;
+};
+
 export type { FokosPartitionRef } from "../sharding/repartition-types.js";
 
 export type DebugForcePromoteKeyRequest = { hashKey: KeyBytes };
@@ -352,6 +388,7 @@ export type PartitionOps = {
 	apiGetItem: { req: GetItemRpcRequest; res: GetItemRpcResponse };
 	apiDeleteItem: { req: DeleteItemRpcRequest; res: DeleteItemRpcResponse };
 	apiQueryItems: { req: QueryItemsRpcRequest; res: QueryItemsRpcResponse };
+	apiScanItems: { req: ScanItemsRpcRequest; res: ScanItemsRpcResponse };
 	apiBatchGetItems: { req: BatchGetItemsRpcRequest; res: BatchGetItemsRpcResponse };
 	apiBatchWriteItems: { req: BatchWriteItemsRpcRequest; res: BatchWriteItemsRpcResponse };
 	gsiWriteEntries: { req: GsiWriteEntriesRequest; res: GsiWriteEntriesResponse };
@@ -551,6 +588,9 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	}
 	async apiQueryItems(ctx: FokosDBRouteContext, req: QueryItemsRpcRequest) {
 		return await this.#api("apiQueryItems", ctx, req);
+	}
+	async apiScanItems(ctx: FokosDBRouteContext, req: ScanItemsRpcRequest) {
+		return await this.#api("apiScanItems", ctx, req);
 	}
 	async apiBatchGetItems(ctx: FokosDBRouteContext, req: BatchGetItemsRpcRequest) {
 		return await this.#api("apiBatchGetItems", ctx, req);
@@ -905,6 +945,15 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				clip: (req, visit) => clipQueryToVisit(req, visit),
 				local: (req) => this.queryItemsLocal(req),
 				walk: ({ request, visits, local, forward }) => walkRangeVisits(request, visits, local, forward),
+			},
+			// A step names a position and no item. It reads one owned slice from the position.
+			apiScanItems: {
+				shape: "point",
+				whileMigrating: "read_source",
+				readOnly: true,
+				admissionTag: "read",
+				key: (req) => req.start,
+				local: (req, call) => this.scanItemsLocal(req, call),
 			},
 			// A batch is not atomic, so a part that fails does not fail the request: `merge` gives each of
 			// its items an outcome from the error.
@@ -1636,7 +1685,6 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const upperInclusive = interval.upper?.inclusive ?? false;
 
 		const collector = createQueryPageCollector({
-			hashKey: hk,
 			select: req.select,
 			budget: req,
 			estimateResponseBytes: (item) => (Array.isArray(item) ? estimateProjectedRowBytes(item) : estimateItemBytes(item)),
@@ -1672,6 +1720,46 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			lastEvaluatedCursor: page.lastEvaluatedCursor,
 			nextCursor: page.nextCursor,
 			partitions: [{ ...this.answered({ rowsRead, rowsWritten })[0], itemCount: page.items.length }],
+		};
+	}
+
+	/**
+	 * Reads the owned slice that holds `req.start`, from `req.start` to the end of the slice or of the
+	 * segment, until a budget stops the read. A budget stop leaves `nextCursor` of the collector set.
+	 */
+	private scanItemsLocal(req: ScanItemsRpcRequest, call: FokosLocalCall): ScanItemsRpcResponse {
+		const sliceEnd = call.ownedSliceEnd(req.start);
+		const segmentEnds = req.end !== null && (sliceEnd === null || compareStorageKeys(req.end, sliceEnd) <= 0);
+		const collector = createQueryPageCollector({
+			select: req.select,
+			budget: req,
+			estimateResponseBytes: (item) => (Array.isArray(item) ? estimateProjectedRowBytes(item) : estimateItemBytes(item)),
+		});
+		const { rowsRead, rowsWritten } = this.#store.scanStoragePage(
+			{
+				interval: { start: req.start, end: segmentEnds ? req.end : sliceEnd },
+				startInclusive: req.startInclusive,
+				// One row beyond the budget tells a stopped step from a complete slice.
+				limit: Math.max(0, req.remainingEvaluatedItems) + 1,
+				select: req.select,
+				plan: req.plan,
+			},
+			collector.consume,
+		);
+		const page = collector.state;
+		const sliceComplete = page.nextCursor === null;
+		const last = page.lastEvaluatedCursor;
+		return {
+			items: page.items,
+			count: page.count,
+			scannedCount: page.scannedCount,
+			evaluatedBytes: page.evaluatedBytes,
+			responseBytes: page.responseBytes,
+			rowsReturned: page.rowsReturned,
+			partitions: [{ ...this.answered({ rowsRead, rowsWritten })[0], itemCount: page.items.length }],
+			lastEvaluated: last && { hk: last.hk, sk: last.sk },
+			sliceComplete,
+			next: sliceComplete && !segmentEnds ? sliceEnd : null,
 		};
 	}
 

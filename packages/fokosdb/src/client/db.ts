@@ -21,7 +21,11 @@ import {
 	QueryItemsResult,
 	FokosGsi,
 	GsiQueryItemsResult,
+	GsiScanItemsOptions,
 	QuerySelect,
+	ScanItemsOptions,
+	ScanItemsProjectedOptions,
+	ScanItemsResult,
 	SinglePartitionMeta,
 	SortKey,
 } from "../shared/types.js";
@@ -34,13 +38,13 @@ import {
 	txCoordinatorStubByName,
 	type DataNamespaceKey,
 } from "../shared/do-stubs.js";
-import { decodeGsiSortKey } from "../shared/gsi/sort-key.js";
+import { decodeGsiSortKey, gsiItemSortKey } from "../shared/gsi/sort-key.js";
 import { gsiSkInterval } from "../shared/gsi/query.js";
 import type { MaterializationOps } from "../server/materialization/do-materialization.js";
 import type { TopologyEntrypointFactory } from "../shared/topology-hooks.js";
 import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
 import { FOKOS_HASH_PARTITIONS_MAX, type FokosPartitionRef } from "../sharding/route-context.js";
-import type { RoutingHash, RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
+import { asRoutingHash, type RoutingHash, type RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
@@ -141,6 +145,15 @@ import { normalizeSkInterval } from "../sharding/sk-interval.js";
 import { answerMeta, PartitionMetaJoin, routeNodeMeta } from "../shared/partition-meta.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
+import {
+	decodeScanCursor,
+	encodeScanCursor,
+	inSegment,
+	scanFingerprint,
+	segmentBounds,
+	type ScanResume,
+	type ScanSegment,
+} from "../shared/query/scan-cursor.js";
 import {
 	DEFAULT_EVALUATED_ITEMS_PER_PAGE,
 	DEFAULT_RESPONSE_BYTES_PER_PAGE,
@@ -824,6 +837,8 @@ export class FokosDB {
 		return {
 			queryItems: (async (opts: QueryItemsOptions) =>
 				await withFokosErrors(async () => await this.#queryItems(opts, this.#gsiClient(indexName)))) as FokosGsi["queryItems"],
+			scanItems: (async (opts: GsiScanItemsOptions) =>
+				await withFokosErrors(async () => await this.#scanItems(opts, this.#gsiClient(indexName)))) as FokosGsi["scanItems"],
 		};
 	}
 
@@ -878,6 +893,12 @@ export class FokosDB {
 	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T>>;
 	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T> | QueryItemsProjectedResult<T>> {
 		return (await withFokosErrors(async () => await this.#queryItems(opts))) as QueryItemsResult<T> | QueryItemsProjectedResult<T>;
+	}
+
+	async scanItems<T = never>(opts: ScanItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
+	async scanItems<T = never>(opts: ScanItemsOptions): Promise<ScanItemsResult<T>>;
+	async scanItems<T = never>(opts: ScanItemsOptions): Promise<ScanItemsResult<T> | QueryItemsProjectedResult<T>> {
+		return (await withFokosErrors(async () => await this.#scanItems(opts))) as ScanItemsResult<T> | QueryItemsProjectedResult<T>;
 	}
 
 	/**
@@ -1372,45 +1393,7 @@ export class FokosDB {
 		if (opts.queries.length === 0) {
 			throw new FokosValidationError(VALIDATION_CODES.query_queries_empty, { message: "queries must not be empty" });
 		}
-		if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit <= 0)) {
-			throw new FokosValidationError(VALIDATION_CODES.query_limit_invalid, {
-				message: "limit must be a positive integer when provided",
-				attributes: { limit: opts.limit },
-			});
-		}
-		if (opts.maxResponseBytes !== undefined && (!Number.isSafeInteger(opts.maxResponseBytes) || opts.maxResponseBytes <= 0)) {
-			throw new FokosValidationError(VALIDATION_CODES.query_max_response_bytes_invalid, {
-				message: "maxResponseBytes must be a positive integer when provided",
-				attributes: { maxResponseBytes: opts.maxResponseBytes },
-			});
-		}
-		const select: QuerySelect = opts.select ?? "projection";
-		if (select !== "projection" && select !== "count") {
-			throw new FokosValidationError(VALIDATION_CODES.query_select_invalid, {
-				message: 'select must be "projection" or "count" when provided',
-				attributes: { select: opts.select },
-			});
-		}
-		// Count mode returns no item, so a projection has no meaning there.
-		if (select === "count" && opts.projection !== undefined) {
-			throw new FokosValidationError(VALIDATION_CODES.query_projection_with_count, {
-				message: 'a projection is not valid with select "count"',
-			});
-		}
-		// The partition gets the expression trees and compiles them. The client validates them, which
-		// gives the names of the projection, and computes their identities for the cursor.
-		const { filter, projection } = opts;
-		const expressions = filter === undefined && projection === undefined ? null : { filter, projection };
-		const { filterIdentity, projectionIdentity, projectionNames } = withExpressionErrors(() => {
-			if (filter !== undefined) {
-				validateConditionExpression(filter, "filter");
-			}
-			return {
-				filterIdentity: filter === undefined ? null : canonicalConditionIdentity(filter),
-				projectionNames: projection === undefined ? null : validateProjectionExpression(projection).names,
-				projectionIdentity: projection === undefined ? null : canonicalProjectionIdentity(projection),
-			};
-		});
+		const { select, expressions, filterIdentity, projectionIdentity, projectionNames, budget } = parseOptionsAndPrepareBudget(opts);
 
 		const normalizedQueries = opts.queries.map((q) => {
 			const direction = (q.scanIndexForward ?? true) ? ("asc" as const) : ("desc" as const);
@@ -1426,14 +1409,6 @@ export class FokosDB {
 			};
 		});
 		const fingerprint = computeCursorFingerprint(normalizedQueries, filterIdentity, projectionIdentity);
-
-		const budget = new QueryPageBudget({
-			remainingEvaluatedItems: Math.min(opts.limit ?? DEFAULT_EVALUATED_ITEMS_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE),
-			remainingEvaluatedBytes: MAX_EVALUATED_BYTES_PER_PAGE,
-			remainingResponseBytes: Math.min(opts.maxResponseBytes ?? DEFAULT_RESPONSE_BYTES_PER_PAGE, MAX_RESPONSE_BYTES_PER_PAGE),
-			remainingPartitionVisits: MAX_PARTITION_VISITS_PER_PAGE,
-			allowOversizedFirstItem: true,
-		});
 
 		let startQueryIdx = 0;
 		let startInner: DecodedCursor["inner"] = null;
@@ -1510,25 +1485,9 @@ export class FokosDB {
 			scannedCount += rpcResult.scannedCount;
 			rowsReturned += rpcResult.rowsReturned;
 			if (select === "projection") {
-				withAnswerMeta({ forwardCount, partitions: pageMeta }, () => {
-					if (projectionNames) {
-						for (const item of rpcResult.items) {
-							items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
-						}
-					} else {
-						for (const item of rpcResult.items) {
-							const stored = item as StoredItem;
-							items.push({
-								hashKey: KeyCodec.decode(stored.hk),
-								...(gsi ? gsiKeys(stored.sk) : { sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk) }),
-								// json data arrives as JSON text and is parsed once here to the public JsonValue.
-								...decodeItemData(stored.kind, stored.data),
-								...(stored.ttl_epoch_utc_seconds === null ? {} : { ttlAt: stored.ttl_epoch_utc_seconds }),
-								version: stored.v,
-							});
-						}
-					}
-				});
+				withAnswerMeta({ forwardCount, partitions: pageMeta }, () =>
+					appendPageItems(items, rpcResult.items, projectionNames, gsi !== undefined),
+				);
 			}
 			budget.consume(rpcResult);
 
@@ -1574,6 +1533,121 @@ export class FokosDB {
 		const meta: QueryItemsResult["meta"] = { forwardCount, partitions: pageMeta, rowsReturned };
 
 		return { items, count, scannedCount, cursor, meta } as QueryItemsResult | QueryItemsProjectedResult;
+	}
+
+	/**
+	 * One page of a scan. The page walks the storage order from one owned slice to the next: each step goes
+	 * to the owner of its start position and answers with the start of the next slice. The page stops at a
+	 * budget, at `MAX_PARTITION_VISITS_PER_PAGE` steps, or at the end of the table or the segment. A step
+	 * error ends the page with no item: a step only reads, so the caller can send the page again.
+	 * `gsi` is the client of a GSI table, or undefined for the base table.
+	 */
+	async #scanItems(
+		opts: GsiScanItemsOptions,
+		gsi?: FokosShardingClient<FokosDBPolicy, PartitionOps>,
+	): Promise<ScanItemsResult | GsiQueryItemsResult | QueryItemsProjectedResult> {
+		const partitions = gsi ?? this.#partitions;
+		const { select, expressions, projectionNames, budget } = parseOptionsAndPrepareBudget(opts);
+		const segment = scanSegmentOf(opts);
+		if (opts.cursor !== undefined && opts.exclusiveStartKey !== undefined) {
+			throw new FokosValidationError(VALIDATION_CODES.scan_start_key_with_cursor, {
+				message: "a scan takes a cursor or an exclusiveStartKey, not both",
+			});
+		}
+		const bounds = segmentBounds(segment);
+		const fingerprint = scanFingerprint(partitions.shardGroup, segment);
+		let resume: ScanResume = { pos: { routingHash: bounds.start }, inclusive: true };
+		if (opts.cursor !== undefined) {
+			resume = decodeScanCursor(opts.cursor, fingerprint, bounds);
+		} else if (opts.exclusiveStartKey !== undefined) {
+			const key = this.#scanStartKey(opts.exclusiveStartKey, gsi !== undefined);
+			const routingHash = partitions.routingHashOf(key.hk);
+			if (!inSegment(routingHash, bounds)) {
+				throw new FokosValidationError(VALIDATION_CODES.scan_start_key_outside_segment, {
+					message: "the hash key of exclusiveStartKey is outside the segment",
+				});
+			}
+			resume = { pos: { routingHash, ...key }, inclusive: false };
+		}
+		const end = bounds.end === null ? null : { routingHash: bounds.end };
+
+		const items: Array<QueryItemsResult["items"][number] | ProjectedItem> = [];
+		const pageMeta: QueryItemsResult["meta"]["partitions"] = [];
+		let count = 0;
+		let scannedCount = 0;
+		let rowsReturned = 0;
+		let forwardCount = 0;
+		let next: ScanResume | null = resume;
+		for (let visits = 0; next !== null && visits < MAX_PARTITION_VISITS_PER_PAGE; visits++) {
+			const { pos, inclusive } = next;
+			let answer: FokosCallResult<PartitionOps["apiScanItems"]["res"]>;
+			try {
+				answer = await partitions.point("apiScanItems", pos, {
+					start: pos,
+					startInclusive: inclusive,
+					end,
+					remainingEvaluatedItems: budget.remainingEvaluatedItems,
+					remainingEvaluatedBytes: budget.remainingEvaluatedBytes,
+					remainingResponseBytes: budget.remainingResponseBytes,
+					allowOversizedFirstItem: budget.allowOversizedFirstItem,
+					select,
+					plan: expressions,
+				});
+			} catch (e) {
+				throw withMetaSoFar(e, { forwardCount, partitions: pageMeta });
+			}
+			const { value: step, routing } = answer;
+			pageMeta.push(...answerMeta(step.partitions, routing).partitions);
+			forwardCount += routing.forwardCount;
+			count += step.count;
+			scannedCount += step.scannedCount;
+			rowsReturned += step.rowsReturned;
+			if (select === "projection") {
+				withAnswerMeta({ forwardCount, partitions: pageMeta }, () =>
+					appendPageItems(items, step.items, projectionNames, gsi !== undefined),
+				);
+			}
+			budget.consume(step);
+			if (!step.sliceComplete) {
+				// A budget stopped the step inside its slice. A step that evaluated no row starts again at its start.
+				const last = step.lastEvaluated;
+				next =
+					last === null ? next : { pos: { routingHash: partitions.routingHashOf(last.hk), hk: last.hk, sk: last.sk }, inclusive: false };
+				break;
+			}
+			next = step.next === null ? null : { pos: { ...step.next, routingHash: asRoutingHash(step.next.routingHash) }, inclusive: true };
+			if (budget.budgetExhausted) {
+				break;
+			}
+		}
+		const cursor = next === null ? undefined : encodeScanCursor(fingerprint, next);
+		const meta: QueryItemsResult["meta"] = { forwardCount, partitions: pageMeta, rowsReturned };
+		return { items, count, scannedCount, cursor, meta } as ScanItemsResult | QueryItemsProjectedResult;
+	}
+
+	/** The encoded key of a start key. A GSI start key names its position in the GSI: the stored GSI sort key. */
+	#scanStartKey(key: NonNullable<GsiScanItemsOptions["exclusiveStartKey"]>, gsi: boolean): { hk: KeyBytes; sk: KeyBytes } {
+		validateItemKeys(key.hashKey, key.sortKey);
+		const hk = encodeHashKey(key.hashKey, this.#limits);
+		const sk = encodeSortKey(key.sortKey, this.#limits);
+		if (!gsi) {
+			if (key.baseHashKey !== undefined || key.baseSortKey !== undefined) {
+				throw new FokosValidationError(VALIDATION_CODES.scan_start_key_invalid, {
+					message: "exclusiveStartKey of a table scan has no baseHashKey or baseSortKey",
+				});
+			}
+			return { hk, sk };
+		}
+		if (key.baseSortKey !== undefined && key.baseHashKey === undefined) {
+			throw new FokosValidationError(VALIDATION_CODES.scan_start_key_invalid, {
+				message: "baseSortKey of exclusiveStartKey needs baseHashKey",
+			});
+		}
+		if (key.baseHashKey !== undefined) {
+			validateItemKeys(key.baseHashKey, key.baseSortKey);
+		}
+		const baseHk = key.baseHashKey === undefined ? KeyCodec.encodeOptional(undefined) : encodeHashKey(key.baseHashKey, this.#limits);
+		return { hk, sk: gsiItemSortKey(sk, baseHk, encodeSortKey(key.baseSortKey, this.#limits)) };
 	}
 
 	/**
@@ -1837,3 +1911,111 @@ function gsiKeys(physicalSk: KeyBytes): { sortKey?: SortKey; baseHashKey: HashKe
 		...(baseSK.length === 0 ? {} : { baseSortKey: KeyCodec.decode(baseSK) }),
 	};
 }
+
+/**
+ * The checks of the page options that `queryItems` and `scanItems` share, the plan that the partition
+ * compiles, the identities of the plan for the `queryItems` cursor, and the budget of the page.
+ */
+function parseOptionsAndPrepareBudget(opts: Pick<QueryItemsOptions, "limit" | "maxResponseBytes" | "select" | "filter" | "projection">) {
+	if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit <= 0)) {
+		throw new FokosValidationError(VALIDATION_CODES.query_limit_invalid, {
+			message: "limit must be a positive integer when provided",
+			attributes: { limit: opts.limit },
+		});
+	}
+	if (opts.maxResponseBytes !== undefined && (!Number.isSafeInteger(opts.maxResponseBytes) || opts.maxResponseBytes <= 0)) {
+		throw new FokosValidationError(VALIDATION_CODES.query_max_response_bytes_invalid, {
+			message: "maxResponseBytes must be a positive integer when provided",
+			attributes: { maxResponseBytes: opts.maxResponseBytes },
+		});
+	}
+	const select: QuerySelect = opts.select ?? "projection";
+	if (select !== "projection" && select !== "count") {
+		throw new FokosValidationError(VALIDATION_CODES.query_select_invalid, {
+			message: 'select must be "projection" or "count" when provided',
+			attributes: { select: opts.select },
+		});
+	}
+	// Count mode returns no item, so a projection has no meaning there.
+	if (select === "count" && opts.projection !== undefined) {
+		throw new FokosValidationError(VALIDATION_CODES.query_projection_with_count, {
+			message: 'a projection is not valid with select "count"',
+		});
+	}
+	// The partition gets the expression trees and compiles them. The client validates them, which
+	// gives the names of the projection, and computes their identities for the cursor.
+	const { filter, projection } = opts;
+	const expressions = filter === undefined && projection === undefined ? null : { filter, projection };
+	const { filterIdentity, projectionIdentity, projectionNames } = withExpressionErrors(() => {
+		if (filter !== undefined) {
+			validateConditionExpression(filter, "filter");
+		}
+		return {
+			filterIdentity: filter === undefined ? null : canonicalConditionIdentity(filter),
+			projectionNames: projection === undefined ? null : validateProjectionExpression(projection).names,
+			projectionIdentity: projection === undefined ? null : canonicalProjectionIdentity(projection),
+		};
+	});
+
+	const budget = new QueryPageBudget({
+		remainingEvaluatedItems: Math.min(opts.limit ?? DEFAULT_EVALUATED_ITEMS_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE),
+		remainingEvaluatedBytes: MAX_EVALUATED_BYTES_PER_PAGE,
+		remainingResponseBytes: Math.min(opts.maxResponseBytes ?? DEFAULT_RESPONSE_BYTES_PER_PAGE, MAX_RESPONSE_BYTES_PER_PAGE),
+		remainingPartitionVisits: MAX_PARTITION_VISITS_PER_PAGE,
+		allowOversizedFirstItem: true,
+	});
+	return { select, expressions, filterIdentity, projectionIdentity, projectionNames, budget };
+}
+
+/** Appends the items of one partition answer to the public page: projected records, or decoded items. */
+function appendPageItems(
+	items: Array<QueryItemsResult["items"][number] | ProjectedItem>,
+	rpcItems: ReadonlyArray<StoredItem | ProjectedWireRow>,
+	projectionNames: readonly string[] | null,
+	gsi: boolean,
+): void {
+	if (projectionNames) {
+		for (const item of rpcItems) {
+			items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
+		}
+		return;
+	}
+	for (const item of rpcItems) {
+		const stored = item as StoredItem;
+		items.push({
+			hashKey: KeyCodec.decode(stored.hk),
+			...(gsi ? gsiKeys(stored.sk) : { sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk) }),
+			// json data arrives as JSON text and is parsed once here to the public JsonValue.
+			...decodeItemData(stored.kind, stored.data),
+			...(stored.ttl_epoch_utc_seconds === null ? {} : { ttlAt: stored.ttl_epoch_utc_seconds }),
+			version: stored.v,
+		});
+	}
+}
+
+/** The segment of a scan request, after its checks. */
+function scanSegmentOf(opts: { segment?: number; totalSegments?: number }): ScanSegment {
+	const { segment, totalSegments } = opts;
+	if (segment === undefined && totalSegments === undefined) {
+		return null;
+	}
+	if (
+		segment === undefined ||
+		totalSegments === undefined ||
+		!Number.isSafeInteger(totalSegments) ||
+		totalSegments < 1 ||
+		totalSegments > MAX_SCAN_SEGMENTS ||
+		!Number.isSafeInteger(segment) ||
+		segment < 0 ||
+		segment >= totalSegments
+	) {
+		throw new FokosValidationError(VALIDATION_CODES.scan_segment_invalid, {
+			message: `segment and totalSegments go together: totalSegments from 1 to ${MAX_SCAN_SEGMENTS}, and segment from 0 to totalSegments - 1`,
+			attributes: { segment, totalSegments },
+		});
+	}
+	return { segment, totalSegments };
+}
+
+/** The largest `totalSegments` of a scan. */
+const MAX_SCAN_SEGMENTS = 1_000_000;

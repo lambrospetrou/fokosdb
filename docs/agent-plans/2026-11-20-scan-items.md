@@ -1,6 +1,6 @@
 # RFC — `scanItems`: a paginated scan of a table or a GSI
 
-**State:** Draft
+**State:** Implemented on 2026-11-22
 **Date:** 2026-11-20
 **Author:** Lambros
 
@@ -105,7 +105,7 @@ Each milestone ships on its own, and the full test suite passes after each one.
 1. **Position routing.** A `point` descriptor can give a `FokosStorageKey` in place of a `RouteKey`. The runtime and
    the client resolve the owner of a position. Each use of the point key accepts a position (section 4.2.4). No
    operation uses it yet, so there is no change in behaviour.
-2. **Owned slice.** `call.ownedSlice(pos)` in the runtime, the store method for the next override, and the scope of a
+2. **Owned slice.** `call.ownedSliceEnd(pos)` in the runtime, the store method for the next override, and the scope of a
    read-through.
 3. **Host operation.** `apiScanItems` in `FokosDBPartitionDO`, the scan of a storage interval in `PartitionStore`, and
    the hash key of each row in the page collector (section 4.2.3).
@@ -264,7 +264,7 @@ type ScanItemsRpcResponse = {
 
 The local handler is synchronous, as the other point handlers are:
 
-1. It gets `{ end: sliceEnd, next }` from `call.ownedSlice(req.start)`.
+1. It gets `sliceEnd` from `call.ownedSliceEnd(req.start)`. The next slice starts at `sliceEnd`.
 2. It reads from `req.start` to `min(sliceEnd, req.end)` in the storage order:
    `WHERE (routing_hash, hk, sk) > (?, ?, ?) AND (routing_hash, hk, sk) < (?, ?, ?) ORDER BY routing_hash, hk, sk`.
    The first bound uses `>=` when `startInclusive` is true.
@@ -276,7 +276,8 @@ The local handler is synchronous, as the other point handlers are:
    many hash keys. Thus the consumer also gets the `hk` of each row, and the collector writes that `hk` into
    `lastEvaluatedCursor` and `nextCursor`. The `queryItems` leaf scan gives its one hash key for each row, so its
    behaviour does not change.
-4. When `req.end` is at or before `sliceEnd`, the read ends at `req.end`, and `next` is null.
+4. When `req.end` is at or before `sliceEnd`, the read ends at `req.end`, and `next` is null. Else `next` is
+   `sliceEnd`.
 
 `PartitionStore` gets one method for this read. The method takes a storage interval, the direction `asc`, and the
 plan. It does not change the existing query read.
@@ -337,8 +338,9 @@ routingHash, so they need no change.
 
 #### 4.2.5 The owned slice
 
-`FokosLocalCall` gets one function: `ownedSlice(pos: FokosStorageKey): { end: FokosStorageKey | null; next:
-FokosStorageKey | null }`. The runtime computes it against the scope of the current call.
+`FokosLocalCall` gets one function: `ownedSliceEnd(pos: FokosStorageKey): FokosStorageKey | null`. It gives the end
+of the slice that holds `pos`. The next slice starts at this end, and null is the end of the table. The runtime
+computes it against the scope of the current call.
 
 The scope of the call:
 
@@ -347,19 +349,19 @@ The scope of the call:
   source is a router, and its own interval covers the slices of all its children. If the source used its own interval,
   a walk could get one row from the source for two children.
 
-The end and `next` depend on the kind of the scope, not on the kind of the partition that runs the step. During a
+The end depends on the kind of the scope, not on the kind of the partition that runs the step. During a
 read-through, a hash source can serve a scope inside a range tree.
 
 - A **hash scope** is an owner hash partition or a `hash_child` caller slice.
 - A **range scope** is an owner range partition, a `range` caller slice, or a `promoted_routing_hash` caller slice
   (`sharding/repartition-slice.ts`).
 
-| Scope | `end` | `next` |
-|---|---|---|
-| Hash scope, no override in `[pos, B)` | `B`, the end of its routingHash interval | `(B)`, or null at the end |
-| Hash scope, an override in `[pos, B)` | `P`, the first cut-over override in `[pos, B)` | `(P)` |
-| Range scope, not the last of its tree | its end boundary `(P, hk, sk)` | `(P, hk, sk)` |
-| Range scope, the last of its tree | the end of the routingHash `P` | `(P + 1)`, or null when `P` is the maximum |
+| Scope | End of the slice |
+|---|---|
+| Hash scope, no override in `[pos, B)` | `(B)`, the end of its routingHash interval, or null at the end |
+| Hash scope, an override in `[pos, B)` | `(P)`, the first cut-over override in `[pos, B)` |
+| Range scope, not the last of its tree | its end boundary `(P, hk, sk)` |
+| Range scope, the last of its tree | `(P + 1)`, the end of the routingHash `P`, or null when `P` is the maximum |
 
 A `promoted_routing_hash` caller slice is the last of its tree. Only a hash scope reads `fokos_route_overrides`. A
 range scope is inside the range tree of `P`, so the override of `P` does not end it. This rule is necessary during

@@ -106,6 +106,12 @@ export type FokosChild = { ref: FokosPartitionRef; start: FokosCompositeKey | nu
  */
 export type FokosStorageKey = { routingHash: Uint8Array; hk?: KeyBytes; sk?: KeyBytes };
 
+/**
+ * A `FokosStorageKey` after normalization: `routingHash` is a checked 8-byte `RoutingHash`, and an absent
+ * `hk` or `sk` is the empty key. The range lookups use it as their composite key, so they make no copy of it.
+ */
+export type FokosStoragePosition = FokosCompositeKey & { routingHash: RoutingHash };
+
 /** A half-open storage interval. A null end has no upper bound. */
 export type FokosStorageInterval = { start: FokosStorageKey; end: FokosStorageKey | null };
 
@@ -198,7 +204,16 @@ export type FokosSignals = {
  * knows facts its response does not carry. The runtime applies the signals after the handler returns
  * without throwing. `fokosExecuteLocal` passes one whose `signal` is a no-op.
  */
-export type FokosLocalCall = { signal(signals: FokosSignals): void };
+export type FokosLocalCall = {
+	signal(signals: FokosSignals): void;
+	/**
+	 * The end of the slice of the scope of this call that holds `pos`. The next slice starts at this end.
+	 * Null is the end of the table. The scope is the owned interval of this partition, or the caller slice
+	 * during a read-through. The slice of a hash scope ends at the first routingHash after `pos` whose
+	 * promotion has cut over. It throws on a router, which owns no slice.
+	 */
+	ownedSliceEnd(pos: FokosStorageKey): FokosStorageKey | null;
+};
 
 export type FokosOperationWhileMigrating = "throw" | "read_source";
 

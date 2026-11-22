@@ -36,6 +36,7 @@ export type {
 	FokosRuntimeOptions,
 	FokosShardingHooks,
 	FokosSignals,
+	FokosStorageKey,
 } from "./runtime-types.js";
 export { DEFAULT_RUNTIME_CONFIG, resolveRuntimeConfig } from "./runtime-config.js";
 export type { FokosMigrationPageBudget, FokosRuntimeConfig, FokosRuntimeConfigOverrides } from "./runtime-config.js";

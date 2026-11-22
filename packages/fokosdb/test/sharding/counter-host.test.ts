@@ -1,6 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FokosError, FokosShardingStore, HashTopology, KeyCodec, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/index-server.js";
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
 import { testRoutingHashSeedResolver } from "../routing-hash.js";
@@ -30,7 +31,7 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		await table.settle();
 	});
 
-	it("routes a position to the owner of a key with the same routingHash, and admits it with no keys", async () => {
+	it("routes a position to the owner of a key with the same routingHash, admits it with no keys, and ends its slice at the owner", async () => {
 		const table = makeCounterTable();
 		for (let i = 0; i < 5; i++) {
 			await table.increment(`k-${i}`);
@@ -43,6 +44,8 @@ describe.concurrent("Sharding runtime — counter host", () => {
 			const located = await table.client.send("locate", table.root, { routingHash }, []);
 			expect(located.routing.forwardCount).toBe(1);
 			expect(located.routing.servedBy.map((n) => n.ref.doName)).toEqual(owner.routing.servedBy.map((n) => n.ref.doName));
+			const { end } = PartitionIdHelper.routingHashInterval(owner.routing.servedBy[0].ref.partitionId, table.root.topology);
+			expect(located.value).toEqual(end && { routingHash: end });
 		}
 		await table.settle();
 	});

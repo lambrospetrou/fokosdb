@@ -296,13 +296,15 @@ export type RangeScanBounds = {
 };
 
 /**
- * Receives one candidate of a queryItems leaf scan and returns `false` to stop the scan. `matched`
+ * Receives one candidate of a queryItems leaf scan or of a scan step, and returns `false` to stop the
+ * scan. `hk` is the hash key of the candidate: a scan step reads rows of many hash keys. `matched`
  * is false when the plan's filter rejected the candidate. `decodePayload` builds the payload of a
  * matched candidate on demand: the complete item when the request has no projection, the projected
  * wire row when it has one. It must be called at most once per candidate, only for a matched
  * candidate of a `"projection"` selection, and only before the consumer returns.
  */
 export type QueryCandidateConsumer = (
+	hk: KeyBytes,
 	sk: KeyBytes,
 	itemBytes: number,
 	matched: boolean,
@@ -494,6 +496,35 @@ export function queryScanStatement(opts: RangeScanBounds & { limit: number; sele
 			? `SELECT sk, item_bytes FROM items WHERE ${conds.join(" AND ")} ${order}`
 			: `SELECT hk, sk, item_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
 	return { sql, params: [...params, opts.limit] };
+}
+
+/**
+ * The SQL of one scan step: the items that `conds` select, in the storage order, with the hash key of each
+ * row as `key_hk`. The selections and the plan are those of `queryScanStatement`.
+ */
+function storageScanStatement(opts: {
+	conds: string[];
+	params: unknown[];
+	limit: number;
+	select: QuerySelect;
+	plan: CompiledQueryPlan | null;
+}): {
+	sql: string;
+	params: unknown[];
+} {
+	const { conds, params } = opts;
+	if (opts.plan !== null) {
+		return {
+			sql: composeQueryStatement(opts.plan, { select: opts.select, direction: "asc", scanConditions: conds, storageOrder: true }),
+			params: [...materializedPlanBindings(opts.plan, "pool"), ...params, opts.limit],
+		};
+	}
+	const columns =
+		opts.select === "count" ? "" : `, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts`;
+	return {
+		sql: `SELECT hk AS key_hk, sk, item_bytes${columns} FROM items WHERE ${conds.join(" AND ")} ORDER BY routing_hash, hk, sk LIMIT ?`,
+		params: [...params, opts.limit],
+	};
 }
 
 /**
@@ -1733,28 +1764,71 @@ export class PartitionStore implements ItemSource {
 		opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: QueryExpressions | null },
 		consumer: QueryCandidateConsumer,
 	): SqlMetrics {
-		const query = opts.plan;
-		const plan = query === null ? null : withExpressionErrors(() => queryPlanOf(query, this.#gsiSortKey()));
+		const plan = this.#queryPlan(opts.plan);
 		const { sql, params } = queryScanStatement({ ...opts, plan });
+		const hk = opts.hk;
+		return this.#feedCandidates(sql, params, opts.select, plan, () => hk, consumer);
+	}
+
+	/**
+	 * Reads the items of a storage interval in the storage order `(routing_hash, hk, sk)`, and gives each
+	 * row to `consumer` as `scanQueryPage` does. `startInclusive` false starts after `interval.start`, which
+	 * must then hold `hk` and `sk`. `limit` binds as given.
+	 */
+	scanStoragePage(
+		opts: { interval: KeyRange; startInclusive: boolean; limit: number; select: QuerySelect; plan: QueryExpressions | null },
+		consumer: QueryCandidateConsumer,
+	): SqlMetrics {
+		const plan = this.#queryPlan(opts.plan);
+		const { start } = opts.interval;
+		const after = opts.startInclusive ? null : [start.routingHash, start.hk ?? NO_KEY, start.sk ?? NO_KEY];
+		const { sql, params } = storageScanStatement({
+			...intervalTerms(ITEM_KEY_COLUMNS, opts.interval, after),
+			limit: opts.limit,
+			select: opts.select,
+			plan,
+		});
+		return this.#feedCandidates(sql, params, opts.select, plan, (row) => fromSqlKey(row.key_hk as ArrayBuffer), consumer);
+	}
+
+	#queryPlan(query: QueryExpressions | null): CompiledQueryPlan | null {
+		return query === null ? null : withExpressionErrors(() => queryPlanOf(query, this.#gsiSortKey()));
+	}
+
+	/** Runs a candidate statement and gives each row to `consumer` until it returns false. */
+	#feedCandidates(
+		sql: string,
+		params: unknown[],
+		select: QuerySelect,
+		plan: CompiledQueryPlan | null,
+		hkOf: (row: Record<string, SqlStorageValue>) => KeyBytes,
+		consumer: QueryCandidateConsumer,
+	): SqlMetrics {
 		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
 		const entryCount = plan?.projection?.names.length ?? 0;
 		// The mode is fixed per request. A count scan carries no payload, a complete-item scan carries
 		// the item, and a projected scan carries the projected row. A payload exists on a matched row only.
-		const mode: "none" | "item" | "projected" = opts.select !== "projection" ? "none" : plan?.projection ? "projected" : "item";
+		const mode: "none" | "item" | "projected" = select !== "projection" ? "none" : plan?.projection ? "projected" : "item";
 
 		// One closure for the whole scan reads the row the loop is on, so a consumer that never asks for
-		// a payload (count mode, a rejected candidate, a full budget) costs no allocation per row.
+		// a payload (count mode, a rejected candidate, a full budget) costs no allocation per row. The row
+		// is set only while the consumer runs, so a call after the consumer returns fails.
 		let current: Record<string, SqlStorageValue> | undefined;
+		let currentHk: KeyBytes | undefined;
 		let currentSk: KeyBytes | undefined;
 		const decodePayload = (): StoredItem | ProjectedWireRow => {
-			const row = current!;
+			invariant(
+				current !== undefined && currentHk !== undefined && currentSk !== undefined,
+				"fokos/partition-store.scanQueryPage: decodePayload is valid only while the consumer runs",
+			);
 			invariant(mode !== "none", "fokos/partition-store.scanQueryPage: a count scan has no payload to decode");
+			const row = current;
 			if (mode === "projected") {
 				return decodeProjectedRow(row, entryCount);
 			}
 			return {
-				hk: fromSqlKey(row.hk as ArrayBuffer),
-				sk: currentSk!,
+				hk: currentHk,
+				sk: currentSk,
 				data: fromSqlData(row.data as string | ArrayBuffer),
 				kind: kindFromCode(row.data_kind as number),
 				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds as number | null,
@@ -1766,10 +1840,13 @@ export class PartitionStore implements ItemSource {
 
 		for (const row of cursor) {
 			current = row;
+			currentHk = hkOf(row);
 			currentSk = fromSqlKey(row.sk as ArrayBuffer);
 			// Without a plan the statement yields no `matched` column; every candidate matches.
 			const matched = plan === null ? true : row.matched === 1;
-			if (!consumer(currentSk, row.item_bytes as number, matched, decodePayload)) {
+			const more = consumer(currentHk, currentSk, row.item_bytes as number, matched, decodePayload);
+			current = currentHk = currentSk = undefined;
+			if (!more) {
 				break;
 			}
 		}

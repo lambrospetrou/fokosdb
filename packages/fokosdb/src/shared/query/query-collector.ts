@@ -31,7 +31,6 @@ export type QueryCollectionState = {
  * the cursor, and consumes zero response bytes.
  */
 export function createQueryPageCollector(opts: {
-	hashKey: KeyBytes;
 	select: QuerySelect;
 	budget: Pick<
 		QueryPageBudgetState,
@@ -39,7 +38,7 @@ export function createQueryPageCollector(opts: {
 	>;
 	estimateResponseBytes: (item: StoredItem | ProjectedWireRow) => number;
 }): { consume: QueryCandidateConsumer; state: QueryCollectionState } {
-	const { hashKey, select, budget, estimateResponseBytes } = opts;
+	const { select, budget, estimateResponseBytes } = opts;
 
 	const state: QueryCollectionState = {
 		items: [],
@@ -57,15 +56,15 @@ export function createQueryPageCollector(opts: {
 	let remainingResponseBytes = budget.remainingResponseBytes;
 
 	// A budget rejects the candidate BEFORE it enters the page: the next page resumes at it.
-	const stopBefore = (sk: KeyBytes): false => {
-		state.nextCursor = { hk: hashKey, sk, inclusive: true };
+	const stopBefore = (hk: KeyBytes, sk: KeyBytes): false => {
+		state.nextCursor = { hk, sk, inclusive: true };
 		return false;
 	};
 
-	const consume: QueryCandidateConsumer = (sk, itemBytes, matched, decodePayload) => {
+	const consume: QueryCandidateConsumer = (hk, sk, itemBytes, matched, decodePayload) => {
 		state.rowsReturned++;
 		if (remainingItems <= 0 || itemBytes > remainingEvaluatedBytes) {
-			return stopBefore(sk);
+			return stopBefore(hk, sk);
 		}
 
 		let materialized: StoredItem | ProjectedWireRow | null = null;
@@ -74,7 +73,7 @@ export function createQueryPageCollector(opts: {
 			materialized = decodePayload();
 			materializedBytes = estimateResponseBytes(materialized);
 			if (materializedBytes > remainingResponseBytes && !state.allowOversizedFirstItem) {
-				return stopBefore(sk);
+				return stopBefore(hk, sk);
 			}
 		}
 
@@ -82,7 +81,7 @@ export function createQueryPageCollector(opts: {
 		state.evaluatedBytes += itemBytes;
 		remainingItems--;
 		remainingEvaluatedBytes -= itemBytes;
-		state.lastEvaluatedCursor = { hk: hashKey, sk };
+		state.lastEvaluatedCursor = { hk, sk };
 		if (matched) {
 			state.count++;
 		}

@@ -208,7 +208,7 @@ const scratchView = new DataView(new ArrayBuffer(8));
 const scratchBytes = new Uint8Array(scratchView.buffer);
 
 /** The 8 bytes of `value`, most significant byte first, in a new array. */
-function routingHashBytes(value: bigint): RoutingHash {
+export function routingHashBytes(value: bigint): RoutingHash {
 	scratchView.setBigUint64(0, value, false);
 	return scratchBytes.slice() as RoutingHash;
 }

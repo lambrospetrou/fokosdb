@@ -348,4 +348,40 @@ export type GsiQueryItemsResult<T = never> = QueryItemsPage<GsiReadItem<T>>;
 export interface FokosGsi {
 	queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
 	queryItems<T = never>(opts: QueryItemsOptions): Promise<GsiQueryItemsResult<T>>;
+	scanItems<T = never>(opts: GsiScanItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
+	scanItems<T = never>(opts: GsiScanItemsOptions): Promise<GsiQueryItemsResult<T>>;
 }
+
+// ─── scanItems public API ─────────────────────────────────────────────────────
+
+/**
+ * One page of the items of a table, in the storage order. The items of one hash key come together, in
+ * sort-key order. `limit`, `maxResponseBytes`, `select`, `filter`, and `projection` have the rules of
+ * `queryItems`, and they can change between pages.
+ */
+export type ScanItemsOptions = Omit<QueryItemsOptions, "queries" | "cursor"> & {
+	/** The `cursor` of the previous page, sent back unchanged with the same `segment` and `totalSegments`. */
+	cursor?: string;
+	/** The first page starts after this key. Not valid with `cursor`. */
+	exclusiveStartKey?: { hashKey: HashKey; sortKey?: SortKey };
+	/** From 0 to `totalSegments - 1`. Give `segment` and `totalSegments` together, or neither. */
+	segment?: number;
+	/** From 1 to 1,000,000. */
+	totalSegments?: number;
+};
+
+/** A `scanItems` request that carries a projection. The projected overload resolves on this type. */
+export type ScanItemsProjectedOptions = ScanItemsOptions & { projection: readonly ProjectionExpression[]; select?: "projection" };
+
+/**
+ * The options of `db.gsi(indexName).scanItems`. The start key can name one entry of the GSI. A start key
+ * with no base keys starts before each entry with its GSI keys.
+ */
+export type GsiScanItemsOptions = Omit<ScanItemsOptions, "exclusiveStartKey"> & {
+	exclusiveStartKey?: { hashKey: HashKey; sortKey?: SortKey; baseHashKey?: HashKey; baseSortKey?: SortKey };
+};
+
+export type GsiScanItemsProjectedOptions = GsiScanItemsOptions & { projection: readonly ProjectionExpression[]; select?: "projection" };
+
+/** A page of `scanItems`. `cursor` is absent when the scan of the table, or of the segment, is complete. */
+export type ScanItemsResult<T = never> = QueryItemsPage<ReadItem<T>>;
