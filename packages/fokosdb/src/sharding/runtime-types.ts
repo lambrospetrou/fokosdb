@@ -269,7 +269,14 @@ type FokosGroupBase<Req, Res> = FokosOperationBase<Req, Res> & {
 };
 
 export type FokosOperation<Req, Res> =
-	| (FokosOperationBase<Req, Res> & { shape: "point"; key(req: Req): RouteKey })
+	| (FokosOperationBase<Req, Res> & {
+			shape: "point";
+			/**
+			 * The key that routes the request, or a position in the storage order. A position names no
+			 * item, so its admission gets `keys: []`.
+			 */
+			key(req: Req): RouteKey | FokosStorageKey;
+	  })
 	| (FokosGroupBase<Req, Res> & {
 			/** Each part carries the sub-request it was given, so a merge can answer for every item. */
 			merge(parts: Array<FokosGroupPart<Req, Res>>): Res;
@@ -423,6 +430,7 @@ export interface FokosShardingHooks<TPolicy> {
 	admit?(input: {
 		op: string;
 		admissionTag?: string;
+		/** The keys that the request names. A read at a position names no key, so it gets `[]`. */
 		keys: RouteKey[];
 		/** Read on demand: it costs several storage reads, and a hook that ignores it pays nothing. */
 		lifecycle: FokosLifecycle;

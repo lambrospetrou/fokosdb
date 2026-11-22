@@ -53,6 +53,14 @@ export type CounterOps = {
 	 * that starts with `refuse-`, and the local handler throws, before any write, for a part with a key
 	 * that starts with `throw-`.
 	 */
+	/**
+	 * Reads nothing at a position in the storage order, so a test can see which partition owns it.
+	 * Admission refuses it when it gets a key, because a position names no item.
+	 */
+	locate: {
+		req: { routingHash: Uint8Array };
+		res: null;
+	};
 	incrementMany: {
 		req: { items: Array<{ hashKey: KeyBytes; amount: number }> };
 		res: { applied: CounterRow[]; failed: CounterFailure[] };
@@ -131,6 +139,13 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 		req: CounterOps["increment"]["req"],
 	): Promise<FokosEnvelope<CounterOps["increment"]["res"]>> {
 		return await this.fokos.dispatch("increment", ctx, req);
+	}
+
+	async locate(
+		ctx: FokosRouteContext<CounterPolicy>,
+		req: CounterOps["locate"]["req"],
+	): Promise<FokosEnvelope<CounterOps["locate"]["res"]>> {
+		return await this.fokos.dispatch("locate", ctx, req);
 	}
 
 	async incrementMany(
@@ -263,6 +278,13 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 					return { key, val };
 				},
 			},
+			locate: {
+				shape: "point",
+				whileMigrating: "throw",
+				admissionTag: "locate",
+				key: (req) => ({ routingHash: req.routingHash }),
+				local: () => null,
+			},
 			incrementMany: {
 				shape: "group",
 				whileMigrating: "throw",
@@ -334,10 +356,14 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 					}
 				},
 			},
-			admit: ({ admissionTag, keys }) =>
-				admissionTag === "increment_many" && keys.some((key) => (KeyCodec.decode(key.hashKey) as string).startsWith("refuse-"))
+			admit: ({ admissionTag, keys }) => {
+				if (admissionTag === "locate" && keys.length > 0) {
+					return { reject: new Error("counter host: admission got a key for a position") };
+				}
+				return admissionTag === "increment_many" && keys.some((key) => (KeyCodec.decode(key.hashKey) as string).startsWith("refuse-"))
 					? { reject: new Error("counter host: admission refuses the part") }
-					: "allow",
+					: "allow";
+			},
 			// Every child has acknowledged its import, so the rows of this router are old copies.
 			cleanupSourceStep: () => {
 				sql.exec("DELETE FROM counters");

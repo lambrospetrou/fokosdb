@@ -17,6 +17,7 @@ import { AddResult } from "../shared/bloom-filter.js";
 import { attachRouting, envelope, RouteCollector, routedError } from "./envelope.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import {
+	asRoutingHash,
 	compareRoutingHashes,
 	RoutingHashDigitCursor,
 	routingHashDigits,
@@ -45,6 +46,7 @@ import {
 	rangeStorageInterval,
 	sliceIncludesHashKey,
 	sliceIncludesItem,
+	sliceIncludesPosition,
 } from "./repartition-slice.js";
 import type {
 	FokosExecuteLocalRequest,
@@ -96,6 +98,7 @@ import type {
 	FokosShardingHooks,
 	FokosSignals,
 	FokosStorageInterval,
+	FokosStorageKey,
 } from "./runtime-types.js";
 import { FokosScheduler, INIT_RETRY_ALARM_MS } from "./scheduler.js";
 import { jitterBackoff } from "durable-utils/retries";
@@ -145,6 +148,12 @@ type Resolution =
 
 type RemoteResolution = Extract<Resolution, { kind: "remote" }>;
 type OwnedResolution = Exclude<Resolution, { kind: "out_of_range" }>;
+
+/**
+ * A place in the storage order, with the empty key for an absent `hk` or `sk`. It is also the composite key
+ * of the range lookups, so a resolution makes no other object for the key.
+ */
+type Position = FokosCompositeKey & { routingHash: RoutingHash };
 
 /** The caches a resolution reads. The hash arena has no switch: each resolution reads it. */
 type ResolveOptions = {
@@ -406,8 +415,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (descriptor.shape === "range") {
 			this.#assertCanOwnRange(op, descriptor.range(req));
 		} else {
-			for (const key of this.#scopeRouteKeys(descriptor, req)) {
-				if (!this.#ownsByTopology(key, this.#routingHash(key.hashKey))) {
+			for (const pos of this.#scopePositions(descriptor, req)) {
+				if (!this.#ownsByTopology(pos)) {
 					throw misrouted(op, "key outside this partition");
 				}
 			}
@@ -441,7 +450,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			throw e;
 		}
-		this.#learn(result.routing.servedBy, this.#scopeKeys(descriptor, req));
+		this.#learn(result.routing.servedBy, this.#scopeRoutingHashes(descriptor, req));
 		collector.mergeForwarded(result.routing, this.#hashDepthStampForRangeNodes());
 		return envelope(result.value, collector.build());
 	}
@@ -453,19 +462,22 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		collector: RouteCollector,
 	): Promise<FokosEnvelope<unknown>> {
 		const key = descriptor.key(req);
-		const resolution = this.#resolve(key, HINTED);
+		const pos = this.#positionOf(key);
+		// A position names no item, so its admission gets no keys.
+		const admitted = "routingHash" in key ? [] : [key];
+		const resolution = this.#resolvePosition(pos, HINTED);
 		if (resolution.kind === "out_of_range") {
 			throw misrouted(op, "key outside this partition");
 		}
 		if (resolution.kind === "local") {
-			this.#admit(op, descriptor, [key]);
+			this.#admit(op, descriptor, admitted);
 			const before = this.#beforeForward(descriptor, req);
 			const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
 			await this.#applySignals([...before, ...signals]);
 			return envelope(value, collector.build());
 		}
 		const before = this.#beforeForward(descriptor, req);
-		const forwarded = this.#forwardPoint(op, descriptor, req, key, resolution, collector, 0);
+		const forwarded = this.#forwardPoint(op, descriptor, req, pos, admitted, resolution, collector, 0);
 		forwarded.catch(() => {});
 		await this.#applySignals(before);
 		return envelope(await forwarded, collector.build());
@@ -499,31 +511,32 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		op: string,
 		descriptor: Extract<AnyOperation, { shape: "point" }>,
 		req: unknown,
-		key: RouteKey,
+		pos: Position,
+		admitted: RouteKey[],
 		resolution: RemoteResolution,
 		collector: RouteCollector,
 		retries: number,
 	): Promise<unknown> {
 		try {
-			return await this.#forwardTo(collector, resolution.target, op, req, [key.hashKey]);
+			return await this.#forwardTo(collector, resolution.target, op, req, [pos.routingHash]);
 		} catch (e) {
-			const opts = this.#missLadder([key], resolution, e, descriptor.readOnly === true, "point");
+			const opts = this.#missLadder(pos.routingHash, resolution, e, descriptor.readOnly === true, "point");
 			if (!opts || retries >= this.#config().maxForwardRetries) {
 				throw e;
 			}
 			// Every error that starts a fallback comes before any handler ran on the target.
 			collector.forget(resolution.target.partitionId);
-			const next = this.#resolve(key, opts);
+			const next = this.#resolvePosition(pos, opts);
 			if (next.kind === "out_of_range") {
 				throw misrouted(op, "key outside this partition");
 			}
 			if (next.kind === "local") {
-				this.#admit(op, descriptor, [key]);
+				this.#admit(op, descriptor, admitted);
 				const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
 				await this.#applySignals(signals);
 				return value;
 			}
-			return await this.#forwardPoint(op, descriptor, req, key, next, collector, retries + 1);
+			return await this.#forwardPoint(op, descriptor, req, pos, admitted, next, collector, retries + 1);
 		}
 	}
 
@@ -531,23 +544,22 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * The options to resolve the keys of a failed forward again with, or null when the failure is not
 	 * a cache miss. It forgets the hint that caused the miss, so the next resolution cannot repeat it.
 	 * The keys share the target of `resolution`, thus they share its hint, and one forget covers all
-	 * of them. A point retry can use the Bloom step again. A group or single-owner retry turns the
-	 * Bloom step off and keeps the learned range slices.
+	 * of them. `routingHash` is the routingHash of the first key. A point retry can use the Bloom step
+	 * again. A group or single-owner retry turns the Bloom step off and keeps the learned range slices.
 	 */
 	#missLadder(
-		keys: readonly RouteKey[],
+		routingHash: RoutingHash,
 		resolution: RemoteResolution,
 		e: unknown,
 		readOnly: boolean,
 		shape: "point" | "group" | "single_owner",
 	): ResolveOptions | null {
 		const retry = (point: ResolveOptions) => (shape === "point" ? point : HINTED_NO_BLOOM);
-		const hashKey = keys[0].hashKey;
 		const notInitialized = FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
 		const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
 		const awaitingData = isAwaitingData(e);
 		if (resolution.learned && notInitialized) {
-			this.#store.deleteLearnedRangeSlice(this.#routingHash(hashKey), resolution.learned);
+			this.#store.deleteLearnedRangeSlice(routingHash, resolution.learned);
 			return retry({ bloom: resolution.via === "bloom", learnedRange: true });
 		}
 		// A Bloom hit can name the range root of a key whose promotion has not cut over. The exact
@@ -565,7 +577,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				cutTopologyHint(resolution.topologyHint.entry, resolution.topologyHint.pos);
 			}
 			const arena = this.#arena();
-			if (arena?.invalidate(this.#routingHash(hashKey), resolution.relDepth!)) {
+			if (arena?.invalidate(routingHash, resolution.relDepth!)) {
 				this.#store.putHashArena(arena.toSnapshot());
 			}
 			return retry(HINTED);
@@ -866,17 +878,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			group.entries.map((entry) => entry.item),
 		);
 		const keys = group.entries.map((entry) => entry.key);
+		const routingHashes = keys.map((key) => this.#routingHash(key.hashKey));
 		try {
-			const result = await this.#forwardTo(
-				collector,
-				target,
-				op,
-				request,
-				keys.map((key) => key.hashKey),
-			);
+			const result = await this.#forwardTo(collector, target, op, request, routingHashes);
 			return [{ target, request, result }];
 		} catch (e) {
-			const opts = this.#missLadder(keys, group.resolution, e, descriptor.readOnly === true, "group");
+			const opts = this.#missLadder(routingHashes[0], group.resolution, e, descriptor.readOnly === true, "group");
 			if (!opts || retries >= this.#config().maxForwardRetries) {
 				throw e;
 			}
@@ -991,16 +998,11 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		collector: RouteCollector,
 		retries: number,
 	): Promise<unknown> {
+		const routingHashes = keys.map((key) => this.#routingHash(key.hashKey));
 		try {
-			return await this.#forwardTo(
-				collector,
-				resolution.target,
-				op,
-				req,
-				keys.map((key) => key.hashKey),
-			);
+			return await this.#forwardTo(collector, resolution.target, op, req, routingHashes);
 		} catch (e) {
-			const opts = this.#missLadder(keys, resolution, e, descriptor.readOnly === true, "single_owner");
+			const opts = this.#missLadder(routingHashes[0], resolution, e, descriptor.readOnly === true, "single_owner");
 			if (!opts || retries >= this.#config().maxForwardRetries) {
 				throw e;
 			}
@@ -1235,7 +1237,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const descriptor = this.#ops[op];
 		invariant(descriptor && descriptor.shape !== "local", () => `fokos/runtime: ${op} cannot be forwarded`);
 		const collector = new RouteCollector();
-		const value = await this.#forwardTo(collector, target, op, req, this.#scopeKeys(descriptor, req));
+		const value = await this.#forwardTo(collector, target, op, req, this.#scopeRoutingHashes(descriptor, req));
 		return envelope(value as Ops[K]["res"], collector.build());
 	}
 
@@ -1355,17 +1357,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const routeCtx = this.routeContext();
 
 		if (descriptor.shape === "point") {
-			const key = descriptor.key(req.request);
-			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, topology, this.#routingHashSeedResolver)) {
+			const pos = this.#positionOf(descriptor.key(req.request));
+			if (!sliceIncludesPosition(slice, pos.routingHash, pos, topology)) {
 				throw misrouted(req.op, "key outside the caller slice");
 			}
 			// A promoted key's rows live in the range tree; the local copies are stale or already
 			// collected. Only a hash-child caller can reach one: a range or promoted-key slice is itself
 			// inside a range tree.
-			const routingHash = this.#routingHash(key.hashKey);
-			if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash)) {
-				const owner = this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "override", false, true);
-				const value = await this.#forwardTo(collector, owner.target, req.op, req.request, [key.hashKey]);
+			if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(pos.routingHash)) {
+				const owner = this.#rangeOwner(pos.routingHash, pos, "override", false, true);
+				const value = await this.#forwardTo(collector, owner.target, req.op, req.request, [pos.routingHash]);
 				return envelope(value, collector.build());
 			}
 			collector.add(this.#selfNode("executed"));
@@ -1416,7 +1417,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// A range request spans sort keys, so it carries no one key that could select a deeper range
 			// slice; it enters at the range root and the routers below it fan out.
 			const root = refOf(resolveRangePartitionContext(routeCtx, routingHash, null, null));
-			const value = await this.#forwardTo(collector, root, req.op, request, [input.hashKey]);
+			const value = await this.#forwardTo(collector, root, req.op, request, [routingHash]);
 			return envelope(value, collector.build());
 		}
 		collector.add(this.#selfNode("executed"));
@@ -1742,20 +1743,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 	}
 
-	/**
-	 * Hash step 1 and range step 1: can this partition own the key at all, by its identity alone.
-	 * `routingHash` is the routingHash of `key.hashKey`.
-	 */
-	#ownsByTopology(key: RouteKey, routingHash: RoutingHash): boolean {
+	/** Hash step 1 and range step 1: can this partition own the position at all, by its identity alone. */
+	#ownsByTopology(pos: Position): boolean {
 		const identity = this.identity();
 		if (identity.kind === "hash") {
-			return this.#hashesHere(routingHash, identity);
+			return this.#hashesHere(pos.routingHash, identity);
 		}
 		const range = identity.range!;
-		return (
-			compareRoutingHashes(routingHash, range.routingHash) === 0 &&
-			compositeInInterval({ hk: key.hashKey, sk: key.sortKey }, range.start, range.end)
-		);
+		return compareRoutingHashes(pos.routingHash, range.routingHash) === 0 && compositeInInterval(pos, range.start, range.end);
 	}
 
 	#hashesHere(routingHash: RoutingHash, identity: FokosPartitionIdentity): boolean {
@@ -1768,23 +1763,38 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return routingHashOf(hashKey, this.identity().topology.shardGroup, this.#routingHashSeedResolver);
 	}
 
-	/** `view` is read here when the caller does not give one. A hash key with a cut-over override does not need it. */
+	/** The resolution of a key: the resolution of its position. */
 	#resolve(key: RouteKey, opts: ResolveOptions, view?: RouterView): Resolution {
+		return this.#resolvePosition(this.#positionOf(key), opts, view);
+	}
+
+	/**
+	 * The position of a route key or of a storage key. A key costs one hash, which the ownership check,
+	 * the override, the Bloom filter, and the topology all use. A storage key with no `hk` or `sk` gets the
+	 * empty key, which is the minimum.
+	 */
+	#positionOf(key: RouteKey | FokosStorageKey): Position {
+		if ("routingHash" in key) {
+			return { routingHash: asRoutingHash(key.routingHash), hk: key.hk ?? NO_SORT_KEY, sk: key.sk ?? NO_SORT_KEY };
+		}
+		return { routingHash: this.#routingHash(key.hashKey), hk: key.hashKey, sk: key.sortKey };
+	}
+
+	/** `view` is read here when the caller does not give one. A position with a cut-over override does not need it. */
+	#resolvePosition(pos: Position, opts: ResolveOptions, view?: RouterView): Resolution {
 		const identity = this.identity();
-		// One hash of the key for each resolve: the ownership check, the override, the Bloom filter, and
-		// the topology use it.
-		const routingHash = this.#routingHash(key.hashKey);
-		if (!this.#ownsByTopology(key, routingHash)) {
+		const { routingHash } = pos;
+		if (!this.#ownsByTopology(pos)) {
 			return { kind: "out_of_range" };
 		}
 
 		if (identity.kind === "hash") {
 			const override = this.#store.routeOverrideFor(routingHash);
 			if (override && cutOver(override.state)) {
-				return this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "override", false, opts.learnedRange);
+				return this.#rangeOwner(routingHash, pos, "override", false, opts.learnedRange);
 			}
 			if (opts.bloom && this.#bloom?.maybePromoted(routingHash)) {
-				return this.#rangeOwner(routingHash, { hk: key.hashKey, sk: key.sortKey }, "bloom", true, opts.learnedRange);
+				return this.#rangeOwner(routingHash, pos, "bloom", true, opts.learnedRange);
 			}
 			return this.#hashTopologyOwner(routingHash, (view ?? this.#routerView()).router);
 		}
@@ -1794,9 +1804,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return { kind: "local" };
 		}
 		const range = identity.range!;
-		const composite = { hk: key.hashKey, sk: key.sortKey };
-		const child = this.#rangeChildFor(composite, rangeChildren);
-		const learned = opts.learnedRange ? this.#store.findDeepestKnownRangeSlice(range.routingHash, composite) : null;
+		const child = this.#rangeChildFor(pos, rangeChildren);
+		const learned = opts.learnedRange ? this.#store.findDeepestKnownRangeSlice(range.routingHash, pos) : null;
 		const jump = learned && isStrictSubSlice(learned, child.start, child.end) ? learned : null;
 		const target = jump
 			? refOf(resolveRangePartitionContext(this.routeContext(), range.routingHash, jump.startBoundary, jump.endBoundary))
@@ -1964,10 +1973,11 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		invariant(plan, "fokos/runtime.forwardRangeVisit: the visit was not planned by this runtime");
 		invariant(visit.target !== "local", "fokos/runtime.forwardRangeVisit: a local visit is served by the tracked local function");
 		const input = descriptor.range(req);
+		const routingHashes = [this.#routingHash(input.hashKey)];
 		let target = visit.target;
 		for (let attempt = 0; ; attempt++) {
 			try {
-				return await this.#forwardTo(collector, target, op, req, [input.hashKey]);
+				return await this.#forwardTo(collector, target, op, req, routingHashes);
 			} catch (e) {
 				if (attempt >= this.#config().maxForwardRetries) {
 					throw e;
@@ -1977,7 +1987,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
 				const awaitingData = isAwaitingData(e);
 				if (plan.learned && notInitialized) {
-					this.#store.deleteLearnedRangeSlice(this.#routingHash(input.hashKey), plan.learned);
+					this.#store.deleteLearnedRangeSlice(routingHashes[0], plan.learned);
 					invariant(plan.base.target !== "local", "fokos/runtime.forwardRangeVisit: a learned slice never overlays a local base");
 					target = plan.base.target;
 					plan = { visit, base: plan.base, learned: null };
@@ -2007,7 +2017,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/**
 	 * One outbound RPC to a partition of the host's own class. The default calls the method named
 	 * after the operation with the derived route context. The list of the answer, or of the error, is
-	 * learned against `hashKeys`, the keys of this request that the RPC carried, and merged into
+	 * learned against `routingHashes`, of the keys or the position that the RPC carried, and merged into
 	 * `collector` here, so every path that forwards pays for it once.
 	 */
 	async #forwardTo(
@@ -2015,7 +2025,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		target: FokosPartitionRef,
 		op: string,
 		req: unknown,
-		hashKeys: readonly KeyBytes[],
+		routingHashes: readonly RoutingHash[],
 	): Promise<unknown> {
 		const descriptor = this.#ops[op];
 		invariant(descriptor && descriptor.shape !== "local", () => `fokos/runtime: ${op} cannot be forwarded`);
@@ -2034,7 +2044,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const stamp = isRangePartition(target) ? this.#hashDepthStampForRangeNodes() : undefined;
 		try {
 			const result = await call;
-			this.#learn(result.routing.servedBy, hashKeys);
+			this.#learn(result.routing.servedBy, routingHashes);
 			collector.mergeForwarded(result.routing, stamp);
 			return result.value;
 		} catch (e) {
@@ -2047,7 +2057,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				// whatever this partition had already collected.
 				const raiser = routed.routing.servedBy[0];
 				try {
-					this.#learn(routed.routing.servedBy, hashKeys);
+					this.#learn(routed.routing.servedBy, routingHashes);
 				} catch {}
 				collector.mergeForwarded(routed.routing, stamp);
 				// Under `collect`, the error becomes a failed part, and this partition answers with a value.
@@ -2079,16 +2089,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * Learns from the nodes of a child envelope for the hash keys of this request: the range
+	 * Learns from the nodes of a child envelope for the routingHashes of this request: the range
 	 * boundaries and the promotion of every range node, and the depth of the deepest hash node that
-	 * owns each key. The identity of a node is its scope, so a hash node owns a key when the key hashes
-	 * along its path, and a range node names its hash key and its own slice itself.
+	 * owns each routingHash. The identity of a node is its scope, so a hash node owns a routingHash on
+	 * its path, and a range node names its hash key and its own slice itself.
 	 *
 	 * A slice is stored only when this partition can use it. A hash partition uses each slice below
 	 * the range root. A range partition at depth d uses only a slice strictly inside one of its
 	 * children, which is at depth d + 2 or deeper.
 	 */
-	#learn(nodes: readonly FokosRouteNode[], hashKeys: readonly KeyBytes[]): void {
+	#learn(nodes: readonly FokosRouteNode[], routingHashes: readonly RoutingHash[]): void {
 		const identity = this.identity();
 		const myDepth = identityDepth(identity);
 		const minRangeDepth = identity.kind === "hash" ? 1 : myDepth + 2;
@@ -2141,8 +2151,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				continue;
 			}
 			const bytes = Uint8Array.fromHex(node.ref.partitionId);
-			for (const hashKey of hashKeys) {
-				const routingHash = this.#routingHash(hashKey);
+			for (const routingHash of routingHashes) {
 				if (hashPathOwns(bytes, routingHash, identity.topology)) {
 					learnDepth(routingHash, node.hashDepth);
 				}
@@ -2242,21 +2251,21 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 	}
 
-	/** The hash keys a request names, which a forward learns against. */
-	#scopeKeys(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): KeyBytes[] {
-		return this.#scopeRouteKeys(descriptor, req).map((key) => key.hashKey);
+	/** The routingHashes of the keys or the position that a request names, which a forward learns against. */
+	#scopeRoutingHashes(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): RoutingHash[] {
+		return this.#scopePositions(descriptor, req).map((pos) => pos.routingHash);
 	}
 
-	/** The keys a request names, for the ownership check of the read-through gate. */
-	#scopeRouteKeys(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): RouteKey[] {
+	/** The positions of the keys a request names, or its position, for the ownership check of the read-through gate. */
+	#scopePositions(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): Position[] {
 		switch (descriptor.shape) {
 			case "point":
-				return [descriptor.key(req)];
+				return [this.#positionOf(descriptor.key(req))];
 			case "group":
 			case "single_owner":
-				return descriptor.items(req).map((item) => item.key);
+				return descriptor.items(req).map((item) => this.#positionOf(item.key));
 			case "range":
-				return [{ hashKey: descriptor.range(req).hashKey, sortKey: NO_SORT_KEY }];
+				return [this.#positionOf({ hashKey: descriptor.range(req).hashKey, sortKey: NO_SORT_KEY })];
 		}
 	}
 

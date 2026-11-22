@@ -4,13 +4,13 @@ import { FokosError, type FokosCodeDef } from "../shared/errors.js";
 import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
-import type { KeyBytes } from "./key-codec.js";
-import { routingHashOf, type RoutingHash, type RoutingHashSeedResolver } from "./hash-primitives.js";
+import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
+import { asRoutingHash, routingHashOf, type RoutingHash, type RoutingHashSeedResolver } from "./hash-primitives.js";
 import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
 import { isRangePartition, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
 import { FokosRouter, publicRouting } from "./router.js";
-import type { FokosEnvelope, FokosOperationSpec, FokosPublicRouting, FokosRangeInput } from "./runtime-types.js";
+import type { FokosEnvelope, FokosOperationSpec, FokosPublicRouting, FokosRangeInput, FokosStorageKey } from "./runtime-types.js";
 import type { RepartitionKind } from "./sharding-store.js";
 import { cachedHashTopology, cachedRangeTopology, cutTopologyHint, type FokosTopologyCacheOptions } from "./topology-cache.js";
 import {
@@ -118,6 +118,9 @@ type MissFallback<TPolicy> = (e: unknown) => FokosRouteContext<TPolicy> | null;
  */
 const MAX_TOPOLOGY_FALLBACKS = 16;
 
+/** The empty key: the minimum `hk` or `sk` of a position. */
+const NO_KEY = KeyCodec.encodeOptional(undefined);
+
 /** True when the partition `doName` answered that it has no identity. Nothing ran on it. */
 function notInitializedAt(e: unknown, code: FokosCodeDef, doName: string): boolean {
 	return FokosError.isCode(e, code) && e.attributes.doName === doName;
@@ -164,15 +167,35 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * `speculative` false gives only a partition that exists: it does not send a key with a Bloom hit
 	 * and no cached range entry to the range root of the key. Use it for an address that another
 	 * client instance sends to later, because only this instance can fall back after a miss.
+	 *
+	 * `key` can be a position in the storage order. A position with no `hk` or `sk` gets the empty
+	 * key, which is the minimum, so in a range tree it resolves to the partition that holds the minimum.
 	 */
-	resolve(key: RouteKey, opts?: FokosResolveOptions): FokosRouteContext<TPolicy> {
-		const composite = { hk: key.hashKey, sk: key.sortKey };
-		return this.#resolveKey(key.hashKey, (view, cut) => rangePointLookup(view, composite, cut), true, opts?.speculative ?? true);
+	resolve(key: RouteKey | FokosStorageKey, opts?: FokosResolveOptions): FokosRouteContext<TPolicy> {
+		const pos = this.#positionOf(key);
+		return this.#resolveKey(pos.routingHash, (view, cut) => rangePointLookup(view, pos, cut), true, opts?.speculative ?? true);
 	}
 
 	/** The deepest known partition that holds the whole interval. That partition plans the range frontier. */
 	resolveRange(input: FokosRangeInput): FokosRouteContext<TPolicy> {
-		return this.#resolveKey(input.hashKey, (view, cut) => rangeIntervalLookup(view, input.hashKey, input.interval, cut), true, true);
+		return this.#resolveKey(
+			this.#routingHashOf(input.hashKey),
+			(view, cut) => rangeIntervalLookup(view, input.hashKey, input.interval, cut),
+			true,
+			true,
+		);
+	}
+
+	/** The position of a key, which is also the composite key of the range lookup. */
+	#positionOf(key: RouteKey | FokosStorageKey): FokosCompositeKey & { routingHash: RoutingHash } {
+		if ("routingHash" in key) {
+			return { routingHash: asRoutingHash(key.routingHash), hk: key.hk ?? NO_KEY, sk: key.sk ?? NO_KEY };
+		}
+		return { routingHash: this.#routingHashOf(key.hashKey), hk: key.hashKey, sk: key.sortKey };
+	}
+
+	#routingHashOf(hashKey: KeyBytes): RoutingHash {
+		return routingHashOf(hashKey, this.#router.topology.shardGroup, this.#router.routingHashSeedResolver);
 	}
 
 	/**
@@ -186,8 +209,8 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * that exists, because the keeper records only completed repartitions. The hash leaf of a promoted
 	 * key forwards to its range tree.
 	 */
-	#resolveKey(hashKey: KeyBytes, rangeLookup: RangeLookup, bloom: boolean, speculative: boolean): FokosRouteContext<TPolicy> {
-		const root = this.#router.rootContext(hashKey);
+	#resolveKey(routingHash: RoutingHash, rangeLookup: RangeLookup, bloom: boolean, speculative: boolean): FokosRouteContext<TPolicy> {
+		const root = this.#router.rootContextOf(routingHash);
 		const opts = this.#topologyCache;
 		if (!opts) {
 			return root;
@@ -199,7 +222,6 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		}
 		// A promotion moves the whole routingHash of a key, so the promoted set and the range
 		// entries are by routingHash.
-		const routingHash = routingHashOf(hashKey, topology.shardGroup, this.#router.routingHashSeedResolver);
 		const hit = bloom ? isPromotedRoutingHash(hash.view, routingHash) : false;
 		if (hit) {
 			const cached = cachedRangeTopology(opts, topology.shardGroup, routingHash);
@@ -230,13 +252,13 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 						next: (e) => {
 							const missing = notInitializedAt(e, SHARDING_ROUTING_CODES.range_partition_not_initialized, ctx.doName);
 							if (target.rank === 0 && (missing || awaitingData(e))) {
-								return this.#resolveKey(hashKey, rangeLookup, false, speculative);
+								return this.#resolveKey(routingHash, rangeLookup, false, speculative);
 							}
 							if (!missing || !range) {
 								return null;
 							}
 							cutTopologyHint(range, rangeCutKey(range.view, target));
-							return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
+							return this.#resolveKey(routingHash, rangeLookup, bloom, speculative);
 						},
 					});
 					return ctx;
@@ -255,7 +277,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 					return null;
 				}
 				cutTopologyHint(hash, leaf.pos);
-				return this.#resolveKey(hashKey, rangeLookup, bloom, speculative);
+				return this.#resolveKey(routingHash, rangeLookup, bloom, speculative);
 			},
 		});
 		return ctx;
@@ -282,13 +304,14 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 
 	// ─── resolve, send, retry, unwrap ─────────────────────────────────────────
 
+	/** `key` can be a position in the storage order, for an operation whose `key(req)` gives a position. */
 	async point<K extends keyof Ops & string>(
 		op: K,
-		key: RouteKey,
+		key: RouteKey | FokosStorageKey,
 		req: Ops[K]["req"],
 		opts?: FokosCallOptions,
 	): Promise<FokosCallResult<Ops[K]["res"]>> {
-		return await this.send(op, this.resolve(key), req, [key], opts);
+		return await this.send(op, this.resolve(key), req, "routingHash" in key ? [] : [key], opts);
 	}
 
 	async range<K extends keyof Ops & string>(

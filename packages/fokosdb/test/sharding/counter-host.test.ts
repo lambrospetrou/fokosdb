@@ -30,6 +30,23 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		await table.settle();
 	});
 
+	it("routes a position to the owner of a key with the same routingHash, and admits it with no keys", async () => {
+		const table = makeCounterTable();
+		for (let i = 0; i < 5; i++) {
+			await table.increment(`k-${i}`);
+		}
+		await table.settle((n) => n[0].stats.role === "router");
+		const shardGroup = table.root.topology.shardGroup;
+		for (let i = 0; i < 5; i++) {
+			const owner = await table.increment(`k-${i}`);
+			const routingHash = routingHashOf(KeyCodec.encode(`k-${i}`), shardGroup, testRoutingHashSeedResolver);
+			const located = await table.client.send("locate", table.root, { routingHash }, []);
+			expect(located.routing.forwardCount).toBe(1);
+			expect(located.routing.servedBy.map((n) => n.ref.doName)).toEqual(owner.routing.servedBy.map((n) => n.ref.doName));
+		}
+		await table.settle();
+	});
+
 	it("keeps every write when the children split again", async () => {
 		const table = makeCounterTable();
 		for (let i = 0; i < 5; i++) {

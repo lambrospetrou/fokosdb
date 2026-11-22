@@ -147,6 +147,24 @@ describe("topology cache — hash entries", () => {
 		expect(t.fetched).toHaveLength(2);
 	});
 
+	it("resolves a position like the key of its routingHash, before and after the fetch", async () => {
+		const keys = ["alpha", "beta", "gamma", "delta", "eps"].map((hk) => ({ hashKey: KeyCodec.encode(hk), sortKey: NO_SORT_KEY }));
+		const shardGroup = newShardGroup();
+		const roots = [...new Set(keys.map((key) => childOf(shardGroup, key.hashKey).root))].sort((a, b) => a - b);
+		const t = setup(new Map([[GET, () => hashBody({ version: 1, splits: roots.map(rootId) })]]), undefined, {}, shardGroup);
+		const position = (key: { hashKey: KeyBytes }) => ({
+			routingHash: routingHashOf(key.hashKey, shardGroup, defaultRoutingHashSeedResolver),
+		});
+		for (const key of keys) {
+			expect(t.client.resolve(position(key)).doName).toBe(t.client.resolve(key).doName);
+		}
+		await t.settle();
+		for (const key of keys) {
+			const { root, child } = childOf(shardGroup, key.hashKey);
+			expect(t.client.resolve(position(key)).doName).toBe(PartitionIdHelper.hashId(shardGroup, root, [child]).doName);
+		}
+	});
+
 	it("stops waiting for a fetch that does not end, aborts its signal, and can refresh again", async () => {
 		vi.spyOn(console, "warn").mockImplementation(() => {});
 		const key = { hashKey: KeyCodec.encode("hung"), sortKey: NO_SORT_KEY };
@@ -423,6 +441,21 @@ describe("topology cache — range entries", () => {
 		expect(t.client.resolveRange({ hashKey, descending: false, interval: { lower: { value: k("q"), inclusive: true } } }).doName).toBe(
 			f.name("p", null),
 		);
+	});
+
+	it("resolves a position like a key in the range tree, and a position with no hk to the first range partition", async () => {
+		const f = fixture(rangeBody);
+		const t = setup(f.bodies, undefined, {}, f.shardGroup);
+		const routingHash = routingHashOf(hashKey, f.shardGroup, defaultRoutingHashSeedResolver);
+		t.client.resolve({ routingHash });
+		await t.settle();
+		t.client.resolve({ routingHash });
+		await t.settle();
+		for (const sk of ["a", "g", "h", "k", "o", "p", "z"]) {
+			expect(t.client.resolve({ routingHash, hk: hashKey, sk: k(sk) }).doName).toBe(t.client.resolve({ hashKey, sortKey: k(sk) }).doName);
+		}
+		expect(t.client.resolve({ routingHash }).doName).toBe(f.name(null, "g"));
+		expect(t.client.resolve({ routingHash, hk: hashKey }).doName).toBe(f.name(null, "g"));
 	});
 
 	it("completes through the hash path when the range root of a Bloom hit does not exist", async () => {

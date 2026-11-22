@@ -70,6 +70,19 @@ export function sliceIncludesItem(
 	return slice.kind !== "range" || compositeInInterval({ hk: hashKey, sk: sortKey }, slice.start, slice.end);
 }
 
+/** Says whether the position `(routingHash, key)` belongs to the slice. An empty `hk` is the minimum of the routingHash. */
+export function sliceIncludesPosition(
+	slice: FokosSlice,
+	routingHash: RoutingHash,
+	key: FokosCompositeKey,
+	topology: SliceTopology,
+): boolean {
+	if (!sliceIncludesRoutingHash(slice, routingHash, topology)) {
+		return false;
+	}
+	return slice.kind !== "range" || compositeInInterval(key, slice.start, slice.end);
+}
+
 /** Says whether one hash key belongs to the slice, ignoring the sort-key axis. */
 export function sliceIncludesHashKey(
 	slice: FokosSlice,

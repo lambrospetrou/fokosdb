@@ -1,5 +1,11 @@
 import { PartitionIdHelper } from "./partition-id.js";
-import { RoutingHashDigitCursor, routingHashOf, defaultRoutingHashSeedResolver, type RoutingHashSeedResolver } from "./hash-primitives.js";
+import {
+	RoutingHashDigitCursor,
+	routingHashOf,
+	defaultRoutingHashSeedResolver,
+	type RoutingHash,
+	type RoutingHashSeedResolver,
+} from "./hash-primitives.js";
 import type { KeyBytes } from "./key-codec.js";
 import {
 	validatePolicyVersion,
@@ -34,7 +40,11 @@ export class FokosRouter<TPolicy> {
 
 	/** The root partition that owns `hashKey`. Keys arrive already encoded. */
 	rootContext(hashKey: KeyBytes): FokosRouteContext<TPolicy> {
-		const routingHash = routingHashOf(hashKey, this.topology.shardGroup, this.routingHashSeedResolver);
+		return this.rootContextOf(routingHashOf(hashKey, this.topology.shardGroup, this.routingHashSeedResolver));
+	}
+
+	/** The root partition of a routingHash. */
+	rootContextOf(routingHash: RoutingHash): FokosRouteContext<TPolicy> {
 		return this.#root(new RoutingHashDigitCursor(routingHash, this.topology.rootTreesN).root);
 	}
 
