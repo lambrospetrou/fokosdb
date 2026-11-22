@@ -10,8 +10,7 @@ FokosDB is a strongly consistent, distributed database with bottomless storage, 
 - **ACID transactions.** Write up to 100 items (4 MB in total) atomically across partitions, or read up to 100 items as one consistent snapshot.
 - **SQLite expressions.** Conditions, updates, filters, and projections use JSON paths, arithmetic, and the SQLite core and math functions.
 - **GSIs and push targets.** Add up to 10 global secondary indexes to a table, and send each change to your own Worker or Durable Object.
-- **Small client.** `fokosdb/client` is less than 50 KB minified and gzipped.
-- **Your Cloudflare account.** All data stays in Durable Objects of your account, and one option keeps a table in the EU, the US, or FedRAMP.
+- **Your Cloudflare account.** All data stays in Durable Objects of your account, and optionally keep a table in the EU, the US, or FedRAMP jurisdictions.
 
 ```ts
 await db.putItem({
@@ -29,7 +28,10 @@ const { items } = await db.queryItems({
   queries: [
     {
       hashKey: "user#1",
-      sortKeyCondition: { op: "begins_with", prefix: "order#" },
+      sortKeyCondition: {
+        op: "begins_with",
+        prefix: "order#",
+      },
     },
   ],
 });
@@ -43,6 +45,7 @@ const { items } = await db.queryItems({
 
 ```ts
 const data = (path: string) => ({ ref: "data", path }) as const;
+
 await db.putItem({
   hashKey: "user#ada",
   data: { name: "ada", country: "de", credit: 100 },
@@ -370,31 +373,31 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Revamp the item size statistics for better boundary calculations and choosing keys to promote (`docs/agent-plans/2026-10-31-item-size-facts-and-range-split.md`).
 - Implement the splits with the new Durable Object Snapshot API (needs mocking locally or using the existing approach).
 - Battle test the topology Worker Cache parameters (expiration TTL and stale-while-revalidate).
 - Enable cached topology for the GSI writers and `db.gsi()` client.
 - Extend the topology caching in clients from responses.
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
-- Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
+- Fix transaction coordinator scaling for transactions without idempotency tokens (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Optimize the transactions RTTs by having the Worker send the Transaction Coordinator (TC) request in parallel to the partitions prepare() and handing off the driving to the TC. Partitions reply to the TC directly, not the Worker. It has some nuances if partitions RPC the TC before the initial call arrives, but with some wait timeout it might worth it.
-- Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting.
+- Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting. Not needed once we switch to the Snapshot API.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range. Easy with the Snapshot API.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s. Optionally use the Workers Rate limit binding for colo-level accuracy.
+- Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
 - Extend the split/migration flow to also allow writes while migration in-progress (probably will need some kind of logical replication of writes after the migration started `_fokos_replication_log`). Not needed once we use DO Snapshot API.
 
 ### Features
 
+- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
+- Refactor the Fokos Sharding Runtime RPCs to be a single internal RPC function that switches on the requested action.
 - Allow online configuration (adding/removing/changing) global eventual indexes (DynamoDB GSIs) and push targets.
 - Add operation hooks that run during request forwarding and on the final serving partition (before, after, etc).
-- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
-- Allow custom FokosDB partition classes to add their own migration hooks in addition to the FokosDB items, so that custom data also moves to child partitions.
+- Allow custom FokosDB partition classes to add their own migration hooks in addition to the FokosDB items, so that custom data also moves to child partitions. When using the Snapshot API the hooks should configure what to delete.
 - Think about backups and export in a consistent fashion using Durable Object bookmarks.
 - Allow custom split conditions in user-provided function of the FokosDB partition DO class.
 - Add custom jobs to run on alarms, with their own best-effort interval.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
-- Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions.
-- Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
+- Add a healthcheck of each partition DO to a provider R2 bucket (do name -> partition context, split status, migrations status).
 - Add automatic hashing of the item and signature comparison, similar to the managed "v".
 - Add external version in each write operation, to complement the partition driven "v" version.
 - User provided code running inside the DO for N+1 operations.
@@ -404,3 +407,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
 - Support CASPaxosDO for the data partitions for multi-region availability. Use Paxos Commit and CAS Paxos for the topology keeper for higher availability (speed is no issue).
+
+### Project tasks
+
+- Write proper docs. I like https://github.com/tigerbeetle/tigerbeetle/tree/main/docs and https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/.
