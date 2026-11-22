@@ -14,16 +14,18 @@
 - [6. Frequently asked questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
 - [8. Appendix: dispatch by footprint and execution](#8-appendix-dispatch-by-footprint-and-execution)
-- [9. Appendix: the inversion of `xxh64`](#9-appendix-the-inversion-of-xxh64)
+- [9. Appendix: a resume key in place of the cursor](#9-appendix-a-resume-key-in-place-of-the-cursor)
+- [10. Appendix: the inversion of `xxh64`](#10-appendix-the-inversion-of-xxh64)
 
 ## 1. Overview and context
 
 ### 1.1 The problem
 
 FokosDB has no operation that reads all items of a table. `queryItems` reads the items of the hash keys that the caller
-names. A caller who does not know the hash keys cannot read the table. DynamoDB has `Scan` for this, with the
-pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a parallel scan by `Segment` and
-`TotalSegments`. FokosDB follows the DynamoDB API, so it needs the same operation.
+names. A caller who does not know the hash keys cannot read the table. DynamoDB has `Scan` for this, with a parallel
+scan by `Segment` and `TotalSegments`. FokosDB follows the DynamoDB API, so it needs the same operation. DynamoDB pages
+a scan with `ExclusiveStartKey` and `LastEvaluatedKey`. FokosDB pages it with an opaque cursor, as `queryItems` does,
+and accepts a start key on the first page (section 5 gives the reason).
 
 ### 1.2 What the reader must know about the current system
 
@@ -38,7 +40,8 @@ pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a paralle
   the same place in the storage order.
 - **A repartition does not move an item in the storage order.** A hash split, a range split, and a promotion change
   the owner of a row. They do not change the position `(routingHash, hk, sk)` of the row.
-- **The `queryItems` page.** `queryItems` returns one bounded page with an opaque `cursor`. `QueryPageBudget`
+- **The `queryItems` page.** `queryItems` returns one bounded page with an opaque `cursor` (`shared/query/cursor.ts`):
+  base64url JSON with a version, a fingerprint of the request, and the resume position. `QueryPageBudget`
   (`shared/query/page-budget.ts`) carries four budgets: evaluated items, evaluated bytes, response bytes, and partition
   visits. `MAX_PARTITION_VISITS_PER_PAGE` is 100.
 - **Dispatch shapes.** Each partition operation declares a shape: `point`, `group`, `single_owner`, `range`, or
@@ -51,9 +54,7 @@ pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a paralle
 - **Slice** — the part of the storage order that one partition owns now, from a position to its end. An override
   that has cut over ends the slice of a hash partition.
 - **Step** — one RPC from `db.ts` to the owner of one position. The owner reads its slice and answers.
-- **`E`** — the slice of the last complete step of a page. A page that stops at a slice boundary returns a key inside
-  `E`.
-- **Found key** — a string or binary hash key that the client computes, so that its routingHash has an exact value.
+- **Cursor** — the opaque string of a page. It holds the position where the next page starts (section 4.2.7).
 
 ## 2. Goals and requirements
 
@@ -62,13 +63,13 @@ pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a paralle
 - `db.scanItems(opts)` returns one bounded page of the items of the base table, in the storage order.
 - `db.gsi(indexName).scanItems(opts)` returns one bounded page of the entries of a GSI, in the storage order of the
   GSI.
-- A caller continues the scan with `exclusiveStartKey = lastEvaluatedKey` until `lastEvaluatedKey` is absent.
+- A caller continues the scan with the `cursor` of each page, until a page has no `cursor`.
+- The first page can start after a key that the caller gives in `exclusiveStartKey`.
 - A caller can scan one segment of `totalSegments` segments. The caller runs the segments in parallel.
-- A page continues at the owner of its start position. It does not visit again a partition that an earlier page read,
-  except for the one partition that holds the start position (section 4.2.7). There are two exceptions, and both
-  return `key(L)`: a page that a budget stops before the first row of a step, and the fallback 1 of section 4.2.6.
-  The next page then reads again the empty slices after `L`, which are fewer than the visit limit.
-- A page that visits only empty partitions still makes progress, and it does not return an error.
+- A page visits at most `MAX_PARTITION_VISITS_PER_PAGE` (100) partitions, with no exception.
+- A page that visits only empty partitions still makes progress. It returns a cursor at the next slice, and no error.
+- The next page starts at the owner of the cursor position. It reads a partition again only to read the rest of a
+  slice that a budget stopped.
 - Each item that exists for the whole scan and is not deleted appears exactly once. A split, a promotion, or an import
   during the scan does not change this.
 - `scanItems` takes `limit`, `maxResponseBytes`, `select`, `filter`, and `projection`, with the same rules as
@@ -81,18 +82,21 @@ pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a paralle
   during the scan can appear or not appear. DynamoDB `Scan` has the same behaviour.
 - **A descending scan.** DynamoDB `Scan` has no direction.
 - **A change of the `range` dispatch shape.** Section 8 describes this follow-up.
+- **A resume key in the DynamoDB style.** A page returns no `lastEvaluatedKey`. A follow-up can add one, for example
+  as an option of the client next to the cursor. Section 5 gives the reason to wait, and section 9 records a design.
 
 ### 2.3 Requirements
 
-- The public request and response contain only keys. They contain no routingHash, no position, no partition name, and
-  no opaque cursor.
+- The cursor is opaque. A caller must not parse it or build it. A new cursor version can change its format.
+- A cursor works only with the table or the GSI, the `segment`, and the `totalSegments` of the page that returned it.
 - The visit limit of a page is `MAX_PARTITION_VISITS_PER_PAGE` (100), the limit of `queryItems`. This keeps the latency
-  of one page between 1 and 10 s (section 4.2.11). The subrequest limit of the Worker is set high enough that it does
+  of one page between 1 and 10 s (section 4.2.10). The subrequest limit of the Worker is set high enough that it does
   not limit a page.
 - The client must not import a Durable Object class as a value (`AGENTS.md`).
 - The host must not read a `fokos_` table. It gets each routing fact from the runtime (`AGENTS.md`).
-- The GSI scan needs the total order of GSI entries (`2026-11-22-gsi-sort-key-total-order.md`). That RFC adds the
-  separator `00 00` after the escaped base sort key. Section 4.2.9 depends on it.
+- A GSI start key depends on the total order of GSI entries. `2026-11-22-gsi-sort-key-total-order.md` gives this
+  order, and the code has it: the stored GSI sort key ends each part with the separator `00 00`. Section 4.2.8 uses
+  it.
 
 ## 3. Milestones
 
@@ -105,9 +109,8 @@ Each milestone ships on its own, and the full test suite passes after each one.
    read-through.
 3. **Host operation.** `apiScanItems` in `FokosDBPartitionDO`, the scan of a storage interval in `PartitionStore`, and
    the hash key of each row in the page collector (section 4.2.3).
-4. **Client.** `db.scanItems`: the walk, the segments, the key at a slice boundary, and the found key.
-5. **GSI.** `db.gsi(indexName).scanItems`. This milestone starts after the RFC
-   `2026-11-22-gsi-sort-key-total-order.md` is implemented.
+4. **Client.** `db.scanItems`: the walk, the segments, the cursor, and the start key.
+5. **GSI.** `db.gsi(indexName).scanItems`.
 6. **Documentation.** A `scanItems` section in `AGENTS.md`.
 
 ## 4. Proposed solution
@@ -116,17 +119,18 @@ Each milestone ships on its own, and the full test suite passes after each one.
 
 `db.ts` walks the storage order of the table, from one owned slice to the next.
 
-1. The client turns the start key into a start position. With no start key, the position is the minimum. With a start
-   key `k`, the client computes `rh = routingHashOf(k.hashKey)`, and the position is "after `(rh, hk, sk)`".
+1. The client finds the start position. With a cursor, it is the position in the cursor. With a start key `k`, the
+   client computes `rh = routingHashOf(k.hashKey)`, and the position is "after `(rh, hk, sk)`". With neither, it is
+   the start of the segment, or the minimum.
 2. The client sends a step to the owner of the position. It uses the route cache, as for `getItem`.
 3. The owner reads its slice from the position, in the storage order. It stops at the end of its slice, at the end of
    the segment, or when the budget of the page is used up. It answers with the items and with `next`, the position
    where the next slice starts.
 4. The client sends the next step to the owner of `next`. It repeats until the budget or the visit limit stops the
    page, or until `next` is absent.
-5. The client returns `lastEvaluatedKey`. This is the key of the last evaluated item. When the page stopped at a slice
-   boundary after an empty slice, it is a key inside that slice (section 4.2.7). The client takes that key from a range
-   boundary, or computes a found key that hashes to an exact routingHash.
+5. The client returns a `cursor` with the position where the next page starts. When a budget stopped a step inside
+   its slice, this is the position after the last evaluated row. Else it is the start of the next slice. When the
+   scan of the table or of the segment is complete, the page has no cursor.
 
 A step is a `point` request whose route key is a position. No new dispatch shape is necessary.
 
@@ -143,8 +147,9 @@ storage order (routingHash, hk, sk) ──────────────�
  steps:  (00)→0.0   (40)→0.1.0   (47)→R.0   (47,eve,m)→R.1   (48)→0.1.0   (60)→0.1.1   (80)→root 1
 ```
 
-The next page starts at the owner of the last key of the page. The resolver finds the owner from the key. Partitions
-before that owner get no visit.
+The next page starts at the owner of the cursor position. Partitions before that owner get no visit. For example, a
+page that stops at the visit limit after the empty partition `0.1.1` returns a cursor at `(80)`, and the next page
+starts at root 1.
 
 ### 4.2 Technical details
 
@@ -159,6 +164,9 @@ type ScanItemsOptions = {
 	select?: QuerySelect;
 	filter?: ConditionExpression;
 	projection?: readonly ProjectionExpression[];
+	/** The `cursor` of the previous page. Absent on the first page. */
+	cursor?: string;
+	/** The first page starts after this key. Not valid with `cursor`. */
 	exclusiveStartKey?: { hashKey: HashKey; sortKey?: SortKey };
 	/** From 0 to `totalSegments - 1`. Give `segment` and `totalSegments` together, or neither. */
 	segment?: number;
@@ -176,21 +184,16 @@ type ScanItemsPage<Item> = {
 	count: number;
 	scannedCount: number;
 	/** Absent when the scan of the table, or of the segment, is complete. */
-	lastEvaluatedKey?: { hashKey: HashKey; sortKey?: SortKey };
+	cursor?: string;
 	meta: QueryItemsPage<Item>["meta"];
 };
 ```
 
-- `items`, `count`, `scannedCount`, and `meta` have the meanings that they have in `QueryItemsPage`.
+- `items`, `count`, `scannedCount`, and `meta` have the meanings that they have in `QueryItemsPage`. A GSI page has
+  the items of a GSI `queryItems` page, with `baseHashKey` and `baseSortKey`.
 - The projected overload follows `queryItems`: a request with a `projection` returns `ProjectedItem` records.
-- `lastEvaluatedKey` can name a key that holds no item (section 4.2.7). The caller must treat it as a resume value.
-  It can hold control characters (section 4.2.8), so a caller encodes it before it puts it in a URL, a header, or a
-  log.
-- The result has no fingerprint. A caller can send a different `filter`, `projection`, or `limit` on each page, and
-  can start a scan at a key that the caller chooses.
-- On a GSI, `lastEvaluatedKey` is `{ hashKey, sortKey?, baseHashKey?, baseSortKey? }`. The base keys are present when
-  the key names a real entry, because two entries can have the same GSI keys. A key at a slice boundary can have no
-  base keys (section 4.2.9).
+- The caller sends the cursor back unchanged, with the same table or GSI, `segment`, and `totalSegments`. `limit`,
+  `maxResponseBytes`, `select`, `filter`, and `projection` can change between pages. Section 4.2.7 gives the cursor.
 
 **Validation.** The client validates before any I/O:
 
@@ -198,12 +201,15 @@ type ScanItemsPage<Item> = {
   validation codes.
 - `segment` and `totalSegments` must both be present or both be absent. `totalSegments` must be an integer from 1 to
   1,000,000. `segment` must be an integer from 0 to `totalSegments - 1`.
+- A request must not have both `cursor` and `exclusiveStartKey`. The validation code is `scan_start_key_with_cursor`.
 - `exclusiveStartKey` gets `validateItemKeys`. On a GSI, `baseHashKey` and `baseSortKey` get the same key checks, and
-  `baseSortKey` requires `baseHashKey`. The validation code for a `baseSortKey` without `baseHashKey` is
+  `baseSortKey` needs `baseHashKey`. The validation code for a `baseSortKey` without `baseHashKey` is
   `scan_start_key_invalid`.
 - When the request has a segment, the routingHash of `exclusiveStartKey.hashKey` must be inside the segment.
-- Each failure is a `FokosValidationError`. The new codes are `scan_segment_invalid`, `scan_start_key_invalid`, and
-  `scan_start_key_outside_segment`.
+- `cursor` gets the checks of section 4.2.7.
+- Each failure is a `FokosValidationError`. The new codes are `scan_segment_invalid`, `scan_start_key_invalid`,
+  `scan_start_key_outside_segment`, and `scan_start_key_with_cursor`. The cursor uses the codes of the `queryItems`
+  cursor: `cursor_malformed`, `cursor_version_unknown`, and `cursor_fingerprint_mismatch`.
 
 #### 4.2.2 Segments
 
@@ -379,194 +385,103 @@ copies.
 #### 4.2.6 The walk in `db.ts`
 
 ```
-pos  = exclusiveStartKey ? after(position(exclusiveStartKey)) : min(segment)
-L    = none                                     // the last evaluated row of this page
-last = none                                     // the start position and the answer of the last complete step
-for visits = 1 .. ∞:
-    if visits > MAX_PARTITION_VISITS_PER_PAGE or budget.budgetExhausted:
-        k = stopKey(last, pos)
-        if k: return page(k)
-                                                // no key: one more step, over the visit limit
+pos = cursor ? cursor.position                            // inclusive or exclusive, as the cursor says
+    : exclusiveStartKey ? after(position(exclusiveStartKey))
+    : start(segment)
+for visits = 1 .. MAX_PARTITION_VISITS_PER_PAGE:
     answer = partitions.point("apiScanItems", pos, request(pos, segmentEnd, budget))
     collect answer.items; budget.consume(answer)
-    if answer.lastEvaluated: L = answer.lastEvaluated
-    if !answer.sliceComplete:
-        return page(answer.lastEvaluated ? key(L) : stopKey(last, pos))
-    if answer.next == null: return page(no lastEvaluatedKey)          // the end of the table or the segment
-    last = { start: pos, answer }
-    pos = answer.next
-
-stopKey(last, S) = boundaryKey(last, S) ?? (L ? key(L) : none)
+    if !answer.sliceComplete:                             // a budget stopped the step inside its slice
+        return page(cursor(answer.lastEvaluated ? after(answer.lastEvaluated) : pos))
+    if answer.next == null: return page(no cursor)        // the end of the table or the segment
+    pos = at(answer.next)                                 // the start of the next slice, inclusive
+    if budget.budgetExhausted: return page(cursor(pos))
+return page(cursor(pos))                                  // the visit limit
 ```
 
-The position of a start key is `(routingHashOf(hk), hk, sk)`, with the encoded keys. An absent `sortKey` is the empty
-sort key. Section 4.2.9 gives the position of a GSI start key.
-
-A step that stops inside its slice has `sliceComplete: false`. When it evaluated a row, `lastEvaluatedKey` is the key
-of that row. When it evaluated no row, the page stops at the start of that step, and `boundaryKey` applies. This
-happens when the remaining response bytes cannot hold the first row of the step. An earlier step then returned a row,
-so `L` exists for the fallback.
-
-`boundaryKey` gives no key only when the found-key search reaches its cap or a check of case 4 or 5 fails
-(section 4.2.7). The fallback is then:
-
-1. When the page has `L`, the page returns `key(L)`. The next page reads the empty slices after `L` again. It still
-   makes progress, because those slices are fewer than the visit limit.
-2. When the page has no `L`, the page does one more step and calls `boundaryKey` again for the new `E`. The new `E`
-   ends at a different boundary, so the search has a new target and a new independent chance.
-
-Both cases occur with a chance of about `e^-37` for each page, or with a 64-bit collision of two hash keys. A page
-goes over the visit limit only in case 2.
+- The position of a start key is `(routingHashOf(hk), hk, sk)`, with the encoded keys. An absent `sortKey` is the
+  empty sort key. Section 4.2.8 gives the position of a GSI start key.
+- `after(row)` is the position `(routingHashOf(hk), hk, sk)` of the row, exclusive. `at(next)` is the start of the next
+  slice, inclusive. The cursor keeps the flag, and the next page sends it as `startInclusive` (section 4.2.3).
+- A step that a budget stopped before its first row has no `lastEvaluated`. This happens when the remaining response
+  bytes cannot hold the first row of the step. The cursor is then the start position of that step, and the next page
+  reads the step again with a full budget.
+- Each page makes progress. The first step of a page has the full budget and `allowOversizedFirstItem`, so it
+  evaluates one row or more, or it reads its slice to the end.
+- A page never goes over the visit limit. A run of empty partitions ends the page with a cursor at the next slice, and
+  the next page continues there.
 
 **A step error.** `partitions.point` retries a step with the retry policy of the client. An error that stays after
 those retries ends the page: `scanItems` throws it and returns no item of the page. The caller retries the page with
-the same `exclusiveStartKey`. A step only reads, so a retry is safe. DynamoDB `Scan` does the same.
+the same `cursor`, or with the same `exclusiveStartKey` on the first page. A step only reads, so a retry is safe.
+DynamoDB `Scan` does the same.
 
-#### 4.2.7 The key at a slice boundary
+#### 4.2.7 The cursor
 
-When a page stops at a slice boundary `S`, `E` is the slice of the last complete step: `[last.start, S)`. `E` was
-read. `boundaryKey` returns a key whose position is inside `E`. The next page starts after that key, in `E`. It finds
-no row in the rest of `E` and continues at `S`. The cost is one RPC with one index seek that returns no row.
+The scan cursor has the form of the `queryItems` cursor (`shared/query/cursor.ts`): base64url of a JSON object.
 
-An empty `E` is never the first step of a page. The first step has the full budget and `allowOversizedFirstItem`, so
-it stops inside its slice only after it evaluates a row. When a page stops at a boundary right after its first step,
-that step evaluated a row, and case 1 applies. Thus an empty `E` starts at a slice boundary, after the start of the
-page. The client checks this with an `invariant`.
+```ts
+type ScanCursorWire = {
+	/** The version of the scan cursor. */
+	v: number;
+	/** Tells a scan cursor apart from a `queryItems` cursor. */
+	k: "scan";
+	/** The u64 fingerprint as a decimal string, as in the `queryItems` cursor. A JSON number is exact only to 2^53. */
+	fp: string;
+	/** The position: the routingHash, and the hash key and the sort key when present, as base64url bytes. */
+	pos: { rh: string; hk?: string; sk?: string };
+	/** True: the next page starts at `pos`. False: it starts after `pos`. */
+	incl: boolean;
+};
+```
 
-The cases:
+**The fingerprint** is `hash64` of the shard group of the table or the GSI, `segment`, and `totalSegments`. An absent
+segment has its own marker. The fingerprint does not cover `limit`, `maxResponseBytes`, `select`, `filter`, or
+`projection`, because a position is valid with each of them.
 
-| Case | `E` | The key |
-|---|---|---|
-| 1 | `E` had rows | `key(L)`, the last evaluated row |
-| 2 | An empty hash slice `[A, S)` | a found key with `xxh64(hk) = S − 1` |
-| 3 | The only range partition of a promoted `P`, empty: `[(P), (P + 1))` | a found key with `xxh64(hk) = S − 1 = P` |
-| 4 | The first range partition of `P`, empty: `[(P), (P, hk_S, sk_S))` | `{ hashKey: hk_S }` |
-| 5 | Another range partition of `P`, empty: `[(P, hk_a, sk_a), S)` | `{ hashKey: hk_a, sortKey: v }` |
+**The checks**, in this order:
 
-In case 2, `A` is the start of a hash partition or `P + 1`, and `S` is the end of the hash partition or a promoted
-`P`. In case 5, `v` is `smallestValidAtOrAfter(sk_a)`. When `v` is empty, the key is `{ hashKey: hk_a }` with no
-`sortKey`, because an empty sort key fails `sort_key_empty`. Its position `(P, hk_a, "")` is the start of `E`, so the
-key is inside `E`.
+1. The cursor must be base64url of a JSON object. Else the code is `cursor_malformed`.
+2. `v` must be a known version. Else the code is `cursor_version_unknown`.
+3. `k` must be `"scan"`, `rh` must hold 8 bytes, `sk` needs `hk`, and `incl` must be a boolean. Else the code is
+   `cursor_malformed`. A `queryItems` cursor fails here.
+4. `fp` must equal the fingerprint of the request. Else the code is `cursor_fingerprint_mismatch`.
+5. The position must be inside the segment of the request. Else the code is `cursor_malformed`.
 
-The client tells the cases apart from the positions `last.start` and `S`:
+**The properties of the cursor:**
 
-- When `last.start` has an `hk`, the case is 5.
-- When `last.start` has no `hk` and `S` has an `hk`, the case is 4.
-- When neither has an `hk`, the case is 2 or 3. `E` then holds every position with the routingHash `S − 1`, for every
-  `hk` and `sk`. Thus any hash key whose routingHash is `S − 1` gives a position inside `E`, whatever its bytes are.
+- **It stays valid across splits.** A repartition does not move a position (section 1.2), so a split, a promotion, or
+  an import between two pages does not change the meaning of a cursor.
+- **It is not signed.** The fingerprint finds a mistake, for example a cursor of another table. It is not a security
+  control, because `hash64` is not a cryptographic hash. A caller who edits a cursor can only move the start of the
+  scan inside the same table and segment, which the caller can scan anyway.
+- **Its size** follows the keys. The JSON holds the position bytes as base64url, and the whole JSON is base64url
+  again, as in the `queryItems` cursor. With the default limits of a base table (`h = 1024`, `s = 512`), the largest
+  cursor is about 3 KB. On a GSI, the stored sort key can be 4,620 bytes, and the largest cursor is about 10 KB.
 
-**Cases 4 and 5 use the real hash key of the range tree.** A range tree of `P` holds the hash keys whose routingHash is
-`P`. Two hash keys with one routingHash need a 64-bit collision, so in practice the tree holds one hash key.
-`shortestCompositeSeparator` (`sharding/key-codec.ts`) keeps the hash key of the upper item when the two items have
-the same hash key, so the boundary holds the real hash key. A found key cannot be used here: its order against the
-real hash key is random, so its position can be outside `E`.
-
-The checks of cases 4 and 5:
-
-- `routingHashOf(hk)` must equal `P`. Between two hash keys of one routingHash, the boundary is
-  `(prefix of hk, "")`, and this check rejects it.
-- Case 4 needs a non-empty `sk_S`, because `(hk_S, "")` must be less than `S`. On a GSI, the position of the key is
-  `(P, hk_S, gsiItemSortKey("", "", ""))`, and the client checks that this position is less than `S`. The check
-  passes each time: `sk_S` is a cut of a stored GSI sort key that has a non-empty base hash key, so `sk_S` is greater
-  than the stored key of three empty parts.
-- Case 5 needs a key that is less than `S` when `S` is in the same tree. The key passes this check each time, because
-  each range partition holds one item or more when its split creates it. The split planner puts each boundary
-  between two items. Thus a valid key exists in `[a, S)`, and the smallest valid key at or after `a` is at or below it.
-  On a GSI, this argument needs the total order of GSI entries (section 4.2.9).
-
-When a check fails, `boundaryKey` gives no key, and the fallback of section 4.2.6 applies. Only a 64-bit collision of
-two hash keys in one range tree can make a check fail.
-
-**`smallestValidAtOrAfter(b)`** gives the smallest encoded sort key that is a valid public key and is at or after the
-bytes `b`. A boundary is a byte prefix of an item key, so only its last character can be cut:
-
-- **Binary** (`b[0] = 0xFF`): `b` is valid. The one exception is `b = [0xFF]`, which decodes to an empty `Uint8Array`
-  and fails `sort_key_empty`. The result is then `[0xFF, 0x00]`, the binary key `Uint8Array.of(0)`. This boundary
-  occurs when the lower item has a string sort key and the upper item has a binary one, because
-  `shortestSeparator` does not treat the `0xFF` tag in a special way.
-- **String:** when `b` is valid UTF-8, the result is `b`. Else the last character of `b` is cut, and the client
-  completes it with the smallest valid continuation bytes. For example, the lead byte `0xE2` becomes `E2 80 80`. The
-  smallest continuation depends on the lead byte, because UTF-8 excludes overlong forms and surrogates: after `E0` the
-  next byte is at least `A0`, and after `F0` it is at least `90`.
-- **GSI:** see section 4.2.9.
-
-The result is never longer than the item key that the boundary came from, so it fits `maxSortKeyBytes`.
-
-#### 4.2.8 The found key
-
-A found key is a hash key of 16 encoded bytes. The client computes it so that `xxh64(bytes, seed) = T` exactly, with
-the seed of the shard group. `xxh64` of a 16-byte input processes two 8-byte lanes and then the avalanche. Each step is
-a bijection: a multiply by an odd constant, a rotate, a xor-shift. Thus the client fixes the first lane and computes the
-second lane from `T` in O(1).
-Section 9 gives the steps.
-
-- **String found key.** The first lane is `"fokos"` and 3 base-36 characters. The client computes the
-  second lane. When all its 8 bytes are in `0x01–0x7F`, the 16 bytes are an ASCII string that passes
-  `validateKeyContent`. Else the client takes the next value of the 3 characters. The chance of success for each try is
-  `(127/256)^8`, about `1/270`. A local workerd measurement over 2,000 targets gave a mean of 265 tries and 0.33 ms, a
-  median of 185 tries, a p99 of 1,307 tries, and a maximum of 1,779 tries. One try costs about 0.83 µs: 20,000 tries
-  took 16.6 ms. The cap is 10,000 tries, which is about 8.3 ms.
-  The chance that the search reaches the cap is about `(1 − 1/270)^10000`, which is about `e^-37`. Then
-  `boundaryKey` gives no key, and the fallback of section 4.2.6 applies.
-- **Control characters.** A string found key can hold the bytes `0x01–0x1F` and `0x7F`, for example `\n` and `\r`.
-  A key of a caller can hold them too, and a binary key can hold any byte. Thus FokosDB does not promise that a
-  returned key is safe in a URL, a header, or a log. A caller that puts a key there must encode it, for example with
-  base64url. The documentation of `lastEvaluatedKey` says this.
-- **Binary found key.** The tag `0xFF`, 7 fixed bytes, and the computed lane. Any byte value is valid in a binary
-  key, so the client needs no search. One binary key costs about 0.8 µs in workerd.
-
-**The type of the found key** is the type of a hash key of the request, so that the caller gets the type that it uses:
-
-1. When the request has an `exclusiveStartKey`, the found key has the type of its `hashKey`.
-2. Else, when the page evaluated a row, the found key has the type of the hash key of `L`. The tag `0xFF` of the
-   encoded bytes gives the type.
-3. Else the found key is a string. This is the first page of a scan that found no row. A string survives JSON, and
-   `JSON.stringify` of a `Uint8Array` does not give back a `Uint8Array`. A caller that declares `HashKey` as
-   `Uint8Array` gets a string only in this case.
-
-The found key is a normal key. The prefix `"fokos"` is not reserved, and the client does not treat the key in a
-special way on the next page. When an item with the same key exists later, that item is behind the scan position.
-This is the same behaviour as any other write during a scan. The found key has 16 bytes, and `maxHashKeyBytes` is at
-least 64 (`resolveLimits`).
-
-#### 4.2.9 GSI
-
-> **Updated on 2026-11-22.** `2026-11-22-gsi-sort-key-total-order.md` is implemented. The layout below is the
-> implemented layout, and the note of case 3 comes from section 4.3 of that RFC.
+#### 4.2.8 GSI
 
 A GSI is its own shard group with its own seed. `db.gsi(indexName).scanItems` runs the same walk with the GSI client
-(`#gsiClient`), as `#queryItems` does. The client decodes each row with `gsiKeys`. It takes `GsiScanItemsOptions`
-(section 4.2.1), so a caller can send the `lastEvaluatedKey` of a GSI page back with its base keys.
+(`#gsiClient`), as `#queryItems` does. The client decodes each row with `gsiKeys`. The fingerprint uses the shard group
+of the GSI, so a cursor of a GSI fails on its base table and on another GSI.
 
 **The position of a GSI start key** is `(routingHashOf(hk), hk, gsiItemSortKey(sortKey, baseHashKey, baseSortKey))`
-(`shared/gsi/sort-key.ts`). An absent part is the empty key. The same mapping applies to every GSI start key, also to
-a found key and to a key from a boundary. In cases 2 and 3 any sort key gives a position inside `E`, so a found key
-with no other part is correct.
+(`shared/gsi/sort-key.ts`). An absent part is the empty key.
+
+**A GSI start key without base keys** starts before each entry with its GSI keys. Its position sorts at or below each
+of these entries, so the first page returns them. This is different from DynamoDB, which needs the full key of the
+entry on a GSI.
 
 **The order of GSI entries.** The stored GSI sort key is
-`0xFF escape(gsiSK) 00 00 escape(baseHK) 00 00 escape(baseSK) 00 00 [rawGsiSK] <L><flag><D>`
-(`2026-11-22-gsi-sort-key-total-order.md`). Each part ends with `00 00`, and `00 00` never occurs inside an escaped
-part. Thus the stored order is the order of `(gsiSK, baseHK, baseSK)`, each part compared as `KeyBytes`, and the raw
-copy and the suffix never decide the order. An absent part encodes as the empty key and its separator, so the start
-key of the parts that are present sorts at or below each entry that has those parts.
+`0xFF escape(gsiSK) 00 00 escape(baseHK) 00 00 escape(baseSK) 00 00 [rawGsiSK] <L><flag><D>`. The entry prefix ends
+with the third separator, and the suffix is the raw copy and the trailer. The stored order is the order of
+`(gsiSK, baseHK, baseSK)`, each part compared as `KeyBytes`, and the suffix never decides the order
+(`2026-11-22-gsi-sort-key-total-order.md`, section 4.2). An absent part encodes as the empty key and its separator, so
+the start key of the parts that are present sorts at or below each entry that has those parts.
 
-**`smallestValidAtOrAfter(b)` for a GSI** follows the layout of `decodeGsiSortKey`: the escaped GSI sort key, the
-separator `00 00`, the escaped base hash key, the separator, the escaped base sort key, the separator, and the suffix
-with the raw copy, the length, and the flag. The client parses `b` up to the cut:
+**A GSI cursor** holds the stored sort key of its position as bytes. The client does not decode it.
 
-1. It completes the part that is cut with its smallest valid continuation. The parts after the cut are absent.
-2. A cut after the first `00` of a pair continues with `00`, which is the separator, because `00 00` is less than the
-   escaped NUL `00 FF`. The part before the pair is then complete.
-3. A cut after the third separator, inside the raw copy or the suffix, gives back the full key of the item. All three
-   parts are complete there, and the client computes the raw copy and the suffix from `gsiSK`. A range split never
-   gives this case: each boundary of a range split ends inside the entry prefix of the upper entry
-   (`2026-11-22-gsi-sort-key-total-order.md`, section 4.3). The client keeps the case, because it gives a correct
-   result for each input.
-
-Because the stored order is the order of the parts, the result encodes to bytes at or after `b`, and at or below each
-stored GSI sort key that starts with `b`. A test compares it with a reference that tries all short keys.
-
-#### 4.2.10 Concurrency and consistency
+#### 4.2.9 Concurrency and consistency
 
 - One step reads one slice in one synchronous block of the local handler. The step sees one state of its slice.
 - Two steps of one page read at different times. A page is not a snapshot.
@@ -576,55 +491,50 @@ stored GSI sort key that starts with `b`. A test compares it with a reference th
   position. A child that is still importing reads through its source with its caller slice.
 - The client learns routes from `servedBy` of each step. A later step goes directly to the owner on a cache hit.
 
-#### 4.2.11 Performance
+#### 4.2.10 Performance
 
 - One step is one round trip from the client, plus one forward for each stale hint. A round trip takes 10 to 100 ms
   within one location hint or jurisdiction, by the location of the partition.
 - A page has at most `MAX_PARTITION_VISITS_PER_PAGE` (100) steps, one after another. A page that reads 100 slices
   therefore takes 1 to 10 s. A caller who needs more throughput scans segments in parallel.
 - The scan of a slice is a range read on the primary key of `items`, plus one seek on `fokos_route_overrides`.
-- A page that stops at a slice boundary makes the next page do one extra step. That step returns no row.
-- The found key costs 0.33 ms on average and about 8.3 ms at its cap (section 4.2.8). The key from a boundary costs
-  no I/O.
+- The next page starts at the cursor position. It reads a partition again only for the rest of a slice that a budget
+  stopped.
+- The cursor costs no I/O. The client encodes it from the last answer.
 
-#### 4.2.12 Testing
+#### 4.2.11 Testing
 
 The tests use `TestPartition` (`partition-harness.ts`) to build the topology.
 
 - **Walk.** A table with hash partitions at more than one depth, an empty partition, and a promoted routingHash with
   two range partitions. A full scan returns each item once, in the storage order.
 - **Stale copies.** The scan never returns the stale copies of a promoted routingHash in its hash partition.
-- **Split between pages.** A hash split and a range split between two pages give no duplicate and no missed item.
+- **Split between pages.** A hash split and a range split between two pages give no duplicate and no missed item. The
+  cursor of the earlier page stays valid.
 - **Read-through.** A step to a child that is still importing returns only the rows of the caller slice.
 - **Promotion import.** A scan during the `cutover` state of a promotion returns each item of `P` once. The range root
   reads through to the hash source, and the scope is a range scope (section 4.2.5).
 - **Page byte budgets.** A page of large items across many slices stops when the sum of `responseBytes` reaches
-  `maxResponseBytes`, and when the sum of `evaluatedBytes` reaches `MAX_EVALUATED_BYTES_PER_PAGE`.
-- **Start key.** A page that starts at `lastEvaluatedKey` visits no partition before the owner of that key.
-- **Boundary cases.** One test for each case 1 to 5 of section 4.2.7, and a case 5 with an empty `v`. Each test
-  stops a page at the visit limit after that kind of empty slice. The next page starts with one step inside `E` and
-  then continues at `S`.
-- **Found key.** For random targets and seeds, `xxh64` of the string found key and of the binary found key equals the
-  target, and the string passes `validateItemKeys`. The found key has the type of the start key, else of `L`, else it
-  is a string.
+  `maxResponseBytes`, and when the sum of `evaluatedBytes` reaches `MAX_EVALUATED_BYTES_PER_PAGE`. A page that the
+  response budget stops before the first row of a step returns the start of that step, and the next page returns that
+  row.
+- **Empty partitions.** A run of more than 100 empty partitions. Each page visits at most 100 partitions and returns a
+  cursor at the next slice, and the scan completes.
+- **Start key.** A first page with `exclusiveStartKey` visits no partition before the owner of that key, and returns
+  the items after it. A request with `exclusiveStartKey` and `cursor` fails with `scan_start_key_with_cursor`.
+- **Cursor.** A cursor encodes and decodes to the same position and flag. A cursor of another table, of another GSI,
+  or of another segment fails with `cursor_fingerprint_mismatch`. A `queryItems` cursor and a cursor with a bad field
+  fail with `cursor_malformed`, and an unknown version fails with `cursor_version_unknown`. A changed `filter` or
+  `projection` between two pages is valid.
 - **Collector.** A step that reads rows of two hash keys and stops inside its slice gives `lastEvaluated` with the
   hash key of the last row, and the next page starts after that row.
 - **Step error.** A step that still fails after the retry policy makes `scanItems` throw. A retry of the page with the
-  same `exclusiveStartKey` returns the same items.
-- **Fallback.** `boundaryKey` and the found-key search are pure functions, and the cap is an argument. A unit test calls
-  them with a cap of 0. The page returns `key(L)` when it has `L`, and it does one more step when it has none.
-- **`smallestValidAtOrAfter`.** A cut UTF-8 character of 2, 3, and 4 bytes, the lead bytes `E0`, `ED`, `F0`, and `F4`,
-  the boundary `[0xFF]`, and GSI keys cut in each part and in each separator. Include GSI base sort keys, string and
-  binary, where one value is a prefix of another and the next byte is below `0x3A`, for example `"order#01"` and
-  `"order#0100"`, or `[01]` and `[01 00]`. For short keys, the result equals the result of a reference that tries all
-  keys.
-- **GSI case 5 after a range split.** A promoted GSI hash key with entries that share the GSI sort key and the base
-  hash key, and the base sort keys `"order#0099"`, `"order#0100"`, and `"order#0101"`. A range split puts
-  `"order#0100"` alone in one partition. Delete that entry, and stop a page at the visit limit after that partition.
-  The next page returns `"order#0101"`.
+  same cursor returns the same items.
 - **Segments.** The union of all segments of `T` equals the full scan, for some values of `T`. A start key outside
   its segment fails with `scan_start_key_outside_segment`.
-- **GSI.** The same walk on a GSI, with two entries that have the same GSI keys and different base keys.
+- **GSI.** The same walk on a GSI, with two entries that have the same GSI keys and different base keys. A page that
+  stops between them returns a cursor, and the next page returns the second entry. A start key with these GSI keys and
+  no base keys returns both entries.
 - **Property-based.** For a random set of items and a random sequence of splits between pages, the pages of a scan
   together return each item exactly once. Read `test/property-based/README.md` first.
 - **No regression.** The `queryItems` suites and the routing suites pass without a change.
@@ -634,25 +544,16 @@ The tests use `TestPartition` (`partition-harness.ts`) to build the topology.
 
 ## 5. Alternative options
 
-- **An opaque cursor with the routingHash.** The cursor could hold the exact position. Rejected: the public API must
-  contain only keys.
-- **A reserved key that holds the position**, for example `"~fokos.scan.<position>"`. It is exact and simple.
-  Rejected: it puts the routingHash in the API, and it needs a reserved prefix that items cannot use.
-- **A key `(rh, smallest hk, "")` at the boundary.** Rejected: the client always computes `rh` from `hk`, so the caller
-  cannot choose `rh`. The key resumes at `xxh64(smallest hk)`, a random position.
-- **A random search for a key whose routingHash falls in the empty region.** The client tries `"<prefix>" + counter`
-  until `xxh64` falls in the region. Rejected: the expected number of tries is `2^64 / width`. For a table with
-  10,000,000 leaves and a page of 100 empty leaves, 10,000 tries find a key with a chance of about 10%. The search
-  cannot work for a region inside one routingHash.
-- **Walk past the visit limit until the page evaluates an item.** Rejected: a long run of empty partitions, for example
-  after a mass delete, gives a page with no bound on its latency. 1,000 empty partitions take 10 to 100 s.
-- **Fail at the visit limit.** Rejected: a table with many empty partitions cannot be scanned.
-- **Always a binary found key.** It needs no search. Rejected: it breaks a caller who declares `HashKey` as `string`,
-  and it does not survive JSON.
-- **Always a string found key.** Rejected: it breaks a caller who declares `HashKey` as `Uint8Array`. The type of the
-  hash key of the request is the better choice (section 4.2.8).
-- **A binary found key when the string search reaches its cap.** Rejected: it has the type problem of a binary key,
-  and the fallback of section 4.2.6 keeps the type of the caller.
+- **A resume key in the DynamoDB style (`lastEvaluatedKey`), with no cursor.** Rejected for now. In the storage order
+  `(routingHash, hk, sk)`, a slice boundary of a hash partition is a routingHash, and no key has that position. A page
+  that stops after a run of empty partitions must then compute a key inside the last slice. For a hash slice, this is
+  a found key with an exact routingHash, from an inversion of `xxh64`. For a range slice, it is a key from the range
+  boundary, which the client repairs into a valid public key. This adds five cases, a search with a cap and a
+  fallback, a page that can go over the visit limit, and a next page that reads the last slice again. A cursor holds
+  the position, so it needs none of this, and it has the form of the `queryItems` cursor. Section 9 records the
+  design. A follow-up can add it, for example as an option of the client.
+- **Put `filter` and `projection` in the fingerprint, as the `queryItems` cursor does.** Rejected: a position is valid
+  with any filter and projection, so a caller can change them between pages.
 - **A new `scan` dispatch shape.** Rejected: one step goes to one owner, which is the `point` contract. A new shape
   copies the point routing and adds one more shape.
 - **Change `range` to take a storage interval now.** Rejected for this RFC: `#planRange`, `planRangeFrontier`, the
@@ -663,39 +564,33 @@ The tests use `TestPartition` (`partition-harness.ts`) to build the topology.
 
 ## 6. Frequently asked questions
 
-**Why can `lastEvaluatedKey` name a key that holds no item?**
-A slice boundary of a hash partition is a routingHash, and a routingHash is not a key. FokosDB does not track which
-partitions are empty, so a page cannot always stop at a real item. A key inside the last empty slice is the only way to
-make progress with keys only.
+**Why does a page return a cursor and not a `lastEvaluatedKey`, as DynamoDB does?**
+A slice boundary of a hash partition is a routingHash, and a routingHash is not a key. A key-only resume value needs
+a computed key at each boundary after an empty slice. A cursor holds the position directly. Section 5 gives the
+details, and section 9 records the design of the key.
 
-**Why does the next page visit a partition again?**
-The next page starts at the owner of the start key. When the page stopped at a slice boundary, that owner holds `E`,
-which the page already read. The first step finds no row and continues at `S`. The cost is one RPC.
+**Does the next page visit a partition again?**
+Only when a budget stopped a step inside its slice. The owner of that slice then serves the rest of it. After a
+complete step, the cursor is at the start of the next slice.
 
 **Is the order correct when string keys and binary keys are mixed?**
 Yes. A string encodes to UTF-8 with no tag and a binary key to `0xFF` and its bytes. Both sort in one byte order, and
-`xxh64` hashes the encoded bytes. A found key of either type has a position inside `E`.
+`xxh64` hashes the encoded bytes.
 
 **Are the items in key order?**
 No. They are in the storage order `(routingHash, hk, sk)`. The items of one hash key come together, in sort-key order.
 
-**Can a caller build `exclusiveStartKey`?**
-Yes. Any valid key works. With a segment, the routingHash of the key must be inside the segment.
+**Can a caller start a scan at a key?**
+Yes, with `exclusiveStartKey` on the first page. Any valid key works. With a segment, the routingHash of the key must
+be inside the segment.
 
-**Why is there no fingerprint as in the `queryItems` cursor?**
-A scan has no list of sub-queries for the fingerprint to protect. The start key alone gives the position.
-
-**Why does the client not cache the found key?**
-The client computes a found key at most once for each page, and only when the page stops after an empty slice. The
-cost is 0.33 ms on average, and a page takes 1 to 10 s. A cache gets a hit only when two pages stop at the same
-boundary. The next page of a segment stops at a different boundary, and two segments have no boundary in common, so
-almost only a retry of the same page gets a hit. A cache in the partition has the same low hit rate. It also needs an
-in-memory entry that a split or a promotion makes stale, and a field in each step response. A partition does not know
-whether the client stops after its step, so it must compute the key for each empty step, or the client must ask for it.
+**Can a caller build or edit a cursor?**
+No. The cursor is opaque, and its format can change with its version. An edited cursor fails a check, or it starts at
+another position in the same table and segment (section 4.2.7).
 
 **What happens when a partition splits during a scan?**
-The position of each item stays the same. The next step goes to a router, which forwards it to the new owner. See
-section 4.2.10.
+The position of each item stays the same, so the cursor stays valid. The next step goes to a router, which forwards
+it to the new owner. See section 4.2.9.
 
 ## 7. References
 
@@ -705,6 +600,7 @@ section 4.2.10.
 - `docs/agent-plans/2026-09-14-read-projections-and-query-filters.md`
 - `docs/agent-plans/2026-09-27-learned-routes-for-every-dispatch-shape.md`
 - `docs/agent-plans/2026-11-22-gsi-sort-key-total-order.md`
+- `packages/fokosdb/src/shared/query/cursor.ts`
 - [DynamoDB API Reference: Scan](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Scan.html)
 - [DynamoDB Developer Guide: Parallel scan](
   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan)
@@ -749,14 +645,287 @@ Each new operation with a new footprint adds a shape, and the shapes get harder 
 Items 2 and 3 change the transaction operations and the query path. The property-based suites are the gate for that
 RFC.
 
-## 9. Appendix: the inversion of `xxh64`
+## 9. Appendix: a resume key in place of the cursor
 
-This appendix gives the steps that compute a found key (section 4.2.8). `xxh64` is a fast hash, not a cryptographic
+This appendix records a design for a resume key in the DynamoDB style. FokosDB does not build it now (section 5). A
+follow-up can add it, for example as an option of the client next to the cursor. The design uses the walk, the
+position routing, and the owned slice of section 4. It changes only the value that a page returns.
+
+### 9.1 The resume key
+
+- A page returns `lastEvaluatedKey` in place of `cursor`. It is the key of the last evaluated row `L`. When the page
+  stopped at a slice boundary after an empty slice, it is a key inside that slice (section 9.3).
+- A caller continues with `exclusiveStartKey = lastEvaluatedKey`, until `lastEvaluatedKey` is absent.
+- On a GSI, `lastEvaluatedKey` is `{ hashKey, sortKey?, baseHashKey?, baseSortKey? }`. The base keys are present when
+  the key names a real entry, because two entries can have the same GSI keys. A key at a slice boundary can have no
+  base keys (section 9.5). Thus a GSI start key without base keys must start before each entry with its GSI keys, as
+  section 4.2.8 gives.
+- `lastEvaluatedKey` can name a key that holds no item. The caller must treat it as a resume value. It can hold
+  control characters (section 9.4), so a caller encodes it before it puts it in a URL, a header, or a log.
+- A page does not visit again a partition that an earlier page read, except for the one partition that holds the start
+  position. There are two exceptions, and both return `key(L)`: a page that a budget stops before the first row of a
+  step, and fallback 1 of section 9.2. The next page then reads again the empty slices after `L`, which are fewer than
+  the visit limit.
+
+Two more terms:
+
+- **`E`** — the slice of the last complete step of a page. A page that stops at a slice boundary returns a key inside
+  `E`.
+- **Found key** — a string or binary hash key that the client computes, so that its routingHash has an exact value.
+
+### 9.2 The walk
+
+With a resume key, the walk of section 4.2.6 becomes:
+
+```
+pos  = exclusiveStartKey ? after(position(exclusiveStartKey)) : min(segment)
+L    = none                                     // the last evaluated row of this page
+last = none                                     // the start position and the answer of the last complete step
+for visits = 1 .. ∞:
+    if visits > MAX_PARTITION_VISITS_PER_PAGE or budget.budgetExhausted:
+        k = stopKey(last, pos)
+        if k: return page(k)
+                                                // no key: one more step, over the visit limit
+    answer = partitions.point("apiScanItems", pos, request(pos, segmentEnd, budget))
+    collect answer.items; budget.consume(answer)
+    if answer.lastEvaluated: L = answer.lastEvaluated
+    if !answer.sliceComplete:
+        return page(answer.lastEvaluated ? key(L) : stopKey(last, pos))
+    if answer.next == null: return page(no lastEvaluatedKey)          // the end of the table or the segment
+    last = { start: pos, answer }
+    pos = answer.next
+
+stopKey(last, S) = boundaryKey(last, S) ?? (L ? key(L) : none)
+```
+
+A step that stops inside its slice has `sliceComplete: false`. When it evaluated a row, `lastEvaluatedKey` is the key
+of that row. When it evaluated no row, the page stops at the start of that step, and `boundaryKey` applies. This
+happens when the remaining response bytes cannot hold the first row of the step. An earlier step then returned a row,
+so `L` exists for the fallback.
+
+`boundaryKey` gives no key only when the found-key search reaches its cap or a check of case 4 or 5 fails
+(section 9.3). The fallback is then:
+
+1. When the page has `L`, the page returns `key(L)`. The next page reads the empty slices after `L` again. It still
+   makes progress, because those slices are fewer than the visit limit.
+2. When the page has no `L`, the page does one more step and calls `boundaryKey` again for the new `E`. The new `E`
+   ends at a different boundary, so the search has a new target and a new independent chance.
+
+Both fallbacks occur with a chance of about `e^-37` for each page, or with a 64-bit collision of two hash keys. A page
+goes over the visit limit only in fallback 2.
+
+### 9.3 The key at a slice boundary
+
+When a page stops at a slice boundary `S`, `E` is the slice of the last complete step: `[last.start, S)`. `E` was
+read. `boundaryKey` returns a key whose position is inside `E`. The next page starts after that key, so its first step
+reads the rest of `E`, finds no row, and continues at `S`. The cost is one RPC with one index seek that returns no row.
+
+For example, in the diagram of section 4.1, a page reads the empty partition `0.1.1 [60,80)` and then reaches the visit
+limit. `S` is `80`, and `E` is `[60,80)`. `boundaryKey` returns a found key whose routingHash is `7F…`. The next page
+starts after that key at `0.1.1`, reads no row, and continues at root 1.
+
+**`E` is not the first step of the page.** The first step has the full budget and `allowOversizedFirstItem`, so it
+stops inside its slice only after it evaluates a row. When a page stops at a boundary right after its first step, that
+step evaluated a row, and case 1 applies. Thus an empty `E` starts at a slice boundary, after the start of the page.
+The client checks this with an `invariant`.
+
+**The cases.**
+
+| Case | `E` | The key |
+|---|---|---|
+| 1 | `E` had rows | `key(L)`, the last evaluated row |
+| 2 | An empty hash slice `[A, S)` | a found key with `xxh64(hk) = S − 1` |
+| 3 | The only range partition of a promoted `P`, empty: `[(P), (P + 1))` | a found key with `xxh64(hk) = S − 1 = P` |
+| 4 | The first range partition of `P`, empty: `[(P), (P, hk_S, sk_S))` | `{ hashKey: hk_S }` |
+| 5 | Another range partition of `P`, empty: `[(P, hk_a, sk_a), S)` | `{ hashKey: hk_a, sortKey: v }` |
+
+The client knows case 1 from `L`. For an empty `E`, it finds the case from the positions `last.start` and `S`:
+
+- When `last.start` has an `hk`, the case is 5.
+- When `last.start` has no `hk` and `S` has an `hk`, the case is 4.
+- When neither has an `hk`, the case is 2 or 3.
+
+**Cases 2 and 3: a found key.** In case 2, `A` is the start of a hash partition or `P + 1`, and `S` is the end of the
+hash partition or a promoted `P`. In both cases, `E` holds every position with the routingHash `S − 1`, for every `hk`
+and `sk`. Thus any hash key whose routingHash is `S − 1` gives a position inside `E`, whatever its bytes are. Section
+9.4 computes this key.
+
+**Cases 4 and 5: the real hash key from the boundary.** A range tree of `P` holds the hash keys whose routingHash is
+`P`. Two hash keys with one routingHash need a 64-bit collision, so in practice the tree holds one hash key.
+`shortestCompositeSeparator` (`sharding/key-codec.ts`) keeps the hash key of the upper item when the two items have
+the same hash key, so the boundary holds the real hash key. A found key cannot be used here: its order against the
+real hash key is random, so its position can be outside `E`.
+
+Each key must pass checks before the client returns it:
+
+- **Both cases:** `routingHashOf(hk)` must equal `P`. Between two hash keys of one routingHash, the boundary is
+  `(prefix of hk, "")`, and this check rejects it.
+- **Case 4:** `sk_S` must not be empty, because `(hk_S, "")` must be less than `S`. On a GSI, the position of the key is
+  `(P, hk_S, gsiItemSortKey("", "", ""))`, and the client checks that this position is less than `S`. The check passes
+  each time: `sk_S` is a cut of a stored GSI sort key that has a non-empty base hash key, so `sk_S` is greater than the
+  stored key of three empty parts.
+- **Case 5:** `v` is `smallestValidAtOrAfter(sk_a)`. When `v` is empty, the key is `{ hashKey: hk_a }` with no
+  `sortKey`, because an empty sort key fails `sort_key_empty`. Its position `(P, hk_a, "")` is the start of `E`, so the
+  key is inside `E`. When `S` is in the same tree, the key must be less than `S`. The key passes this check each time,
+  because each range partition holds one item or more when its split creates it. The split planner puts each boundary
+  between two items. Thus a valid key exists in `[a, S)`, and the smallest valid key at or after `a` is at or below it.
+  On a GSI, this argument uses the total order of GSI entries (section 4.2.8).
+
+When a check fails, `boundaryKey` gives no key, and the fallback of section 9.2 applies. Only a 64-bit collision of
+two hash keys in one range tree can make a check fail.
+
+**`smallestValidAtOrAfter(b)`** gives the smallest encoded sort key that is a valid public key and is at or after the
+bytes `b`. A boundary is a byte prefix of an item key, so only its last character can be cut:
+
+- **Binary** (`b[0] = 0xFF`): `b` is valid. The one exception is `b = [0xFF]`, which decodes to an empty `Uint8Array`
+  and fails `sort_key_empty`. The result is then `[0xFF, 0x00]`, the binary key `Uint8Array.of(0)`. This boundary
+  occurs when the lower item has a string sort key and the upper item has a binary one, because
+  `shortestSeparator` does not treat the `0xFF` tag in a special way.
+- **String:** when `b` is valid UTF-8, the result is `b`. Else the last character of `b` is cut, and the client
+  completes it with the smallest valid continuation bytes. For example, the lead byte `0xE2` becomes `E2 80 80`. The
+  smallest continuation depends on the lead byte, because UTF-8 excludes overlong forms and surrogates: after `E0` the
+  next byte is at least `A0`, and after `F0` it is at least `90`.
+- **GSI:** see section 9.5.
+
+The result is never longer than the item key that the boundary came from, so it fits `maxSortKeyBytes`.
+
+A page that stops at a slice boundary makes the next page do one extra step, which returns no row. The key from a
+boundary costs no I/O.
+
+### 9.4 The found key
+
+A found key is a hash key of 16 encoded bytes. The client computes it so that `xxh64(bytes, seed) = T` exactly, with
+the seed of the shard group. `xxh64` of a 16-byte input processes two 8-byte lanes and then the avalanche. Each step is
+a bijection: a multiply by an odd constant, a rotate, a xor-shift. Thus the client fixes the first lane and computes the
+second lane from `T` in O(1).
+Section 10 gives the steps.
+
+- **String found key.** The first lane is `"fokos"` and 3 base-36 characters. The client computes the
+  second lane. When all its 8 bytes are in `0x01–0x7F`, the 16 bytes are an ASCII string that passes
+  `validateKeyContent`. Else the client takes the next value of the 3 characters. The chance of success for each try is
+  `(127/256)^8`, about `1/270`. A local workerd measurement over 2,000 targets gave a mean of 265 tries and 0.33 ms, a
+  median of 185 tries, a p99 of 1,307 tries, and a maximum of 1,779 tries. One try costs about 0.83 µs: 20,000 tries
+  took 16.6 ms. The cap is 10,000 tries, which is about 8.3 ms.
+  The chance that the search reaches the cap is about `(1 − 1/270)^10000`, which is about `e^-37`. Then
+  `boundaryKey` gives no key, and the fallback of section 9.2 applies.
+- **Control characters.** A string found key can hold the bytes `0x01–0x1F` and `0x7F`, for example `\n` and `\r`.
+  A key of a caller can hold them too, and a binary key can hold any byte. Thus FokosDB does not promise that a
+  returned key is safe in a URL, a header, or a log. A caller that puts a key there must encode it, for example with
+  base64url. The documentation of `lastEvaluatedKey` says this.
+- **Binary found key.** The tag `0xFF`, 7 fixed bytes, and the computed lane. Any byte value is valid in a binary
+  key, so the client needs no search. One binary key costs about 0.8 µs in workerd.
+
+**The type of the found key** is the type of a hash key of the request, so that the caller gets the type that it uses:
+
+1. When the request has an `exclusiveStartKey`, the found key has the type of its `hashKey`.
+2. Else, when the page evaluated a row, the found key has the type of the hash key of `L`. The tag `0xFF` of the
+   encoded bytes gives the type.
+3. Else the found key is a string. This is the first page of a scan that found no row. A string survives JSON, and
+   `JSON.stringify` of a `Uint8Array` does not give back a `Uint8Array`. A caller that declares `HashKey` as
+   `Uint8Array` gets a string only in this case.
+
+The found key is a normal key. The prefix `"fokos"` is not reserved, and the client does not treat the key in a
+special way on the next page. When an item with the same key exists later, that item is behind the scan position.
+This is the same behaviour as any other write during a scan. The found key has 16 bytes, and `maxHashKeyBytes` is at
+least 64 (`resolveLimits`).
+
+The found key costs 0.33 ms on average and about 8.3 ms at its cap.
+
+### 9.5 GSI
+
+The position mapping of section 4.2.8 applies to every GSI start key, also to a found key and to a key from a
+boundary. In cases 2 and 3 of section 9.3, any sort key gives a position inside `E`, so a found key with no other part
+is correct.
+
+**`smallestValidAtOrAfter(b)` for a GSI** follows the layout of `decodeGsiSortKey`: the escaped GSI sort key, the
+separator `00 00`, the escaped base hash key, the separator, the escaped base sort key, the separator, and the suffix
+with the raw copy, the length, and the flag. The client parses `b` up to the cut:
+
+1. It completes the part that is cut with its smallest valid continuation. The parts after the cut are absent.
+2. A cut after the first `00` of a pair continues with `00`, which is the separator, because `00 00` is less than the
+   escaped NUL `00 FF`. The part before the pair is then complete.
+3. A cut in the suffix gives back the full key of the item. All three parts are complete there, and the client
+   computes the suffix from `gsiSK`.
+
+Because the stored order is the order of the parts, the result encodes to bytes at or after `b`, and at or below each
+stored GSI sort key that starts with `b`.
+
+A range boundary never gives item 2 or item 3 of this list. The boundary ends inside the entry prefix of the upper entry
+(`2026-11-22-gsi-sort-key-total-order.md`, section 4.3), at the first byte where the upper entry is greater than the
+lower entry. That byte is never `00`, so the boundary never ends after the first `00` of a pair. The client keeps
+both items, because they give a correct result for each input.
+
+### 9.6 Testing
+
+- **Boundary cases.** One test for each case 1 to 5 of section 9.3, and a case 5 with an empty `v`. Each test stops a
+  page at the visit limit after that kind of empty slice. The next page starts with one step inside `E` and then
+  continues at `S`.
+- **Found key.** For random targets and seeds, `xxh64` of the string found key and of the binary found key equals the
+  target, and the string passes `validateItemKeys`. The found key has the type of the start key, else of `L`, else it
+  is a string.
+- **Fallback.** `boundaryKey` and the found-key search are pure functions, and the cap is an argument. A unit test calls
+  them with a cap of 0. The page returns `key(L)` when it has `L`, and it does one more step when it has none.
+- **`smallestValidAtOrAfter`.** A cut UTF-8 character of 2, 3, and 4 bytes, the lead bytes `E0`, `ED`, `F0`, and `F4`,
+  the boundary `[0xFF]`, and GSI keys cut in each part and in each separator. Include GSI base sort keys, string and
+  binary, where one value is a prefix of another, for example `"order#01"` and `"order#0100"`, or `[01]` and
+  `[01 00]`. For short keys, the result equals the result of a reference that tries all keys.
+- **GSI case 5 after a range split.** A promoted GSI hash key with entries that share the GSI sort key and the base
+  hash key, and the base sort keys `"order#0099"`, `"order#0100"`, and `"order#0101"`. A range split puts
+  `"order#0100"` alone in one partition. Delete that entry, and stop a page at the visit limit after that partition.
+  The next page returns `"order#0101"`.
+- **Start key.** A page that starts at `lastEvaluatedKey` visits no partition before the owner of that key.
+
+### 9.7 Rejected options of this design
+
+- **A reserved key that holds the position**, for example `"~fokos.scan.<position>"`. It is exact and simple.
+  Rejected: it puts the routingHash in the API, and it needs a reserved prefix that items cannot use.
+- **A key `(rh, smallest hk, "")` at the boundary.** Rejected: the client always computes `rh` from `hk`, so the caller
+  cannot choose `rh`. The key resumes at `xxh64(smallest hk)`, a random position.
+- **A random search for a key whose routingHash falls in the empty region.** The client tries `"<prefix>" + counter`
+  until `xxh64` falls in the region. Rejected: the expected number of tries is `2^64 / width`. For a table with
+  10,000,000 leaves and a page of 100 empty leaves, 10,000 tries find a key with a chance of about 10%. The search
+  cannot work for a region inside one routingHash.
+- **Walk past the visit limit until the page evaluates an item.** Rejected: a long run of empty partitions, for example
+  after a mass delete, gives a page with no bound on its latency. 1,000 empty partitions take 10 to 100 s.
+- **Fail at the visit limit.** Rejected: a table with many empty partitions cannot be scanned.
+- **Always a binary found key.** It needs no search. Rejected: it breaks a caller who declares `HashKey` as `string`,
+  and it does not survive JSON.
+- **Always a string found key.** Rejected: it breaks a caller who declares `HashKey` as `Uint8Array`. The type of the
+  hash key of the request is the better choice (section 9.4).
+- **A binary found key when the string search reaches its cap.** Rejected: it has the type problem of a binary key,
+  and the fallback of section 9.2 keeps the type of the caller.
+
+### 9.8 Frequently asked questions
+
+**Why can `lastEvaluatedKey` name a key that holds no item?**
+A slice boundary of a hash partition is a routingHash, and a routingHash is not a key. FokosDB does not track which
+partitions are empty, so a page cannot always stop at a real item. A key inside the last empty slice is the only way to
+make progress with keys only.
+
+**Why does the next page visit a partition again?**
+The next page starts at the owner of the start key. When the page stopped at a slice boundary, that owner holds `E`,
+which the page already read. The first step finds no row and continues at `S`. The cost is one RPC.
+
+**Is the found key safe when an item with the same key exists later?**
+Yes. The found key is a normal key, and that item is behind the scan position. This is the same behaviour as any
+other write during a scan.
+
+**Why does the client not cache the found key?**
+The client computes a found key at most once for each page, and only when the page stops after an empty slice. The
+cost is 0.33 ms on average, and a page takes 1 to 10 s. A cache gets a hit only when two pages stop at the same
+boundary. The next page of a segment stops at a different boundary, and two segments have no boundary in common, so
+almost only a retry of the same page gets a hit. A cache in the partition has the same low hit rate. It also needs an
+in-memory entry that a split or a promotion makes stale, and a field in each step response. A partition does not know
+whether the client stops after its step, so it must compute the key for each empty step, or the client must ask for it.
+
+## 10. Appendix: the inversion of `xxh64`
+
+This appendix gives the steps that compute a found key (section 9.4). `xxh64` is a fast hash, not a cryptographic
 hash. Each step of `xxh64` is a bijection. When the length of the input is 16 bytes and the first 8 bytes are fixed,
 the last 8 bytes map one to one to the 64-bit result. Thus each target `T` has exactly one value of the last 8 bytes,
 and the client computes it when it runs the steps in the reverse order.
 
-### 9.1 `xxh64` of a 16-byte input
+### 10.1 `xxh64` of a 16-byte input
 
 All arithmetic is modulo `2^64`. `P1` to `P5` are the constants of `xxh64`. The input is two 64-bit lanes, read in
 little-endian order.
@@ -777,7 +946,7 @@ return acc
 A 16-byte input has no tail of 4 bytes or of 1 byte. Those steps apply only to other lengths. The fixed length keeps
 the function to exactly the steps above.
 
-### 9.2 The inverse of each operation
+### 10.2 The inverse of each operation
 
 | Operation | Inverse | Why the inverse exists |
 |---|---|---|
@@ -794,7 +963,7 @@ For an odd `a`, the start value `x = a` has 3 correct bits, because `a² ≡ 1 (
 **The inverse of a xor-shift.** In `y = x ^ (x >> s)`, the top `s` bits of `y` are the top `s` bits of `x`. Each pass
 of `x = y ^ (x >> s)` gives the next `s` bits. A shift of 32 or 33 needs 1 pass. A shift of 29 needs 2 passes.
 
-### 9.3 The second lane from `T`
+### 10.3 The second lane from `T`
 
 The first lane `lane1` is fixed. The steps are:
 
@@ -818,11 +987,11 @@ The client writes `lane2` in little-endian order as the last 8 bytes. The 16 byt
 solution is a small number of 64-bit operations, about 0.8 µs in workerd.
 
 - **Byte order.** A routingHash is stored with the most significant byte first. The client reads it as a big-endian
-  number to get `T`. The lanes are little-endian, as `xxh64` requires.
+  number to get `T`. The lanes are little-endian, as in `xxh64`.
 - **Seed.** The seed is the seed of the shard group (`routingHashOf`). The client already has it for routing. A GSI
   has its own seed.
 
-### 9.4 A valid string key
+### 10.4 A valid string key
 
 The solved `lane2` can have any byte value. A string key must be well-formed UTF-8 with no NUL. The client accepts
 only ASCII `0x01–0x7F` in `lane2`.
@@ -831,8 +1000,8 @@ only ASCII `0x01–0x7F` in `lane2`.
   `1/270`.
 - When a byte is out of the range, the client changes `lane1`. `lane1` is `"fokos"` and a counter of 3 base-36
   characters. A different `lane1` gives a different `acc1`, and thus an independent `lane2`. The client solves again.
-- The number of tries has a geometric distribution with a mean of about 270. The chance of more than `n` tries is
-  `(1 − 1/270)^n`, about `e^-37` for the cap of 10,000 tries.
+- The number of tries has a geometric distribution with a mean of about 270. Section 9.4 gives the cap and the
+  chance to reach it.
 
 The result is 16 ASCII bytes: 8 fixed characters and 8 computed characters. `KeyCodec.encode` of this string gives the
 same 16 bytes, so the next page hashes the same bytes and gets `T`.
@@ -840,7 +1009,7 @@ same 16 bytes, so the next page hashes the same bytes and gets `T`.
 **A binary key needs no search.** `lane1` starts with the tag `0xFF`, and the client uses the solved `lane2` as it is,
 because a binary key accepts any byte value. The public key is the 15 bytes after the tag.
 
-### 9.5 Why the inversion is safe
+### 10.5 Why the inversion is safe
 
 - **It is the standard `xxh64`.** A prototype gave the same result as `xxhash-wasm`, which `hash-primitives.ts` uses.
   It matched 1,000 targets in Node.js and 500 targets through `routingHash` in workerd.
