@@ -65,7 +65,9 @@ pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a paralle
 - A caller continues the scan with `exclusiveStartKey = lastEvaluatedKey` until `lastEvaluatedKey` is absent.
 - A caller can scan one segment of `totalSegments` segments. The caller runs the segments in parallel.
 - A page continues at the owner of its start position. It does not visit again a partition that an earlier page read,
-  except for the one partition that holds the start position (section 4.2.7).
+  except for the one partition that holds the start position (section 4.2.7). There are two exceptions, and both
+  return `key(L)`: a page that a budget stops before the first row of a step, and the fallback 1 of section 4.2.6.
+  The next page then reads again the empty slices after `L`, which are fewer than the visit limit.
 - A page that visits only empty partitions still makes progress, and it does not return an error.
 - Each item that exists for the whole scan and is not deleted appears exactly once. A split, a promotion, or an import
   during the scan does not change this.
@@ -89,6 +91,8 @@ pagination fields `ExclusiveStartKey` and `LastEvaluatedKey`, and with a paralle
   not limit a page.
 - The client must not import a Durable Object class as a value (`AGENTS.md`).
 - The host must not read a `fokos_` table. It gets each routing fact from the runtime (`AGENTS.md`).
+- The GSI scan needs the total order of GSI entries (`2026-11-22-gsi-sort-key-total-order.md`). That RFC adds the
+  separator `00 00` after the escaped base sort key. Section 4.2.9 depends on it.
 
 ## 3. Milestones
 
@@ -99,9 +103,11 @@ Each milestone ships on its own, and the full test suite passes after each one.
    operation uses it yet, so there is no change in behaviour.
 2. **Owned slice.** `call.ownedSlice(pos)` in the runtime, the store method for the next override, and the scope of a
    read-through.
-3. **Host operation.** `apiScanItems` in `FokosDBPartitionDO`, and the scan of a storage interval in `PartitionStore`.
+3. **Host operation.** `apiScanItems` in `FokosDBPartitionDO`, the scan of a storage interval in `PartitionStore`, and
+   the hash key of each row in the page collector (section 4.2.3).
 4. **Client.** `db.scanItems`: the walk, the segments, the key at a slice boundary, and the found key.
-5. **GSI.** `db.gsi(indexName).scanItems`.
+5. **GSI.** `db.gsi(indexName).scanItems`. This milestone starts after the RFC
+   `2026-11-22-gsi-sort-key-total-order.md` is implemented.
 6. **Documentation.** A `scanItems` section in `AGENTS.md`.
 
 ## 4. Proposed solution
@@ -178,6 +184,8 @@ type ScanItemsPage<Item> = {
 - `items`, `count`, `scannedCount`, and `meta` have the meanings that they have in `QueryItemsPage`.
 - The projected overload follows `queryItems`: a request with a `projection` returns `ProjectedItem` records.
 - `lastEvaluatedKey` can name a key that holds no item (section 4.2.7). The caller must treat it as a resume value.
+  It can hold control characters (section 4.2.8), so a caller encodes it before it puts it in a URL, a header, or a
+  log.
 - The result has no fingerprint. A caller can send a different `filter`, `projection`, or `limit` on each page, and
   can start a scan at a key that the caller chooses.
 - On a GSI, `lastEvaluatedKey` is `{ hashKey, sortKey?, baseHashKey?, baseSortKey? }`. The base keys are present when
@@ -258,6 +266,10 @@ The local handler is synchronous, as the other point handlers are:
    and the remaining budgets. The rules for visibility and expiry are the rules of the `queryItems` leaf scan. The
    response takes `evaluatedBytes` and `responseBytes` from the state of the collector, as `QueryItemsRpcResponse`
    does. `QueryPageBudget.consume` subtracts them, so the byte budgets apply to the whole page and not to each step.
+   The collector reads one fixed `hashKey` now, and `QueryCandidateConsumer` gets only `sk`. A scan step reads rows of
+   many hash keys. Thus the consumer also gets the `hk` of each row, and the collector writes that `hk` into
+   `lastEvaluatedCursor` and `nextCursor`. The `queryItems` leaf scan gives its one hash key for each row, so its
+   behaviour does not change.
 4. When `req.end` is at or before `sliceEnd`, the read ends at `req.end`, and `next` is null.
 
 `PartitionStore` gets one method for this read. The method takes a storage interval, the direction `asc`, and the
@@ -406,6 +418,10 @@ so `L` exists for the fallback.
 Both cases occur with a chance of about `e^-37` for each page, or with a 64-bit collision of two hash keys. A page
 goes over the visit limit only in case 2.
 
+**A step error.** `partitions.point` retries a step with the retry policy of the client. An error that stays after
+those retries ends the page: `scanItems` throws it and returns no item of the page. The caller retries the page with
+the same `exclusiveStartKey`. A step only reads, so a retry is safe. DynamoDB `Scan` does the same.
+
 #### 4.2.7 The key at a slice boundary
 
 When a page stops at a slice boundary `S`, `E` is the slice of the last complete step: `[last.start, S)`. `E` was
@@ -449,10 +465,14 @@ The checks of cases 4 and 5:
 
 - `routingHashOf(hk)` must equal `P`. Between two hash keys of one routingHash, the boundary is
   `(prefix of hk, "")`, and this check rejects it.
-- Case 4 needs a non-empty `sk_S`, because `(hk_S, "")` must be less than `S`.
+- Case 4 needs a non-empty `sk_S`, because `(hk_S, "")` must be less than `S`. On a GSI, the position of the key is
+  `(P, hk_S, gsiItemSortKey("", "", ""))`, and the client checks that this position is less than `S`. The check
+  passes each time: `sk_S` is a cut of a stored GSI sort key that has a non-empty base hash key, so `sk_S` is greater
+  than the stored key of three empty parts.
 - Case 5 needs a key that is less than `S` when `S` is in the same tree. The key passes this check each time, because
   each range partition holds one item or more when its split creates it. The split planner puts each boundary
   between two items. Thus a valid key exists in `[a, S)`, and the smallest valid key at or after `a` is at or below it.
+  On a GSI, this argument needs the total order of GSI entries (section 4.2.9).
 
 When a check fails, `boundaryKey` gives no key, and the fallback of section 4.2.6 applies. Only a 64-bit collision of
 two hash keys in one range tree can make a check fail.
@@ -488,6 +508,10 @@ Section 9 gives the steps.
   took 16.6 ms. The cap is 10,000 tries, which is about 8.3 ms.
   The chance that the search reaches the cap is about `(1 − 1/270)^10000`, which is about `e^-37`. Then
   `boundaryKey` gives no key, and the fallback of section 4.2.6 applies.
+- **Control characters.** A string found key can hold the bytes `0x01–0x1F` and `0x7F`, for example `\n` and `\r`.
+  A key of a caller can hold them too, and a binary key can hold any byte. Thus FokosDB does not promise that a
+  returned key is safe in a URL, a header, or a log. A caller that puts a key there must encode it, for example with
+  base64url. The documentation of `lastEvaluatedKey` says this.
 - **Binary found key.** The tag `0xFF`, 7 fixed bytes, and the computed lane. Any byte value is valid in a binary
   key, so the client needs no search. One binary key costs about 0.8 µs in workerd.
 
@@ -516,13 +540,25 @@ A GSI is its own shard group with its own seed. `db.gsi(indexName).scanItems` ru
 a found key and to a key from a boundary. In cases 2 and 3 any sort key gives a position inside `E`, so a found key
 with no other part is correct.
 
+**The order of GSI entries.** The stored GSI sort key is
+`0xFF escape(gsiSK) 00 00 escape(baseHK) 00 00 escape(baseSK) 00 00 [rawGsiSK] <L><flag><D>`
+(`2026-11-22-gsi-sort-key-total-order.md`). Each part ends with `00 00`, and `00 00` never occurs inside an escaped
+part. Thus the stored order is the order of `(gsiSK, baseHK, baseSK)`, each part compared as `KeyBytes`, and the raw
+copy and the suffix never decide the order. An absent part encodes as the empty key and its separator, so the start
+key of the parts that are present sorts at or below each entry that has those parts.
+
 **`smallestValidAtOrAfter(b)` for a GSI** follows the layout of `decodeGsiSortKey`: the escaped GSI sort key, the
-separator `00 00`, the escaped base hash key, the separator, the escaped base sort key, and the suffix with the
-length and the flag. The client parses `b` up to the cut. It completes the part that is cut with its smallest valid
-continuation, and the parts after the cut are absent. A cut after the first `00` of a pair continues with `00`, which
-is the separator, because `00 00` is less than the escaped NUL `00 FF`. A cut inside the suffix gives back the full
-key of the item. The result encodes to bytes at or after `b`, and at or below each valid GSI sort key that starts with
-`b`. A test compares it with a reference that tries all short keys.
+separator `00 00`, the escaped base hash key, the separator, the escaped base sort key, the separator, and the suffix
+with the raw copy, the length, and the flag. The client parses `b` up to the cut:
+
+1. It completes the part that is cut with its smallest valid continuation. The parts after the cut are absent.
+2. A cut after the first `00` of a pair continues with `00`, which is the separator, because `00 00` is less than the
+   escaped NUL `00 FF`. The part before the pair is then complete.
+3. A cut after the third separator, inside the raw copy or the suffix, gives back the full key of the item. All three
+   parts are complete there, and the client computes the raw copy and the suffix from `gsiSK`.
+
+Because the stored order is the order of the parts, the result encodes to bytes at or after `b`, and at or below each
+stored GSI sort key that starts with `b`. A test compares it with a reference that tries all short keys.
 
 #### 4.2.10 Concurrency and consistency
 
@@ -565,11 +601,21 @@ The tests use `TestPartition` (`partition-harness.ts`) to build the topology.
 - **Found key.** For random targets and seeds, `xxh64` of the string found key and of the binary found key equals the
   target, and the string passes `validateItemKeys`. The found key has the type of the start key, else of `L`, else it
   is a string.
+- **Collector.** A step that reads rows of two hash keys and stops inside its slice gives `lastEvaluated` with the
+  hash key of the last row, and the next page starts after that row.
+- **Step error.** A step that still fails after the retry policy makes `scanItems` throw. A retry of the page with the
+  same `exclusiveStartKey` returns the same items.
 - **Fallback.** `boundaryKey` and the found-key search are pure functions, and the cap is an argument. A unit test calls
   them with a cap of 0. The page returns `key(L)` when it has `L`, and it does one more step when it has none.
 - **`smallestValidAtOrAfter`.** A cut UTF-8 character of 2, 3, and 4 bytes, the lead bytes `E0`, `ED`, `F0`, and `F4`,
-  the boundary `[0xFF]`, and GSI keys cut in each part. For short keys, the result equals the result of a reference
-  that tries all keys.
+  the boundary `[0xFF]`, and GSI keys cut in each part and in each separator. Include GSI base sort keys, string and
+  binary, where one value is a prefix of another and the next byte is below `0x3A`, for example `"order#01"` and
+  `"order#0100"`, or `[01]` and `[01 00]`. For short keys, the result equals the result of a reference that tries all
+  keys.
+- **GSI case 5 after a range split.** A promoted GSI hash key with entries that share the GSI sort key and the base
+  hash key, and the base sort keys `"order#0099"`, `"order#0100"`, and `"order#0101"`. A range split puts
+  `"order#0100"` alone in one partition. Delete that entry, and stop a page at the visit limit after that partition.
+  The next page returns `"order#0101"`.
 - **Segments.** The union of all segments of `T` equals the full scan, for some values of `T`. A start key outside
   its segment fails with `scan_start_key_outside_segment`.
 - **GSI.** The same walk on a GSI, with two entries that have the same GSI keys and different base keys.
@@ -652,6 +698,7 @@ section 4.2.10.
 - `docs/agent-plans/2026-09-11-query-items-selection.md`
 - `docs/agent-plans/2026-09-14-read-projections-and-query-filters.md`
 - `docs/agent-plans/2026-09-27-learned-routes-for-every-dispatch-shape.md`
+- `docs/agent-plans/2026-11-22-gsi-sort-key-total-order.md`
 - [DynamoDB API Reference: Scan](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Scan.html)
 - [DynamoDB Developer Guide: Parallel scan](
   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan)
