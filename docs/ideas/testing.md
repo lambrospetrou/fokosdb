@@ -12,6 +12,7 @@
 - [Linearizability testing S2 with deterministic simulation](https://s2.dev/blog/linearizability)
 - [What's the big deal about Deterministic Simulation Testing?](https://notes.eatonphil.com/2024-08-20-deterministic-simulation-testing.html)
 - [Protocol-Aware Deterministic Simulation Testing](https://tigerbeetle.com/blog/2026-08-20-protocol-aware-dst/)
+- [Deterministic Simulation Testing](https://martinfowler.com/articles/deterministic-simulation-testing.html)
 - (video) [How to write your own Deterministic Simulator](https://www.youtube.com/watch?v=JoYjji1DZCE)
 - (video) [Testing Distributed Systems w/ Deterministic Simulation by Will Wilson](https://www.youtube.com/watch?v=4fFDFbi3toc)
 
