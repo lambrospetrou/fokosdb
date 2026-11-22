@@ -57,6 +57,7 @@ prefix. The trailer breaks this assumption. A scan can then return a resume key 
 `S`, and the next page skips the entries between `S` and the key. For example, with the boundaries
 `a = … "order#01"` and `S = … "order#0101"`, the key `… "order#01" 4 : 1` is after `S`, and also after the entry
 `"order#0101"`.
+
 ### 1.3 What the reader must know about the current system
 
 - `encodeGsiSortKey` builds the physical key. `gsiItemSortKey` adds the binary tag `0xFF`. `decodeGsiSortKey` reads
