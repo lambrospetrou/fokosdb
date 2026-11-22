@@ -1535,6 +1535,9 @@ can call `gsiWriteEntries`.
 
 ##### Order-preserving composite sort key with `<L><flag><D>` trailer
 
+> **Updated on 2026-11-22.** `2026-11-22-gsi-sort-key-total-order.md` added the separator `0x00 0x00` after
+> `escape(baseSK)`, for a total order of the entries. This section shows the new layout.
+
 Multiple base items can share `(gsiHK, gsiSK)`. The identity invariant of FokosDB makes item identity a byte
 comparison, never a hash. Two facts of SQLite also apply:
 
@@ -1546,11 +1549,13 @@ To support byte-order B-tree range scans and `O(1)` `substr` extraction in SQLit
 builds `physicalSk`:
 
 - Escape each `0x00` byte in `gsiSK`, `baseHK`, and `baseSK` as `0x00 0xFF`.
-- Join `escape(gsiSK)`, `escape(baseHK)`, and `escape(baseSK)` with the 2-byte separator `0x00 0x00`.
+- Write `escape(gsiSK)`, `escape(baseHK)`, and `escape(baseSK)`, and end each one with the 2-byte separator
+  `0x00 0x00`. The bytes up to the end of the third separator are the entry prefix.
 - Append the trailer `<L><flag><D>`:
   - `<L>` is the decimal ASCII byte length of the unescaped `gsiSK` (`1` to `9` digits, `"0"` when absent).
   - `<flag>` at offset `-2` is `':'` (`0x3A`) when `gsiSK` contains no `0x00` byte. It is `'!'` (`0x21`) when `gsiSK`
-    contains a `0x00` byte. In that case, the unescaped `rawGsiSK` comes directly before `<L>!<D>`.
+    contains a `0x00` byte. In that case, the unescaped `rawGsiSK` comes directly before `<L>!<D>`. The flag also
+    identifies the layout: a new layout uses new flag values, and a flag value is never an ASCII digit.
   - `<D>` at offset `-1` is the ASCII digit `'1'..'9'` that gives the byte length of `<L>`.
 
 The GSI `PartitionDO` stores `physicalSk` as a binary sort key. `KeyCodec.encode` prepends the binary
@@ -1558,29 +1563,33 @@ tag `0xFF`, so `i.sk` in SQLite is `0xFF || physicalSk`. Byte `n` of `physicalSk
 
 ```text
 Case 1: gsiSK has no 0x00 byte (gsiSK = "2026-10-17", L = 10, D = 2):
-  1 .. 10        11..12   13..14   15..16   17..18   19..22
-+--------------+--------+--------+--------+--------+--------+
-| "2026-10-17" | \x0000 |  "u1"  | \x0000 |  "o9"  | "10:2" |
-+--------------+--------+--------+--------+--------+--------+
-  ^----------^                                        ^ ^ ^
-  gsiSK (10 B)                                        L : D
+  1 .. 10        11..12   13..14   15..16   17..18   19..20   21..24
++--------------+--------+--------+--------+--------+--------+--------+
+| "2026-10-17" | \x0000 |  "u1"  | \x0000 |  "o9"  | \x0000 | "10:2" |
++--------------+--------+--------+--------+--------+--------+--------+
+  ^----------^                                                 ^ ^ ^
+  gsiSK (10 B)                                                 L : D
 
 Case 2: gsiSK contains a 0x00 byte (gsiSK = \xff\x61\x00\x62, L = 4, D = 1):
-  1 .. 5                6..7     8..9    10..11   12..13   14 .. 17          18..20
-+---------------------+--------+-------+--------+-------+-----------------+-------+
-| \xff\x61\x00\xff\x62| \x0000 | "u1"  | \x0000 | "o9"  | \xff\x61\x00\x62| "4!1" |
-+---------------------+--------+-------+--------+-------+-----------------+-------+
-  ^-----------------^                                     ^--------------^  ^ ^ ^
-  escaped (for sort)                                      rawGsiSK (4 B)    L ! D
+  1 .. 5                6..7     8..9    10..11   12..13  14..15   16 .. 19          20..22
++---------------------+--------+-------+--------+-------+--------+-----------------+-------+
+| \xff\x61\x00\xff\x62| \x0000 | "u1"  | \x0000 | "o9"  | \x0000 | \xff\x61\x00\x62| "4!1" |
++---------------------+--------+-------+--------+-------+--------+-----------------+-------+
+  ^-----------------^                                              ^--------------^  ^ ^ ^
+  escaped (for sort)                                               rawGsiSK (4 B)    L ! D
 ```
 
 Properties of `0xFF || physicalSk`:
 
 - **Uniqueness.** An escaped component never contains `0x00 0x00`, and items with an equal `gsiSK` share the same
-  trailer. Thus two different base items never produce equal bytes.
-- **Contiguous `gsiSK` ranges.** Each entry with `gsiSK = k` starts with `escape(k) || 0x00 0x00`. Thus entries sort
-  by `gsiSK`, then by `baseHK`. In the same `(gsiSK, baseHK)`, entries sort by the stored bytes of
-  `escape(baseSK) || trailer`. DynamoDB also does not specify the order of identical GSI keys.
+  raw copy and trailer. Thus two different base items never produce equal bytes.
+- **Total order.** Each component ends with `0x00 0x00`. When one component is a strict prefix of another, the
+  shorter one continues with `0x00 0x00`, and the longer one continues with a byte from `0x01` to `0xFF`, or with
+  the escaped `0x00 0xFF`. Thus entries sort by `gsiSK`, then by `baseHK`, then by `baseSK`, each compared as
+  `KeyBytes`. The comparison of two different entries ends inside the entry prefix, so the raw copy and the trailer
+  never decide the order. Each entry with `gsiSK = k` starts with `escape(k) || 0x00 0x00`, so the entries of one
+  `gsiSK` are contiguous. DynamoDB does not specify the order of identical GSI keys, and this order is not a public
+  promise.
 
 In SQLite, `CAST(substr(i.sk, -2 - D) AS INTEGER)` stops at the non-digit `<flag>`:
 
@@ -1645,16 +1654,19 @@ Measured in SQLite 3.45.1 over 20,000 rows (the average of 25 runs) for a compil
 
 ##### Derived GSI key limits
 
+> **Updated on 2026-11-22.** `2026-11-22-gsi-sort-key-total-order.md` added a third separator. The formula and the
+> example below include it.
+
 `MaterializationDO` and `db.gsi(indexName)` configure the internal GSI `FokosDB` client with these limits. `h` and `s`
 are the `maxHashKeyBytes` and `maxSortKeyBytes` of the base table.
 
 - `maxHashKeyBytes = h`.
-- `maxSortKeyBytes = 1 + 2 * (2 * s + h) + 4 + s + digits(s) + 2`:
+- `maxSortKeyBytes = 1 + 2 * (2 * s + h) + 6 + s + digits(s) + 2`:
   - `1` is the `0xFF` tag.
   - `2 * (2 * s + h)` covers the worst-case `0x00` escape of `gsiSK`, `baseHK`, and `baseSK`.
-  - `4` covers the two `0x00 0x00` separators.
+  - `6` covers the three `0x00 0x00` separators.
   - `s + digits(s) + 2` covers the `'!'` trailer.
-- With the default limits (`h = 1024`, `s = 512`), `maxSortKeyBytes` is 4,618 bytes.
+- With the default limits (`h = 1024`, `s = 512`), `maxSortKeyBytes` is 4,620 bytes.
 
 #### 4.2.15 Backpressure, circuit breaking, and cost
 

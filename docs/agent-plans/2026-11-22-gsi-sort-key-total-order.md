@@ -1,6 +1,6 @@
 # RFC — A total order of GSI entries: a separator after the base sort key
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-11-22
 **Author:** Lambros
 

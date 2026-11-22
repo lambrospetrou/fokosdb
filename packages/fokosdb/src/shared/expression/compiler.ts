@@ -1125,11 +1125,13 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 	}
 }
 
-// The physical GSI sort key is `0xFF body <L> <flag> <D>` (see `shared/gsi/sort-key.ts`). `<D>` is the
-// last byte, `<flag>` the byte before it, and `<L>` the `<D>` digits before `<flag>`: the byte length of
-// the encoded GSI sort key. With the ':' flag, the GSI sort key holds no 0x00 byte, so it is the `<L>`
-// bytes after the tag. With the '!' flag, it is the raw copy of `<L>` bytes before `<L>`. A GSI with no
-// sort key gives the empty key, whose body starts with the separator 0x00 0x00.
+// The physical GSI sort key is `0xFF <entry prefix> [raw copy] <L> <flag> <D>` (see
+// `shared/gsi/sort-key.ts`). `<D>` is the last byte, `<flag>` the byte before it, and `<L>` the `<D>`
+// digits before `<flag>`: the byte length of the encoded GSI sort key. With the ':' flag, the GSI sort key
+// holds no 0x00 byte, so it is the `<L>` bytes after the tag. With the '!' flag, it is the raw copy of
+// `<L>` bytes before `<L>`. A GSI with no sort key gives the empty key, whose entry prefix starts with the
+// separator 0x00 0x00. These expressions read each flag other than '!' as ':'. A new layout uses a new
+// flag value, so it must also change these expressions.
 const GSI_D = "CAST(substr(i.sk, -1, 1) AS INTEGER)";
 const GSI_L = `CAST(substr(i.sk, -2 - ${GSI_D}, ${GSI_D}) AS INTEGER)`;
 const GSI_SORT_KEY_VALUE = `(CASE WHEN substr(i.sk, -2, 1) = x'21' THEN substr(i.sk, -2 - ${GSI_D} - ${GSI_L}, ${GSI_L}) ELSE substr(i.sk, 2, ${GSI_L}) END)`;

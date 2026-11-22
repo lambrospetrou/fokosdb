@@ -531,6 +531,9 @@ least 64 (`resolveLimits`).
 
 #### 4.2.9 GSI
 
+> **Updated on 2026-11-22.** `2026-11-22-gsi-sort-key-total-order.md` is implemented. The layout below is the
+> implemented layout, and the note of case 3 comes from section 4.3 of that RFC.
+
 A GSI is its own shard group with its own seed. `db.gsi(indexName).scanItems` runs the same walk with the GSI client
 (`#gsiClient`), as `#queryItems` does. The client decodes each row with `gsiKeys`. It takes `GsiScanItemsOptions`
 (section 4.2.1), so a caller can send the `lastEvaluatedKey` of a GSI page back with its base keys.
@@ -555,7 +558,10 @@ with the raw copy, the length, and the flag. The client parses `b` up to the cut
 2. A cut after the first `00` of a pair continues with `00`, which is the separator, because `00 00` is less than the
    escaped NUL `00 FF`. The part before the pair is then complete.
 3. A cut after the third separator, inside the raw copy or the suffix, gives back the full key of the item. All three
-   parts are complete there, and the client computes the raw copy and the suffix from `gsiSK`.
+   parts are complete there, and the client computes the raw copy and the suffix from `gsiSK`. A range split never
+   gives this case: each boundary of a range split ends inside the entry prefix of the upper entry
+   (`2026-11-22-gsi-sort-key-total-order.md`, section 4.3). The client keeps the case, because it gives a correct
+   result for each input.
 
 Because the stored order is the order of the parts, the result encodes to bytes at or after `b`, and at or below each
 stored GSI sort key that starts with `b`. A test compares it with a reference that tries all short keys.

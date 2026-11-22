@@ -171,12 +171,12 @@ export function isGsiShardGroup(shardGroup: string): boolean {
 /**
  * The key limits of a GSI table. `h` and `s` are the limits of the base table. The physical sort key
  * holds the tag byte, the escaped GSI sort key, base hash key, and base sort key (each 0x00 can double),
- * two separators, and the longest trailer: a raw copy of the GSI sort key, its length, and two bytes.
+ * three separators, and the longest suffix: a raw copy of the GSI sort key, its length, and two bytes.
  */
 export function gsiLimits(base: FokosDBLimits): FokosDBLimits {
 	const h = base.maxHashKeyBytes;
 	const s = base.maxSortKeyBytes;
-	return { maxHashKeyBytes: h, maxSortKeyBytes: 1 + 2 * (2 * s + h) + 4 + s + String(s).length + 2 };
+	return { maxHashKeyBytes: h, maxSortKeyBytes: 1 + 2 * (2 * s + h) + 6 + s + String(s).length + 2 };
 }
 
 /**
