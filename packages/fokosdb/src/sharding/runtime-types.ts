@@ -380,6 +380,11 @@ export type FokosRepartitionPlan<TPolicy = unknown> = {
 };
 
 export type FokosJob = {
+	/**
+	 * The stored key of the scheduled run of the job. Each pass deletes the stored run of a name that
+	 * is not registered, so a rename, a removal, or a rollback loses at most one scheduled run. A job
+	 * that must not lose a run must also give `deadline()`.
+	 */
 	name: string;
 	/**
 	 * False skips the job in this pass, and keeps its `deadline()` out of the alarm. Synchronous. All

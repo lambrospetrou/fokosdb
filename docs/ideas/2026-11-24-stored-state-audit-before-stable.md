@@ -65,7 +65,7 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    it with A1.
 10. (NON-ISSUE) **A split router keeps its item rows** — The rows stay after a hash split (FIXME in `cleanupSourceStep`,
     `do-partition.ts`). This adds storage cost, and a snapshot restore copies the rows. It is not a format change.
-11. **Job names are stored** — `__fokos/jobs` keeps an entry of a removed or renamed job. This does no harm, but a
+11. (DONE) **Job names are stored** — `__fokos/jobs` keeps an entry of a removed or renamed job. This does no harm, but a
     job name is a stored contract.
 
 ## Order

@@ -10,7 +10,7 @@
  */
 import type { FokosPlatform, FokosTimer } from "../shared/platform.js";
 import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
-import type { FokosShardingStore } from "./sharding-store.js";
+import type { FokosJobsRecord, FokosShardingStore } from "./sharding-store.js";
 
 /**
  * The alarm interval of a Durable Object whose initialization failed. It is a fixed constant and
@@ -248,6 +248,29 @@ export class FokosScheduler {
 	}
 
 	/**
+	 * Deletes from `record`, and from storage, the entry of each job name that is not registered: a job
+	 * that this version removed or renamed, or a name that `scheduleJob` received in error. The
+	 * comparison uses all registered jobs, not only the runnable jobs, so a job that cannot run now
+	 * keeps its scheduled run. It writes only when it deletes an entry. The caller read `record` in the
+	 * same synchronous block, so no other write can come between the read and this write.
+	 */
+	#deleteUnregisteredJobs(record: FokosJobsRecord): void {
+		const registered = new Set(this.#deps.jobs().map((job) => job.name));
+		const deleted = Object.keys(record).filter((name) => !registered.has(name));
+		if (deleted.length > 0) {
+			for (const name of deleted) {
+				delete record[name];
+			}
+			this.#deps.store.putJobs(record);
+			console.warn({
+				...this.#deps.logParams(),
+				message: "fokos/scheduler: deleted the scheduled runs of jobs that are not registered.",
+				jobs: deleted,
+			});
+		}
+	}
+
+	/**
 	 * The jobs that can run now, built-ins first. Asked again whenever the answer can have changed.
 	 * All jobs get the same lifecycle result, so each fact is read at most one time for each call. The
 	 * filter is synchronous, so the facts cannot change while it runs.
@@ -272,6 +295,7 @@ export class FokosScheduler {
 	/** The earliest durable deadline of each runnable job: its scheduled run, or its own durable work. */
 	#deadlines(runnable: readonly FokosJob[]): Array<{ job: FokosJob; at: number }> {
 		const record = this.#deps.store.getJobs();
+		this.#deleteUnregisteredJobs(record);
 		const out: Array<{ job: FokosJob; at: number }> = [];
 		for (const job of runnable) {
 			const entry = record[job.name];
