@@ -106,7 +106,7 @@ import type {
 } from "./runtime-types.js";
 import { FokosScheduler, INIT_RETRY_ALARM_MS } from "./scheduler.js";
 import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
-import { jitterBackoff } from "./retries.js";
+import { jitterBackoff } from "durable-utils/retries";
 import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
 import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
@@ -2531,7 +2531,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					// The base delay plus a jittered backoff, so each retry waits from 1 s to 5 min.
 					const delay =
 						ADMIN_OUTBOX_RETRY_BASE_MS +
-						jitterBackoff(this.#platform, attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS);
+						jitterBackoff(attempt, ADMIN_OUTBOX_RETRY_BASE_MS, ADMIN_OUTBOX_RETRY_MAX_MS - ADMIN_OUTBOX_RETRY_BASE_MS, this.#platform);
 					const updated = this.#store.transactionSync(() =>
 						this.#store.setAdminOutboxAttempt(row.eventType, row.id, attempt, this.#platform.now() + delay, row.eventJson),
 					);

@@ -1,5 +1,5 @@
 import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
-import { jitterBackoff } from "../sharding/retries.js";
+import { jitterBackoff } from "durable-utils/retries";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type {
 	BatchGetItemKey,
@@ -158,7 +158,7 @@ async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 			break;
 		}
 		// The first retry is retry 0 of the backoff.
-		await platform.wait(jitterBackoff(platform, calls - 1, retry.baseDelayMs, retry.maxDelayMs));
+		await platform.wait(jitterBackoff(calls - 1, retry.baseDelayMs, retry.maxDelayMs, platform));
 		positions = next;
 	}
 	return {

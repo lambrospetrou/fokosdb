@@ -3,7 +3,7 @@ import { FokosError, type FokosCodeDef } from "../shared/errors.js";
 import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
-import { tryWhile } from "./retries.js";
+import { tryWhile } from "durable-utils/retries";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
 import { routingHashOf, type RoutingHash, type RoutingHashSeedResolver } from "./hash-primitives.js";
@@ -369,9 +369,10 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		const policy = opts?.retry ?? this.#retry;
 		try {
 			const result = policy
-				? await tryWhile(this.#platform, attempt, policy.shouldRetry, {
+				? await tryWhile(attempt, policy.shouldRetry, {
 						baseDelayMs: policy.baseDelayMs ?? 100,
 						maxDelayMs: policy.maxDelayMs ?? 2_000,
+						platform: this.#platform,
 					})
 				: await attempt();
 			return { ...this.#router.unwrap(result), ...cost };

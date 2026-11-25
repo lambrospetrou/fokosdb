@@ -180,9 +180,8 @@ export const systemPlatform: FokosPlatform;
 - `keyPairSeed` in `src/sharding/key-codec.ts` stays as it is, outside the platform. Section 4.2.1.1 tells why.
 - The `error_id` of an error (`newErrorId` in `src/shared/errors.ts`) stays on `crypto.randomUUID`. It is only a
   name, no decision reads it, and the checkers ignore it.
-- `jitterBackoff` and `tryWhile` of `durable-utils/retries` read `Math.random` and the global `setTimeout`. The
-  library uses its own copies in `src/sharding/retries.ts`, which take the platform. When `durable-utils` accepts
-  these dependencies as arguments, the copies go and the call sites import `durable-utils` again.
+- `jitterBackoff` and `tryWhile` of `durable-utils/retries` (version 0.3.8 or later) take an optional platform with
+  `random` and `wait`. Each call site gives the `FokosPlatform` of its caller.
 - The platform is one object for each Durable Object, not a module global. Each Durable Object then has its own clock,
   which can be skewed, and each timer belongs to one Durable Object.
 - No wrapper replaces the globals of the runtime (`Date.now`, `setTimeout`, `Math.random`) while a callback runs.
@@ -197,8 +196,8 @@ export const systemPlatform: FokosPlatform;
 - A test that sets the clock of one instance overrides `fokosPlatform` in a test subclass
   (`ControlledPartitionDO`, `ControlledTransactionCoordinatorDO`). The returned platform reads `testNow()` of the
   instance at each call, so `vi.spyOn(instance, "testNow")` changes the clock after the constructor ran.
-- M1 adds only a small sanity test of the platform (`src/sharding/retries.test.ts`). The tests that set the clock
-  through `testNow` show the wiring, and the full suite shows that the behavior did not change.
+- M1 adds no new test of the platform. The tests that set the clock through `testNow` show the wiring, and the full
+  suite shows that the behavior did not change.
 
 The call sites today:
 
