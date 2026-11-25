@@ -1,6 +1,6 @@
 # FokosDB
 
-FokosDB is a strongly consistent, distributed database with bottomless storage, built on top of Cloudflare Durable Objects. Your table grows as long as your account can create Durable Objects: FokosDB splits its partitions automatically, so you never plan capacity. It has the API and the transaction model of Amazon DynamoDB, plus SQLite expressions that DynamoDB does not have.
+FokosDB is a strongly consistent, distributed database with bottomless storage, built on top of Cloudflare Durable Objects. The tables grow as long as your account can create Durable Objects: FokosDB splits its partitions automatically, so you never plan capacity. It has the API and the transaction model of Amazon DynamoDB, plus SQLite expressions for updating, filtering, and projecting items.
 
 > [!CAUTION]
 > **Do NOT use FokosDB in production, yet.** Breaking changes still occur. Do not store data that you must keep until a stable version is published.
@@ -214,7 +214,7 @@ npx wrangler dev
 ## Features
 
 - **Strong consistency.** FokosDB stores each item, identified by a hash key and an optional sort key, in one partition. Each read and each write of that item is strongly consistent.
-- **All the item operations you need.** Use `putItem`, `getItem`, and `deleteItem` for one item, and `batchGetItems` and `batchWriteItems` for up to 100 items in one call. Use `queryItems` to read the items of a hash key in sort-key order, and set `ttlAt` to delete an item automatically. An update can set, extend, or remove the TTL with an expression, for example `{ action: "set", target: { ref: "ttlAt" }, value: { fn: "+", args: [{ ref: "ttlAt" }, { val: 3600 }] } }`.
+- **All the item operations you need.** Use `putItem`, `getItem`, and `deleteItem` for one item, and `batchGetItems` and `batchWriteItems` for up to 100 items in one call. Use `queryItems` to read the items of a hash key in sort-key order, or `scanItems` to walk through all the items, and set `ttlAt` to delete an item automatically. An update can set, extend, or remove the TTL with an expression, for example `{ action: "set", target: { ref: "ttlAt" }, value: { fn: "+", args: [{ ref: "ttlAt" }, { val: 3600 }] } }`.
 - **Expressions with the power of SQLite.** Conditions, updates, query filters, and projections read any JSON path of an item. They use arithmetic, `LIKE`, `GLOB`, `IIF`, `COALESCE`, and the other SQLite string and math functions. The partition runs each expression as SQL, next to the data.
 - **ACID transactions across partitions.** `transactWriteItems` writes items in different partitions atomically, with the two-phase commit of the DynamoDB papers. `transactGetItems` reads them as one consistent snapshot. A client request token makes a retry safe.
 - **Ordered operations on one item.** With `executionMode: "ordered_per_item"`, one transaction can write the same item more than one time, in the order that you give. DynamoDB does not let you do this.
