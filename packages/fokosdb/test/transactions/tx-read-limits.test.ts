@@ -7,8 +7,9 @@ import { controlledPartition, keysInOnePartition, makeDB, partitionNameOf } from
 /** `count` keys of one hash key, so they are in one partition. */
 const keysOfHashKey = (hashKey: string, count: number) => Array.from({ length: count }, (_, i) => ({ hashKey, sortKey: `sk-${i}` }));
 
-// 42 items of binary data just under the item limit count more than MAX_PAYLOAD_BYTES_PER_TX.
-const LARGE_ITEMS = 42;
+// 18 items of 1 MiB - 1 KiB of binary data count 17.98 MiB, above the 16 MiB of MAX_PAYLOAD_BYTES_PER_TX.
+// Half of them, 8.99 MiB, are below it.
+const LARGE_ITEMS = 18;
 const largeData = () => new Uint8Array(MAX_ITEM_BYTES - 1024);
 
 describe("transactGetItems — the limits", () => {

@@ -624,10 +624,10 @@ describe("transactWriteItems - the image cap of one transaction", () => {
 		);
 		expect(await capOf(small)).toBe(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX);
 
-		// 20 items of text just under the item limit: about 16 MB of payload, at two bytes for each character.
+		// 8 texts of 1,000,000 characters: 16,000,000 bytes of payload, at two bytes for each character.
 		const large = `cap-large-${crypto.randomUUID()}`;
-		const largeKeys = keysAcrossPartitions(db, 20, `cap-large-${crypto.randomUUID()}`);
-		const data = "x".repeat(MAX_ITEM_BYTES - 2048);
+		const largeKeys = keysAcrossPartitions(db, 8, `cap-large-${crypto.randomUUID()}`);
+		const data = "x".repeat(1_000_000);
 		expect(
 			await writeOutcome(
 				db.transactWriteItems({ clientRequestToken: large, items: largeKeys.map((k) => ({ ...k, operation: "put", data })) }),

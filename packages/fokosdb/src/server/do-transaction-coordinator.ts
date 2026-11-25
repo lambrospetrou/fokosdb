@@ -267,12 +267,11 @@ function parseTagged<T>(json: string): T {
 }
 
 /**
- * The most UTF-8 bytes of one stored chunk of a results array. The limit of one row in the SQLite
- * storage of a Durable Object is 8 MB, but workerd refuses a statement whose bound values are about
- * 4 MiB or more in total (SQLITE_TOOBIG). A chunk is one bound value, so it stays below that limit
- * with a margin.
+ * The most UTF-8 bytes of one stored chunk of a results array. A chunk is one bound value, and the
+ * limit of one string, BLOB or row in the SQLite storage of a Durable Object is 8 MB. 5 MiB leaves
+ * room for the other columns of the row.
  */
-const RESULT_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
+const RESULT_CHUNK_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
  * Splits the tagged JSON text of a results array into the chunks that storage holds, each at most

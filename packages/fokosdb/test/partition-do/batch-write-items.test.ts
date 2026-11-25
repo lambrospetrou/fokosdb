@@ -53,8 +53,9 @@ async function batchWrite(partition: TestPartition, req: BatchWriteItemsRpcReque
 	return (await partition.stub.apiBatchWriteItems(partition.ctx, req)) as unknown as FokosEnvelope<BatchWriteItemsRpcResponse>;
 }
 
-// Just under the item limit: the store measures the whole row, so the data leaves room for the keys.
-const IMAGE_BYTES = MAX_ITEM_BYTES - 2048;
+// 25 images of 400 KiB fit below the 10 MiB of MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, so each child of
+// a router can answer with more than one image.
+const IMAGE_BYTES = 400 * 1024;
 const IMAGE_DATA = "x".repeat(IMAGE_BYTES);
 const FITTING_IMAGES = Math.floor(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX / IMAGE_BYTES);
 
@@ -288,17 +289,18 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 		await expect(db.batchWriteItems({ items: [{ ...put, condition: { op: "nope" } as never }] })).rejects.toThrow(
 			fokosErrorWith("expression_invalid"),
 		);
-		// Each item is valid. A text counts two bytes for each character, so 31 items at the item limit are
-		// above the 24 MiB of `MAX_PAYLOAD_BYTES_PER_BATCH`, and 30 such items with their keys are below it.
+		// Each item is valid. A text counts two bytes for each character, so 12 texts of 1 MiB count 24 MiB.
+		// With their keys and conditions they are above the 24 MiB of `MAX_PAYLOAD_BYTES_PER_BATCH`, and
+		// 11 such items, 22 MiB with their keys, are below it.
 		const large: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.x" }, { val: "x".repeat(1_000) }] };
-		const tooLarge = Array.from({ length: 31 }, (_, i) => ({
+		const tooLarge = Array.from({ length: 12 }, (_, i) => ({
 			...put,
 			hashKey: `k-${i}`,
 			data: "d".repeat(MAX_ITEM_BYTES),
 			condition: large,
 		}));
 		await expect(db.batchWriteItems({ items: tooLarge })).rejects.toThrow(fokosErrorWith("batch_payload_too_large"));
-		const fits = tooLarge.slice(0, 30).map((item) => ({ ...item, condition: undefined }));
+		const fits = tooLarge.slice(0, 11).map((item) => ({ ...item, condition: undefined }));
 		await expect(db.batchWriteItems({ items: fits })).resolves.toMatchObject({ unprocessedItems: [] });
 		await expect(db.batchWriteItems({ items: [{ ...put, data: 3 as never }] })).rejects.toThrow(fokosErrorWith("item_data_wrong_type"));
 		await expect(db.batchWriteItems({ items: [{ ...put, data: "x".repeat(MAX_ITEM_BYTES + 1) }] })).rejects.toThrow(

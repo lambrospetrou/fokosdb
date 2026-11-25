@@ -1069,16 +1069,19 @@ describe("PartitionStore - items", () => {
 
 	it("updateItemSingleShot reports an oversized result, and writes nothing", async () => {
 		await withStore((store) => {
+			// An expression literal is at most 512 KiB, below the 1 MiB of MAX_ITEM_BYTES. So the upsert makes
+			// an item 1 KiB below the limit, and the update adds 2 KiB.
 			const hk = kb("too-big");
 			const sk = kb("s");
-			const update: UpdateExpression = [
-				{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: "a".repeat(MAX_ITEM_BYTES) } },
-			];
+			const data = JSON.stringify({ x: "a".repeat(MAX_ITEM_BYTES - 1024) });
+			store.upsertItem({ routingHash: P(hk), hk, sk, data, kind: "json", ttlAt: null, txOrderTs: 1 });
+			const before = store.getItem(P(hk), hk, sk).row;
+			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.y" }, value: { val: "b".repeat(2048) } }];
 			const plan = updateTree(update);
-			expect(() => store.updateItemSingleShot({ routingHash: P(hk), hk, sk, plan, txOrderTs: 1 })).toThrow(
+			expect(() => store.updateItemSingleShot({ routingHash: P(hk), hk, sk, plan, txOrderTs: 2 })).toThrow(
 				fokosErrorWith("item_too_large"),
 			);
-			expect(store.getItem(P(hk), hk, sk).row).toBeUndefined();
+			expect(store.getItem(P(hk), hk, sk).row).toEqual(before);
 		});
 	});
 

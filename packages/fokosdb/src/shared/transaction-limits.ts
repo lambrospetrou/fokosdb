@@ -57,7 +57,7 @@ export const DEFAULT_LIMITS: FokosDBLimits = Object.freeze({ maxHashKeyBytes: MA
 const LARGE_KEY_WARNING_BYTES = 2 * 1024;
 
 /**
- * Per-item ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation in a
+ * Per-item ceiling. Applies to EVERY write path — `putItem` and each operation in a
  * transaction — so one item cannot be larger through one API than the other. Without it a single
  * transactional put could carry the whole 16 MiB transaction budget while `putItem` had no ceiling at
  * all.
@@ -68,8 +68,12 @@ const LARGE_KEY_WARNING_BYTES = 2 * 1024;
  * bytes that no client ever sent. A write between the two ceilings therefore passes validation and is
  * rejected by the partition, which is the intended order: the client check is a cheap early answer,
  * not the definition.
+ *
+ * The bucket threshold `m` of a hash leaf comes from the largest estimate of one item
+ * (`maxItemEstimate` in `partition/item-size.ts`). 1 MiB gives an estimate of about 3.5 MiB, so `m` is
+ * 16 for the default cap of 500 MiB, and a hash key with fewer than 16 items writes no bucket row.
  */
-export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
+export const MAX_ITEM_BYTES = 1024 * 1024; // 1 MiB
 
 /** The most items of one `transactWriteItems`, `transactGetItems`, `batchWriteItems`, or `batchGetItems` call. */
 export const MAX_ITEMS_PER_REQUEST = 1_000;
@@ -215,7 +219,7 @@ export function validateClientRequestToken(token: string): void {
  * A string's UTF-8 size is at least its `length` (every code unit is one or more bytes) and at most
  * `length * 3`, so this NEVER over-counts and the limits built on it never reject a string that
  * would have fit. The cost is the other direction: text above U+07FF is 3 UTF-8 bytes per code unit,
- * so a 400 KB check can admit 1.2 MB of CJK.
+ * so a 1 MiB check can admit 3 MiB of CJK.
  *
  * Being a lower bound is what makes it safe to keep. The store measures the truth with `octet_length`
  * over the value it writes, and it counts both keys as DynamoDB does (`itemBytesExpr` in
@@ -256,7 +260,7 @@ export function validateItemDataSize(data: Uint8Array | string, where: string): 
 	const bytes = itemDataBytes(data);
 	if (bytes > MAX_ITEM_BYTES) {
 		throw new FokosValidationError(VALIDATION_CODES.item_data_too_large, {
-			message: `item data exceeds ${MAX_ITEM_BYTES / 1024} KB`,
+			message: `item data exceeds ${MAX_ITEM_BYTES / 1024 / 1024} MiB`,
 			attributes: { api: where, limitBytes: MAX_ITEM_BYTES, bytes },
 		});
 	}

@@ -221,9 +221,10 @@ describe("validateTransactWriteOperations", () => {
 	// The per-item cap alone does not bound a transaction: MAX_ITEMS_PER_TRANSACTION items at the item
 	// limit would be far over the transaction budget, so the total is still checked separately.
 	it("sums payload bytes across operations", () => {
+		// 15 items of 1 MiB with their keys are below the 16 MiB of MAX_PAYLOAD_BYTES_PER_TX, and 16 are
+		// above it: 16 MiB of data plus the keys.
 		const maxItem = new Uint8Array(MAX_ITEM_BYTES);
-		const atLimit = Math.floor(MAX_PAYLOAD_BYTES_PER_TX / MAX_ITEM_BYTES); // 40 items → 16,000 KiB, under 16 MiB
-		const ops = Array.from({ length: atLimit }, (_, i) => putOp(`hk-${i}`, undefined, maxItem));
+		const ops = Array.from({ length: 15 }, (_, i) => putOp(`hk-${i}`, undefined, maxItem));
 		expect(() => validate(ops)).not.toThrow();
 		expect(() => validate([...ops, putOp("one-more", undefined, maxItem)])).toThrow(fokosErrorWith("transact_payload_too_large"));
 	});
@@ -231,10 +232,10 @@ describe("validateTransactWriteOperations", () => {
 	it("counts the JSON bytes of an expression tree in the transaction payload", () => {
 		const condition = { op: "eq", args: [{ ref: "data", path: "$.text" }, { val: "x".repeat(50 * 1024) }] } as const;
 		const update = [{ action: "set", target: { ref: "data", path: "$.text" }, value: { val: "y".repeat(50 * 1024) } }] as const;
-		// A text counts two bytes for each character, so 20 items at the item limit leave less than
-		// 400 KiB of the transaction payload.
-		const data = "d".repeat(MAX_ITEM_BYTES);
-		const ops: TransactWriteOperationLike[] = Array.from({ length: 20 }, (_, i) => putOp(`tree-${i}`, undefined, data));
+		// A text counts two bytes for each character. 8 texts of 1,022,976 characters count
+		// 2 × 8 × 1,022,976 bytes, which is 16 MiB - 400 KiB, so the keys and the trees go above the limit.
+		const data = "d".repeat(1_022_976);
+		const ops: TransactWriteOperationLike[] = Array.from({ length: 8 }, (_, i) => putOp(`tree-${i}`, undefined, data));
 		expect(() => validate(ops)).not.toThrow();
 		const updates = [1, 2, 3].map(
 			(i): TransactWriteOperationLike => ({ hashKey: `tree-update-${i}`, operation: "update", condition, update }),
@@ -242,15 +243,16 @@ describe("validateTransactWriteOperations", () => {
 		const all = [...ops, ...updates];
 		const treeBytes = 3 * 2 * (JSON.stringify(condition).length + JSON.stringify(update).length);
 		expect(() => validate(all)).toThrow(
-			fokosErrorWith("transact_payload_too_large", { bytes: 20 * 2 * data.length + treeBytes + keyBytes(all) }),
+			fokosErrorWith("transact_payload_too_large", { bytes: 8 * 2 * data.length + treeBytes + keyBytes(all) }),
 		);
 	});
 
 	it("counts the encoded keys in the transaction payload", () => {
-		// The data fills the payload up to the limit, and one more byte of key goes above it.
+		// 15 items of 1 MiB, and a last item whose data fills the payload up to the 16 MiB limit. One more
+		// byte of key goes above it.
 		const data = new Uint8Array(MAX_ITEM_BYTES);
-		const ops = Array.from({ length: 40 }, (_, i) => putOp(`hk-${i}`, undefined, data));
-		const rest = MAX_PAYLOAD_BYTES_PER_TX - 40 * MAX_ITEM_BYTES - keyBytes(ops) - keyBytes([putOp("last")]);
+		const ops = Array.from({ length: 15 }, (_, i) => putOp(`hk-${i}`, undefined, data));
+		const rest = MAX_PAYLOAD_BYTES_PER_TX - 15 * MAX_ITEM_BYTES - keyBytes(ops) - keyBytes([putOp("last")]);
 		const atLimit = [...ops, putOp("last", undefined, new Uint8Array(rest))];
 		expect(() => validate(atLimit)).not.toThrow();
 		const over = [...ops, putOp("last-", undefined, new Uint8Array(rest))];

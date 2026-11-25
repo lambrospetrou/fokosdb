@@ -229,7 +229,7 @@ export function estimate(model: StorageModel, f: ItemFacts): number {
  * - The `overflow_bytes` of a row are less than one overflow page, plus 4 bytes for each overflow
  *   page, plus `overflowRowOverhead`.
  *
- * For `ITEMS_MODEL` the bound is about 1.37 MiB.
+ * For `ITEMS_MODEL` the bound is about 3.5 MiB.
  */
 export function maxItemEstimate(model: StorageModel): number {
 	const pages = Math.ceil((MAX_ITEM_BYTES + model.rowPayloadOverhead) / OVERFLOW_PAGE_DATA);

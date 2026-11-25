@@ -62,10 +62,10 @@ export const EXPRESSION_LIMITS = {
 	 * - The JSON array that holds all bound values of a projection or a query. This array is one bound
 	 *   value.
 	 *
-	 * The value must stay below the platform limit "Maximum string, BLOB or table row size", 2 MB,
+	 * The value must stay below the platform limit "Maximum string, BLOB or table row size", 8 MB,
 	 * because the JSON array is one string that SQLite gets. 512 KiB is a budget of this library below
-	 * that limit. It is above the largest item (`MAX_ITEM_BYTES`), so a literal can hold a value as
-	 * large as an item.
+	 * that limit. It is below the largest item (`MAX_ITEM_BYTES`), so a literal cannot hold a value as
+	 * large as an item: a put writes such a value.
 	 */
 	canonicalPayloadBytes: 512 * 1024,
 	/**

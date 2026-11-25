@@ -2516,9 +2516,10 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 
 describe("FokosDBTransactionCoordinatorDO - results and answers in more than one chunk", () => {
 	// 5,000 rejected operations with binary keys of 1,000 bytes. Each stored entry holds 1,334
-	// characters of base64url for its key, so the answer and the results are each above one chunk.
+	// characters of base64url for its key, so the answer and the results each hold more than
+	// 6,670,000 bytes, above one chunk of 5 MiB (5,242,880 bytes).
 	const OPS = 5_000;
-	const CHUNK_BYTES = 3 * 1024 * 1024;
+	const CHUNK_BYTES = 5 * 1024 * 1024;
 	const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 
 	function keyOf(i: number): Uint8Array {
@@ -2649,10 +2650,11 @@ describe("FokosDBTransactionCoordinatorDO - results and answers in more than one
 		});
 	});
 
-	// Each key is 250 characters above U+FFFF, and each of them is two UTF-16 code units. The text is
-	// above one chunk, so a cut falls between the characters of some key.
+	// Each key is 250 characters above U+FFFF, and each of them is two UTF-16 code units and four UTF-8
+	// bytes. 6,000 keys hold 6,000,000 bytes, above one chunk of 5 MiB (5,242,880 bytes), so a cut falls
+	// between the characters of some key.
 	it("cuts the text only between characters, and answers with every key", async () => {
-		const ops = 4_000;
+		const ops = 6_000;
 		const keyOfText = (i: number) => `${i}:${"\u{1F600}".repeat(250)}`;
 		await withCoordinator((tc, state) => {
 			insertState(tc, state, { token: TOKEN, transactionId: TX_ID, state: "PREPARING", createdAt: Date.now() - 10_000 });

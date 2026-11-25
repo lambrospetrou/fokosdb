@@ -478,12 +478,12 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("rejects transaction with item_too_large when update result exceeds MAX_ITEM_BYTES", async () => {
+		// An expression literal is at most 512 KiB, below the 1 MiB of MAX_ITEM_BYTES. So the put makes an
+		// item 1 KiB below the limit, and the update adds 2 KiB.
 		const key = { hashKey: `large-${crypto.randomUUID()}` };
-		await db.putItem({ ...key, data: { str: "small" } });
+		await db.putItem({ ...key, data: { str: "x".repeat(MAX_ITEM_BYTES - 1024) } });
 
-		const update: UpdateExpression = [
-			{ action: "set", target: { ref: "data", path: "$.str" }, value: { val: "x".repeat(MAX_ITEM_BYTES + 10) } },
-		];
+		const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.more" }, value: { val: "y".repeat(2048) } }];
 
 		const res = await writeOutcomeWithClockRetry(db, {
 			items: [{ ...key, operation: "update", update }],

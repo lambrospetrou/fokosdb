@@ -99,7 +99,7 @@ class StatementTail {
  */
 function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
 	throw new FokosValidationError(VALIDATION_CODES.item_too_large, {
-		message: `stored item exceeds ${MAX_ITEM_BYTES / 1024} KB`,
+		message: `stored item exceeds ${MAX_ITEM_BYTES / 1024 / 1024} MiB`,
 		attributes: decodeItemKeys(hk, sk),
 	});
 }

@@ -644,8 +644,9 @@ describe("ItemStats bucket threshold on a hash leaf", () => {
 	const MiB = 1024 * 1024;
 
 	it("bounds the estimate of each item, and gives m from the promotion floor", () => {
-		expect(MAX_EST).toBe(1_438_258);
-		expect(maxItemEstimate(LATEST_ITEMS_MODEL)).toBe(1_438_257);
+		// The estimate of an indexed item of 1 MiB (MAX_ITEM_BYTES) with keys of 1 MiB.
+		expect(MAX_EST).toBe(3_675_298);
+		expect(maxItemEstimate(LATEST_ITEMS_MODEL)).toBe(3_675_297);
 		for (const model of [ITEMS_MODEL, LATEST_ITEMS_MODEL]) {
 			let largest = 0;
 			for (let itemBytes = 0; itemBytes <= MAX_ITEM_BYTES; itemBytes++) {
@@ -653,8 +654,8 @@ describe("ItemStats bucket threshold on a hash leaf", () => {
 			}
 			expect(largest).toBeLessThanOrEqual(maxItemEstimate(model));
 		}
-		// The floors of the caps 10, 50, 100, and 176 MiB with the default fractions.
-		expect([1.25, 6.25, 12.5, 22].map((mb) => bucketThreshold(ITEMS_MODEL, mb * MiB))).toEqual([1, 4, 9, 16]);
+		// The floors of the caps 10, 100, 200, and 500 MiB with the default fractions, divided by MAX_EST.
+		expect([1.25, 12.5, 25, 62.5].map((mb) => bucketThreshold(ITEMS_MODEL, mb * MiB))).toEqual([1, 3, 7, 16]);
 		expect(bucketThreshold(ITEMS_MODEL, 0)).toBe(1);
 		expect(bucketThreshold(ITEMS_MODEL, null)).toBe(BUCKET_THRESHOLD_MAX);
 	});

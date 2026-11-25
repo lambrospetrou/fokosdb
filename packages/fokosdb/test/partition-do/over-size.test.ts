@@ -195,7 +195,9 @@ describe("FokosDBPartitionDO - a hash leaf that refuses a write for size", () =>
 	});
 
 	it("promotes the one hash key of a leaf whose estimate is below the promotion threshold", async () => {
-		const partition = makePartition({ ns: CONTROLLED_NS });
+		// A cap of 500 MiB gives a promotion floor of 62.5 MiB. The largest estimate of one item is about
+		// 3.5 MiB, so the bucket threshold m is 16, and the 4 items of the key have no bucket.
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: 500 } });
 		const rangeRoot = partition.rangeRoot("solo");
 		await keepTestLocks(partition, rangeRoot);
 		// The pending payloads make the file large, and the estimate counts the committed items only.
