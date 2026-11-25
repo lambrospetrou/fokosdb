@@ -30,7 +30,7 @@
  */
 import { collectBatch } from "./batch-scan.js";
 import type { FokosPlatform } from "../shared/platform.js";
-import { jitterBackoff } from "./retries.js";
+import { jitterBackoff } from "durable-utils/retries";
 import invariant from "../shared/invariant.js";
 import { KeyCodec, type FokosCompositeKey } from "./key-codec.js";
 
@@ -377,7 +377,7 @@ export class RepartitionSource {
 					// A size-triggered split can find fewer than N items in its interval, because each child
 					// needs one. Only a new write can change that, so the retry backs off to `sourceRetryMaxMs`.
 					const { sourceRetryBaseMs, sourceRetryMaxMs } = this.deps.config();
-					this.#deferSource(row, now, jitterBackoff(this.deps.platform, row.attempts, sourceRetryBaseMs, sourceRetryMaxMs));
+					this.#deferSource(row, now, jitterBackoff(row.attempts, sourceRetryBaseMs, sourceRetryMaxMs, this.deps.platform));
 					return "progressed";
 				}
 				// The children tile [start, end) with these boundaries. A boundary out of order or out of the
@@ -590,7 +590,7 @@ export class RepartitionSource {
 					row.id,
 					target.partitionId,
 					attempts,
-					now + jitterBackoff(this.deps.platform, attempts, sourceRetryBaseMs, sourceRetryMaxMs),
+					now + jitterBackoff(attempts, sourceRetryBaseMs, sourceRetryMaxMs, this.deps.platform),
 				);
 			}
 			this.store.refreshRepartitionDue(row.id, now);
@@ -1348,7 +1348,7 @@ function retryDelay(
 	) {
 		return config.nonRetryableRetryMs;
 	}
-	return jitterBackoff(platform, attempts, base, max);
+	return jitterBackoff(attempts, base, max, platform);
 }
 
 const PHASE_ORDER: Record<FokosMigrationCursor["phase"], number> = { overrides: 0, host: 1 };
