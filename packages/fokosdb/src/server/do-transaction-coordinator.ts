@@ -920,7 +920,6 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				await this.runPrepareRecovery(routingHash, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
 				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
 			}
-			case "PREPARED":
 			case "COMMITTING": {
 				await this.runCommit(routingHash, transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, seen);
 				return this.loadFinalResponse(routingHash, transactionId, idempotencyToken, seen);
@@ -939,7 +938,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 *
 	 * - COMMITTED: every participant confirmed the commit, so "committed" also promises
 	 *   read-your-writes — a caller that receives it can read what it wrote on every participant.
-	 * - COMMITTING (or PREPARED from older code): the decision is durable and is the point of no return
+	 * - COMMITTING: the decision is durable and is the point of no return
 	 *   (nothing transitions COMMITTING → CANCELLING; the writer of CANCELLING guards on state =
 	 *   'PREPARING'), so the transaction WILL commit — but some participant has not applied it yet.
 	 *   Answering "committed" would let a caller read a stale value from that participant, so these
@@ -967,7 +966,6 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				// The transaction is all-or-nothing, so "committed" already says every operation applied.
 				// Nothing per-item to report, and so no tc_items read on this path.
 				return { outcome: "committed", transactionId, idempotencyToken, meta: seen.meta() };
-			case "PREPARED":
 			case "COMMITTING":
 				// The outcome is decided and final, but not every participant has applied it yet, so
 				// this is not a terminal answer for the caller: retry with the same token.
@@ -1527,18 +1525,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// same token, the `tx_recovery` job, and a participant's recovery call. Each drive sends commits
 		// only when the stored decision is commit. A drive whose own decision lost sends nothing.
 		//
-		// This step writes no row for a COMMITTING transaction: markCommitting already wrote the decision.
-		// An UPDATE that writes the same value again also counts as one row written. A PREPARED row from
-		// older code moves to COMMITTING here, because completeTransaction expects COMMITTING.
-		// FIXME: Remove the fallback after all older code that writes PREPARED rows is gone.
-		const stateRow = this.transition(idempotencyToken, () => {
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'COMMITTING' WHERE routing_hash = ? AND transaction_id = ? AND state = 'PREPARED'`,
-				routingHash,
-				transactionId,
-			);
-			return this.loadStateRow(routingHash, transactionId);
-		});
+		// This step writes no row: markCommitting already wrote the decision.
+		const stateRow = this.transition(idempotencyToken, () => this.loadStateRow(routingHash, transactionId));
 		invariant(stateRow, () => `fokos/tc: runCommit found no tc_state row for transaction ${transactionId}`);
 		if (stateRow.state !== "COMMITTING") {
 			return;
@@ -1900,7 +1888,6 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			case "PREPARING":
 				await this.runPrepareRecovery(routingHash, transactionId, idempotencyToken, budgetMs);
 				break;
-			case "PREPARED":
 			case "COMMITTING":
 				await this.runCommit(routingHash, transactionId, idempotencyToken, budgetMs);
 				break;
@@ -2294,7 +2281,6 @@ function isPastPrepare(state: TCState): boolean {
 		case "CREATED":
 		case "PREPARING":
 			return false;
-		case "PREPARED":
 		case "COMMITTING":
 		case "COMMITTED":
 		case "CANCELLING":

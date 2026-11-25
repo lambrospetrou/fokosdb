@@ -300,11 +300,8 @@ export type ReadSnapshotResponse = (ReadSnapshotOutcome & TransactionPartitionsA
 /**
  * Commit:  CREATED → PREPARING → COMMITTING → COMMITTED
  * Cancel:  CREATED → PREPARING → CANCELLING → CANCELLED
- *
- * The coordinator does not write PREPARED. A row that older code wrote, or that a migration page from
- * older code holds, can be PREPARED. It has the same meaning as COMMITTING: the decision is commit.
  */
-export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
+export type TCState = "CREATED" | "PREPARING" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
 
 // ─── FokosDBTransactionCoordinatorDO — recoverTransaction ───────────────────────────
 

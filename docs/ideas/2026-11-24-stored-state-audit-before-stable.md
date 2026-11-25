@@ -45,7 +45,7 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    version.
 2. **`__fokos/cache/hash_arena` has no version** — A wrong layout routes to the wrong children with no error. Add a
    version, and drop a snapshot with another version. `__fokos/policy` also has no version.
-3. **No guard against a rollback** — `SQLSchemaMigrations` of `durable-utils` does nothing when the stored migration
+3. (NON-ISSUE) **No guard against a rollback** — `SQLSchemaMigrations` of `durable-utils` does nothing when the stored migration
    id is higher than the last migration of the code. Older code then runs on a newer schema. Each of the six
    migration trackers must refuse this case with `partition_init_failed`.
 4. **JSON columns with no version** — `tc_items.conditions_json` and `update_json` (expression trees),
@@ -56,7 +56,7 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
 6. **The range DO name** — It stores the shared leading bytes of the two boundaries two times (FIXME in
    `rangePartitionDoName`, `sharding/partition-id.ts`). The name encoding must never change after the release, so
    decide now.
-7. **The `PREPARED` fallback** — The coordinator still moves `PREPARED` rows from older code to `COMMITTING`. No such
+7. (DONE) **The `PREPARED` fallback** — The coordinator still moves `PREPARED` rows from older code to `COMMITTING`. No such
    rows exist before the release. Remove the fallback.
 8. **Two KV key prefixes** — The sharding store uses `__fokos/`, and the partition, coordinator, materialization,
    and item-stats stores use `__fokosdb/`. A rename costs nothing now.

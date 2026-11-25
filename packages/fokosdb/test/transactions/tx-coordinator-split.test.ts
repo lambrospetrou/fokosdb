@@ -216,7 +216,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		expect(reads.every(Boolean)).toBe(true);
 	});
 
-	it("stops the source at the PREPARED transition after a cutover, and the child resumes the same transaction once", async () => {
+	it("stops the source at the COMMITTING transition after a cutover, and the child resumes the same transaction once", async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "tc-split-prepare");
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "v" }));
@@ -236,7 +236,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			await vi.waitFor(async () => expect(await roleOf(root)).toBe("router"), { timeout: SPLIT_TIMEOUT_MS, interval: 20 });
 			await held.testReleasePrepare();
 
-			// The source answers `partition_migrating` at PREPARED, and db.ts retries with the same token
+			// The source answers `partition_migrating` at COMMITTING, and db.ts retries with the same token
 			// until the child has imported the ledger row and resumes it.
 			const result = await write;
 			expect(result).toMatchObject({ outcome: "committed" });

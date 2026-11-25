@@ -70,7 +70,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			() => null,
 			(e: unknown) => e,
 		);
-		// PREPARED is final, so this transaction commits — but the unreachable participant has not
+		// COMMITTING is final, so this transaction commits — but the unreachable participant has not
 		// applied it yet, and the caller must not be told "committed".
 		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(false);

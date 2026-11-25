@@ -326,10 +326,10 @@ describe("FokosDBTransactionCoordinatorDO - loadFinalResponse: committed only af
 		});
 	});
 
-	// The decision is durable and PREPARED is final, so these transactions WILL commit — but a
+	// The decision is durable and COMMITTING is final, so these transactions WILL commit — but a
 	// straggling participant has not applied yet, and a caller that reads now could see a stale
 	// value from it. The answer must be the retryable commit-pending error, never "committed".
-	it.each(["PREPARED", "COMMITTING"] as const)("throws the commit-pending error in state %s", async (tcState) => {
+	it.each(["COMMITTING"] as const)("throws the commit-pending error in state %s", async (tcState) => {
 		await withCoordinator((tc, state) => {
 			seed(tc, state, tcState);
 			let err: unknown;
@@ -1226,7 +1226,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		});
 	});
 
-	it.each(["PREPARED", "COMMITTING", "CANCELLING"] as const)(
+	it.each(["COMMITTING", "CANCELLING"] as const)(
 		"the recovery claim removes the payload of a %s transaction and keeps its keys",
 		async (tcState) => {
 			await withCoordinator(async (tc, state) => {
@@ -1539,17 +1539,6 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
 
 				expect(committedBy).toEqual(["p2"]);
-				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTED");
-			});
-		});
-
-		it("moves a PREPARED row from older code to COMMITTING, and completes it", async () => {
-			await withCoordinator(async (tc, state) => {
-				twoParticipants(tc, state, "PREPARED");
-				mockCommits(new Set());
-
-				await tc.runCommit(P(tc), TX_ID, TOKEN, BUDGET_MS);
-
 				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTED");
 			});
 		});
@@ -2127,7 +2116,6 @@ describe("FokosDBTransactionCoordinatorDO - migration pages", () => {
 
 	it.each([
 		["PREPARING", true],
-		["PREPARED", false],
 		["COMMITTING", false],
 		["CANCELLING", false],
 		["COMMITTED", false],
