@@ -1,5 +1,14 @@
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, makeDB, type Key, writeOutcome } from "./tx-helpers.js";
+import {
+	controlledCoordinator,
+	countDistinctPartitions,
+	keysAcrossPartitions,
+	keysInOnePartition,
+	makeDB,
+	type Key,
+	writeOutcome,
+} from "./tx-helpers.js";
 import invariant from "../../src/shared/invariant.js";
 import { applyImageCap, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import type { TransactWriteItemsOptions } from "../../src/shared/transaction-api-types.js";
@@ -590,5 +599,42 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				expect(items[1].itemOmitted).toBeUndefined();
 			}
 		});
+	});
+});
+
+describe("transactWriteItems - the image cap of one transaction", () => {
+	// The coordinator stores the cap of each transaction when it creates it. A transaction whose own
+	// rows are large gets a lower cap, so that one migration page and one answer can still carry it.
+	it("stores the global cap for a small transaction and a lower cap for a large one", async () => {
+		const db = makeDB({ controlled: true });
+		const coordinator = controlledCoordinator(db);
+		const capOf = async (token: string) =>
+			await runInDurableObject(
+				coordinator,
+				(_instance: unknown, state: DurableObjectState) =>
+					state.storage.sql
+						.exec<{ image_cap_bytes: number }>(`SELECT image_cap_bytes FROM tc_state WHERE idempotency_token = ?`, token)
+						.one().image_cap_bytes,
+			);
+
+		const small = `cap-small-${crypto.randomUUID()}`;
+		const smallKeys = keysAcrossPartitions(db, 2, `cap-small-${crypto.randomUUID()}`);
+		await writeOutcome(
+			db.transactWriteItems({ clientRequestToken: small, items: smallKeys.map((k) => ({ ...k, operation: "put", data: "v" })) }),
+		);
+		expect(await capOf(small)).toBe(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX);
+
+		// 25 items just under the item limit: about 10 MB of payload.
+		const large = `cap-large-${crypto.randomUUID()}`;
+		const largeKeys = keysAcrossPartitions(db, 25, `cap-large-${crypto.randomUUID()}`);
+		const data = "x".repeat(MAX_ITEM_BYTES - 2048);
+		expect(
+			await writeOutcome(
+				db.transactWriteItems({ clientRequestToken: large, items: largeKeys.map((k) => ({ ...k, operation: "put", data })) }),
+			),
+		).toMatchObject({ outcome: "committed" });
+		const cap = await capOf(large);
+		expect(cap).toBeGreaterThan(0);
+		expect(cap).toBeLessThan(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX);
 	});
 });

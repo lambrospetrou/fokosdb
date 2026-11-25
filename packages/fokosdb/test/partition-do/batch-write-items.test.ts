@@ -288,11 +288,18 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 		await expect(db.batchWriteItems({ items: [{ ...put, condition: { op: "nope" } as never }] })).rejects.toThrow(
 			fokosErrorWith("expression_invalid"),
 		);
-		// Each condition is valid. Together they are above the 4 MB of `MAX_PAYLOAD_BYTES_PER_TX`.
-		const large: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.x" }, { val: "x".repeat(43_000) }] };
-		const tooLarge = Array.from({ length: MAX_ITEMS_PER_BATCH }, (_, i) => ({ ...put, hashKey: `k-${i}`, condition: large }));
-		await expect(db.batchWriteItems({ items: tooLarge })).rejects.toThrow(fokosErrorWith("batch_conditions_too_large"));
-		await expect(db.batchWriteItems({ items: tooLarge.slice(0, 90) })).resolves.toMatchObject({ unprocessedItems: [] });
+		// Each item is valid. 41 items at the item limit are above the 16 MiB of `MAX_PAYLOAD_BYTES_PER_BATCH`,
+		// and 40 such items with their keys and conditions are below it.
+		const large: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.x" }, { val: "x".repeat(1_000) }] };
+		const tooLarge = Array.from({ length: 41 }, (_, i) => ({
+			...put,
+			hashKey: `k-${i}`,
+			data: "d".repeat(MAX_ITEM_BYTES),
+			condition: large,
+		}));
+		await expect(db.batchWriteItems({ items: tooLarge })).rejects.toThrow(fokosErrorWith("batch_payload_too_large"));
+		const fits = tooLarge.slice(0, 40).map((item) => ({ ...item, condition: undefined }));
+		await expect(db.batchWriteItems({ items: fits })).resolves.toMatchObject({ unprocessedItems: [] });
 		await expect(db.batchWriteItems({ items: [{ ...put, data: 3 as never }] })).rejects.toThrow(fokosErrorWith("item_data_wrong_type"));
 		await expect(db.batchWriteItems({ items: [{ ...put, data: "x".repeat(MAX_ITEM_BYTES + 1) }] })).rejects.toThrow(
 			fokosErrorWith("item_data_too_large"),
@@ -606,27 +613,17 @@ describe.concurrent("FokosDBStd.batchGetItemsWithRetry", () => {
 });
 
 // One request of about 40 MB. It runs alone, so the memory of the other tests does not add to it.
-describe("FokosDB.batchWriteItems — the RPC limit", () => {
-	it("rejects each item of a call above 32 MiB, applies none of them, and the helper sends it once", async () => {
+describe("FokosDB.batchWriteItems — the payload limit", () => {
+	// 100 items of 400,000 characters are about 40 MB, above the 32 MiB of one RPC. The client refuses
+	// the call before any I/O, so no RPC goes above the limit. The client maps an RPC failure above
+	// the limit to `batch_request_too_large` for each item (`src/shared/batch-failure.test.ts`).
+	it("refuses a call above MAX_PAYLOAD_BYTES_PER_BATCH before any RPC, and applies none of its items", async () => {
 		const db = makeDB({ controlled: true });
 		const data = "x".repeat(400_000);
 		const items = Array.from({ length: 100 }, (_, i) => ({ operation: "put" as const, hashKey: "big", sortKey: `sk-${i}`, data }));
-		const calls: number[] = [];
-		const batcher: ItemBatcher = {
-			batchGetItems: (opts) => db.batchGetItems(opts),
-			batchWriteItems: (opts) => {
-				calls.push(opts.items.length);
-				return db.batchWriteItems(opts);
-			},
-		};
 
-		const write = await FokosDBStd.batchWriteItemsWithRetry(batcher, { items }, { baseDelayMs: 1, maxDelayMs: 2 });
+		await expect(db.batchWriteItems({ items })).rejects.toThrow(fokosErrorWith("batch_payload_too_large"));
 
-		expect(calls).toEqual([100]);
-		for (const result of write.results) {
-			expect(result).toMatchObject({ outcome: "rejected", code: "batch_request_too_large", error_id: expect.stringMatching(/^e_nhncs4_/) });
-		}
-		expect(write.unprocessedItems).toEqual([]);
 		expect(await recordedTxCalls(controlledPartition(db, { hashKey: "big", sortKey: "sk-0" }), "apiBatchWriteItems")).toHaveLength(0);
 		const read = await db.batchGetItems({ items: items.slice(0, 5).map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
 		expect(read.items.map((r) => r.outcome)).toEqual(["not_found", "not_found", "not_found", "not_found", "not_found"]);

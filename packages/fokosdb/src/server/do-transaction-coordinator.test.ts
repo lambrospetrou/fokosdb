@@ -22,6 +22,7 @@ import { FOKOS_KV_KEYS } from "../sharding/sharding-store.js";
 import { IDEMPOTENCY_WINDOW_MS, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX } from "../shared/transaction-limits.js";
 import { DEFAULT_COORDINATOR_CONFIG } from "./host-config.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
+import invariant from "../shared/invariant.js";
 import type {
 	InitiateWriteRequest,
 	InitiateWriteResponseEncoded,
@@ -152,8 +153,8 @@ function seed(
 	state.storage.sql.exec(`DELETE FROM tc_items`);
 	const now = createdAt ?? Date.now() - 10_000;
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tc_state (routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash, image_cap_bytes)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		P(tc),
 		TOKEN,
 		TX_ID,
@@ -164,6 +165,7 @@ function seed(
 		results === undefined ? null : JSON.stringify(results),
 		// loadFinalResponse never reads the fingerprint; any non-null value satisfies the column.
 		"0000000000000000",
+		MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
 	);
 	// A realistic item set, one row with a sort key and one without. The response must not depend on
 	// it: a committed transaction reports no items.
@@ -206,8 +208,8 @@ function insertState(
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_state
-			(routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		options.routingHash ?? P(tc, options.token),
 		options.token,
 		options.transactionId,
@@ -218,6 +220,7 @@ function insertState(
 		options.completedAt == null ? options.createdAt + DEFAULT_COORDINATOR_CONFIG.staleTransactionMs : null,
 		options.results === undefined ? null : JSON.stringify(options.results),
 		options.operationsHash ?? "0000000000000000",
+		MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
 	);
 }
 
@@ -238,7 +241,8 @@ function insertParticipant(
 		outcome.prepare ?? null,
 		outcome.commit ?? null,
 		outcome.cancel ?? null,
-		outcome.answer === undefined ? null : JSON.stringify(outcome.answer),
+		// The stored answer is the results array of a rejected answer.
+		outcome.answer?.outcome === "rejected" ? JSON.stringify(outcome.answer.results) : null,
 		outcome.error === undefined ? null : JSON.stringify(outcome.error),
 	);
 }
@@ -269,7 +273,7 @@ function rejection(opIndex: number, hashKey: string, imageBytes: number): Prepar
 			{
 				opIndex,
 				outcome: "rejected",
-				reason: { code: "condition_failed", hashKey, item: { hashKey, data: `image-${opIndex}`, kind: "text", version: 1 } },
+				reason: { code: "condition_failed", hashKey, item: { hashKey, data: "x".repeat(imageBytes), kind: "text", version: 1 } },
 				imageBytes,
 			},
 		],
@@ -895,8 +899,9 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 			insertParticipant(tc, state, { name: "p1" });
 			insertParticipant(tc, state, { name: "p2" });
+			state.storage.sql.exec(`UPDATE tc_state SET image_cap_bytes = 100`);
 			// The first image fills the whole cap, so the cap drops the second image.
-			tc.storePrepareAnswer(P(tc), TX_ID, "p1", rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX));
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", rejection(0, "hk1", 100));
 			tc.storePrepareAnswer(P(tc), TX_ID, "p2", rejection(1, "hk2", 6));
 			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
 			const before = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
@@ -1001,8 +1006,9 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 				insertParticipant(tc, state, { name: "p1" });
 				insertParticipant(tc, state, { name: "p2" });
+				state.storage.sql.exec(`UPDATE tc_state SET image_cap_bytes = 100`);
 				const answers: Record<string, PrepareOutcome> = {
-					p1: rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX - 5),
+					p1: rejection(0, "hk1", 95),
 					p2: rejection(1, "hk2", 10),
 				};
 				for (const name of order) {
@@ -1020,7 +1026,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 		expect(first).toMatchObject({
 			outcome: "cancelled",
 			results: [
-				{ outcome: "rejected", reason: { code: "condition_failed", item: { data: "image-0" } } },
+				{ outcome: "rejected", reason: { code: "condition_failed", item: { data: "x".repeat(95) } } },
 				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" }, itemOmitted: "response_too_large" },
 			],
 		});
@@ -1315,20 +1321,16 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
 				P(tc),
 				TX_ID,
-				JSON.stringify({
-					outcome: "rejected",
-					reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
-					// A participant answers for every operation it owns, not only the ones it rejected.
-					results: [
-						{
-							opIndex: 0,
-							outcome: "rejected",
-							reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
-							imageBytes: 50_000,
-						},
-						{ opIndex: 1, outcome: "passed" },
-					],
-				}),
+				// A participant answers for every operation it owns, not only the ones it rejected.
+				JSON.stringify([
+					{
+						opIndex: 0,
+						outcome: "rejected",
+						reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
+						imageBytes: 50_000,
+					},
+					{ opIndex: 1, outcome: "passed" },
+				]),
 			);
 			state.storage.sql.exec(
 				`INSERT INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
@@ -1370,11 +1372,7 @@ describe("FokosDBTransactionCoordinatorDO - bounded transaction storage", () => 
 				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
 				P(tc),
 				TX_ID,
-				JSON.stringify({
-					outcome: "rejected",
-					reason: { code: "condition_failed", hashKey: "hk2" },
-					results: [{ opIndex: 1, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" } }],
-				}),
+				JSON.stringify([{ opIndex: 1, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" } }]),
 			);
 
 			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
@@ -2514,4 +2512,251 @@ describe("FokosDBTransactionCoordinatorDO - fatal prepare errors", () => {
 			expect(callsFor(txPrepare)).toHaveLength(DEFAULT_COORDINATOR_CONFIG.participantRetry.prepareMaxAttempts);
 		});
 	}, 15_000);
+});
+
+describe("FokosDBTransactionCoordinatorDO - results and answers in more than one chunk", () => {
+	// 5,000 rejected operations with binary keys of 1,000 bytes. Each stored entry holds 1,334
+	// characters of base64url for its key, so the answer and the results are each above one chunk.
+	const OPS = 5_000;
+	const CHUNK_BYTES = 3 * 1024 * 1024;
+	const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
+
+	function keyOf(i: number): Uint8Array {
+		const key = new Uint8Array(1_000).fill(7);
+		new DataView(key.buffer).setUint32(0, i);
+		return key;
+	}
+
+	function seedWide(tc: CoordinatorInternals, state: DurableObjectState): void {
+		insertState(tc, state, { token: TOKEN, transactionId: TX_ID, state: "PREPARING", createdAt: Date.now() - 10_000 });
+		for (let i = 0; i < OPS; i++) {
+			state.storage.sql.exec(
+				`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, ?, 'check', 'p1')`,
+				P(tc),
+				TX_ID,
+				KeyCodec.encode(keyOf(i)),
+				ABSENT_SK,
+				i,
+			);
+		}
+		insertParticipant(tc, state, {});
+	}
+
+	const wideRejection: PrepareOutcome = {
+		outcome: "rejected",
+		results: Array.from({ length: OPS }, (_, i) => ({
+			opIndex: i,
+			outcome: "rejected" as const,
+			reason: { code: "condition_failed" as const, hashKey: keyOf(i) },
+		})),
+	};
+
+	function maxChunkBytes(state: DurableObjectState): number {
+		return Math.max(
+			...[
+				`SELECT MAX(LENGTH(CAST(results_json AS BLOB))) AS n FROM tc_state`,
+				`SELECT MAX(LENGTH(CAST(results_json AS BLOB))) AS n FROM tc_result_chunks`,
+				`SELECT MAX(LENGTH(CAST(answer_json AS BLOB))) AS n FROM tc_participants`,
+				`SELECT MAX(LENGTH(CAST(answer_json AS BLOB))) AS n FROM tc_answer_chunks`,
+			].map((sql) => state.storage.sql.exec<{ n: number | null }>(sql).one().n ?? 0),
+		);
+	}
+
+	function expectEveryKey(response: InitiateWriteResponseEncoded): void {
+		invariant(response.outcome === "cancelled", "expected the transaction to cancel");
+		expect(response.results).toHaveLength(OPS);
+		for (const [i, r] of response.results.entries()) {
+			invariant(r.outcome === "rejected", `operation ${i} should be rejected`);
+			expect(r.reason.hashKey).toEqual(keyOf(i));
+		}
+	}
+
+	it("stores the answer and the results in chunks, and answers with every key", async () => {
+		await withCoordinator((tc, state) => {
+			seedWide(tc, state);
+			expect(tc.storePrepareAnswer(P(tc), TX_ID, "p1", wideRejection)).toBe(true);
+			expect(countRows(state, "tc_answer_chunks")).toBeGreaterThan(0);
+
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			expect(countRows(state, "tc_result_chunks")).toBeGreaterThan(0);
+			expect(maxChunkBytes(state)).toBeLessThanOrEqual(CHUNK_BYTES);
+			// The keys are base64url text, not arrays of numbers.
+			expect(state.storage.sql.exec<{ results_json: string }>(`SELECT results_json FROM tc_state`).one().results_json).toContain('"$b64"');
+
+			expectEveryKey(tc.loadFinalResponse(P(tc), TX_ID, TOKEN));
+		});
+	});
+
+	it("moves the result chunks in a migration page, and no prepare answer after the decision", async () => {
+		await withCoordinator((tc, state) => {
+			seedWide(tc, state);
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", wideRejection);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			const before = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
+
+			const { page } = tc.buildMigrationPage(null, () => true, budget, hashStorageInterval(asRoutingHash(new Uint8Array(8)), null));
+			const [tx] = page as unknown as Array<{
+				participants: Array<{ answer_json: string | null }>;
+				resultChunks: unknown[];
+				answerChunks: unknown[];
+			}>;
+			expect(tx.participants.map((p) => p.answer_json)).toEqual([null]);
+			expect(tx.answerChunks).toEqual([]);
+			expect(tx.resultChunks.length).toBeGreaterThan(0);
+
+			for (const table of ["tc_state", "tc_items", "tc_participants", "tc_answer_chunks", "tc_results", "tc_result_chunks"]) {
+				state.storage.sql.exec(`DELETE FROM ${table}`);
+			}
+			tc.applyMigrationPage(page);
+			tc.applyMigrationPage(page);
+			expect(tc.loadFinalResponse(P(tc), TX_ID, TOKEN)).toEqual(before);
+		});
+	});
+
+	it("moves the answer chunks of a transaction in PREPARING", async () => {
+		await withCoordinator((tc, state) => {
+			seedWide(tc, state);
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", wideRejection);
+			const chunks = countRows(state, "tc_answer_chunks");
+
+			const { page } = tc.buildMigrationPage(null, () => true, budget, hashStorageInterval(asRoutingHash(new Uint8Array(8)), null));
+			for (const table of ["tc_state", "tc_items", "tc_participants", "tc_answer_chunks", "tc_results", "tc_result_chunks"]) {
+				state.storage.sql.exec(`DELETE FROM ${table}`);
+			}
+			tc.applyMigrationPage(page);
+			expect(countRows(state, "tc_answer_chunks")).toBe(chunks);
+
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			expectEveryKey(tc.loadFinalResponse(P(tc), TX_ID, TOKEN));
+		});
+	});
+
+	it("deletes the answer chunks at the completion and the result chunks at the expiry", async () => {
+		await withCoordinator(async (tc, state) => {
+			seedWide(tc, state);
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", wideRejection);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+
+			await tc.completeTransaction(P(tc), TX_ID, TOKEN, "CANCELLED");
+			expect(countRows(state, "tc_answer_chunks")).toBe(0);
+			expect(countRows(state, "tc_result_chunks")).toBeGreaterThan(0);
+			expectEveryKey(tc.loadFinalResponse(P(tc), TX_ID, TOKEN));
+
+			state.storage.sql.exec(`UPDATE tc_state SET completed_at = 0`);
+			tc.sweepExpiredTransactions();
+			expect(countRows(state, "tc_state")).toBe(0);
+			expect(countRows(state, "tc_result_chunks")).toBe(0);
+		});
+	});
+
+	// Each key is 250 characters above U+FFFF, and each of them is two UTF-16 code units. The text is
+	// above one chunk, so a cut falls between the characters of some key.
+	it("cuts the text only between characters, and answers with every key", async () => {
+		const ops = 4_000;
+		const keyOfText = (i: number) => `${i}:${"\u{1F600}".repeat(250)}`;
+		await withCoordinator((tc, state) => {
+			insertState(tc, state, { token: TOKEN, transactionId: TX_ID, state: "PREPARING", createdAt: Date.now() - 10_000 });
+			for (let i = 0; i < ops; i++) {
+				state.storage.sql.exec(
+					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, ?, 'check', 'p1')`,
+					P(tc),
+					TX_ID,
+					KeyCodec.encode(keyOfText(i)),
+					ABSENT_SK,
+					i,
+				);
+			}
+			insertParticipant(tc, state, {});
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", {
+				outcome: "rejected",
+				results: Array.from({ length: ops }, (_, i) => ({
+					opIndex: i,
+					outcome: "rejected" as const,
+					reason: { code: "condition_failed" as const, hashKey: keyOfText(i) },
+				})),
+			});
+			expect(countRows(state, "tc_answer_chunks")).toBeGreaterThan(0);
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			expect(countRows(state, "tc_result_chunks")).toBeGreaterThan(0);
+			expect(maxChunkBytes(state)).toBeLessThanOrEqual(CHUNK_BYTES);
+
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
+			invariant(response.outcome === "cancelled", "expected the transaction to cancel");
+			expect(response.results.map((r) => (r.outcome === "rejected" ? r.reason.hashKey : undefined))).toEqual(
+				Array.from({ length: ops }, (_, i) => keyOfText(i)),
+			);
+		});
+	});
+});
+
+describe("FokosDBTransactionCoordinatorDO - the image cap of one transaction", () => {
+	it("drops the images above the stored cap of the transaction", async () => {
+		await withCoordinator((tc, state) => {
+			seed(tc, state, "PREPARING");
+			state.storage.sql.exec(`UPDATE tc_state SET image_cap_bytes = 1000`);
+			insertParticipant(tc, state, {});
+			tc.storePrepareAnswer(P(tc), TX_ID, "p1", rejection(0, "hk1", 2000));
+			expect(countRows(state, "tc_results")).toBe(0);
+
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
+			invariant(response.outcome === "cancelled", "expected the transaction to cancel");
+			expect(response.results[0]).toMatchObject({ outcome: "rejected", itemOmitted: "response_too_large" });
+			expect(response.results[0]).not.toHaveProperty("reason.item");
+		});
+	});
+
+	// The answers arrive in the reverse order of opIndex, so each answer above the cap drops the image
+	// that the answer before it stored.
+	it("stays at the cap when many answers arrive above it, and keeps the images of the final cap", async () => {
+		const participants = 20;
+		await withCoordinator((tc, state) => {
+			seed(tc, state, "PREPARING");
+			state.storage.sql.exec(`UPDATE tc_state SET image_cap_bytes = 1000`);
+			state.storage.sql.exec(`DELETE FROM tc_items`);
+			for (let i = 0; i < participants; i++) {
+				insertParticipant(tc, state, { name: `p${i}` });
+				state.storage.sql.exec(
+					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, ?, 'check', ?)`,
+					P(tc),
+					TX_ID,
+					kb(`hk${i}`),
+					ABSENT_SK,
+					i,
+					`p${i}`,
+				);
+			}
+			const stored = () =>
+				state.storage.sql
+					.exec<{
+						counted: number;
+						bytes: number | null;
+					}>(`SELECT image_bytes_stored AS counted, (SELECT SUM(octet_length(image_data)) FROM tc_results) AS bytes FROM tc_state`)
+					.one();
+			for (let i = participants - 1; i >= 0; i--) {
+				tc.storePrepareAnswer(P(tc), TX_ID, `p${i}`, rejection(i, `hk${i}`, 300));
+				const { counted, bytes } = stored();
+				expect(counted).toBe(bytes ?? 0);
+				expect(counted).toBeLessThanOrEqual(1000);
+			}
+			expect(state.storage.sql.exec<{ op_index: number }>(`SELECT op_index FROM tc_results ORDER BY op_index`).toArray()).toEqual([
+				{ op_index: 0 },
+				{ op_index: 1 },
+				{ op_index: 2 },
+			]);
+
+			tc.cancelTransactionInStore(P(tc), TX_ID, TOKEN);
+			const response = tc.loadFinalResponse(P(tc), TX_ID, TOKEN);
+			invariant(response.outcome === "cancelled", "expected the transaction to cancel");
+			for (const [i, r] of response.results.entries()) {
+				invariant(r.outcome === "rejected", `operation ${i} should be rejected`);
+				if (i < 3) {
+					expect(r.reason).toHaveProperty("item.data", "x".repeat(300));
+				} else {
+					expect(r).toMatchObject({ itemOmitted: "response_too_large" });
+					expect(r.reason).not.toHaveProperty("item");
+				}
+			}
+		});
+	});
 });

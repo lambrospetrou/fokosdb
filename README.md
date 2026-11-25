@@ -7,7 +7,7 @@ FokosDB is a strongly consistent, distributed database with bottomless storage, 
 
 - **Strongly consistent.** You identify each item by a hash key and an optional sort key. Each read and each write of an item is strongly consistent.
 - **Bottomless.** A partition that gets too large splits into child partitions, and a hash key that gets too large moves into a range tree of its own.
-- **ACID transactions.** Write up to 100 items (4 MB in total) atomically across partitions, or read up to 100 items as one consistent snapshot.
+- **ACID transactions.** Write up to 10,000 items (10 MB in total, keys included) atomically across partitions, or read up to 100 items as one consistent snapshot.
 - **SQLite expressions.** Conditions, updates, filters, and projections use JSON paths, arithmetic, and the SQLite core and math functions.
 - **GSIs and push targets.** Add up to 10 global secondary indexes to a table, and send each change to your own Worker or Durable Object.
 - **Your Cloudflare account.** All data stays in Durable Objects of your account, and optionally keep a table in the EU, the US, or FedRAMP jurisdictions.

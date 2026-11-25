@@ -30,7 +30,7 @@ import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { compositeInInterval } from "../../src/sharding/repartition-slice.js";
 import { TransactionParticipant } from "../../src/shared/partition/transaction-participant.js";
-import { DEFAULT_STALE_TRANSACTION_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_STALE_TRANSACTION_MS } from "../../src/shared/transaction-limits.js";
 import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
 
 /**
@@ -799,9 +799,10 @@ describe("Repartition — promotions", () => {
 			source.queue({ kind: "key_promotion", routingHash: P(kb("alice")) });
 		});
 		await cutOver(root);
-		// Rows as the source keeps them after the cutover: one transaction with MAX_ITEMS_PER_TX keys
-		// under the moved key, one quarantined transaction, and one lock of a key that stays here.
-		const wide = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => lockRow("alice", `m${String(i).padStart(3, "0")}`, "tx-a"));
+		// Rows as the source keeps them after the cutover: one transaction with WIDE_TX_KEYS keys under
+		// the moved key, one quarantined transaction, and one lock of a key that stays here.
+		const WIDE_TX_KEYS = 100;
+		const wide = Array.from({ length: WIDE_TX_KEYS }, (_, i) => lockRow("alice", `m${String(i).padStart(3, "0")}`, "tx-a"));
 		const guarded = { ...lockRow("alice", "s2", "tx-g"), guarded_at: 77 };
 		await root.enter(({ store }) => {
 			for (const row of [...wide, guarded]) {
@@ -816,14 +817,14 @@ describe("Repartition — promotions", () => {
 			// The payload, the coordinator reference, the timestamps, and the quarantine came across.
 			expect([...store.queryPendingTxPage(null, 1_000, ALL_ROWS)]).toEqual([...wide, guarded]);
 		});
-		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1));
+		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(WIDE_TX_KEYS + 1));
 
 		const ack = { repartitionId: "r1", target: rangeRoot.ref };
 		await sendAck(rangeRoot);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			// The completion deletes no lock row, so the acknowledgement stays small.
-			expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1);
+			expect(lockCount(store, "alice")).toBe(WIDE_TX_KEYS + 1);
 			expect(lockCount(store, "bob")).toBe(1);
 		});
 
@@ -831,7 +832,7 @@ describe("Repartition — promotions", () => {
 		await root.peer.fokosMigrationAck(ack);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1);
+			expect(lockCount(store, "alice")).toBe(WIDE_TX_KEYS + 1);
 		});
 
 		// The cleanup deletes the lock copies first, then the items. Each step has a budget of
@@ -855,7 +856,7 @@ describe("Repartition — promotions", () => {
 			expect(lockCount(store, "bob")).toBe(1);
 		});
 		// The target keeps its locks.
-		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 1_000, ALL_ROWS)]).toHaveLength(MAX_ITEMS_PER_TX + 1));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 1_000, ALL_ROWS)]).toHaveLength(WIDE_TX_KEYS + 1));
 	});
 
 	// A promotion reads only the rows of its key. The other keys hold ten times the scan cap, so a read

@@ -86,8 +86,8 @@ export type BatchWriteItem =
 export type BatchWriteItemsOptions = {
 	/**
 	 * 0 to 100 operations. An empty list sends no RPC. Two operations on one item fail the request with
-	 * `batch_duplicate_key`. Conditions above `MAX_PAYLOAD_BYTES_PER_TX` in total fail it with
-	 * `batch_conditions_too_large`.
+	 * `batch_duplicate_key`. A payload above `MAX_PAYLOAD_BYTES_PER_BATCH` (the data, the
+	 * conditions, and the keys, summed) fails it with `batch_payload_too_large`.
 	 */
 	items: BatchWriteItem[];
 };

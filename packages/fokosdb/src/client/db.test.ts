@@ -17,7 +17,7 @@ import type { PartitionNamespaceKey } from "../shared/partition-context.js";
 import { namespaceFingerprint } from "../shared/do-stubs.js";
 import { FokosShardingClient } from "../sharding/client.js";
 import type { FokosOperationSpec } from "../sharding/runtime-types.js";
-import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
+import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX_GET } from "../shared/transaction-limits.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
 import type { JsonValue } from "../shared/json-types.js";
@@ -1570,7 +1570,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("caps the transactGetItems item count like the write path", async () => {
 			const db = makeDB();
-			const items = Array.from({ length: MAX_ITEMS_PER_TX + 1 }, (_, i) => ({ hashKey: `k-${i}` }));
+			const items = Array.from({ length: MAX_ITEMS_PER_TX_GET + 1 }, (_, i) => ({ hashKey: `k-${i}` }));
 			await expect(db.transactGetItems({ items })).rejects.toThrow(fokosErrorWith("transact_items_too_many", { limit: 100 }));
 			await expect(db.transactGetItems({ items: [] })).rejects.toThrow(fokosErrorWith("transact_items_empty"));
 		});

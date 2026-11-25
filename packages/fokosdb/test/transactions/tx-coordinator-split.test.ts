@@ -10,7 +10,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { DEFAULT_LIMITS, encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
+import {
+	DEFAULT_LIMITS,
+	encodeHashKey,
+	MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
+	MAX_ITEM_BYTES,
+	MAX_PAYLOAD_BYTES_PER_TX,
+	txOrderTimestampNow,
+} from "../../src/shared/transaction-limits.js";
 import { asRoutingHash, compareRoutingHashes, type RoutingHash } from "../../src/sharding/hash-primitives.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
@@ -44,8 +51,8 @@ function tokenKey(token: string) {
 /** Writes a committed ledger row under a new token, as a transaction that completed now writes it. */
 function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState, token: string): void {
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000')`,
+		`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash, image_cap_bytes)
+		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000', 0)`,
 		instance.fokos.routingHashForKey(tokenKey(token).hashKey),
 		`tx-${crypto.randomUUID()}`,
 		token,
@@ -266,8 +273,8 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const transactionId = `tx-${crypto.randomUUID()}`;
 		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
-				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash, image_cap_bytes)
+				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000', 0)`,
 				instance.fokos.routingHashForKey(tokenKey(token).hashKey),
 				transactionId,
 				token,
@@ -290,6 +297,89 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			},
 			{ timeout: 10_000, interval: 50 },
 		);
+	});
+
+	// One migration page carries one transaction with all of its rows, also when the transaction is
+	// larger than the page budget. This transaction holds more than any transaction can: the payload
+	// limit, the global image cap, and a prepare answer of 5,000 entries in more than one chunk.
+	it("moves a transaction in PREPARING that is larger than one page budget", async () => {
+		const db = makeDB({ controlled: true });
+		const items = keysAcrossPartitions(db, 2, "tc-split-large").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
+		const token = `tc-split-large-${crypto.randomUUID()}`;
+		await writeOutcome(db.transactWriteItems({ items, clientRequestToken: `${token}-first` }));
+
+		const root = coordinatorRouter(db).allRoots()[0];
+		const transactionId = `tx-${crypto.randomUUID()}`;
+		const PUTS = 25;
+		const ENTRIES = 5_000;
+		const data = "d".repeat(MAX_PAYLOAD_BYTES_PER_TX / PUTS - 64);
+		const image = "i".repeat(MAX_ITEM_BYTES);
+		const images = Math.floor(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX / MAX_ITEM_BYTES);
+		const counts = async (doName: string) =>
+			await runInDurableObject(coordinatorStub(doName), (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) =>
+				["tc_items", "tc_participants", "tc_answer_chunks", "tc_results"].map(
+					(table) =>
+						state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE transaction_id = ?`, transactionId).one().n,
+				),
+			);
+		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
+			const routingHash = instance.fokos.routingHashForKey(tokenKey(token).hashKey);
+			const now = Date.now();
+			// The next recovery is far away, so no drive changes the transaction during the test.
+			state.storage.sql.exec(
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash, image_cap_bytes)
+				 VALUES (?, ?, ?, 'PREPARING', 1, ?, ?, '0000000000000000', ?)`,
+				routingHash,
+				transactionId,
+				token,
+				now,
+				now + 3_600_000,
+				MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
+			);
+			for (let i = 0; i < PUTS; i++) {
+				state.storage.sql.exec(
+					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, partition_do_name)
+					 VALUES (?, ?, ?, x'', ?, 'put', ?, 1, 'p1')`,
+					routingHash,
+					transactionId,
+					KeyCodec.encode(`put-${i}`),
+					i,
+					data,
+				);
+			}
+			const entry = (i: number) =>
+				`{"opIndex":${i},"outcome":"rejected","reason":{"code":"condition_failed","hashKey":"key-${i}"},"imageBytes":${MAX_ITEM_BYTES}}`;
+			const answer = (from: number, to: number) => `[${Array.from({ length: to - from }, (_, j) => entry(from + j)).join(",")}]`;
+			state.storage.sql.exec(
+				`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
+				routingHash,
+				transactionId,
+				answer(0, ENTRIES / 2),
+			);
+			state.storage.sql.exec(
+				`INSERT INTO tc_answer_chunks (routing_hash, transaction_id, partition_do_name, chunk_index, answer_json) VALUES (?, ?, 'p1', 1, ?)`,
+				routingHash,
+				transactionId,
+				answer(ENTRIES / 2, ENTRIES),
+			);
+			for (let i = 0; i < images; i++) {
+				state.storage.sql.exec(
+					`INSERT INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_data) VALUES (?, ?, ?, 1, 1, ?)`,
+					routingHash,
+					transactionId,
+					i,
+					image,
+				);
+			}
+		});
+		const before = await counts(root.doName);
+		expect(before).toEqual([PUTS, 1, 1, images]);
+
+		await queueCoordinatorSplit(root);
+		const owner = await awaitSplitSettled(root, token);
+
+		expect(await counts(owner.doName)).toEqual(before);
 	});
 
 	it("answers the stale recovery of a partition through a coordinator that became a router", async () => {

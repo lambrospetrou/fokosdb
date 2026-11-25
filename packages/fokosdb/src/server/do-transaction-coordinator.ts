@@ -86,6 +86,7 @@ import {
 	DEFAULT_LIMITS,
 	encodeHashKey,
 	IDEMPOTENCY_WINDOW_MS,
+	MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
 	nextRecoveryAt,
 	txOrderTimestampNow,
 } from "../shared/transaction-limits.js";
@@ -98,6 +99,9 @@ import {
 } from "./host-config.js";
 import type { ConditionExpression, UpdateExpression } from "../shared/expression/types.js";
 import { parseJSONTrusted } from "../shared/tsutils.js";
+import { WORKERS_RPC_MAX_BYTES } from "../sharding/rpc-limits.js";
+
+const encoder = new TextEncoder();
 
 type TcStateRow = {
 	transaction_id: string;
@@ -109,9 +113,11 @@ type TcStateRow = {
 	/** The earliest time at which the `tx_recovery` job drives the transaction. NULL once it is complete. */
 	next_recovery_at: number | null;
 	/**
-	 * Per-operation outcome array (TransactWriteOperationResultEncoded[]), ordered by request opIndex.
-	 * Stores outcome codes, reasons (keys only), and itemOmitted markers.
-	 * Item images are omitted and stored in tc_results to prevent exceeding the 2 MB SQLite row limit.
+	 * The first chunk of the tagged JSON text of the per-operation outcome array
+	 * (TransactWriteOperationResultEncoded[]), ordered by request opIndex. `tc_result_chunks` holds the
+	 * later chunks (`chunkResults`), and the text is JSON only after a reader joins all chunks in order.
+	 * Stores outcome codes, reasons (keys only), and itemOmitted markers. Item images are omitted and
+	 * stored in tc_results.
 	 */
 	results_json: string | null;
 	/**
@@ -119,6 +125,10 @@ type TcStateRow = {
 	 * Detects token reuse across different operations and prevents mismatched replays.
 	 */
 	operations_hash: string;
+	/** The image cap of this transaction (`transactionImageCap`). */
+	image_cap_bytes: number;
+	/** The bytes of the images in tc_results while the transaction is PREPARING (`storePrepareAnswer`). */
+	image_bytes_stored: number;
 };
 
 type TcParticipantRow = {
@@ -129,9 +139,11 @@ type TcParticipantRow = {
 	commit_outcome: string | null;
 	cancel_outcome: string | null;
 	/**
-	 * Serialized PrepareResponse from a rejected participant with item images stripped.
-	 * Retains opIndex, rejection reason (keys only), and imageBytes for coordinator capping.
-	 * NULL for an accepted participant.
+	 * The first chunk of the tagged JSON text of the results of a rejected prepare answer, with item
+	 * images stripped. `tc_answer_chunks` holds the later chunks (`chunkResults`), and the text is JSON
+	 * only after a reader joins all chunks in order. Retains opIndex, rejection reason
+	 * (keys only), and imageBytes for coordinator capping. NULL for an accepted participant, and NULL
+	 * in a migration page of a transaction past its prepare, because only the prepare reads it.
 	 */
 	answer_json: string | null;
 	/** The FokosErrorWire of a prepare that threw after its retries, read only while prepare_outcome is NULL. */
@@ -216,6 +228,12 @@ type TcItemRow = {
 	return_values_on_condition_check_failure: number;
 };
 
+/** One later chunk of the results of a cancelled transaction (`tc_result_chunks`). */
+type TcResultChunkRow = { transaction_id: string; chunk_index: number; results_json: string };
+
+/** One later chunk of the results of a rejected prepare answer (`tc_answer_chunks`). */
+type TcAnswerChunkRow = { transaction_id: string; partition_do_name: string; chunk_index: number; answer_json: string };
+
 type TcResultRow = {
 	transaction_id: string;
 	op_index: number;
@@ -230,16 +248,131 @@ type TcResultRow = {
 };
 
 // The participant answers and the results array can hold binary (Uint8Array) keys, which plain
-// JSON.stringify mangles. These tag and restore them, so a cancelled transaction over binary keys still
-// reports the exact key after reload. A stored error needs no tags: its record holds its own bytes.
+// JSON.stringify mangles. These tag them as base64url text and restore them, so a cancelled transaction
+// over binary keys still reports the exact key after reload. A stored error needs no tags: its record
+// holds its own bytes.
 function stringifyTagged(value: unknown): string {
-	return JSON.stringify(value, (_k, v) => (v instanceof Uint8Array ? { $u8: Array.from(v) } : v));
+	return JSON.stringify(value, (_k, v) =>
+		v instanceof Uint8Array ? { $b64: v.toBase64({ alphabet: "base64url", omitPadding: true }) } : v,
+	);
 }
 
 function parseTagged<T>(json: string): T {
 	return JSON.parse(json, (_k, v) =>
-		v && typeof v === "object" && Array.isArray((v as { $u8?: unknown }).$u8) ? new Uint8Array((v as { $u8: number[] }).$u8) : v,
+		v && typeof v === "object" && typeof (v as { $b64?: unknown }).$b64 === "string"
+			? Uint8Array.fromBase64((v as { $b64: string }).$b64, { alphabet: "base64url" })
+			: v,
 	) as T;
+}
+
+/**
+ * The most UTF-8 bytes of one stored chunk of a results array. The limit of one row in the SQLite
+ * storage of a Durable Object is 8 MB, but workerd refuses a statement whose bound values are about
+ * 4 MiB or more in total (SQLITE_TOOBIG). A chunk is one bound value, so it stays below that limit
+ * with a margin.
+ */
+const RESULT_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
+
+/**
+ * Splits the tagged JSON text of a results array into the chunks that storage holds, each at most
+ * RESULT_CHUNK_MAX_BYTES of UTF-8. A chunk can end in the middle of an entry, but never in the middle
+ * of a character. A reader joins the chunks in order and parses the text one time.
+ */
+function chunkResults(entries: readonly unknown[]): string[] {
+	const text = stringifyTagged(entries);
+	// One UTF-16 code unit is at most 3 bytes of UTF-8.
+	if (text.length * 3 <= RESULT_CHUNK_MAX_BYTES) {
+		return [text];
+	}
+	// `encodeInto` stops before a character that does not fit, and `read` counts the code units that
+	// it encoded, so a cut never separates the two code units of one character.
+	const buffer = new Uint8Array(RESULT_CHUNK_MAX_BYTES);
+	const chunks: string[] = [];
+	for (let offset = 0; offset < text.length; ) {
+		const { read } = encoder.encodeInto(text.substring(offset), buffer);
+		chunks.push(text.slice(offset, offset + read));
+		offset += read;
+	}
+	return chunks;
+}
+
+/** Matches a character outside Latin-1 (above U+00FF). */
+const NON_LATIN1_CHAR = /[\u0100-\uffff]/;
+
+/**
+ * The bytes that structured clone writes for one column value. It writes a text with one byte for
+ * each character when every character is in Latin-1 (U+0000 to U+00FF), and with two bytes for each
+ * character in all other cases.
+ */
+function wireBytes(value: string | ArrayBuffer | Uint8Array | null | undefined): number {
+	if (value == null) {
+		return 0;
+	}
+	if (typeof value !== "string") {
+		return value.byteLength;
+	}
+	return NON_LATIN1_CHAR.test(value) ? 2 * value.length : value.length;
+}
+
+/**
+ * The image cap of one transaction: MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, or less when the other
+ * rows of the transaction leave less room in 75% of WORKERS_RPC_MAX_BYTES. A migration page carries
+ * one transaction with all of its rows, so the transaction must fit in one RPC. The 25% margin is for
+ * the overhead of structured clone that the estimates do not count.
+ *
+ * The largest migration page of a transaction is one of two:
+ * - Before the decision: the items with their payload, the participants with their prepare
+ *   answers, and the images.
+ * - After the decision: the item keys, the participants, the results, and the images.
+ * The answer to the client carries the results and the images. Each prepare answer entry and each
+ * result entry holds the keys of its operation and the fixed fields of the entry, so one bound covers
+ * all three. `imageBytes` counts the stored bytes of an image, and a text image can take two bytes on
+ * the wire for each of them, so the images get half of the room that is left.
+ *
+ * The cap is computed once, from the request, and stored. It never changes, so an image that is above
+ * the cap at one prepare answer stays above it at the decision.
+ */
+function transactionImageCap(
+	items: readonly {
+		hashKey: KeyBytes;
+		sortKey: KeyBytes;
+		data?: string | Uint8Array;
+		conditionJson: string | null;
+		updateJson: string | null;
+		doName: string;
+	}[],
+	participants: readonly { doName: string; contextJson: string }[],
+): number {
+	let fixed = 0;
+	let entryUnits = 0;
+	let twoByteEntries = false;
+	for (const op of items) {
+		// The structured-clone overhead of the rows of this operation, with their column names: 128 for its
+		// `tc_items` row, and 64 for its `tc_results` row, which holds its image.
+		fixed +=
+			128 +
+			64 +
+			op.hashKey.byteLength +
+			op.sortKey.byteLength +
+			wireBytes(op.data) +
+			wireBytes(op.conditionJson) +
+			wireBytes(op.updateJson) +
+			wireBytes(op.doName);
+		const keys = stringifyTagged(decodeItemKeys(op.hashKey, op.sortKey));
+		// 256: the most bytes of one entry other than its keys. These are the outcome, the reason code,
+		// the indexes, `imageBytes`, `itemOmitted`, and a transaction id or an `error_id`.
+		entryUnits += 256 + keys.length;
+		twoByteEntries ||= wireBytes(keys) > keys.length;
+	}
+	for (const p of participants) {
+		// 512: the overhead of one `tc_participants` row, with a stored prepare error in it.
+		fixed += 512 + wireBytes(p.contextJson) + wireBytes(p.doName);
+	}
+	// A chunk is one text, so one key with a character above U+00FF makes the whole chunk two bytes
+	// for each character.
+	const entries = twoByteEntries ? 2 * entryUnits : entryUnits;
+	const room = (WORKERS_RPC_MAX_BYTES * 3) / 4 - fixed - entries;
+	return Math.max(0, Math.min(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, Math.floor(room / 2)));
 }
 
 function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEncoded {
@@ -252,20 +385,15 @@ function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEnco
 }
 
 /**
- * The answer as it is stored: every item image removed, every `imageBytes` kept.
+ * The results of a rejected answer as they are stored: every item image removed, every `imageBytes`
+ * kept.
  *
- * The images go to tc_results instead, because a `$u8` tag costs about four characters for each byte
- * and one answer can carry MAX_ITEMS_PER_TX of them. `imageBytes` stays so the coordinator can apply
- * the cap at CANCELLING without reading the images back.
+ * The images go to tc_results instead, as raw values, because JSON text of an image costs more than
+ * the image, and one answer can carry MAX_ITEMS_PER_TX of them. `imageBytes` stays so the coordinator
+ * can apply the cap at CANCELLING without reading the images back.
  */
-function stripImagesFromPrepareResponse(r: PrepareOutcome): PrepareOutcome {
-	if (r.outcome === "accepted") {
-		return r;
-	}
-	return {
-		outcome: "rejected",
-		results: r.results.map((res) => (res.outcome === "rejected" ? { ...res, reason: reasonWithoutImage(res.reason) } : res)),
-	};
+function stripImagesFromResults(results: readonly ParticipantOperationResultEncoded[]): ParticipantOperationResultEncoded[] {
+	return results.map((res) => (res.outcome === "rejected" ? { ...res, reason: reasonWithoutImage(res.reason) } : res));
 }
 
 // tc_items hk/sk are BLOB; materialize a read column as KeyBytes (trusted re-brand, no copy of bytes).
@@ -325,6 +453,8 @@ type MigratedTransaction = {
 	items: TcItemRow[];
 	participants: TcParticipantRow[];
 	results: TcResultRow[];
+	resultChunks: TcResultChunkRow[];
+	answerChunks: TcAnswerChunkRow[];
 };
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -346,14 +476,19 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 -- transaction is complete. Each attempt moves it forward, so a transaction that stays
                 -- goes behind the others and does not use each step of the job.
                 next_recovery_at        INTEGER,
-                -- Positional TransactWriteOperationResultEncoded array. Item images are omitted
-                -- and stored in tc_results to prevent exceeding the 2 MB SQLite row limit.
+                -- The first chunk of the tagged JSON text of the positional
+                -- TransactWriteOperationResultEncoded array. tc_result_chunks holds the later chunks.
+                -- Item images are omitted and stored in tc_results.
                 results_json            TEXT,
                 -- Fingerprint of the operation set this token was first used for. A replay whose
                 -- operations hash differently is a different request wearing the same token, and is
                 -- rejected instead of being answered with this transaction's outcome.
                 -- TEXT because DO SQL cannot bind a JS bigint.
                 operations_hash         TEXT    NOT NULL,
+                -- The image cap of this transaction, computed from the request at the insert.
+                image_cap_bytes         INTEGER NOT NULL,
+                -- The bytes of the images in tc_results while the transaction is PREPARING.
+                image_bytes_stored      INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (routing_hash, transaction_id)
 			) WITHOUT ROWID, STRICT;
 
@@ -370,7 +505,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 prepare_outcome         TEXT,
                 commit_outcome          TEXT,
                 cancel_outcome          TEXT,
-                -- Serialized PrepareResponse with item images stripped (imageBytes kept for capping).
+                -- The first chunk of the tagged JSON text of the results of a rejected prepare answer,
+                -- with item images stripped (imageBytes kept for capping). tc_answer_chunks holds the
+                -- later chunks.
                 answer_json             TEXT,
                 -- The FokosErrorWire of the error of the last prepare attempt that threw. It is written only
                 -- while prepare_outcome is NULL, so a later answer replaces it. A fatal error (a
@@ -398,6 +535,25 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 return_values_on_condition_check_failure INTEGER NOT NULL DEFAULT 0,
                 -- One row for each operation. More than one operation can have the same (hk, sk).
                 PRIMARY KEY (routing_hash, transaction_id, op_index)
+            ) WITHOUT ROWID, STRICT;
+
+            -- The chunks after the first of tc_state.results_json, from chunk_index 1.
+            CREATE TABLE IF NOT EXISTS tc_result_chunks (
+                routing_hash    BLOB    NOT NULL,
+                transaction_id  TEXT    NOT NULL,
+                chunk_index     INTEGER NOT NULL,
+                results_json    TEXT    NOT NULL,
+                PRIMARY KEY (routing_hash, transaction_id, chunk_index)
+            ) WITHOUT ROWID, STRICT;
+
+            -- The chunks after the first of tc_participants.answer_json, from chunk_index 1.
+            CREATE TABLE IF NOT EXISTS tc_answer_chunks (
+                routing_hash      BLOB    NOT NULL,
+                transaction_id    TEXT    NOT NULL,
+                partition_do_name TEXT    NOT NULL,
+                chunk_index       INTEGER NOT NULL,
+                answer_json       TEXT    NOT NULL,
+                PRIMARY KEY (routing_hash, transaction_id, partition_do_name, chunk_index)
             ) WITHOUT ROWID, STRICT;
 
             -- Stores raw item images for rejected operations requesting all_old.
@@ -840,11 +996,24 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			),
 		);
 
+		const rows = request.items.map((op) => ({
+			...op,
+			conditionJson: op.condition ? JSON.stringify(op.condition) : null,
+			updateJson: op.update ? JSON.stringify(op.update) : null,
+			doName: participantOf[op.opIndex],
+		}));
+		const contexts = participants.map((p) => ({
+			doName: p.doName,
+			// TODO Skip the doName since it can be generated by partitionId to save bytes?
+			contextJson: JSON.stringify(p.context),
+		}));
+		const imageCap = transactionImageCap(rows, contexts);
+
 		const createdAt = this.#platform.now();
 		this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
-				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash)
-                 VALUES (?, ?, ?, 'CREATED', ?, ?, ?, ?)`,
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash, image_cap_bytes)
+                 VALUES (?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)`,
 				routingHash,
 				transactionId,
 				idempotencyToken,
@@ -852,8 +1021,9 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				createdAt,
 				createdAt + this.config().staleTransactionMs,
 				operationsHash,
+				imageCap,
 			);
-			for (const op of request.items) {
+			for (const op of rows) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -867,20 +1037,19 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					// data and kind travel together: put carries both; delete/check/update carry neither (NULL kind).
 					op.kind === undefined ? null : DATA_KINDS.indexOf(op.kind),
 					op.ttlAt ?? null,
-					op.condition ? JSON.stringify(op.condition) : null,
-					op.update ? JSON.stringify(op.update) : null,
-					participantOf[op.opIndex],
+					op.conditionJson,
+					op.updateJson,
+					op.doName,
 					op.returnValuesOnConditionCheckFailure === "all_old" ? 1 : 0,
 				);
 			}
-			for (const p of participants) {
+			for (const p of contexts) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?, ?)`,
 					routingHash,
 					transactionId,
 					p.doName,
-					// TODO Skip the doName since it can be generated by partitionId to save bytes?
-					JSON.stringify(p.context),
+					p.contextJson,
 				);
 			}
 		});
@@ -983,7 +1152,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				if (!row.results_json) {
 					throw unexpectedTransactionStateError("a cancelled transaction has no stored results", { transactionId, state: row.state });
 				}
-				const results = parseTagged<TransactWriteOperationResultEncoded[]>(row.results_json);
+				const results = this.loadStoredResults(routingHash, transactionId, row.results_json);
 				// results_json is positional to the request and tc_results.op_index is that same request
 				// index, so entry i owns the image row with op_index i. The cap already applied before
 				// the array was stored, so a replay answers with exactly the images the first call did.
@@ -1073,6 +1242,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId);
 			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId);
+			this.ctx.storage.sql.exec(`DELETE FROM tc_answer_chunks WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId);
 			transitioned = true;
 		});
 		if (transitioned) {
@@ -1096,17 +1266,20 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * - After a rejection, the transaction can only be cancelled, and the cancel releases a lock that a
 	 *   later prepare took.
 	 *
-	 * So the stored images of a transaction only grow until the decision. The combined image cap keeps
-	 * the images in opIndex order up to the cap, so an image that is above the cap now stays above it in
-	 * the merge of `cancelTransactionInStore`. This method deletes those images, and does not write them,
-	 * so a transaction never stores more than MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX of images. Without
-	 * this bound, one PREPARING transaction can be larger than the RPC limit of a migration page.
+	 * So the answers of a transaction only grow until the decision. The combined image cap keeps the
+	 * images in opIndex order up to the first image that does not fit, and the cap of a transaction never
+	 * changes, so an image that is above the cap now stays above it in the merge of
+	 * `cancelTransactionInStore`. This method writes the images of the answer, then deletes the stored
+	 * images from the highest opIndex until they fit in `image_cap_bytes`. So after each call, a
+	 * transaction stores at most its cap of images. Without this bound, one PREPARING transaction can be
+	 * larger than the RPC limit of a migration page.
 	 *
 	 * Returns true when it stored the answer.
 	 */
 	private storePrepareAnswer(routingHash: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
 		return this.ctx.storage.transactionSync(() => {
-			if (this.loadStateRow(routingHash, transactionId)?.state !== "PREPARING") {
+			const stateRow = this.loadStateRow(routingHash, transactionId);
+			if (stateRow?.state !== "PREPARING") {
 				return false;
 			}
 			// A stored fatal error decides the transaction: it cancels. An answer of a concurrent drive
@@ -1122,11 +1295,12 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			if (isFatalPrepareError(stored?.error_json ?? null)) {
 				return false;
 			}
+			const chunks = answer.outcome === "rejected" ? chunkResults(stripImagesFromResults(answer.results)) : [];
 			const written = this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
 				  WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
 				answer.outcome,
-				answer.outcome === "rejected" ? stringifyTagged(stripImagesFromPrepareResponse(answer)) : null,
+				chunks[0] ?? null,
 				routingHash,
 				transactionId,
 				partitionDoName,
@@ -1134,57 +1308,75 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			if (written.rowsWritten === 0) {
 				return false;
 			}
-			// An answer with no image adds no bytes, so the cap drops no new image.
-			if (answer.outcome !== "rejected" || !answer.results.some((res) => res.outcome === "rejected" && res.imageBytes !== undefined)) {
-				return true;
-			}
-			const aboveCap = this.imagesAboveCap(routingHash, transactionId);
-			for (const opIndex of aboveCap) {
+			for (let i = 1; i < chunks.length; i++) {
 				this.ctx.storage.sql.exec(
-					`DELETE FROM tc_results WHERE routing_hash = ? AND transaction_id = ? AND op_index = ?`,
+					`INSERT OR REPLACE INTO tc_answer_chunks (routing_hash, transaction_id, partition_do_name, chunk_index, answer_json) VALUES (?, ?, ?, ?, ?)`,
 					routingHash,
 					transactionId,
-					opIndex,
+					partitionDoName,
+					i,
+					chunks[i],
 				);
 			}
+			if (answer.outcome !== "rejected") {
+				return true;
+			}
+			let storedBytes = stateRow.image_bytes_stored;
 			for (const res of answer.results) {
-				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item || aboveCap.has(res.opIndex)) {
+				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item) {
 					continue;
 				}
 				const img = res.reason.item;
 				// image_data is an ANY column: text and JSON text bind as TEXT, bytes bind as a BLOB, exactly
-				// as the partition returned them. Nothing JSON-encodes an image anywhere on this path.
+				// as the partition returned them. Nothing JSON-encodes an image anywhere on this path. The
+				// count uses `octet_length`, as the delete below does, so the two always agree.
+				const { bytes } = this.ctx.storage.sql
+					.exec<{ bytes: number }>(
+						`INSERT OR REPLACE INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+						 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING octet_length(image_data) AS bytes`,
+						routingHash,
+						transactionId,
+						res.opIndex,
+						DATA_KINDS.indexOf(img.kind),
+						img.version,
+						img.ttlAt ?? null,
+						img.data,
+					)
+					.one();
+				storedBytes += bytes;
+			}
+			if (storedBytes === stateRow.image_bytes_stored) {
+				return true;
+			}
+			// The cap keeps the images in opIndex order up to the first image that does not fit. So while the
+			// stored images are above the cap, the stored image with the highest opIndex is not in the final
+			// results, and the loop deletes it. Each image is deleted at most one time.
+			while (storedBytes > stateRow.image_cap_bytes) {
+				const top = tryOne(
+					this.ctx.storage.sql.exec<{ op_index: number; bytes: number }>(
+						`SELECT op_index, octet_length(image_data) AS bytes FROM tc_results
+						  WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index DESC LIMIT 1`,
+						routingHash,
+						transactionId,
+					),
+				);
+				invariant(top, () => `fokos/tc: transaction ${transactionId} counts ${storedBytes} image bytes and stores no image`);
 				this.ctx.storage.sql.exec(
-					`INSERT OR REPLACE INTO tc_results (routing_hash, transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					`DELETE FROM tc_results WHERE routing_hash = ? AND transaction_id = ? AND op_index = ?`,
 					routingHash,
 					transactionId,
-					res.opIndex,
-					DATA_KINDS.indexOf(img.kind),
-					img.version,
-					img.ttlAt ?? null,
-					img.data,
+					top.op_index,
 				);
+				storedBytes -= top.bytes;
 			}
+			this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET image_bytes_stored = ? WHERE routing_hash = ? AND transaction_id = ?`,
+				storedBytes,
+				routingHash,
+				transactionId,
+			);
 			return true;
 		});
-	}
-
-	/** The operations whose image the combined cap drops, from the prepare answers that are stored now. */
-	private imagesAboveCap(routingHash: RoutingHash, transactionId: string): Set<number> {
-		const results: ParticipantOperationResultEncoded[] = [];
-		for (const { answer_json } of this.ctx.storage.sql.exec<{ answer_json: string }>(
-			`SELECT answer_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
-			routingHash,
-			transactionId,
-		)) {
-			const answer = parseTagged<PrepareOutcome>(answer_json);
-			if (answer.outcome === "rejected") {
-				results.push(...answer.results);
-			}
-		}
-		applyImageCap(results);
-		return new Set(results.filter((r) => r.outcome === "rejected" && r.itemOmitted === "response_too_large").map((r) => r.opIndex));
 	}
 
 	/**
@@ -1236,8 +1428,13 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 */
 	private cancelTransactionInStore(routingHash: RoutingHash, transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () => {
+			const stateRow = this.loadStateRow(routingHash, transactionId);
+			if (stateRow?.state !== "PREPARING") {
+				return;
+			}
 			const items = this.loadItems(routingHash, transactionId);
 			const itemsByPartition = groupByPartition(items);
+			const answers = this.loadAnswerResults(routingHash, transactionId);
 
 			// results_json is positional to the request: entry i answers the operation the caller sent at
 			// index i. db.ts assigns op_index from the request array, so a transaction of n operations
@@ -1246,14 +1443,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
 			for (const p of this.loadParticipants(routingHash, transactionId)) {
 				const owned = itemsByPartition.get(p.partition_do_name) ?? [];
-				const answer = p.prepare_outcome === "rejected" && p.answer_json ? parseTagged<PrepareOutcome>(p.answer_json) : null;
+				const answer = p.prepare_outcome === "rejected" ? answers.get(p.partition_do_name) : undefined;
 				let answered: ParticipantOperationResultEncoded[];
 				if (p.prepare_outcome === "accepted") {
 					// An accepted participant sends no array: the lock it holds is the proof that its check
 					// pass accepted every operation it owns.
 					answered = owned.map((item) => ({ outcome: "passed", opIndex: item.op_index }));
-				} else if (answer?.outcome === "rejected") {
-					answered = answer.results;
+				} else if (answer !== undefined) {
+					answered = answer;
 				} else {
 					// The participant could not run its operations, so each of them reports why.
 					const failure = this.participantFailure(p);
@@ -1276,7 +1473,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 			// Two participants can each answer under the cap and together exceed it, so the coordinator
 			// caps the whole array once more before it stores one.
-			applyImageCap(merged);
+			applyImageCap(merged, stateRow.image_cap_bytes);
 			// The operations whose image the cap dropped, so their tc_results rows go once the write wins.
 			const cappedOutOpIndexes = merged
 				.filter((r) => r.outcome === "rejected" && r.itemOmitted === "response_too_large")
@@ -1294,9 +1491,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					: { outcome: r.outcome },
 			);
 
+			const chunks = chunkResults(finalResults);
 			const transition = this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'CANCELLING', results_json = ? WHERE routing_hash = ? AND transaction_id = ? AND state = 'PREPARING'`,
-				stringifyTagged(finalResults),
+				chunks[0],
 				routingHash,
 				transactionId,
 			);
@@ -1304,6 +1502,15 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			// on disk, so deleting any of them here would strand its answer without one.
 			if (transition.rowsWritten === 0) {
 				return;
+			}
+			for (let i = 1; i < chunks.length; i++) {
+				this.ctx.storage.sql.exec(
+					`INSERT OR REPLACE INTO tc_result_chunks (routing_hash, transaction_id, chunk_index, results_json) VALUES (?, ?, ?, ?)`,
+					routingHash,
+					transactionId,
+					i,
+					chunks[i],
+				);
 			}
 
 			for (const opIndex of cappedOutOpIndexes) {
@@ -1922,6 +2129,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					const keys = chunk.map(() => "(?, ?)").join(", ");
 					const params = chunk.flatMap((r) => [r.routing_hash, r.transaction_id]);
 					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE (routing_hash, transaction_id) IN (VALUES ${keys})`, ...params);
+					this.ctx.storage.sql.exec(`DELETE FROM tc_result_chunks WHERE (routing_hash, transaction_id) IN (VALUES ${keys})`, ...params);
 					this.ctx.storage.sql.exec(`DELETE FROM tc_state WHERE (routing_hash, transaction_id) IN (VALUES ${keys})`, ...params);
 				}
 			});
@@ -2002,7 +2210,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			params.push(interval.end.routingHash);
 		}
 		const rows = this.ctx.storage.sql.exec<TcStateRow & { routing_hash: ArrayBuffer }>(
-			`SELECT routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
+			`SELECT routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored
              FROM tc_state WHERE ${conds.join(" AND ")} ORDER BY routing_hash, transaction_id LIMIT ?`,
 			...params,
 			budget.scanRows + 1,
@@ -2018,13 +2226,17 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			const routingHash = routingHashFromBlob(routing_hash);
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {
+				// A transaction past its prepare needs only the keys and no prepare answer. Its payload can
+				// still be on disk before its first recovery claim, and the page does not carry it.
+				const pastPrepare = isPastPrepare(row.state);
+				const participants = this.loadParticipants(routingHash, row.transaction_id);
 				const tx: MigratedTransaction = {
 					state: row,
-					// A transaction past its prepare needs only the keys. Its payload can still be on disk
-					// before its first recovery claim, and the page does not carry it.
-					items: this.loadItems(routingHash, row.transaction_id, !isPastPrepare(row.state)),
-					participants: this.loadParticipants(routingHash, row.transaction_id),
+					items: this.loadItems(routingHash, row.transaction_id, !pastPrepare),
+					participants: pastPrepare ? participants.map((p) => ({ ...p, answer_json: null })) : participants,
 					results: this.loadResultImages(routingHash, row.transaction_id),
+					resultChunks: this.loadResultChunks(routingHash, row.transaction_id),
+					answerChunks: pastPrepare ? [] : this.loadAnswerChunks(routingHash, row.transaction_id),
 				};
 				const txBytes = migratedTransactionBytes(tx);
 				if (page.length > 0 && bytes + txBytes > budget.pageBytes) {
@@ -2046,11 +2258,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 */
 	private applyMigrationPage(page: MigratedTransaction[]): void {
 		const sql = this.ctx.storage.sql;
-		for (const { state, items, participants, results } of page) {
+		for (const { state, items, participants, results, resultChunks, answerChunks } of page) {
 			const routingHash = this.routingHashOfToken(state.idempotency_token);
 			sql.exec(
-				`INSERT OR REPLACE INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT OR REPLACE INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				routingHash,
 				state.transaction_id,
 				state.idempotency_token,
@@ -2061,6 +2273,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				state.next_recovery_at,
 				state.results_json,
 				state.operations_hash,
+				state.image_cap_bytes,
+				state.image_bytes_stored,
 			);
 			for (const r of items) {
 				sql.exec(
@@ -2109,12 +2323,31 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					r.image_data,
 				);
 			}
+			for (const r of resultChunks) {
+				sql.exec(
+					`INSERT OR REPLACE INTO tc_result_chunks (routing_hash, transaction_id, chunk_index, results_json) VALUES (?, ?, ?, ?)`,
+					routingHash,
+					r.transaction_id,
+					r.chunk_index,
+					r.results_json,
+				);
+			}
+			for (const r of answerChunks) {
+				sql.exec(
+					`INSERT OR REPLACE INTO tc_answer_chunks (routing_hash, transaction_id, partition_do_name, chunk_index, answer_json) VALUES (?, ?, ?, ?, ?)`,
+					routingHash,
+					r.transaction_id,
+					r.partition_do_name,
+					r.chunk_index,
+					r.answer_json,
+				);
+			}
 		}
 	}
 
 	/**
 	 * One bounded step of the cleanup of a split source. Returns true when no ledger row is left. Each step
-	 * deletes the first `sweepBatchRows` transactions in primary-key order. All four tables lead with
+	 * deletes the first `sweepBatchRows` transactions in primary-key order. All tables lead with
 	 * `(routing_hash, transaction_id)`, so each delete is one key range of its table.
 	 */
 	private deleteMigratedRowsStep(): boolean {
@@ -2125,7 +2358,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				this.config().sweepBatchRows - 1,
 			),
 		);
-		for (const table of ["tc_items", "tc_participants", "tc_results", "tc_state"]) {
+		for (const table of ["tc_items", "tc_participants", "tc_answer_chunks", "tc_results", "tc_result_chunks", "tc_state"]) {
 			if (last === undefined) {
 				sql.exec(`DELETE FROM ${table}`);
 			} else {
@@ -2138,7 +2371,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadStateRow(routingHash: RoutingHash, transactionId: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored
                  FROM tc_state WHERE routing_hash = ? AND transaction_id = ?`,
 				routingHash,
 				transactionId,
@@ -2167,7 +2400,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadStateRowByToken(routingHash: RoutingHash, idempotencyToken: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored
                  FROM tc_state WHERE routing_hash = ? AND idempotency_token = ?`,
 				routingHash,
 				idempotencyToken,
@@ -2222,6 +2455,59 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			.exec<TcResultRow>(
 				`SELECT transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data
                  FROM tc_results WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index`,
+				routingHash,
+				transactionId,
+			)
+			.toArray();
+	}
+
+	/** The results of a cancelled transaction: the first chunk `first`, joined with the chunks of `tc_result_chunks` in order. */
+	private loadStoredResults(routingHash: RoutingHash, transactionId: string, first: string): TransactWriteOperationResultEncoded[] {
+		const chunks = this.loadResultChunks(routingHash, transactionId).map((chunk) => chunk.results_json);
+		return parseTagged<TransactWriteOperationResultEncoded[]>(first + chunks.join(""));
+	}
+
+	/** The stored results of each rejected prepare answer, by the participant that gave it. */
+	private loadAnswerResults(routingHash: RoutingHash, transactionId: string): Map<string, ParticipantOperationResultEncoded[]> {
+		const texts = new Map<string, string[]>();
+		for (const { partition_do_name, answer_json } of this.ctx.storage.sql.exec<{ partition_do_name: string; answer_json: string }>(
+			`SELECT partition_do_name, answer_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
+			routingHash,
+			transactionId,
+		)) {
+			texts.set(partition_do_name, [answer_json]);
+		}
+		for (const chunk of this.loadAnswerChunks(routingHash, transactionId)) {
+			const parts = texts.get(chunk.partition_do_name);
+			invariant(
+				parts,
+				() => `fokos/tc: transaction ${transactionId} has an answer chunk of ${chunk.partition_do_name} without its first chunk`,
+			);
+			parts.push(chunk.answer_json);
+		}
+		const answers = new Map<string, ParticipantOperationResultEncoded[]>();
+		for (const [doName, parts] of texts) {
+			answers.set(doName, parseTagged<ParticipantOperationResultEncoded[]>(parts.join("")));
+		}
+		return answers;
+	}
+
+	private loadResultChunks(routingHash: RoutingHash, transactionId: string): TcResultChunkRow[] {
+		return this.ctx.storage.sql
+			.exec<TcResultChunkRow>(
+				`SELECT transaction_id, chunk_index, results_json FROM tc_result_chunks
+				  WHERE routing_hash = ? AND transaction_id = ? ORDER BY chunk_index`,
+				routingHash,
+				transactionId,
+			)
+			.toArray();
+	}
+
+	private loadAnswerChunks(routingHash: RoutingHash, transactionId: string): TcAnswerChunkRow[] {
+		return this.ctx.storage.sql
+			.exec<TcAnswerChunkRow>(
+				`SELECT transaction_id, partition_do_name, chunk_index, answer_json FROM tc_answer_chunks
+				  WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name, chunk_index`,
 				routingHash,
 				transactionId,
 			)
@@ -2300,7 +2586,7 @@ function isPastPrepare(state: TCState): boolean {
  * that has one, hides the transaction from one of the jobs. The completion deletes the item and
  * participant rows in the same storage transaction as the terminal state.
  */
-function assertMigratedTransaction({ state, items, participants, results }: MigratedTransaction): void {
+function assertMigratedTransaction({ state, items, participants, results, resultChunks, answerChunks }: MigratedTransaction): void {
 	const id = state.transaction_id;
 	const terminal = state.state === "COMMITTED" || state.state === "CANCELLED";
 	invariant(
@@ -2309,29 +2595,48 @@ function assertMigratedTransaction({ state, items, participants, results }: Migr
 			`fokos/tc: migrated transaction ${id} in state ${state.state} has completed_at ${state.completed_at} and next_recovery_at ${state.next_recovery_at}`,
 	);
 	invariant(
-		!terminal || (items.length === 0 && participants.length === 0),
-		() => `fokos/tc: migrated terminal transaction ${id} has ${items.length} item and ${participants.length} participant rows`,
+		!terminal || (items.length === 0 && participants.length === 0 && answerChunks.length === 0),
+		() =>
+			`fokos/tc: migrated terminal transaction ${id} has ${items.length} item, ${participants.length} participant and ${answerChunks.length} answer chunk rows`,
 	);
 	invariant(
 		items.every((r) => r.transaction_id === id) &&
 			participants.every((r) => r.transaction_id === id) &&
-			results.every((r) => r.transaction_id === id),
+			results.every((r) => r.transaction_id === id) &&
+			resultChunks.every((r) => r.transaction_id === id) &&
+			answerChunks.every((r) => r.transaction_id === id),
 		() => `fokos/tc: migrated transaction ${id} has a row of another transaction`,
 	);
 }
 
-/** The size of one migrated transaction, near its serialized size: the payloads and the text columns. */
+/**
+ * The size of one migrated transaction, near its serialized size: the payloads, the text columns, and
+ * the overhead of each row with its column names (64 to 256 bytes).
+ */
 function migratedTransactionBytes(tx: MigratedTransaction): number {
-	const size = (v: string | ArrayBuffer | null) => (v === null ? 0 : typeof v === "string" ? v.length : v.byteLength);
-	let bytes = 256 + size(tx.state.results_json);
+	let bytes = 256 + wireBytes(tx.state.results_json);
 	for (const r of tx.items) {
-		bytes += 128 + r.hk.byteLength + r.sk.byteLength + size(r.data) + size(r.conditions_json) + size(r.update_json);
+		bytes +=
+			128 +
+			r.hk.byteLength +
+			r.sk.byteLength +
+			wireBytes(r.data) +
+			wireBytes(r.conditions_json) +
+			wireBytes(r.update_json) +
+			wireBytes(r.partition_do_name);
 	}
 	for (const r of tx.participants) {
-		bytes += 128 + size(r.partition_context_json) + size(r.answer_json) + size(r.error_json);
+		bytes +=
+			128 + wireBytes(r.partition_context_json) + wireBytes(r.answer_json) + wireBytes(r.error_json) + wireBytes(r.partition_do_name);
 	}
 	for (const r of tx.results) {
-		bytes += 64 + size(r.image_data);
+		bytes += 64 + wireBytes(r.image_data);
+	}
+	for (const r of tx.resultChunks) {
+		bytes += 64 + wireBytes(r.results_json);
+	}
+	for (const r of tx.answerChunks) {
+		bytes += 64 + wireBytes(r.answer_json) + wireBytes(r.partition_do_name);
 	}
 	return bytes;
 }

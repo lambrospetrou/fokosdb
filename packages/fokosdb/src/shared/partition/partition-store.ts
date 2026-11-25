@@ -2183,7 +2183,7 @@ export class PartitionStore implements ItemSource {
 
 	/**
 	 * Releases the locks of one transaction under `keys`, one statement per key. A transaction can hold
-	 * up to MAX_ITEMS_PER_TX (100) keys here, and one statement binds at most 100 parameters.
+	 * up to MAX_ITEMS_PER_TX keys here, and one statement binds at most 100 parameters.
 	 *
 	 * Do not delete by transaction id alone. That delete also removes the copies of a key that a
 	 * promotion moved away, and the source must keep them until the new owner acknowledges its import.
@@ -2207,8 +2207,8 @@ export class PartitionStore implements ItemSource {
 	 * With null, every lock row is a copy (a split). Returns true when no copy remains.
 	 *
 	 * One statement deletes all copies of one transaction, so a transaction never keeps only a part of
-	 * its copies. A transaction has at most MAX_ITEMS_PER_TX (100) rows, thus one call can delete up
-	 * to 99 rows more than `maxRows`.
+	 * its copies. A transaction has at most MAX_ITEMS_PER_TX rows, thus one call can delete up to
+	 * `MAX_ITEMS_PER_TX - 1` rows more than `maxRows`.
 	 */
 	deletePendingTxCopiesBatch(routingHash: RoutingHash | null, maxRows: number): boolean {
 		const sql = this.#storage.sql;

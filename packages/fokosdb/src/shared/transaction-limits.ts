@@ -59,7 +59,7 @@ const LARGE_KEY_WARNING_BYTES = 2 * 1024;
 /**
  * Per-item ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation in a
  * transaction — so one item cannot be larger through one API than the other. Without it a single
- * transactional put could carry the whole 4 MB transaction budget while `putItem` had no ceiling at
+ * transactional put could carry the whole 10 MB transaction budget while `putItem` had no ceiling at
  * all.
  *
  * Two checks hold it, and they measure different things. `itemDataBytes` counts a client's data as a
@@ -71,13 +71,28 @@ const LARGE_KEY_WARNING_BYTES = 2 * 1024;
  */
 export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 
-export const MAX_ITEMS_PER_TX = 100;
-export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
+/** The most operations of one `transactWriteItems` call. */
+export const MAX_ITEMS_PER_TX = 10_000;
+/** The most items of one `transactGetItems` call. */
+export const MAX_ITEMS_PER_TX_GET = 100;
+/**
+ * The most bytes of one `transactWriteItems` call: the data, the condition and update trees as JSON,
+ * and both encoded keys of each operation, summed over the transaction.
+ */
+export const MAX_PAYLOAD_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MB
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 
 /** The most items of one `batchGetItems` or `batchWriteItems` call, DynamoDB parity. */
 export const MAX_ITEMS_PER_BATCH = 100;
+
+/**
+ * The most bytes of one `batchWriteItems` call: the data, the condition trees as JSON, and both
+ * encoded keys of each operation. All operations of a batch can go to one partition in one RPC, so
+ * the sum stays below `RPC_MESSAGE_MAX_BYTES`. A text counts its UTF-16 code units, and an RPC can
+ * carry two bytes for each of them, so `batch_request_too_large` stays as the last check.
+ */
+export const MAX_PAYLOAD_BYTES_PER_BATCH = 16 * 1024 * 1024; // 16 MiB
 
 /**
  * The most response bytes of one batch read answer, as `estimateItemBytes` and
@@ -438,6 +453,7 @@ export function validateTransactWriteOperations(
 		if (op.update) {
 			totalBytes += itemDataBytes(JSON.stringify(op.update));
 		}
+		totalBytes += hashKey.byteLength + sortKey.byteLength;
 		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {
@@ -550,10 +566,10 @@ export function validateTransactGetItemCount(itemCount: number): void {
 	if (itemCount === 0) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_empty, { message: "transactGetItems requires at least 1 item" });
 	}
-	if (itemCount > MAX_ITEMS_PER_TX) {
+	if (itemCount > MAX_ITEMS_PER_TX_GET) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_too_many, {
-			message: `transactGetItems supports at most ${MAX_ITEMS_PER_TX} items`,
-			attributes: { limit: MAX_ITEMS_PER_TX, count: itemCount },
+			message: `transactGetItems supports at most ${MAX_ITEMS_PER_TX_GET} items`,
+			attributes: { limit: MAX_ITEMS_PER_TX_GET, count: itemCount },
 		});
 	}
 }
@@ -606,16 +622,20 @@ export function validateBatchGetItems(
 
 /**
  * Validates a `batchWriteItems` request: the item count, the fields of each operation, the key rules,
- * `ttlAt`, `returnValuesOnConditionCheckFailure`, no two operations on one item, and the sum of the
- * condition sizes. A put carries data. A delete carries no data and no `ttlAt`. No operation carries
- * an update. The caller validates each condition tree.
- * Encodes each key one time and returns the bytes in request order. The caller encodes the data of
- * each put and checks its size.
+ * `ttlAt`, `returnValuesOnConditionCheckFailure`, and no two operations on one item. A put carries
+ * data. A delete carries no data and no `ttlAt`. No operation carries an update. The caller validates
+ * each condition tree.
+ * Encodes each key one time and returns the bytes in request order, with `bytes`: the encoded keys
+ * and the condition trees as JSON. The caller encodes the data of each put, checks its size, and
+ * gives the total with the data to `validateBatchWritePayload`.
  */
-export function validateBatchWriteItems(items: readonly BatchWriteItemLike[], limits: FokosDBLimits): TransactionItemKey[] {
+export function validateBatchWriteItems(
+	items: readonly BatchWriteItemLike[],
+	limits: FokosDBLimits,
+): { keys: TransactionItemKey[]; bytes: number } {
 	validateBatchItemCount("batchWriteItems", items.length);
 	const seen = new KeyPairMap<true>();
-	let conditionBytes = 0;
+	let bytes = 0;
 	const keys = items.map((item, opIndex) => {
 		const invalidFields = (message: string) =>
 			new FokosValidationError(VALIDATION_CODES.batch_operation_fields_invalid, {
@@ -637,17 +657,23 @@ export function validateBatchWriteItems(items: readonly BatchWriteItemLike[], li
 		validateTtlAt(item.ttlAt, "batchWriteItems");
 		validateReturnValuesOnConditionCheckFailure(item.returnValuesOnConditionCheckFailure as string | undefined);
 		if (item.condition !== undefined) {
-			conditionBytes += itemDataBytes(JSON.stringify(item.condition) ?? "");
+			bytes += itemDataBytes(JSON.stringify(item.condition) ?? "");
 		}
-		return encodeBatchKey("batchWriteItems", item, opIndex, limits, seen);
+		const key = encodeBatchKey("batchWriteItems", item, opIndex, limits, seen);
+		bytes += key.hashKey.byteLength + key.sortKey.byteLength;
+		return key;
 	});
-	if (conditionBytes > MAX_PAYLOAD_BYTES_PER_TX) {
-		throw new FokosValidationError(VALIDATION_CODES.batch_conditions_too_large, {
-			message: `batchWriteItems conditions exceed ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MB in total`,
-			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_TX, bytes: conditionBytes },
+	return { keys, bytes };
+}
+
+/** Throws when the payload of a `batchWriteItems` request is above `MAX_PAYLOAD_BYTES_PER_BATCH`. */
+export function validateBatchWritePayload(bytes: number): void {
+	if (bytes > MAX_PAYLOAD_BYTES_PER_BATCH) {
+		throw new FokosValidationError(VALIDATION_CODES.batch_payload_too_large, {
+			message: `batchWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES_PER_BATCH / (1024 * 1024)} MiB`,
+			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_BATCH, bytes },
 		});
 	}
-	return keys;
 }
 
 function validateBatchItemCount(api: string, count: number): void {

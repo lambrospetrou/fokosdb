@@ -95,6 +95,7 @@ import {
 	encodeHashKey,
 	encodeSortBound,
 	encodeSortKey,
+	itemDataBytes,
 	validateItemDataSize,
 	validateItemKeys,
 	validateReturnValuesOnConditionCheckFailure,
@@ -107,6 +108,7 @@ import {
 	validateBatchGetItems,
 	MAX_BATCH_GET_RESPONSE_BYTES,
 	validateBatchWriteItems,
+	validateBatchWritePayload,
 	applyBatchImageCap,
 	decodeItemKeys,
 	resolveLimits,
@@ -1773,10 +1775,11 @@ export class FokosDB {
 	async #batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult> {
 		// The fields of each operation are checked before its data is encoded, so a put with no data
 		// fails with `batch_operation_fields_invalid`.
-		const keys = validateBatchWriteItems(opts.items, this.#limits);
+		const { keys, bytes: keyAndConditionBytes } = validateBatchWriteItems(opts.items, this.#limits);
 		if (opts.items.length === 0) {
 			return { results: [], unprocessedItems: [], meta: { forwardCount: 0, partitions: [] } };
 		}
+		let payloadBytes = keyAndConditionBytes;
 		const items: BatchWriteRpcItem[] = opts.items.map((item, opIndex) => {
 			this.#checkCondition(item.condition);
 			const condition = {
@@ -1790,9 +1793,11 @@ export class FokosDB {
 			}
 			const encoded = encodeItemData(item.data);
 			validateItemDataSize(encoded.data, "batchWriteItems");
+			payloadBytes += itemDataBytes(encoded.data);
 			const ttlAt = item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt };
 			return { opIndex, ...keys[opIndex], operation: "put", ...encoded, ...ttlAt, ...condition };
 		});
+		validateBatchWritePayload(payloadBytes);
 
 		// No retry: a write whose answer is lost could then apply twice.
 		const groups = this.#partitions.resolveAll(items);

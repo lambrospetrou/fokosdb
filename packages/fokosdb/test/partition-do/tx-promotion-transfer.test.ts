@@ -17,7 +17,7 @@ import type { ControlledPartitionDO } from "../controlled-partition-do.js";
 import { testCoordinatorContext, testCoordinatorRef } from "../stub-helpers.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
-import { IDEMPOTENCY_WINDOW_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
+import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { captureConsoleError, insertLock, kb, lockKeys, makeStub, withOpIndex } from "./helpers.js";
 import {
 	CONTROLLED_NS,
@@ -178,10 +178,10 @@ describe("FokosDBPartitionDO — a promotion source and the locks of the key it 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
 	});
 
-	it("commits a transaction of MAX_ITEMS_PER_TX owned keys next to a copy", async () => {
+	it("commits a transaction of 100 owned keys next to a copy", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		const keys = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => ({ hashKey: "bob", sortKey: `sk${String(i).padStart(3, "0")}` }));
+		const keys = Array.from({ length: 100 }, (_, i) => ({ hashKey: "bob", sortKey: `sk${String(i).padStart(3, "0")}` }));
 		const prepare = prepareOf(transactionId, keys, "many");
 		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: FokosDBPartitionDO, state: DurableObjectState) => {
