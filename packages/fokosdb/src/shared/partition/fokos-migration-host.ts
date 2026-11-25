@@ -21,8 +21,8 @@
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
 import { collectBatch } from "../../sharding/batch-scan.js";
+import { estimateItemBytes } from "./item-wire-bytes.js";
 import {
-	estimateItemBytes,
 	estimatePendingTxBytes,
 	PartitionStore,
 	type KeyRange,

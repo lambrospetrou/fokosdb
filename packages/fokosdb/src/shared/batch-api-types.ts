@@ -19,13 +19,13 @@ export type BatchGetItemKey = ItemKey & { projection?: readonly ProjectionExpres
  * no `Ts` keeps the widest types.
  */
 export type BatchGetItemsOptions<Ts extends readonly unknown[] = never[]> = {
-	/** 0 to 100 keys. An empty list sends no RPC. Two keys of one item fail the request with `batch_duplicate_key`. */
+	/** 0 to 1,000 keys (`MAX_ITEMS_PER_REQUEST`). An empty list sends no RPC. Two keys of one item fail the request with `batch_duplicate_key`. */
 	items: { [K in keyof Ts]: BatchGetItemKey };
 	/** The projection of each key that has no projection of its own. */
 	projection?: readonly ProjectionExpression[];
 	/**
 	 * The most bytes of found items in the result. A key that does not fit is `unprocessed` with
-	 * `response_too_large`. Defaults to `MAX_BATCH_GET_RESPONSE_BYTES`, and is clamped to it.
+	 * `response_too_large`. Defaults to `MAX_PAYLOAD_BYTES_PER_BATCH`, and is clamped to it.
 	 */
 	maxResponseBytes?: number;
 };
@@ -85,7 +85,7 @@ export type BatchWriteItem =
 
 export type BatchWriteItemsOptions = {
 	/**
-	 * 0 to 100 operations. An empty list sends no RPC. Two operations on one item fail the request with
+	 * 0 to 1,000 operations (`MAX_ITEMS_PER_REQUEST`). An empty list sends no RPC. Two operations on one item fail the request with
 	 * `batch_duplicate_key`. A payload above `MAX_PAYLOAD_BYTES_PER_BATCH` (the data, the
 	 * conditions, and the keys, summed) fails it with `batch_payload_too_large`.
 	 */

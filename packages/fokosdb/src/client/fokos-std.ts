@@ -32,7 +32,7 @@ export class FokosDBStd {
 	 *
 	 * The result has the positions of the first request: `items[i]` is the last answer for `opts.items[i]`.
 	 * `meta` joins the `meta` of every call. A key that is still unprocessed after the last call stays in
-	 * `unprocessedKeys`. It takes the limits of `batchGetItems`, 0 to 100 keys, and makes one call at a
+	 * `unprocessedKeys`. It takes the limits of `batchGetItems`, 0 to 1,000 keys, and makes one call at a
 	 * time. It throws only for options that are not valid, before any I/O.
 	 */
 	static async batchGetItemsWithRetry<Ts extends readonly unknown[] = never[]>(

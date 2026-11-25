@@ -359,48 +359,6 @@ function codeFromNullableKind(kind: DataKind | null): number | null {
 	return code;
 }
 
-/**
- * The bytes the RPC serialization adds around one item, complete item or projected row, on top of
- * the item's own key, data, and cell bytes. It stands for the object or array itself, its property
- * names or cell slots, and one type tag and one length prefix per field or cell. It is an allowance,
- * not a measurement: a StoredItem has 8 named fields and a projected row has at most
- * `EXPRESSION_LIMITS.projectionEntries` cells, and 64 bytes is in the range both produce.
- *
- * The estimate only feeds the response-byte budget, which keeps one RPC response under
- * `WORKERS_RPC_MAX_BYTES`. `MAX_RESPONSE_BYTES_PER_PAGE` (half of it) leaves a 2x margin: even an error of 64
- * bytes per item on a page of 100,000 tiny items is about 6 MiB, inside that margin. Change this
- * value only when the per-item wire shape grows well past what it stands for (many more named
- * fields, or a much larger cell limit) or when that margin shrinks. Changing it moves page boundaries
- * only; a cursor does not depend on it.
- */
-const ITEM_ENVELOPE_BYTES = 64;
-
-export function estimateItemBytes(item: StoredItem): number {
-	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.byteLength + item.sk.byteLength + dataSize + 16 + ITEM_ENVELOPE_BYTES;
-}
-
-/**
- * Estimated RPC bytes of one projected row: the item envelope plus per-cell sizes, `length * 2`
- * for a string and for the JSON text of an array or an object, `byteLength` for a `Uint8Array`, and
- * 8 for every other cell. It does not use `item_bytes`: a projected row carries only its cells.
- */
-export function estimateProjectedRowBytes(row: ProjectedWireRow): number {
-	let bytes = ITEM_ENVELOPE_BYTES;
-	for (const cell of row) {
-		if (typeof cell === "string") {
-			bytes += cell.length * 2;
-		} else if (cell instanceof Uint8Array) {
-			bytes += cell.byteLength;
-		} else if (cell !== null && typeof cell === "object") {
-			bytes += cell.json.length * 2;
-		} else {
-			bytes += 8;
-		}
-	}
-	return bytes;
-}
-
 export function estimatePendingTxBytes(row: PendingTxItem): number {
 	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
 	return (
@@ -2183,7 +2141,7 @@ export class PartitionStore implements ItemSource {
 
 	/**
 	 * Releases the locks of one transaction under `keys`, one statement per key. A transaction can hold
-	 * up to MAX_ITEMS_PER_TX keys here, and one statement binds at most 100 parameters.
+	 * up to MAX_ITEMS_PER_REQUEST keys here, and one statement binds at most 100 parameters.
 	 *
 	 * Do not delete by transaction id alone. That delete also removes the copies of a key that a
 	 * promotion moved away, and the source must keep them until the new owner acknowledges its import.
@@ -2207,8 +2165,8 @@ export class PartitionStore implements ItemSource {
 	 * With null, every lock row is a copy (a split). Returns true when no copy remains.
 	 *
 	 * One statement deletes all copies of one transaction, so a transaction never keeps only a part of
-	 * its copies. A transaction has at most MAX_ITEMS_PER_TX rows, thus one call can delete up to
-	 * `MAX_ITEMS_PER_TX - 1` rows more than `maxRows`.
+	 * its copies. A transaction has at most MAX_ITEMS_PER_REQUEST rows, thus one call can delete up to
+	 * `MAX_ITEMS_PER_REQUEST - 1` rows more than `maxRows`.
 	 */
 	deletePendingTxCopiesBatch(routingHash: RoutingHash | null, maxRows: number): boolean {
 		const sql = this.#storage.sql;

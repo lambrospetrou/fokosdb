@@ -59,7 +59,7 @@ const LARGE_KEY_WARNING_BYTES = 2 * 1024;
 /**
  * Per-item ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation in a
  * transaction — so one item cannot be larger through one API than the other. Without it a single
- * transactional put could carry the whole 10 MB transaction budget while `putItem` had no ceiling at
+ * transactional put could carry the whole 16 MiB transaction budget while `putItem` had no ceiling at
  * all.
  *
  * Two checks hold it, and they measure different things. `itemDataBytes` counts a client's data as a
@@ -71,36 +71,33 @@ const LARGE_KEY_WARNING_BYTES = 2 * 1024;
  */
 export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 
-/** The most operations of one `transactWriteItems` call. */
-export const MAX_ITEMS_PER_TX = 10_000;
-/** The most items of one `transactGetItems` call. */
-export const MAX_ITEMS_PER_TX_GET = 100;
-/**
- * The most bytes of one `transactWriteItems` call: the data, the condition and update trees as JSON,
- * and both encoded keys of each operation, summed over the transaction.
+/** The most items of one `transactWriteItems`, `transactGetItems`, `batchWriteItems`, or `batchGetItems` call. */
+export const MAX_ITEMS_PER_REQUEST = 1_000;
+
+/*
+ * The payload limits count `wireBytes`: two bytes for each character of a text, because structured
+ * clone can write a text with two bytes for each character. So a limit holds on the wire for every
+ * text, and stays below `WORKERS_RPC_MAX_BYTES` with a margin.
  */
-export const MAX_PAYLOAD_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MB
+
+/**
+ * The most bytes of a transaction: for `transactWriteItems`, the data, the condition and update trees
+ * as JSON, and both encoded keys of each operation; for `transactGetItems`, the items of the response.
+ */
+export const MAX_PAYLOAD_BYTES_PER_TX = 16 * 1024 * 1024; // 16 MiB
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 
-/** The most items of one `batchGetItems` or `batchWriteItems` call, DynamoDB parity. */
-export const MAX_ITEMS_PER_BATCH = 100;
-
 /**
- * The most bytes of one `batchWriteItems` call: the data, the condition trees as JSON, and both
- * encoded keys of each operation. All operations of a batch can go to one partition in one RPC, so
- * the sum stays below `RPC_MESSAGE_MAX_BYTES`. A text counts its UTF-16 code units, and an RPC can
- * carry two bytes for each of them, so `batch_request_too_large` stays as the last check.
+ * The most bytes of a batch, 75% of `WORKERS_RPC_MAX_BYTES` (24 MiB): for `batchWriteItems`, the data,
+ * the condition trees as JSON, and both encoded keys of each operation; for `batchGetItems`, the items
+ * of the response, as `estimateItemBytes` and `estimateProjectedRowBytes` count them.
+ *
+ * All operations of a batch write can go to one partition in one RPC, so `batch_request_too_large`
+ * stays as the last check. Each partition answer and the result of `batchGetItems` hold to the limit.
+ * One answer can go above it by one item, the item of `opIndex` 0, and still stays below the RPC limit.
  */
-export const MAX_PAYLOAD_BYTES_PER_BATCH = 16 * 1024 * 1024; // 16 MiB
-
-/**
- * The most response bytes of one batch read answer, as `estimateItemBytes` and
- * `estimateProjectedRowBytes` count them. It is 75% of `WORKERS_RPC_MAX_BYTES` (24 MiB). Each
- * partition answer and the result of `batchGetItems` hold to it. One answer can go above it by one
- * item, the item of `opIndex` 0, and still stays below the RPC limit.
- */
-export const MAX_BATCH_GET_RESPONSE_BYTES = (WORKERS_RPC_MAX_BYTES * 3) / 4;
+export const MAX_PAYLOAD_BYTES_PER_BATCH = (WORKERS_RPC_MAX_BYTES * 3) / 4;
 
 /**
  * The full limits of a table: the defaults of this package version, with the overrides applied. It
@@ -228,6 +225,17 @@ export function validateClientRequestToken(token: string): void {
  */
 export function itemDataBytes(data: Uint8Array | string): number {
 	return typeof data === "string" ? data.length : data.byteLength;
+}
+
+/**
+ * The most bytes that structured clone writes for one value: two bytes for each character of a text,
+ * and the byte length of binary data. The payload limits count it.
+ */
+export function wireBytes(value: string | ArrayBuffer | Uint8Array | null | undefined): number {
+	if (value == null) {
+		return 0;
+	}
+	return typeof value === "string" ? 2 * value.length : value.byteLength;
 }
 
 /** Throws when `ttlAt` is present and is not an integer greater than zero. `where` names the calling API. */
@@ -393,10 +401,10 @@ export function validateTransactWriteOperations(
 	if (ops.length === 0) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_empty, { message: "transactWriteItems requires at least 1 item" });
 	}
-	if (ops.length > MAX_ITEMS_PER_TX) {
+	if (ops.length > MAX_ITEMS_PER_REQUEST) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_too_many, {
-			message: `transactWriteItems supports at most ${MAX_ITEMS_PER_TX} items`,
-			attributes: { limit: MAX_ITEMS_PER_TX, count: ops.length },
+			message: `transactWriteItems supports at most ${MAX_ITEMS_PER_REQUEST} items`,
+			attributes: { limit: MAX_ITEMS_PER_REQUEST, count: ops.length },
 		});
 	}
 	const seen = new KeyPairMap<true>();
@@ -445,20 +453,20 @@ export function validateTransactWriteOperations(
 		seen.set(hashKey, sortKey, true);
 		if (op.data !== undefined) {
 			validateItemDataSize(op.data, "transactWriteItems");
-			totalBytes += itemDataBytes(op.data);
+			totalBytes += wireBytes(op.data);
 		}
 		if (op.condition) {
-			totalBytes += itemDataBytes(JSON.stringify(op.condition));
+			totalBytes += wireBytes(JSON.stringify(op.condition));
 		}
 		if (op.update) {
-			totalBytes += itemDataBytes(JSON.stringify(op.update));
+			totalBytes += wireBytes(JSON.stringify(op.update));
 		}
 		totalBytes += hashKey.byteLength + sortKey.byteLength;
 		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_payload_too_large, {
-			message: `transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MB`,
+			message: `transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MiB`,
 			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_TX, bytes: totalBytes },
 		});
 	}
@@ -566,10 +574,23 @@ export function validateTransactGetItemCount(itemCount: number): void {
 	if (itemCount === 0) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_empty, { message: "transactGetItems requires at least 1 item" });
 	}
-	if (itemCount > MAX_ITEMS_PER_TX_GET) {
+	if (itemCount > MAX_ITEMS_PER_REQUEST) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_too_many, {
-			message: `transactGetItems supports at most ${MAX_ITEMS_PER_TX_GET} items`,
-			attributes: { limit: MAX_ITEMS_PER_TX_GET, count: itemCount },
+			message: `transactGetItems supports at most ${MAX_ITEMS_PER_REQUEST} items`,
+			attributes: { limit: MAX_ITEMS_PER_REQUEST, count: itemCount },
+		});
+	}
+}
+
+/**
+ * Throws when the found items of a `transactGetItems` response are above `MAX_PAYLOAD_BYTES_PER_TX`, as
+ * `estimateReadItemBytes` counts them. A read is atomic, so it cannot return a part of its items.
+ */
+export function validateTransactResponseBytes(bytes: number): void {
+	if (bytes > MAX_PAYLOAD_BYTES_PER_TX) {
+		throw new FokosValidationError(VALIDATION_CODES.transact_response_too_large, {
+			message: `transactGetItems response exceeds ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MiB, read fewer items or use a projection`,
+			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_TX },
 		});
 	}
 }
@@ -657,7 +678,7 @@ export function validateBatchWriteItems(
 		validateTtlAt(item.ttlAt, "batchWriteItems");
 		validateReturnValuesOnConditionCheckFailure(item.returnValuesOnConditionCheckFailure as string | undefined);
 		if (item.condition !== undefined) {
-			bytes += itemDataBytes(JSON.stringify(item.condition) ?? "");
+			bytes += wireBytes(JSON.stringify(item.condition));
 		}
 		const key = encodeBatchKey("batchWriteItems", item, opIndex, limits, seen);
 		bytes += key.hashKey.byteLength + key.sortKey.byteLength;
@@ -677,10 +698,10 @@ export function validateBatchWritePayload(bytes: number): void {
 }
 
 function validateBatchItemCount(api: string, count: number): void {
-	if (count > MAX_ITEMS_PER_BATCH) {
+	if (count > MAX_ITEMS_PER_REQUEST) {
 		throw new FokosValidationError(VALIDATION_CODES.batch_items_too_many, {
-			message: `${api} supports at most ${MAX_ITEMS_PER_BATCH} items`,
-			attributes: { limit: MAX_ITEMS_PER_BATCH, count },
+			message: `${api} supports at most ${MAX_ITEMS_PER_REQUEST} items`,
+			attributes: { limit: MAX_ITEMS_PER_REQUEST, count },
 		});
 	}
 }

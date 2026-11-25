@@ -12,7 +12,7 @@ import { composeProjectionStatement, composeQueryStatement, type CompiledProject
 import { decodeProjectedRow, projectedItemFromWireRow, type ProjectedItem } from "./projection.js";
 import { evaluateConditionPlan } from "./runtime.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
-import { estimateProjectedRowBytes } from "../partition/partition-store.js";
+import { estimateProjectedRowBytes } from "../partition/item-wire-bytes.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, PROJECTION_PRESENCE_FIXTURES } from "./test-fixtures.js";
 import type { ConditionExpression, ProjectionExpression } from "./types.js";

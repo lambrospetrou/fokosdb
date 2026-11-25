@@ -58,7 +58,7 @@ export function classifyBatchFailure(error: unknown, opts: { write: boolean; loc
 }
 
 /** True for the error of workerd, or for an error that has it as its cause. */
-function isRpcTooLarge(error: unknown): boolean {
+export function isRpcTooLarge(error: unknown): boolean {
 	const cause = error instanceof Error ? error.cause : undefined;
 	return [error, cause].some((e) => e instanceof Error && e.message.startsWith(RPC_TOO_LARGE_PREFIX));
 }

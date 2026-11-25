@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fitBatchResponse } from "./batch-response.js";
-import { MAX_BATCH_GET_RESPONSE_BYTES } from "./transaction-limits.js";
+import { MAX_PAYLOAD_BYTES_PER_BATCH } from "./transaction-limits.js";
 
 const entry = (opIndex: number, bytes: number) => ({ opIndex, bytes });
 const indexes = (entries: Array<{ opIndex: number }>) => entries.map((e) => e.opIndex);
@@ -30,8 +30,8 @@ describe("fitBatchResponse", () => {
 		expect(indexes(dropped)).toEqual([5]);
 	});
 
-	it("clamps the limit to MAX_BATCH_GET_RESPONSE_BYTES", () => {
-		const half = MAX_BATCH_GET_RESPONSE_BYTES / 2;
+	it("clamps the limit to MAX_PAYLOAD_BYTES_PER_BATCH", () => {
+		const half = MAX_PAYLOAD_BYTES_PER_BATCH / 2;
 		const { kept, dropped } = fitBatchResponse([entry(1, half), entry(2, half), entry(3, 1)], Number.MAX_SAFE_INTEGER);
 		expect(indexes(kept)).toEqual([1, 2]);
 		expect(indexes(dropped)).toEqual([3]);

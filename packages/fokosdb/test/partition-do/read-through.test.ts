@@ -16,7 +16,7 @@ import type {
 } from "../../src/server/do-partition.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";
-import { MAX_BATCH_GET_RESPONSE_BYTES } from "../../src/shared/transaction-limits.js";
+import { MAX_PAYLOAD_BYTES_PER_BATCH } from "../../src/shared/transaction-limits.js";
 import type { StoredItem } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -33,7 +33,7 @@ import {
 
 const batchRequest = (keys: Array<[string, string]>): BatchGetItemsRpcRequest => ({
 	items: keys.map(([hashKey, sortKey], opIndex) => ({ opIndex, hashKey: kb(hashKey), sortKey: kb(sortKey) })),
-	maxResponseBytes: MAX_BATCH_GET_RESPONSE_BYTES,
+	maxResponseBytes: MAX_PAYLOAD_BYTES_PER_BATCH,
 });
 
 const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({

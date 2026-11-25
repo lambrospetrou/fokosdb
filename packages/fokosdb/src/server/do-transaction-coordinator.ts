@@ -88,6 +88,7 @@ import {
 	IDEMPOTENCY_WINDOW_MS,
 	MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
 	nextRecoveryAt,
+	wireBytes,
 	txOrderTimestampNow,
 } from "../shared/transaction-limits.js";
 import {
@@ -296,24 +297,6 @@ function chunkResults(entries: readonly unknown[]): string[] {
 	return chunks;
 }
 
-/** Matches a character outside Latin-1 (above U+00FF). */
-const NON_LATIN1_CHAR = /[\u0100-\uffff]/;
-
-/**
- * The bytes that structured clone writes for one column value. It writes a text with one byte for
- * each character when every character is in Latin-1 (U+0000 to U+00FF), and with two bytes for each
- * character in all other cases.
- */
-function wireBytes(value: string | ArrayBuffer | Uint8Array | null | undefined): number {
-	if (value == null) {
-		return 0;
-	}
-	if (typeof value !== "string") {
-		return value.byteLength;
-	}
-	return NON_LATIN1_CHAR.test(value) ? 2 * value.length : value.length;
-}
-
 /**
  * The image cap of one transaction: MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, or less when the other
  * rows of the transaction leave less room in 75% of WORKERS_RPC_MAX_BYTES. A migration page carries
@@ -344,8 +327,7 @@ function transactionImageCap(
 	participants: readonly { doName: string; contextJson: string }[],
 ): number {
 	let fixed = 0;
-	let entryUnits = 0;
-	let twoByteEntries = false;
+	let entries = 0;
 	for (const op of items) {
 		// The structured-clone overhead of the rows of this operation, with their column names: 128 for its
 		// `tc_items` row, and 64 for its `tc_results` row, which holds its image.
@@ -358,19 +340,14 @@ function transactionImageCap(
 			wireBytes(op.conditionJson) +
 			wireBytes(op.updateJson) +
 			wireBytes(op.doName);
-		const keys = stringifyTagged(decodeItemKeys(op.hashKey, op.sortKey));
-		// 256: the most bytes of one entry other than its keys. These are the outcome, the reason code,
-		// the indexes, `imageBytes`, `itemOmitted`, and a transaction id or an `error_id`.
-		entryUnits += 256 + keys.length;
-		twoByteEntries ||= wireBytes(keys) > keys.length;
+		// 256: the most characters of one entry other than its keys. These are the outcome, the reason
+		// code, the indexes, `imageBytes`, `itemOmitted`, and a transaction id or an `error_id`.
+		entries += wireBytes(stringifyTagged(decodeItemKeys(op.hashKey, op.sortKey))) + 2 * 256;
 	}
 	for (const p of participants) {
 		// 512: the overhead of one `tc_participants` row, with a stored prepare error in it.
 		fixed += 512 + wireBytes(p.contextJson) + wireBytes(p.doName);
 	}
-	// A chunk is one text, so one key with a character above U+00FF makes the whole chunk two bytes
-	// for each character.
-	const entries = twoByteEntries ? 2 * entryUnits : entryUnits;
 	const room = (WORKERS_RPC_MAX_BYTES * 3) / 4 - fixed - entries;
 	return Math.max(0, Math.min(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, Math.floor(room / 2)));
 }
@@ -389,7 +366,7 @@ function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEnco
  * kept.
  *
  * The images go to tc_results instead, as raw values, because JSON text of an image costs more than
- * the image, and one answer can carry MAX_ITEMS_PER_TX of them. `imageBytes` stays so the coordinator
+ * the image, and one answer can carry MAX_ITEMS_PER_REQUEST of them. `imageBytes` stays so the coordinator
  * can apply the cap at CANCELLING without reading the images back.
  */
 function stripImagesFromResults(results: readonly ParticipantOperationResultEncoded[]): ParticipantOperationResultEncoded[] {

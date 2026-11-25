@@ -67,7 +67,7 @@ import type {
 	BatchWriteItemsOptions,
 	BatchWriteItemsResult,
 } from "../shared/batch-api-types.js";
-import { classifyBatchFailure, type BatchFailureOutcome } from "../shared/batch-failure.js";
+import { classifyBatchFailure, isRpcTooLarge, type BatchFailureOutcome } from "../shared/batch-failure.js";
 import { fitBatchResponse } from "../shared/batch-response.js";
 import type { FokosErrorCode } from "../shared/errors-operations.js";
 import type {
@@ -95,18 +95,19 @@ import {
 	encodeHashKey,
 	encodeSortBound,
 	encodeSortKey,
-	itemDataBytes,
+	wireBytes,
 	validateItemDataSize,
 	validateItemKeys,
 	validateReturnValuesOnConditionCheckFailure,
 	validateTransactGetItemCount,
 	validateTransactGetItemKeys,
+	validateTransactResponseBytes,
 	validateTransactWriteOperations,
 	validateExecutionMode,
 	validateClientRequestToken,
 	validateTtlAt,
 	validateBatchGetItems,
-	MAX_BATCH_GET_RESPONSE_BYTES,
+	MAX_PAYLOAD_BYTES_PER_BATCH,
 	validateBatchWriteItems,
 	validateBatchWritePayload,
 	applyBatchImageCap,
@@ -147,6 +148,7 @@ import type { WirePartitionMeta } from "../shared/types.js";
 import { normalizeSkInterval } from "../sharding/sk-interval.js";
 import { answerMeta, PartitionMetaJoin, routeNodeMeta } from "../shared/partition-meta.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
+import { estimateReadItemBytes } from "../shared/partition/item-wire-bytes.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
 import {
 	decodeScanCursor,
@@ -210,8 +212,34 @@ function readRetry(retry: Required<FokosDBRetryOptions>, retryable: (err: unknow
 	return { shouldRetry: (err, nextAttempt) => retryable(err) && nextAttempt <= maxAttempts, baseDelayMs, maxDelayMs };
 }
 
-/** A read applies nothing, so each phase of a read transaction sends again after any error. */
-const TRANSACTION_READ_RETRY = readRetry(DEFAULT_RETRY, () => true);
+/**
+ * True for a read answer that is too large: the error of the response limit, or the error of an RPC
+ * value above `WORKERS_RPC_MAX_BYTES`. The same read fails the same way again.
+ */
+function isResponseTooLarge(err: unknown): boolean {
+	return isRpcTooLarge(err) || FokosError.isCode(err, VALIDATION_CODES.transact_response_too_large);
+}
+
+/** The error of a `transactGetItems` answer above the RPC limit is the error of the response limit. */
+function responseTooLargeError(err: unknown): unknown {
+	if (!isRpcTooLarge(err)) {
+		return err;
+	}
+	return new FokosValidationError(VALIDATION_CODES.transact_response_too_large, {
+		message: "transactGetItems response is above the RPC limit, read fewer items or use a projection",
+		cause: err,
+	});
+}
+
+/**
+ * The projection of each item in the second phase of a read transaction. That phase compares only
+ * `version` and `maxDeletedV`, and every projected answer carries `version`, so the answers carry no
+ * data.
+ */
+const KEY_ONLY_PROJECTION: readonly ProjectionExpression[] = Object.freeze([{ expr: { ref: "hashKey" } }]);
+
+/** A read applies nothing, so each phase of a read transaction sends again after any error, except an answer that is too large. */
+const TRANSACTION_READ_RETRY = readRetry(DEFAULT_RETRY, (err) => !isResponseTooLarge(err));
 /** The snapshot read sends again only after a transient fault of the runtime. */
 const SNAPSHOT_READ_RETRY = readRetry(DEFAULT_RETRY, (err) => isRuntimeRetryableError(err));
 
@@ -921,7 +949,7 @@ export class FokosDB {
 	}
 
 	/**
-	 * Reads 0 to 100 items by key, and answers each key in request order. It is not a snapshot across
+	 * Reads 0 to 1,000 items by key, and answers each key in request order. It is not a snapshot across
 	 * partitions, and it does not retry: send `unprocessedKeys` again, with the `projection` and the
 	 * `maxResponseBytes` of the request, or use `FokosDBStd.batchGetItemsWithRetry`. Only a request that is
 	 * not valid throws.
@@ -933,7 +961,7 @@ export class FokosDB {
 	}
 
 	/**
-	 * Puts or deletes 0 to 100 items, and answers each operation in request order. It is not atomic, and
+	 * Puts or deletes 0 to 1,000 items, and answers each operation in request order. It is not atomic, and
 	 * it does not retry: send `unprocessedItems` again, or use `FokosDBStd.batchWriteItemsWithRetry`. Only a
 	 * request that is not valid throws, because after the first RPC an error for the whole call could
 	 * not say which items applied.
@@ -1286,9 +1314,13 @@ export class FokosDB {
 		}
 
 		// Every error, a transport failure included, is the caller's, exactly as on the two-phase path.
-		const { value: response, routing } = await this.#partitions.send("txReadSnapshot", groups[0].ctx, { items }, items, {
-			retry: this.#options.retry === DEFAULT_RETRY ? SNAPSHOT_READ_RETRY : readRetry(this.#options.retry, isRuntimeRetryableError),
-		});
+		const { value: response, routing } = await this.#partitions
+			.send("txReadSnapshot", groups[0].ctx, { items }, items, {
+				retry: this.#options.retry === DEFAULT_RETRY ? SNAPSHOT_READ_RETRY : readRetry(this.#options.retry, isRuntimeRetryableError),
+			})
+			.catch((err: unknown) => {
+				throw responseTooLargeError(err);
+			});
 		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
 		if (response.outcome === "not_applicable") {
 			return null;
@@ -1309,10 +1341,19 @@ export class FokosDB {
 			const items = indexes.map((i) => requestedItems[i]);
 			return { ctx, items };
 		});
-		const retry = this.#options.retry === DEFAULT_RETRY ? TRANSACTION_READ_RETRY : readRetry(this.#options.retry, () => true);
-		const readPhase = () =>
+		const retry =
+			this.#options.retry === DEFAULT_RETRY ? TRANSACTION_READ_RETRY : readRetry(this.#options.retry, (err) => !isResponseTooLarge(err));
+		const readPhase = (phase: "first" | "second") =>
 			Promise.allSettled(
-				groups.map(({ ctx, items }) => this.#partitions.send("txReadForTransaction", ctx, { transactionId, items }, items, { retry })),
+				groups.map(({ ctx, items }) =>
+					this.#partitions.send(
+						"txReadForTransaction",
+						ctx,
+						{ transactionId, items: phase === "first" ? items : items.map((item) => ({ ...item, projection: KEY_ONLY_PROJECTION })) },
+						items,
+						{ retry },
+					),
+				),
 			);
 
 		// The entries of every answer of both phases, one for each partition. Each item changes its index
@@ -1337,7 +1378,7 @@ export class FokosDB {
 				flat.push(...value.items.map((item) => ({ ...item, partitionIndex: indexes[item.partitionIndex] })));
 			}
 			if (failed) {
-				throw withMetaSoFar(failed.reason, meta());
+				throw withMetaSoFar(responseTooLargeError(failed.reason), meta());
 			}
 			if (flat.some((item) => item.hasPendingWrite)) {
 				throw pendingWriteError(meta());
@@ -1345,11 +1386,16 @@ export class FokosDB {
 			return flat;
 		};
 
-		// Phase 1
-		const phase1Flat = settlePhase(await readPhase());
+		// Phase 1. Each partition holds to the response limit, but the answers together can go above it.
+		const phase1Flat = settlePhase(await readPhase("first"));
+		try {
+			validateTransactResponseBytes(phase1Flat.reduce((sum, item) => sum + estimateReadItemBytes(item), 0));
+		} catch (err) {
+			throw withMetaSoFar(err, meta());
+		}
 
 		// Phase 2 — verify no concurrent mutations
-		const phase2Flat = settlePhase(await readPhase());
+		const phase2Flat = settlePhase(await readPhase("second"));
 
 		// Did both phases observe the same committed state? An item found in both phases compares
 		// `version` (the item's `v`). The `v` of a key never repeats in a partition, also after a delete
@@ -1708,7 +1754,7 @@ export class FokosDB {
 			});
 		}
 		// `fitBatchResponse` clamps the value on each node.
-		const maxResponseBytes = opts.maxResponseBytes ?? MAX_BATCH_GET_RESPONSE_BYTES;
+		const maxResponseBytes = opts.maxResponseBytes ?? MAX_PAYLOAD_BYTES_PER_BATCH;
 		if (opts.items.length === 0) {
 			return { items: [], unprocessedKeys: [], meta: { forwardCount: 0, partitions: [] } };
 		}
@@ -1793,7 +1839,7 @@ export class FokosDB {
 			}
 			const encoded = encodeItemData(item.data);
 			validateItemDataSize(encoded.data, "batchWriteItems");
-			payloadBytes += itemDataBytes(encoded.data);
+			payloadBytes += wireBytes(encoded.data);
 			const ttlAt = item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt };
 			return { opIndex, ...keys[opIndex], operation: "put", ...encoded, ...ttlAt, ...condition };
 		});

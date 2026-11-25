@@ -6,9 +6,8 @@ import { projectionTree, updateTree } from "../expression/test-fixtures.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
+import { estimateItemBytes, estimateProjectedRowBytes } from "./item-wire-bytes.js";
 import {
-	estimateItemBytes,
-	estimateProjectedRowBytes,
 	itemsPageStatement,
 	outboxPageStatement,
 	PartitionStore,

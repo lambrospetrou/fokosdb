@@ -23,11 +23,13 @@ import { unexpectedTransactionStateError } from "../errors-operations.js";
 import { KeyCodec, KeyPairMap, type KeyBytes } from "../../sharding/key-codec.js";
 import type { RoutingHash } from "../../sharding/hash-primitives.js";
 import type { OpList, PartitionStore, PendingTxInfo, StalePendingTx, StoredItemData } from "./partition-store.js";
+import { estimateReadItemBytes } from "./item-wire-bytes.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
 	decodeItemKeys,
 	MAX_ITEM_BYTES,
+	validateTransactResponseBytes,
 	nextRecoveryAt,
 	txOrderTimestampNow,
 	TX_ORDER_TS_UNITS_PER_MS,
@@ -889,9 +891,12 @@ export class TransactionParticipant {
 	/**
 	 * Reads every requested key from local storage. Takes only the keys: it holds no lock and
 	 * writes nothing, so the single-shot read path can call it without inventing a transaction id.
+	 * It throws as soon as the items it read are above `MAX_PAYLOAD_BYTES_PER_TX`, so it never builds a
+	 * larger answer.
 	 */
 	readForTransactionLocal(request: Pick<ReadForTransactionRequest, "items">): ReadForTransactionOutcome {
 		const results: ReadForTransactionItemResultEncoded[] = [];
+		let bytes = 0;
 
 		// At most one deletion-metadata read per RPC, shared by every absent item of the request. A
 		// found item needs no value: the read compares its `v`.
@@ -948,6 +953,8 @@ export class TransactionParticipant {
 					hasPendingWrite,
 				});
 			}
+			bytes += estimateReadItemBytes(results[results.length - 1]);
+			validateTransactResponseBytes(bytes);
 		}
 
 		return { items: results };

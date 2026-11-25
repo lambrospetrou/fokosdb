@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import type { BatchGetItemsRpcRequest, BatchGetItemsRpcResponse } from "../../src/server/do-partition.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
-import { MAX_BATCH_GET_RESPONSE_BYTES, MAX_ITEMS_PER_BATCH } from "../../src/shared/transaction-limits.js";
+import { MAX_PAYLOAD_BYTES_PER_BATCH, MAX_ITEMS_PER_REQUEST } from "../../src/shared/transaction-limits.js";
 import { FokosDBStd } from "../../src/client/fokos-std.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { controlledPartition, keysAcrossPartitions, makeDB, partitionNameOf } from "../transactions/tx-helpers.js";
@@ -18,7 +18,7 @@ const SCORE = [{ expr: { ref: "data" as const, path: "$.score" }, as: "score" }]
 /** The estimate counts about 2,100 bytes for an item with this data: 2 bytes for each character. */
 const DATA = "x".repeat(1000);
 
-function batchRequest(keys: Array<[string, string]>, maxResponseBytes = MAX_BATCH_GET_RESPONSE_BYTES): BatchGetItemsRpcRequest {
+function batchRequest(keys: Array<[string, string]>, maxResponseBytes = MAX_PAYLOAD_BYTES_PER_BATCH): BatchGetItemsRpcRequest {
 	return { items: keys.map(([hashKey, sortKey], opIndex) => ({ opIndex, hashKey: kb(hashKey), sortKey: kb(sortKey) })), maxResponseBytes };
 }
 
@@ -157,7 +157,7 @@ describe.concurrent("FokosDBPartitionDO — apiBatchGetItems", () => {
 describe.concurrent("FokosDB.batchGetItems", () => {
 	it("refuses a request that is not valid, before any I/O", async () => {
 		const db = makeDB();
-		const tooMany = Array.from({ length: MAX_ITEMS_PER_BATCH + 1 }, (_, i) => ({ hashKey: `k-${i}` }));
+		const tooMany = Array.from({ length: MAX_ITEMS_PER_REQUEST + 1 }, (_, i) => ({ hashKey: `k-${i}` }));
 		await expect(db.batchGetItems({ items: tooMany })).rejects.toThrow(fokosErrorWith("batch_items_too_many"));
 		await expect(
 			db.batchGetItems({

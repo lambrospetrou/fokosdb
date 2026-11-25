@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { FokosError, FokosExpressionError } from "../src/shared/errors.js";
 import { FokosConditionCheckError, isFokosAnyError, type FokosAnyError, type FokosErrorCode } from "../src/shared/errors-operations.js";
 import { CURSOR_VERSION, encodeCursor } from "../src/shared/query/cursor.js";
-import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX_GET } from "../src/shared/transaction-limits.js";
+import { MAX_ITEM_BYTES, MAX_ITEMS_PER_REQUEST } from "../src/shared/transaction-limits.js";
 import type { ConditionExpression } from "../src/shared/types.js";
 import { makeDB } from "./transactions/tx-helpers.js";
 
@@ -80,7 +80,7 @@ describe("the validation codes of the item operations", () => {
 		["no transaction items", () => db.transactWriteItems({ items: [] }), "transact_items_empty"],
 		[
 			"too many transaction items",
-			() => db.transactGetItems({ items: Array.from({ length: MAX_ITEMS_PER_TX_GET + 1 }, (_, i) => ({ hashKey: `h${i}` })) }),
+			() => db.transactGetItems({ items: Array.from({ length: MAX_ITEMS_PER_REQUEST + 1 }, (_, i) => ({ hashKey: `h${i}` })) }),
 			"transact_items_too_many",
 		],
 		[

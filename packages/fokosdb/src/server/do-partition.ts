@@ -39,9 +39,8 @@ import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { RoutingHash, RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import type { SplitType } from "../sharding/types.js";
 import invariant from "../shared/invariant.js";
+import { estimateItemBytes, estimateProjectedRowBytes, estimateReadItemBytes } from "../shared/partition/item-wire-bytes.js";
 import {
-	estimateItemBytes,
-	estimateProjectedRowBytes,
 	PartitionStore,
 	type ItemImageRead,
 	type StoredItem,
@@ -116,6 +115,7 @@ import {
 	decodeItemKeys,
 	IDEMPOTENCY_WINDOW_MS,
 	txOrderTimestampNow,
+	validateTransactResponseBytes,
 } from "../shared/transaction-limits.js";
 import {
 	CONFLICT_CODES,
@@ -1093,6 +1093,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				// This partition read each item, and it is the first entry of its own list.
 				local: (req) =>
 					this.ownAnswer({ items: this.#participant.readForTransactionLocal(req).items.map((item) => ({ ...item, partitionIndex: 0 })) }),
+				// Each part holds to the response limit, but the parts together can go above it.
 				merge: (parts) => {
 					const items: IndexedReadItemEncoded[] = [];
 					let offset = 0;
@@ -1100,6 +1101,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 						items.push(...result.items.map((item) => withOffset(item, offset)));
 						offset += result.partitions.length;
 					}
+					validateTransactResponseBytes(items.reduce((sum, item) => sum + estimateReadItemBytes(item), 0));
 					return { items, partitions: parts.flatMap((p) => p.result.partitions) };
 				},
 			},
