@@ -93,6 +93,40 @@ describe("hashTransactionOperations", () => {
 		expect(hashTransactionOperations([put("a", "s", "v")], "standard")).toBe(STANDARD_FINGERPRINT);
 	});
 
+	// Fixed values: a coordinator compares a retry with the fingerprint that older code stored. If one
+	// of these values changes, a retry of a transaction in progress during the deploy gets
+	// idempotent_parameter_mismatch.
+	it.each<[string, TCWriteOperation[], "standard" | "ordered_per_item", string]>([
+		["ordered_per_item mode", [put("a", "s", "v")], "ordered_per_item", "f5da63c1276429c1"],
+		[
+			"an update with a condition",
+			[
+				{
+					...put("a", "s", "v"),
+					operation: "update",
+					data: undefined,
+					kind: undefined,
+					condition: { op: "eq", args: [{ ref: "data", path: "$.state" }, { val: "open" }] },
+					update: [{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }],
+					returnValuesOnConditionCheckFailure: "all_old",
+				},
+			],
+			"standard",
+			"503c742c08567ae9",
+		],
+		[
+			"bytes with a TTL, then a delete",
+			[
+				{ ...put("a", "s", ""), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: 1_800_000_000_000 },
+				{ ...put("b", "s", ""), operation: "delete", data: undefined, kind: undefined },
+			],
+			"standard",
+			"5a79be9363f5f646",
+		],
+	])("keeps the fingerprint of %s", (_name, ops, mode, expected) => {
+		expect(hashTransactionOperations(ops, mode)).toBe(expected);
+	});
+
 	it("returns a fixed-width hex string", () => {
 		expect(hash([put("a", "s", "v")])).toMatch(/^[0-9a-f]{16}$/);
 	});

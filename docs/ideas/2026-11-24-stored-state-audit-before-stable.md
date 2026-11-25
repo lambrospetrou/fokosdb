@@ -51,7 +51,7 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
 4. **JSON columns with no version** — `tc_items.conditions_json` and `update_json` (expression trees),
    `answer_json`, `error_json`, `results_json`, and `op_list`. Only `coordinator_json` has a version. Freeze each
    format, or add a version.
-5. **`operations_hash` has no fixed test value** — The test compares the hash only with itself. A change of the
+5. (DONE) **`operations_hash` has no fixed test value** — The test compares the hash only with itself. A change of the
    canonical form makes a retry of an in-flight token fail after a deploy. Add tests with fixed expected values.
 6. **The range DO name** — It stores the shared leading bytes of the two boundaries two times (FIXME in
    `rangePartitionDoName`, `sharding/partition-id.ts`). The name encoding must never change after the release, so
