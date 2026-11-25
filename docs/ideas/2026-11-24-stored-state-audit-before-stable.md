@@ -58,7 +58,7 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    decide now.
 7. (DONE) **The `PREPARED` fallback** — The coordinator still moves `PREPARED` rows from older code to `COMMITTING`. No such
    rows exist before the release. Remove the fallback.
-8. **Two KV key prefixes** — The sharding store uses `__fokos/`, and the partition, coordinator, materialization,
+8. (NON-ISSUE) **Two KV key prefixes** — The sharding store uses `__fokos/`, and the partition, coordinator, materialization,
    and item-stats stores use `__fokosdb/`. A rename costs nothing now.
 9. **A wrong topology hint cancels a transaction** — The coordinator stores the participant address from the hint
    (FIXME in the prepare fan-out of `do-transaction-coordinator.ts`). The fix writes `partition_context_json`, so do

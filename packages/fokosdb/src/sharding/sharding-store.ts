@@ -3,7 +3,7 @@
  * under `__fokos/`. No other class reads or writes them, and the host's own migration runner must not
  * name a `fokos_` table.
  *
- * The store runs its own schema migrations, tracked under `__fokos/schema_version`, so it can share
+ * The store runs its own schema migrations, tracked under `__fokos/sql_schema_version`, so it can share
  * one `DurableObjectStorage` with a host that runs migrations of its own.
  *
  * Design rules:
