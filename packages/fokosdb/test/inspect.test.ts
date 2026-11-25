@@ -8,7 +8,7 @@ import { KeyCodec } from "../src/sharding/key-codec.js";
 import { fokosErrorWith } from "./errors-matchers.js";
 import { testPartitionStub } from "./stub-helpers.js";
 import { controlledCoordinator, holdPendingLock, makeDB, owningPartition } from "./transactions/tx-helpers.js";
-import { makePartition, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition } from "./partition-do/partition-harness.js";
+import { CONTROLLED_NS, makePartition, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition } from "./partition-do/partition-harness.js";
 import { kb } from "./partition-do/helpers.js";
 
 async function allItems(partition: TestPartition): Promise<string[]> {
@@ -90,8 +90,34 @@ describe.concurrent("fokosInspect", () => {
 				instance.fokosInspect({ what: ["locks"], cursor: JSON.stringify({ kind: "locks", after: ["00", "00", "00"] }) }),
 			).rejects.toThrow(invalid);
 			await expect(instance.fokosInspect({ what: ["nope" as never] })).rejects.toThrow(invalid);
+			await expect(instance.fokosInspect({ what: ["items"], hashKey: "a" as never })).rejects.toThrow(invalid);
+			await expect(instance.fokosInspect({ what: ["items"], range: { start: { hk: kb("a") } as never } })).rejects.toThrow(invalid);
+			await expect(instance.fokosInspect({ what: ["items"], range: { from: {} } as never })).rejects.toThrow(invalid);
+			await expect(instance.fokosInspect({ what: ["locks"], transactionId: 5 as never })).rejects.toThrow(invalid);
 			await expect(instance.fokosInspect({ what: ["transactions"] })).rejects.toThrow(invalid);
 		});
+	});
+
+	it("pages the items of a range and skips the items outside it", async ({ expect }) => {
+		const db = makeDB({ rootTreesN: 1 });
+		for (const hashKey of ["a", "b", "c"]) {
+			for (const sortKey of ["s1", "s2"]) {
+				await db.putItem({ hashKey, sortKey, data: `${hashKey}/${sortKey}` });
+			}
+		}
+		const { stub } = owningPartition(db, { hashKey: "a", sortKey: "" });
+		// The range holds b/s2 and c/s1 only. The items in key order of the partition are by routingHash
+		// first, so the scan reads items outside the range between the two.
+		const range = { start: { hk: kb("b"), sk: kb("s2") }, end: { hk: kb("c"), sk: kb("s2") } };
+
+		const keys: string[] = [];
+		let cursor: string | undefined;
+		do {
+			const page = await stub.fokosInspect({ what: ["items"], range, limit: 1, ...(cursor ? { cursor } : {}) });
+			keys.push(...page.items!.map((item) => String(item.data)));
+			cursor = page.cursor;
+		} while (cursor !== undefined);
+		expect(keys.toSorted()).toEqual(["b/s2", "c/s1"]);
 	});
 
 	it("pages the locks and refuses two paged kinds when one has more than one page", async ({ expect }) => {
@@ -215,6 +241,21 @@ describe.concurrent("fokosInspect", () => {
 		expect(res.repartition!.children!.toSorted()).toEqual(children.map((child) => child.doName).toSorted());
 		const childItems = (await Promise.all(children.map(allItems))).flat();
 		expect(childItems.toSorted()).toEqual(written.map((item) => `${String(KeyCodec.decode(item.hashKey))}/sk`).toSorted());
+	}, 60_000);
+
+	it("finds no violation on a promotion source while its cleanup deletes the rows of the promoted key", async ({ expect }) => {
+		const partition = makePartition({ ns: CONTROLLED_NS });
+		await partition.controlled.testConfig({ cleanupPromotedKeyRows: 1 });
+		// One cleanup step, then a long pause: the source keeps most rows of the promoted key.
+		await partition.controlled.testRuntimeConfig({ cleanupRetryMs: 60_000 });
+		for (let i = 0; i < 40; i++) {
+			await partition.put({ hashKey: kb("large"), sortKey: kb(`s${i}`), data: "x", kind: "text" });
+		}
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("large") });
+		await partition.awaitPromotedKeyStatus("large", ["promoted"], { drive: [partition, partition.rangeRoot("large")] });
+		expect(await partition.localItemCount("large")).toBeGreaterThan(16);
+
+		expect(await partition.stub.fokosInspect({ what: ["items", "selfCheck"] })).toEqual({ items: [], selfCheck: { violations: [] } });
 	}, 60_000);
 
 	it("shows no item of a promoted hash key on the promotion source", async ({ expect }) => {

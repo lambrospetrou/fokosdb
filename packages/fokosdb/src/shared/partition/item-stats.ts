@@ -428,17 +428,36 @@ export class ItemStats {
 	 * One page of the self-check of the buckets. First it checks the buckets (`checkBuckets`), then the
 	 * routingHashes with no bucket (`checkUnbucketed`). A position of the first part has 3 parts, and a
 	 * position of the second part has 1. When the first part ends on a page, the second part starts on
-	 * the same page.
+	 * the same page. It checks only the routingHashes whose first item `owns` accepts: a router and a
+	 * promotion source keep copies of keys that another partition owns, and the cleanup deletes the
+	 * copies of a promoted routingHash before its bucket.
 	 */
-	check(after: string[] | null, limit: number, maxItems: number, maxRoutingHashes: number): { entries: string[]; next: string[] | null } {
+	check(
+		after: string[] | null,
+		limit: number,
+		maxItems: number,
+		maxRoutingHashes: number,
+		owns: (key: { hk: KeyBytes; sk: KeyBytes }) => boolean,
+	): { entries: string[]; next: string[] | null } {
+		const answers = new Map<string, boolean>();
+		const ownsRoutingHash = (routingHash: RoutingHash): boolean => {
+			const hex = routingHash.toHex();
+			let owned = answers.get(hex);
+			if (owned === undefined) {
+				const first = this.#opts.items.itemAt(routingHash, null, null, 0);
+				owned = first === undefined || owns(first);
+				answers.set(hex, owned);
+			}
+			return owned;
+		};
 		if (after !== null && after.length === 1) {
-			return this.checkUnbucketed(after, maxRoutingHashes);
+			return this.checkUnbucketed(after, maxRoutingHashes, ownsRoutingHash);
 		}
-		const buckets = this.checkBuckets(after, limit, maxItems);
+		const buckets = this.checkBuckets(after, limit, maxItems, ownsRoutingHash);
 		if (buckets.next !== null) {
 			return buckets;
 		}
-		const unbucketed = this.checkUnbucketed(null, maxRoutingHashes);
+		const unbucketed = this.checkUnbucketed(null, maxRoutingHashes, ownsRoutingHash);
 		return { entries: [...buckets.entries, ...unbucketed.entries], next: unbucketed.next };
 	}
 
@@ -446,9 +465,15 @@ export class ItemStats {
 	 * Checks at most `limit` buckets, in key order, strictly after `after` (the hex of a routingHash and
 	 * of a bound). It counts the items of each bucket and returns a violation for each bucket whose facts
 	 * disagree with them. It stops before a bucket that takes the stored item count of the page past
-	 * `maxItems`, but it always checks one bucket.
+	 * `maxItems`, but it always checks one bucket. It skips the buckets of a routingHash that `owns`
+	 * does not accept.
 	 */
-	checkBuckets(after: string[] | null, limit: number, maxItems: number): { entries: string[]; next: string[] | null } {
+	checkBuckets(
+		after: string[] | null,
+		limit: number,
+		maxItems: number,
+		owns: (routingHash: RoutingHash) => boolean,
+	): { entries: string[]; next: string[] | null } {
 		const rows = this.#storage.sql
 			.exec<BucketRow & { routing_hash: ArrayBuffer }>(
 				`SELECT routing_hash, lower_hk, lower_sk, ${COLUMNS} FROM item_stats
@@ -465,6 +490,10 @@ export class ItemStats {
 		let items = 0;
 		for (; checked < count; checked++) {
 			const row = rows[checked];
+			const routingHash = asRoutingHash(new Uint8Array(row.routing_hash));
+			if (!owns(routingHash)) {
+				continue;
+			}
 			const stored = factsOfRow(row);
 			if (checked > 0 && items + stored.itemCount > maxItems) {
 				break;
@@ -472,7 +501,7 @@ export class ItemStats {
 			items += stored.itemCount;
 			const following = rows[checked + 1];
 			const end = following && hex(following.routing_hash) === hex(row.routing_hash) ? boundOf(following) : null;
-			const counted = this.#opts.items.countFacts(asRoutingHash(new Uint8Array(row.routing_hash)), boundOf(row), end);
+			const counted = this.#opts.items.countFacts(routingHash, boundOf(row), end);
 			if ((Object.keys(stored) as (keyof ItemFacts)[]).some((key) => stored[key] !== counted[key])) {
 				entries.push(
 					`the facts of the bucket ${hex(row.routing_hash)}/${hex(row.lower_hk)}/${hex(row.lower_sk)} disagree with its items: ${JSON.stringify({ stored, counted })}`,
@@ -487,9 +516,14 @@ export class ItemStats {
 	 * Checks at most `maxRoutingHashes` routingHashes with items, in order, strictly after `after` (the hex
 	 * of a routingHash). It returns a violation for each one that has more than `BUCKET_THRESHOLD_MAX`
 	 * items and no bucket. For each routingHash it does one seek, and it counts at most
-	 * `BUCKET_THRESHOLD_MAX + 1` items only when there is no bucket.
+	 * `BUCKET_THRESHOLD_MAX + 1` items only when there is no bucket. It skips a routingHash that `owns`
+	 * does not accept.
 	 */
-	checkUnbucketed(after: string[] | null, maxRoutingHashes: number): { entries: string[]; next: string[] | null } {
+	checkUnbucketed(
+		after: string[] | null,
+		maxRoutingHashes: number,
+		owns: (routingHash: RoutingHash) => boolean,
+	): { entries: string[]; next: string[] | null } {
 		const entries: string[] = [];
 		let routingHash = after === null ? null : asRoutingHash(Uint8Array.fromHex(after[0]));
 		for (let i = 0; i < maxRoutingHashes; i++) {
@@ -499,7 +533,11 @@ export class ItemStats {
 			}
 			routingHash = nextHash;
 			const bucketed = tryOne(this.#storage.sql.exec(`SELECT 1 FROM item_stats WHERE routing_hash = ? LIMIT 1`, routingHash)) !== undefined;
-			if (!bucketed && this.#opts.items.countItems(routingHash, null, null, BUCKET_THRESHOLD_MAX + 1) > BUCKET_THRESHOLD_MAX) {
+			if (
+				!bucketed &&
+				owns(routingHash) &&
+				this.#opts.items.countItems(routingHash, null, null, BUCKET_THRESHOLD_MAX + 1) > BUCKET_THRESHOLD_MAX
+			) {
 				entries.push(`the routingHash ${routingHash.toHex()} has more than ${BUCKET_THRESHOLD_MAX} items and no bucket`);
 			}
 		}

@@ -727,7 +727,14 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 								INSPECT_SCAN_ROWS,
 								ownsByHashKey(this.fokos.ownerCheck()),
 							),
-				selfCheck: (after, limit) => this.#store.itemStats.check(after, limit, INSPECT_CHECK_ITEMS, INSPECT_CHECK_ROUTING_HASHES),
+				selfCheck: (after, limit) =>
+					this.#store.itemStats.check(
+						after,
+						limit,
+						INSPECT_CHECK_ITEMS,
+						INSPECT_CHECK_ROUTING_HASHES,
+						ownsByHashKey(this.fokos.ownerCheck()),
+					),
 			},
 			() => this.#store.locksWithoutInfo(INSPECT_CHECK_LIMIT),
 		);
