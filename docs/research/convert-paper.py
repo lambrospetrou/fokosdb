@@ -3,6 +3,8 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "pymupdf4llm",
+#   "rapidocr",
+#   "onnxruntime",
 # ]
 # ///
 """Convert a research-paper PDF to searchable Markdown plus figure images.
