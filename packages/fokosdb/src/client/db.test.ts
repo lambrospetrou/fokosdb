@@ -855,8 +855,8 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const write = await db.transactWriteItems({
 					items: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
 				});
-				// A cancelled write raises, so the returned token is the commit.
-				expect(write.idempotencyToken).toEqual(expect.any(String));
+				// A cancelled write raises, so a returned result is the commit.
+				expect(write.transactionId).toEqual(expect.any(String));
 
 				const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
 				expect(read.items[0]).toMatchObject({ item: { kind: "json", data: obj } });

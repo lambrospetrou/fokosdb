@@ -38,11 +38,13 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 
 ### 2.1 Correctness and Contract Defects
 
-1. **Fast-path `transactWriteItems` returns a non-idempotent `idempotencyToken`** (`client/db.ts`).
+1. (DONE) **Fast-path `transactWriteItems` returns a non-idempotent `idempotencyToken`** (`client/db.ts`).
    When `clientRequestToken` is absent, `#writeSingleShotFastPath` mints a UUID in the Worker and returns it as `idempotencyToken` on the result and on `FokosTransactionCancelledError`. No partition and no coordinator stores that token. A replay with `clientRequestToken: result.idempotencyToken` goes to a coordinator and runs the write transaction a second time. Also, a lost reply on `txExecuteSingleShot` raises `foreign_error` instead of `transaction_undecided`.
+   `idempotencyToken` is now optional. The fast path leaves it out of the result and of its errors, because nothing stores that transaction. A runtime fault on `txExecuteSingleShot` raises `transaction_undecided` with no token, and the caller reads the items to learn the outcome. A caller that must send the write again sends a `clientRequestToken`, which uses the coordinator path.
 
-2. **Coordinator pending errors omit `idempotencyToken`** (`server/do-transaction-coordinator.ts`, `client/db.ts`).
+2. (DONE) **Coordinator pending errors omit `idempotencyToken`** (`server/do-transaction-coordinator.ts`, `client/db.ts`).
    When the caller omits `clientRequestToken`, `db.ts` generates `idempotencyToken` internally. When `loadFinalResponse` raises `transaction_commit_pending` or `transaction_undecided`, `attributes` holds `{ transactionId, state }` and omits `idempotencyToken`. The caller never gets the generated token and cannot replay the transaction.
+   `coordinatorError` in `client/db.ts` now adds `idempotencyToken` to each `transaction_commit_pending` and `transaction_undecided` error of the coordinator path.
 
 3. (DONE) **`FokosDBPartitionDO` and `FokosDBMaterializationDO` cache pre-init `fokosConfig()` forever** (`server/do-partition.ts`, `server/materialization/do-materialization.ts`).
    In `FokosDBPartitionDO.#api`, `this.#ttl.arm()` reads `this.config()` before `this.fokos.dispatch` writes the identity of a new root partition. `config()` caches the pre-init fallback result in `this.__cachedConfig` for the life of the isolate. A subclass override that checks `this.fokos?.initialized()` never runs with the initialized identity or policy.

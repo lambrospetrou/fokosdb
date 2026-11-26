@@ -13,9 +13,10 @@ import { keysInOnePartition, makeDB, partitionEntryOf, partitionRouter, type Key
  * the error must not depend on it.
  */
 
+// Only the two-phase path stores the transaction, so only its errors carry a token that replays it.
 const PATHS = [
-	["the fast path", {}],
-	["the two-phase path", { singlePartitionFastPath: false }],
+	["the fast path", {}, undefined],
+	["the two-phase path", { singlePartitionFastPath: false }, expect.any(String)],
 ] as const;
 
 async function errorOf(call: () => Promise<unknown>): Promise<FokosError> {
@@ -30,7 +31,7 @@ async function errorOf(call: () => Promise<unknown>): Promise<FokosError> {
 
 const itemAbsent: ConditionExpression = { op: "exists", args: [{ ref: "hashKey" }] };
 
-describe.each(PATHS)("transactWriteItems on %s", (_path, pathOptions) => {
+describe.each(PATHS)("transactWriteItems on %s", (_path, pathOptions, idempotencyToken) => {
 	it("reports invalid input as a validation error", async () => {
 		const db = makeDB(pathOptions);
 		const err = await errorOf(() =>
@@ -70,8 +71,9 @@ describe.each(PATHS)("transactWriteItems on %s", (_path, pathOptions) => {
 			origin: "caller",
 			httpStatusHint: 409,
 			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "condition_failed", ...keys[1] } }],
-			attributes: { transactionId: expect.any(String), idempotencyToken: expect.any(String) },
+			attributes: { transactionId: expect.any(String) },
 		});
+		expect(err.attributes.idempotencyToken).toEqual(idempotencyToken);
 		expect(Object.hasOwn(err, "results")).toBe(true);
 		// A cancelled transaction applied nothing.
 		expect((await db.getItem(keys[0])).item).toBeUndefined();

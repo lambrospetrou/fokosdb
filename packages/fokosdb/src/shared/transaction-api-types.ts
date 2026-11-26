@@ -199,7 +199,13 @@ export type TransactWriteExecutionMode = "standard" | "ordered_per_item";
  */
 export type TransactWriteItemsResult = {
 	transactionId: TransactionId;
-	idempotencyToken: IdempotencyToken;
+	/**
+	 * The token that replays the transaction as `clientRequestToken`. It is absent when the request had
+	 * no `clientRequestToken` and one partition applied every item in one round trip: nothing stores
+	 * that transaction, so a second send of the same write runs it again. Send a `clientRequestToken`
+	 * when the write must be safe to send again.
+	 */
+	idempotencyToken?: IdempotencyToken;
 	meta: FokosMeta;
 };
 

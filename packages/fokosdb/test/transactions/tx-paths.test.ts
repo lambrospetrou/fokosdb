@@ -13,6 +13,7 @@ import {
 	writeOutcome,
 } from "./tx-helpers.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
+import { CORE_INTERNAL_CODES, FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 
 /** The answer a partition gives when it cannot execute the whole item set alone, in its envelope. */
 const self = {
@@ -222,8 +223,8 @@ describe("transactions - single-partition fast path", () => {
 		);
 
 		expect(await calls()).toMatchObject({ txExecuteSingleShot: 1, initiateWrite: 0 });
-		// The public shape is the same on both paths, so a caller cannot tell which one ran.
-		expect(result).toMatchObject({ transactionId: expect.any(String), idempotencyToken: expect.any(String) });
+		// Nothing stores a transaction of this path, so it has no token to replay.
+		expect(result).toEqual({ outcome: "committed", transactionId: expect.any(String) });
 
 		await expect(db.getItem(keys[0])).resolves.toMatchObject({ item: { data: "written" } });
 		expect((await db.getItem(keys[1])).item).toBeUndefined();
@@ -249,7 +250,48 @@ describe("transactions - single-partition fast path", () => {
 			outcome: "cancelled",
 			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "condition_failed", hashKey: keys[1].hashKey } }],
 		});
+		expect(result.idempotencyToken).toBeUndefined();
 		expect((await db.getItem(keys[0])).item).toBeUndefined();
+	});
+
+	it("answers transaction_undecided with no token when the reply of the one round trip is lost after the write", async () => {
+		const db = makeDB({ rootTreesN: 8, controlled: true });
+		const keys = keysInOnePartition(db, 2, "fast-lost-reply");
+		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "applied" }));
+		await controlledPartition(db, keys[0]).testTxResponse("txExecuteSingleShot", {
+			error: "Network connection lost.",
+			afterWork: true,
+			fault: { retryable: true },
+			times: 1,
+		});
+
+		const calls = await countCalls([db], keys);
+		const err = await db.transactWriteItems({ items }).then(
+			() => null,
+			(e: unknown) => e,
+		);
+
+		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(true);
+		expect(err).toMatchObject({ cause: { code: CORE_INTERNAL_CODES.foreign_error.code, attributes: { retryable: true } } });
+		// Nothing stores this transaction, so no token can replay it. A read gives the outcome.
+		expect((err as FokosError).attributes.idempotencyToken).toBeUndefined();
+		for (const key of keys) {
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: "applied" } });
+		}
+		expect(await calls()).toMatchObject({ txExecuteSingleShot: 1, initiateWrite: 0 });
+	});
+
+	it("keeps foreign_error for an error of the one round trip with no runtime marker", async () => {
+		const db = makeDB({ rootTreesN: 8, controlled: true });
+		const keys = keysInOnePartition(db, 1, "fast-defect");
+		await controlledPartition(db, keys[0]).testTxResponse("txExecuteSingleShot", { error: "a defect", times: 1 });
+
+		const err = await db.transactWriteItems({ items: [{ ...keys[0], operation: "put", data: "x" }] }).then(
+			() => null,
+			(e: unknown) => e,
+		);
+
+		expect(FokosError.isCode(err, CORE_INTERNAL_CODES.foreign_error)).toBe(true);
 	});
 
 	it("keeps a transaction that carries a clientRequestToken on the coordinator path", async () => {

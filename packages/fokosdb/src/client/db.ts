@@ -389,7 +389,7 @@ function withMetaSoFar(e: unknown, soFar: FokosMeta): FokosError {
  */
 function coordinatorError(e: unknown, idempotencyToken: string): FokosError {
 	dropCallCost(e);
-	const err = undecidedOnRuntimeFault(mapInternalErrorToPublic(FokosError.wrap(e)), idempotencyToken);
+	const err = withReplayToken(undecidedOnRuntimeFault(mapInternalErrorToPublic(FokosError.wrap(e)), idempotencyToken), idempotencyToken);
 	const routed = routedError(err);
 	if (!routed) {
 		return err;
@@ -399,6 +399,40 @@ function coordinatorError(e: unknown, idempotencyToken: string): FokosError {
 	const participants = (err as { meta?: ParticipantsMeta }).meta ?? NO_META;
 	const raiser = routing.servedBy[0];
 	return Object.assign(err, { meta: { ...participants, ...(raiser ? { txCoordinator: routeNodeMeta(raiser) } : {}) } satisfies FokosMeta });
+}
+
+/**
+ * A runtime fault on the hop of the single-partition fast path, for example a lost reply, does not tell
+ * whether the partition applied the write. The answer is `transaction_undecided` with no token, because
+ * nothing stores the transaction: the caller reads the items to learn the outcome. A foreign error
+ * with no runtime marker stays as it is.
+ */
+function fastPathUndecided(e: unknown): unknown {
+	const err = FokosError.wrap(e);
+	if (!FokosError.isCode(err, CORE_INTERNAL_CODES.foreign_error) || !isRuntimeFault(err)) {
+		return e;
+	}
+	const undecided = new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
+		message: "a runtime fault hid the transaction outcome, and the write has no token to replay: read the items to learn the outcome",
+		error_id: err.error_id,
+		cause: err,
+	});
+	const routed = routedError(err);
+	return routed ? attachRouting(undecided, routed.routing) : undecided;
+}
+
+/**
+ * A pending answer asks the caller to send the same token again, so the error carries the token. When
+ * `db.ts` made the token, the caller has no other copy of it.
+ */
+function withReplayToken(err: FokosError, idempotencyToken: string): FokosError {
+	if (
+		FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending) ||
+		FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)
+	) {
+		err.attributes.idempotencyToken = idempotencyToken;
+	}
+	return err;
 }
 
 /**
@@ -442,13 +476,16 @@ function conditionCheckError(
 /** The error `transactWriteItems` raises for a cancelled transaction, on either path. */
 function transactionCancelledError(fields: {
 	transactionId: string;
-	idempotencyToken: string;
+	idempotencyToken?: string;
 	results: CoordinatorOperationResultEncoded[];
 	meta: FokosMeta;
 }): FokosTransactionCancelledError {
 	return new FokosTransactionCancelledError(TRANSACTION_CANCELLED_CODES.transaction_cancelled, {
 		message: "transaction cancelled",
-		attributes: { transactionId: fields.transactionId, idempotencyToken: fields.idempotencyToken },
+		attributes: {
+			transactionId: fields.transactionId,
+			...(fields.idempotencyToken === undefined ? {} : { idempotencyToken: fields.idempotencyToken }),
+		},
 		results: withAnswerMeta(fields.meta, () => fields.results.map(decodeOperationResult)),
 		meta: fields.meta,
 	});
@@ -1170,8 +1207,9 @@ export class FokosDB {
 	 * path: the option is off, the transaction carries a token, the client hint says the items span
 	 * partitions, or the partition itself answered `not_applicable` because they do.
 	 *
-	 * `transactionId` is generated here, as the coordinator would generate it: nothing on this path
-	 * stores it, and it exists only so the public response shape is the same on both paths.
+	 * `transactionId` is generated here, as the coordinator would generate it. Nothing on this path
+	 * stores it, so the result and the errors of this path have no `idempotencyToken`: a second send of
+	 * the same write runs it again.
 	 */
 	async #writeSingleShotFastPath(items: TCWriteOperation[]): Promise<TransactWriteItemsResult | null> {
 		if (!this.#options.singlePartitionFastPath) {
@@ -1203,7 +1241,6 @@ export class FokosDB {
 				dropCallCost(routed);
 				throw transactionCancelledError({
 					transactionId,
-					idempotencyToken: transactionId,
 					results: items.map((item) => ({
 						outcome: "rejected",
 						reason: { code: routed.code as ExecutionFailureCode, ...decodeItemKeys(item.hashKey, item.sortKey), error_id: routed.error_id },
@@ -1212,7 +1249,7 @@ export class FokosDB {
 					meta: withRaiser(NO_META, routed.routing),
 				});
 			}
-			throw err;
+			throw fastPathUndecided(err);
 		}
 
 		const { value: response } = answer;
@@ -1222,11 +1259,11 @@ export class FokosDB {
 		}
 		const meta = answerMeta(response.partitions, answer.routing);
 		if (response.outcome === "committed") {
-			return { transactionId, idempotencyToken: transactionId, meta };
+			return { transactionId, meta };
 		}
 		// The one partition of the answer rejected each rejected operation.
 		const results = response.results.map((r) => (r.outcome === "rejected" ? { ...r, partitionIndex: 0 } : r));
-		throw transactionCancelledError({ transactionId, idempotencyToken: transactionId, results, meta });
+		throw transactionCancelledError({ transactionId, results, meta });
 	}
 
 	// The positional types of the public method are erased here: every item takes the same path, and only

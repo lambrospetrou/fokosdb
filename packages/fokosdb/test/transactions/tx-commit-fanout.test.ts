@@ -90,6 +90,34 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		}
 	});
 
+	it("gives the commit-pending error the token that db.ts made, and a replay of that token commits", async () => {
+		const db = makeDB({ controlled: true });
+		const keys = keysAcrossPartitions(db, 2, "commit-pending-own-token");
+		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: `data-${key.hashKey}` }));
+		const coordinator = controlledCoordinator(db);
+		await coordinator.testConfig({ fanoutRequestBudgetMs: SHORT_BUDGET_MS });
+		const reachable = await makeUnreachable(db, keys[1], "txCommit", "simulated participant outage");
+
+		// The request has no clientRequestToken, so the caller has no copy of the token.
+		const err = await writeOutcome(db.transactWriteItems({ items })).then(
+			() => null,
+			(e: unknown) => e,
+		);
+
+		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
+		const token = (err as FokosError).attributes.idempotencyToken;
+		expect(token).toEqual(expect.any(String));
+
+		await coordinator.testConfig({});
+		await reachable();
+		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token as string }));
+		expect(replay).toMatchObject({ outcome: "committed", idempotencyToken: token });
+		expect(await coordinator.testInitiateWriteCalls()).toBe(2);
+		for (const key of keys) {
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: `data-${key.hashKey}` } });
+		}
+	});
+
 	it("answers commit-pending while a split participant's children migrate, and a token replay commits once they finish", async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "split-window");

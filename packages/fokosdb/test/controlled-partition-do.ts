@@ -76,9 +76,13 @@ type TxResponse<Op extends TxOp> = Awaited<ReturnType<FokosDBPartitionDO[Op]>>;
 /**
  * What an operation does in place of its work, for `times` calls. `error` fails the call with that
  * message, and `value` answers the call with that value. With `afterWork`, a failing call first does
- * its work, as when the partition applies a request and its answer is lost.
+ * its work, as when the partition applies a request and its answer is lost. `fault` gives the error
+ * its own properties, as the runtime marks a fault, for example `{ retryable: true }`.
  */
-export type TxResponseRule<Op extends TxOp> = ({ error: string; afterWork?: boolean } | { value: TxResponse<Op> }) & { times?: number };
+export type TxResponseRule<Op extends TxOp> = (
+	| { error: string; afterWork?: boolean; fault?: Record<string, unknown> }
+	| { value: TxResponse<Op> }
+) & { times?: number };
 
 export class ControlledPartitionDO extends FokosDBPartitionDO {
 	#pullGate: (Gate & { spec: PullGateSpec }) | null = null;
@@ -118,7 +122,7 @@ export class ControlledPartitionDO extends FokosDBPartitionDO {
 		if ("value" in rule) {
 			return Promise.resolve(rule.value);
 		}
-		return (rule.afterWork ? work() : Promise.resolve()).then(() => Promise.reject(new Error(rule.error)));
+		return (rule.afterWork ? work() : Promise.resolve()).then(() => Promise.reject(Object.assign(new Error(rule.error), rule.fault)));
 	}
 
 	override txReadSnapshot(ctx: FokosDBRouteContext, req: TxRequest<"txReadSnapshot">) {

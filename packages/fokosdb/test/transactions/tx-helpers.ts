@@ -46,7 +46,7 @@ export type WriteOutcome =
 	| {
 			outcome: "cancelled";
 			transactionId: string;
-			idempotencyToken: string;
+			idempotencyToken?: string;
 			results: TransactWriteOperationResult[];
 	  };
 
@@ -65,7 +65,7 @@ export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Pr
 		return {
 			outcome: "cancelled",
 			transactionId: e.attributes.transactionId as string,
-			idempotencyToken: e.attributes.idempotencyToken as string,
+			idempotencyToken: e.attributes.idempotencyToken as string | undefined,
 			results: e.results.map(withoutPartition),
 		};
 	}
