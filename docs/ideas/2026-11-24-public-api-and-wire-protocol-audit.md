@@ -58,7 +58,7 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 
 ### 2.2 Public `fokosdb/client` API Gaps and Inconsistencies
 
-6. **No single-item `updateItem` method** (`client/db.ts`).
+6. (FUTURE-TODO) **No single-item `updateItem` method** (`client/db.ts`).
    `UpdateExpression` exists only in `transactWriteItems`. A single-item update must use a one-item transaction, returns no `version`, and raises `FokosTransactionCancelledError` instead of single-item errors.
 
 7. (DONE) **No `returnValues` option on successful writes** (`shared/types.ts`, `shared/transaction-api-types.ts`).
@@ -80,7 +80,7 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 11. **`FokosDBStd` ignores `db.options().retry` and backs off on `response_too_large`** (`client/fokos-std.ts`).
     `batchGetItemsWithRetry` and `batchWriteItemsWithRetry` take `db: ItemBatcher` and default to `DEFAULT_RETRY` instead of `db.options().retry`. `batchGetItemsWithRetry` also treats `code: "response_too_large"` as an error: it sleeps backoff delays between pages and stops after `maxAttempts` (default 5) even when zero errors occurred. `FokosDBStd` also has an implicit public constructor.
 
-12. **`db.destroy()` has no confirmation guard and misses detached GSIs** (`client/db.ts`).
+12. (FUTURE-TODO) **`db.destroy()` has no confirmation guard and misses detached GSIs** (`client/db.ts`).
     `destroy()` sits on `FokosDB` with zero arguments. It discovers GSI shard groups only through `fokosGsiTargetIds()` on `FokosDBMaterializationDO` when `nsMat` is set, so removed GSI targets or unset `nsMat` leave orphaned GSI objects behind.
 
 13. **Missing `db.gsi(indexName)` validation, `clientRequestToken` surrogate order, and shallow `db.options()`** (`client/db.ts`, `shared/partition-context.ts`, `shared/transaction-limits.ts`).
@@ -134,5 +134,5 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 27. **Missing override option types and leaked wire types in `fokosdb/server`** (`server/index.ts`).
     `fokosdb/server` exports internal wire types (`PartitionOps`, `PartitionRpc`, `MaterializationOps`, `ApplyLatestImagesRequest`, `ApplyLatestImagesResponse`, `LatestImage`), and omits the return types for subclass overrides (`PartitionDOConfigOverrides`, `TransactionCoordinatorDOConfigOverrides`, `MaterializationDOConfigOverrides`, `FokosRuntimeConfigOverrides`, `FokosTopologyKeeperOptions`, `ColoInfo`).
 
-28. **`fokosTargets()` freezes the target list on the first request** (`server/materialization/do-materialization.ts`).
+28. (FUTURE-TODO) **`fokosTargets()` freezes the target list on the first request** (`server/materialization/do-materialization.ts`).
     `#targets()` stores `this.fokosTargets()` on the first request to a materialization partition and ignores all later code changes. An existing table cannot add, change, or remove a GSI or push target, and roots initialized before and after a deploy can store different target lists.
