@@ -52,7 +52,7 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 
 5. (WONTFIX) **Projected `queryItems` and `scanItems` drop item envelopes and GSI base keys, and expressions cannot read GSI base keys** (`shared/types.ts`, `client/db.ts`, `shared/expression/types.ts`).
    `getItem`, `batchGetItems`, and `transactGetItems` return projected rows inside `ReadItem` with keys and `version`. `queryItems` and `scanItems` with `projection` return bare `ProjectedItem[]` records with no keys, no `version`, and on a GSI no `baseHashKey` or `baseSortKey`. `ExpressionReference` also has no `baseHashKey` or `baseSortKey` reference, so a projected GSI query or filter cannot read the base item keys.
-   A projected item is intentionally minimal: it holds only what the projection names, as in DynamoDB. A GSI target that projects `{ ref: "hashKey" }` and `{ ref: "sortKey" }` of the base item puts the base keys in the entry data, where a query projection or a filter can read them. The point reads move to the bare record of a projection in item 8.
+   A projected item is intentionally minimal: it holds only what the projection names, as in DynamoDB. A GSI target that projects `{ ref: "hashKey" }` and `{ ref: "sortKey" }` of the base item puts the base keys in the entry data, where a query projection or a filter can read them. `docs/agent-plans/2026-11-26-read-result-shape.md` gives every projected read, the query and scan pages too, the item `{ kind: "projected", data: record }`, with no keys and no `version`.
 
 ### 2.2 Public `fokosdb/client` API Gaps and Inconsistencies
 
@@ -62,9 +62,10 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 7. **No `returnValues` option on successful writes** (`shared/types.ts`, `shared/transaction-api-types.ts`).
    Write operations support `returnValuesOnConditionCheckFailure?: "none" | "all_old"`, and have no option to return `all_old` or `all_new` when a write commits.
 
-8. **Asymmetric result envelopes and outcome tags across read and batch methods** (`shared/types.ts`, `shared/transaction-api-types.ts`, `shared/batch-api-types.ts`).
+8. (DONE) **Asymmetric result envelopes and outcome tags across read and batch methods** (`shared/types.ts`, `shared/transaction-api-types.ts`, `shared/batch-api-types.ts`).
    `getItem` nests keys and data under `res.item`, `transactGetItems` flattens them onto `res.items[i]`, and `batchGetItems` uses `outcome: "found" | "not_found"` instead of `found: boolean`. `batchGetItems` returns `{ items, unprocessedKeys }`, while `batchWriteItems` returns `{ results, unprocessedItems }`. Success outcomes use four different literals across public types: `"ok"` (while its doc comment says `applied`), `"passed"`, `"found"`, and `"applied"`.
-   (DONE for the read shapes) `docs/agent-plans/2026-11-26-read-result-shape.md` gives every read the same item shape. The batch names and the write outcome literals are still open.
+   `docs/agent-plans/2026-11-26-read-result-shape.md` gives every read the same item shape and removes `"found"`. `"applied"` was only a wrong word in the doc comment of `BatchWriteItemResult`, and the comment now says `ok`.
+   The other names stay. `"passed"` is in the error of a cancelled transaction, where nothing was written, so `"ok"` would be misleading. DynamoDB also gives `Code: "None"` there. `unprocessedKeys` and `unprocessedItems` follow DynamoDB `BatchGetItem` and `BatchWriteItem`: a read sends keys again, and a write sends items again. `results[i]` of a write is the result of an operation, not an item.
 
 9. **Split pagination rules between `queryItems` and `scanItems`, and single-version cursors** (`shared/query/cursor.ts`, `shared/query/scan-cursor.ts`).
    `queryItems` takes only `cursor` and fingerprints `filter` and `projection`, so neither can change between pages. `scanItems` takes `exclusiveStartKey` or `cursor` (with no `lastEvaluatedKey`) and fingerprints only `shardGroup` and `segment`, so `filter` and `projection` can change between pages. Both decoders accept only version `1`, so a format bump breaks in-flight pagination during a gradual deploy.

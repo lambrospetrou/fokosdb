@@ -98,7 +98,7 @@ export type BatchWriteItemsOptions = {
  * The answer for one operation of `batchWriteItems`. It carries no key, as
  * `TransactWriteOperationResult`. `partitionIndex` is as in `BatchGetItemResult`.
  *
- * - `applied`: the operation committed.
+ * - `ok`: the operation committed.
  * - `unprocessed`: nothing of the operation applied. Send it again.
  * - `rejected`: nothing of the operation applied, and the same operation against the same state of the
  *   item fails the same way again. A failed condition has the code `condition_failed`. After an
