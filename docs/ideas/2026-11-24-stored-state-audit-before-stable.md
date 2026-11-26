@@ -34,10 +34,14 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    counter. When the target table sends a lower version, the stored policy of the source stays: wrong binding names
    and wrong split conditions. The stale-transaction job also reads `nsTx` from it. Reset the key at restore, or
    do not store binding names in it.
-5. **`topology.jurisdiction` in `__fokos/identity`** — The RFC rewrites only `doName` and `shardGroup`.
+5. (FUTURE-ISSUE) **`topology.jurisdiction` in `__fokos/identity`** — The RFC rewrites only `doName` and `shardGroup`.
    `topologiesEqual` compares the jurisdiction, so a restore into another jurisdiction refuses every request. The
    namespace fingerprint also uses the jurisdiction, so the names of the coordinators and the materialization DOs
    change with it.
+   Decision: the jurisdiction is part of the identity of the table. The `new_table` marker of the restore RFC
+   carries the jurisdiction of the target, and the restore rewrites `topology.jurisdiction` with `doName` and
+   `shardGroup`. The fingerprint is not stored: the code computes it, and it occurs in stored state only inside
+   the names that the restore rewrites.
 6. (NON-ISSUE) **`PushTargetBatch.producerId`** — It is `ctx.id.toString()` of the materialization DO, and a push
    sink of the user stores it as a fence key with the `targetId`. The DO ID is the contract (`targets.ts`). A restore
    into a new table gives new IDs, and that is correct, because the table is new. A logical id from the position

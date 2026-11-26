@@ -802,15 +802,18 @@ names. A split during the walk adds only DOs that did not exist at P, and those 
 2. `fokosRestoreReceive({ restoreId, snapshot, marker })` on the target DO. When `__fokos/restored` or
    `__fokos/backup/last_restore` holds this `restoreId`, the DO answers `already_received`. Else it calls
    `onNextSessionRestore(snapshot, { kvData: { "__fokos/restored": marker } })`. The marker is
-   `{ restoreId, kind: "new_table", shardGroup }`.
+   `{ restoreId, kind: "new_table", shardGroup, jurisdiction }`. `jurisdiction` is the jurisdiction of the target
+   table, and it is absent when the target table has none.
 3. The restart of the target DO ([4.2.8](#428-m7--restore-windows-and-the-admin-client)). After `not_restored`, the
    worker runs this list again from step 1.
 
 **The steps of the marker `new_table`.** They are part of the restore and need no cut (I1).
 
 - The runtime, in its start block before `cutIfNeeded()`:
-  1. Rewrite `__fokos/identity`: `ref.doName` and `topology.shardGroup` get the names of the target. The position,
-     the kind and `routingHashSeed` stay. The seed scope is the same, so the seed check passes.
+  1. Rewrite `__fokos/identity`: `ref.doName` and `topology.shardGroup` get the names of the target, and
+     `topology.jurisdiction` gets the jurisdiction of the target. The jurisdiction is part of the identity of the
+     table, and the route context check compares it. The position, the kind and `routingHashSeed` stay. The seed
+     scope is the same, so the seed check passes.
   2. Delete every row of `fokos_backup_cuts`, the key `__fokos/backup/cut_boundary` and the key
      `__fokos/backup/generation` (R9). The source keeps its own.
 - The host, after its migrations, in one `transactionSync`:
