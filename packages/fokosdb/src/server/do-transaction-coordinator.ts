@@ -36,7 +36,7 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusRequest,
 } from "../sharding/repartition-types.js";
-import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
+import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "./do-partition.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
@@ -1722,14 +1722,18 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						// address of the participant of "bob". Each `txPrepare` to it misses, and the caller gets
 						// `transaction_cancelled`, although the root `fokos.p.users~h.0` can serve "bob".
 						//
-						// The fix, on a miss at `p.context.doName`:
-						// 1. Compute the root context of the participant from the hash key of its first item. All
-						//    the keys of one participant are under one root.
-						// 2. In one SQL transaction, while `prepare_outcome IS NULL`, write the partition ID of the
-						//    root to `partition_id` of the participant row. `participant_idx` stays the key.
-						// 3. Set `p.context` to the root context, and send `txPrepare` again.
-						// The commit, the cancel, and the recovery read `partition_id`, so they also go to the
-						// root. Two drives that miss at the same time write the same root.
+						// The cancel of such a transaction completes: `runCancel` counts a partition with no
+						// identity as cancelled, because it holds no lock.
+						//
+						// A fix must not only write the root to `partition_id` of the participant. Another
+						// participant of the same root tree can then send its keys to the same owner in another
+						// commit, and the commit of each one throws `commit_keyset_mismatch`, because each owner
+						// must receive all its keys of the transaction in one sub-request. Example: the hint
+						// names `h.5.0` for key "a" and `h.5.1` for key "b", and both miss. With only the root
+						// `h.5` written for both, `h.5` gets the commit of {a} and then the commit of {b}, but it
+						// holds the locks of {a, b}. Thus a fix must move each participant of the root tree to
+						// the root while the transaction is PREPARING, and send one commit and one cancel for
+						// each `partition_id` with all its keys.
 						this.storePrepareError(routingHash, transactionId, p.index, err);
 						throw err;
 					});
@@ -1932,11 +1936,23 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				}
 				const pCtx = this.participantContext(groups, p);
 				const keys = toTransactionItemKeys(keysByParticipant.get(p.participant_idx) ?? []);
-				seen.add(
-					await this.partitionClient(pCtx).send("txCancel", pCtx, { transactionId, items: keys }, keys, {
-						retry: this.fanoutRetry(deadlineMs),
-					}),
-				);
+				const retry = this.fanoutRetry(deadlineMs);
+				try {
+					seen.add(
+						await this.partitionClient(pCtx).send("txCancel", pCtx, { transactionId, items: keys }, keys, {
+							retry: {
+								...retry,
+								shouldRetry: (err, nextAttempt) => !hasNoIdentity(err, pCtx.doName) && retry.shouldRetry(err, nextAttempt),
+							},
+						}),
+					);
+				} catch (err) {
+					// A partition with no identity holds no lock of this transaction, so the cancel is done
+					// there. A retry cannot change this: only `fokosInit` or a `destroy` changes the identity.
+					if (!hasNoIdentity(err, pCtx.doName)) {
+						throw err;
+					}
+				}
 				this.ctx.storage.sql.exec(
 					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE routing_hash = ? AND transaction_id = ? AND participant_idx = ?`,
 					routingHash,
@@ -2599,6 +2615,19 @@ function prepareRetry(retry: ParticipantRetryConfig, maxAttempts: number): Fokos
  */
 function isFatalPrepare(err: unknown): boolean {
 	return FokosValidationError.is(err) || FokosExpressionError.is(err);
+}
+
+/**
+ * True when `err` says that the partition `doName` itself has no identity. Such a partition refuses
+ * each request before any handler runs, and it has no stored rows. An error from a partition that a
+ * router forwarded to has the name of that partition, so it does not match.
+ */
+function hasNoIdentity(err: unknown, doName: string): boolean {
+	return (
+		(FokosError.isCode(err, SHARDING_ROUTING_CODES.hash_partition_not_initialized) ||
+			FokosError.isCode(err, SHARDING_ROUTING_CODES.range_partition_not_initialized)) &&
+		err.attributes.doName === doName
+	);
 }
 
 /** True when a stored prepare error is fatal (`isFatalPrepare`). */

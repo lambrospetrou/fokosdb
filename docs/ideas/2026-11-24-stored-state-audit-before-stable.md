@@ -75,9 +75,15 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    rows exist before the release. Remove the fallback.
 8. (NON-ISSUE) **Two KV key prefixes** — The sharding store uses `__fokos/`, and the partition, coordinator, materialization,
    and item-stats stores use `__fokosdb/`. A rename costs nothing now.
-9. **A wrong topology hint cancels a transaction** — The coordinator stores the participant address from the hint
+9. (FUTURE-ISSUE) **A wrong topology hint cancels a transaction** — The coordinator stores the participant address from the hint
    (FIXME in the prepare fan-out of `do-transaction-coordinator.ts`). The fix writes `tc_participants.partition_id`
    after A1.
+   The only case is a table that `destroy` deleted and that is made again with the same name and shape, while the
+   topology cache of an isolate still has the old hint (about 10 s). A fallback to the root must also move the
+   other participants of the root tree, and group commit and cancel by `partition_id`, or a commit throws
+   `commit_keyset_mismatch`.
+   Fix now: the cancel of such a transaction completes. `runCancel` counts a partition with no identity at the
+   address as cancelled, because it holds no lock. Before, the transaction stayed in CANCELLING.
 10. (NON-ISSUE) **A split router keeps its item rows** — The rows stay after a hash split (FIXME in `cleanupSourceStep`,
     `do-partition.ts`). This adds storage cost, and a snapshot restore copies the rows. It is not a format change.
 11. (DONE) **Job names are stored** — `__fokos/jobs` keeps an entry of a removed or renamed job. This does no harm, but a

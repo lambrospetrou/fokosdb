@@ -1,4 +1,5 @@
 import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FokosDBTransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { FokosDBPartitionDO } from "./do-partition.js";
@@ -13,6 +14,7 @@ import {
 	EXPRESSION_CODES,
 	FokosError,
 	FokosExpressionError,
+	FokosRoutingError,
 	FokosUnavailableError,
 	FokosValidationError,
 	TRANSACTION_PENDING_CODES,
@@ -20,7 +22,7 @@ import {
 	VALIDATION_CODES,
 	type FokosErrorWire,
 } from "../shared/errors.js";
-import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
+import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "../sharding/partition-id.js";
 import { FokosRouter } from "../sharding/router.js";
@@ -2844,6 +2846,72 @@ describe("FokosDBTransactionCoordinatorDO - the image cap of one transaction", (
 					expect(r.reason).not.toHaveProperty("item");
 				}
 			}
+		});
+	});
+});
+
+describe("FokosDBTransactionCoordinatorDO - a participant address with no partition", () => {
+	// A topology hint can name a partition that `destroy` deleted, when the table is made again with the
+	// same name. A partition with no identity refuses each request before any handler runs, so it holds
+	// no lock of the transaction.
+	it("cancels the transaction, releases the locks of the other participants, and completes it", async () => {
+		let rootDoName = "";
+		await withCoordinator(async (tc, state) => {
+			seed(tc, state, "PREPARING", undefined, Date.now());
+			const shardGroup = partitionShardGroupOfCoordinator(tc.fokos.routeContext().topology.shardGroup);
+			const root = PartitionIdHelper.hashId(shardGroup, 0);
+			rootDoName = root.doName;
+			// Participant 0 is the root, which exists and locks its item. Participant 1 is the hash child
+			// h.0.1, which has no identity.
+			state.storage.sql.exec(`UPDATE tc_items SET participant_idx = 0 WHERE transaction_id = ? AND op_index = 0`, TX_ID);
+			state.storage.sql.exec(
+				`INSERT INTO tc_participants (routing_hash, transaction_id, participant_idx, partition_id) VALUES (?, ?, 0, ?)`,
+				P(tc),
+				TX_ID,
+				root.opaque,
+			);
+			insertParticipant(tc, state, { name: "p1" });
+
+			const response = await tc.drivePrepare(P(tc), TX_ID, TOKEN, BUDGET_MS);
+
+			expect(response).toMatchObject({ outcome: "cancelled" });
+			expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).one().state).toBe(
+				"CANCELLED",
+			);
+		});
+		const pendingAtRoot = await runInDurableObject(
+			env.PARTITION_DO.getByName(rootDoName),
+			(_instance, state: DurableObjectState) =>
+				state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE transaction_id = ?`, TX_ID).one().n,
+		);
+		expect(pendingAtRoot).toBe(0);
+	});
+
+	// A router that forwards the cancel to a child with no identity gives the name of the child. The
+	// router can hold locks of the transaction, so its cancel is not done.
+	it("does not count a missing partition behind the address as cancelled", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(tc, state, "CANCELLING");
+			insertParticipant(tc, state, { name: "p1" });
+			const txCancel = vi.fn(async () => {
+				throw new FokosRoutingError(SHARDING_ROUTING_CODES.hash_partition_not_initialized, {
+					message: "hash partition is not initialized",
+					attributes: { doName: "another-partition" },
+				});
+			});
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txCancel } as unknown as DurableObjectStub<FokosDBPartitionDO>);
+
+			await tc.runCancel(P(tc), TX_ID, TOKEN, 50);
+
+			expect(txCancel.mock.calls.length).toBeGreaterThan(1);
+			expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).one().state).toBe(
+				"CANCELLING",
+			);
+			expect(
+				state.storage.sql
+					.exec<{ cancel_outcome: string | null }>(`SELECT cancel_outcome FROM tc_participants WHERE transaction_id = ?`, TX_ID)
+					.one().cancel_outcome,
+			).toBeNull();
 		});
 	});
 });
