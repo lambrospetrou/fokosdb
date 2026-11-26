@@ -16,7 +16,7 @@ describe("transactions - a runtime fault on the hop to the coordinator", () => {
 
 	async function expectCommitted(db: FokosDB, keys: Key[], data: string) {
 		for (const key of keys) {
-			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data } });
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data } });
 		}
 	}
 

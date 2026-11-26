@@ -46,8 +46,8 @@ import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/j
 import { SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
-import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
-import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";
+import type { TransactGetItemResult, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
+import type { DeleteItemResult, PutItemResult, ReadItem } from "../../src/shared/types.js";
 import { testControlledPartitionStub } from "../stub-helpers.js";
 import { controlledCoordinator, partitionRouter } from "../transactions/tx-helpers.js";
 
@@ -445,17 +445,18 @@ function applyUpdate(m: Model, key: ItemKey, actions: readonly ModelUpdateAction
 }
 
 /** Compares one read answer (a `getItem` result or one `transactGetItems` entry) with the model. */
-function expectRead(m: Model, key: ItemKey, res: unknown): void {
+/** Compares the `item` of one read with the model. `item` is absent when the item does not exist. */
+function expectRead(m: Model, key: ItemKey, item: unknown): void {
 	const expected = m.items.get(keyId(key));
 	if (expected === undefined) {
-		expect(res).toMatchObject({ found: false, ...key });
+		expect(item).toBeUndefined();
 		return;
 	}
-	expect(res).toMatchObject({ found: true, ...key, kind: expected.kind });
-	expectVersion(m, key, (res as { version: unknown }).version);
+	expect(item).toMatchObject({ ...key, kind: expected.kind });
+	expectVersion(m, key, (item as { version: unknown }).version);
 	// `toMatchObject` matches a SUBSET of an object value, so it accepts a document that kept a field
 	// the model removed. The data of a found item is therefore compared exactly.
-	expect((res as { data: unknown }).data).toEqual(expected.data);
+	expect((item as { data: unknown }).data).toEqual(expected.data);
 }
 
 // ─── The operations of a write transaction ────────────────────────────────────
@@ -715,7 +716,7 @@ async function seedPool(db: FokosDB, m: Model, keys: readonly ItemKey[], seedDat
  * cancelled transaction answers its caller before its last participants release their locks, so
  * both conditions clear on their own here.
  */
-async function readPool(db: FokosDB, keys: readonly ItemKey[]): Promise<MaybeReadItem[]> {
+async function readPool(db: FokosDB, keys: readonly ItemKey[]): Promise<TransactGetItemResult[]> {
 	const isReadBlocked = (e: unknown): boolean =>
 		FokosError.isCode(e, CONFLICT_CODES.pending_write) || FokosError.isCode(e, CONFLICT_CODES.read_conflict);
 	const res = await retryWhile(() => untilAvailable(() => db.transactGetItems({ items: [...keys] })), isReadBlocked);
@@ -725,15 +726,15 @@ async function readPool(db: FokosDB, keys: readonly ItemKey[]): Promise<MaybeRea
 /** Reads every key of the pool and compares each answer with the model. */
 async function expectModelMatches(db: FokosDB, m: Model, keys: readonly ItemKey[]): Promise<void> {
 	const items = await readPool(db, keys);
-	keys.forEach((key, i) => expectRead(m, key, items[i]));
+	keys.forEach((key, i) => expectRead(m, key, items[i].item));
 }
 
 /** The model the pool holds now, built from the answers of `readPool`. */
-function poolModel(items: readonly MaybeReadItem[], keys: readonly ItemKey[]): Model {
+function poolModel(items: readonly TransactGetItemResult[], keys: readonly ItemKey[]): Model {
 	const model = emptyModel();
 	keys.forEach((key, i) => {
-		const read = items[i];
-		if (read.found) {
+		const read = items[i].item as ReadItem | undefined;
+		if (read) {
 			model.items.set(keyId(key), { data: read.data as ItemData, kind: read.kind as DataKind, version: read.version });
 		}
 	});
@@ -799,7 +800,7 @@ export class GetItem extends ModelCommand {
 	}
 	async run(m: Model, db: FokosDB): Promise<void> {
 		const res = await untilAvailable(() => db.getItem(this.key));
-		expectRead(m, this.key, { ...res.item, found: res.found });
+		expectRead(m, this.key, res.item);
 	}
 	toString(): string {
 		return `GetItem(${keyId(this.key)})`;
@@ -828,7 +829,7 @@ export class TransactGet extends ModelCommand {
 	async run(m: Model, db: FokosDB): Promise<void> {
 		const res = await untilAvailable(() => db.transactGetItems({ items: this.keys }));
 		expect(res.items).toHaveLength(this.keys.length);
-		this.keys.forEach((key, i) => expectRead(m, key, res.items[i]));
+		this.keys.forEach((key, i) => expectRead(m, key, res.items[i].item));
 	}
 	toString(): string {
 		return `TransactGet(${this.keys.map(keyId).join(", ")})`;
@@ -930,7 +931,7 @@ export class BatchGet extends ModelCommand {
 			const item = res.items[i];
 			expect(item.outcome, `${keyId(key)}: the model knows no reason to reject a read`).not.toBe("rejected");
 			if (item.outcome !== "unprocessed") {
-				expectRead(m, key, { ...item, found: item.outcome === "found" });
+				expectRead(m, key, item.item);
 			}
 		});
 	}
@@ -982,9 +983,9 @@ export class BatchWrite extends ModelCommand {
 				applyDelete(m, op.key);
 			} else if (result.outcome === "unknown") {
 				const read = await untilAvailable(() => db.getItem(op.key));
-				if (op.operation === "put" && read.found && isDeepStrictEqual(read.item.data, op.data)) {
+				if (op.operation === "put" && read.item && isDeepStrictEqual(read.item.data, op.data)) {
 					m.items.set(id, { data: op.data, kind: expectedDataKind(op.data), version: read.item.version });
-				} else if (op.operation === "delete" && !read.found) {
+				} else if (op.operation === "delete" && !read.item) {
 					applyDelete(m, op.key);
 				}
 			}
@@ -1596,7 +1597,7 @@ export async function expectSeedIntact(db: FokosDB): Promise<number> {
 		const batch = Array.from({ length: Math.min(SEED_CONCURRENCY, SEED_ITEMS - start) }, (_, j) => start + j);
 		const reads = await Promise.all(batch.map((i) => untilAvailable(() => db.getItem(seedKey(i)))));
 		reads.forEach((res, j) => {
-			expect(res).toMatchObject({ found: true, item: { data: seedItemData(batch[j]), version: 1 } });
+			expect(res).toMatchObject({ item: { data: seedItemData(batch[j]), version: 1 } });
 			maxHashDepth = Math.max(maxHashDepth, res.meta.partitions[0].hashDepth!);
 		});
 	}

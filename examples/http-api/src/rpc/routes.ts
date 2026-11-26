@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
-import type { QueryItemsProjectedOptions } from "fokosdb/client";
 import { makeFokosDB, type AppEnv } from "../shared.js";
 import {
 	BatchGetItemsBodySchema,
@@ -17,7 +16,6 @@ import {
 	serializeBatchGetItemsResult,
 	serializeBatchWriteItemsResult,
 	serializeGetItemResult,
-	serializeProjectedQueryItemsResult,
 	serializeQueryItemsResult,
 	serializeTransactGetItemsResult,
 } from "./serialize.js";
@@ -88,14 +86,6 @@ rpcRoutes.post("/:tableName/:rpcAction", async (c) => {
 		}
 		case "queryItems": {
 			const { partitionOptions, ...opts } = parseBody(QueryItemsBodySchema);
-			if (opts.projection !== undefined) {
-				const result = await makeFokosDB(c.env, tableName, partitionOptions).queryItems({
-					...opts,
-					projection: opts.projection,
-				} as QueryItemsProjectedOptions);
-				c.set("dbItemMeta", result.meta);
-				return c.json(serializeProjectedQueryItemsResult(result));
-			}
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).queryItems(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(serializeQueryItemsResult(result));

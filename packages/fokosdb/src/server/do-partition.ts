@@ -177,12 +177,11 @@ export type GetItemRpcRequest = ItemRpcKeys & { projection?: readonly Projection
 // json data is JSON text here; db.ts parses it once at the public boundary. The type is free of the
 // recursive JsonValue so the Workers-RPC type machinery does not instantiate infinitely deep.
 //
-// A projected read carries the positional row inside `item`, so `kind`, `version`, and `ttlAt` are
-// common to both found variants. `kind` is then `"projected"`, which is a read-result tag and never
-// a stored `data_kind`.
+// A projected read carries only the positional row, because the public result of a projection is
+// only its record.
 export type GetItemRpcItem =
 	| { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number }
-	| { projected: ProjectedWireRow; kind: "projected"; ttlAt?: number; version: number };
+	| { projected: ProjectedWireRow };
 
 export type GetItemRpcResponse =
 	| { found: true; item: GetItemRpcItem; partitions: ItemRpcPartitions }
@@ -1492,13 +1491,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			if (!row) {
 				return { rowsRead, rowsWritten };
 			}
-			const item: GetItemRpcItem = {
-				projected: row.projected,
-				kind: "projected",
-				...(row.ttlAt === undefined ? {} : { ttlAt: row.ttlAt }),
-				version: row.version,
-			};
-			return { found: { item, bytes: estimateProjectedRowBytes(row.projected) }, rowsRead, rowsWritten };
+			return { found: { item: { projected: row.projected }, bytes: estimateProjectedRowBytes(row.projected) }, rowsRead, rowsWritten };
 		}
 		const { row, rowsRead, rowsWritten } = this.#store.getItem(routingHash, hashKey, sortKey);
 		if (!row) {

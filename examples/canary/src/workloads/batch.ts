@@ -21,6 +21,8 @@ export const batch: Workload = {
 			);
 			const read = await s.op(() => s.db.batchGetItems({ items: keys.map((hashKey) => ({ hashKey })) }));
 			const count = (items: readonly { outcome: string }[], outcome: string): number => items.filter((r) => r.outcome === outcome).length;
+			const countOk = (items: readonly { outcome: string; item?: unknown }[], found: boolean): number =>
+				items.filter((r) => r.outcome === "ok" && (r.item !== undefined) === found).length;
 			const writeRes = write.result?.results ?? [];
 			const readRes = read.result?.items ?? [];
 			s.iter(
@@ -30,8 +32,8 @@ export const batch: Workload = {
 					read.ms,
 					count(writeRes, "ok"),
 					count(writeRes, "unprocessed") + count(writeRes, "unknown"),
-					count(readRes, "found"),
-					count(readRes, "not_found"),
+					countOk(readRes, true),
+					countOk(readRes, false),
 					count(readRes, "unprocessed"),
 				],
 				write.outcome === "ok" ? read.outcome : write.outcome,

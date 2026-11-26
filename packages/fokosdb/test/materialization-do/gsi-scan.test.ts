@@ -33,7 +33,7 @@ describe("db.gsi(indexName).scanItems", () => {
 			await db.putItem({ hashKey, sortKey: "s", data: { status, at, owner: "u" } });
 		}
 		const gsi = db.gsi("byStatus");
-		const drain = async (opts: GsiScanItemsOptions) => {
+		const drain = async (opts: GsiScanItemsOptions & { projection?: undefined }) => {
 			const items: Entry[] = [];
 			let cursor: string | undefined;
 			do {

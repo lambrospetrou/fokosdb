@@ -40,7 +40,10 @@ async function putAll(db: FokosDB, keys: readonly Key[]): Promise<void> {
 }
 
 /** Reads every page of a scan. */
-async function drain(db: FokosDB, opts: ScanItemsOptions = {}): Promise<{ keys: string[]; pages: ScanItemsResult[] }> {
+async function drain(
+	db: FokosDB,
+	opts: ScanItemsOptions & { projection?: undefined } = {},
+): Promise<{ keys: string[]; pages: ScanItemsResult[] }> {
 	const pages: ScanItemsResult[] = [];
 	let cursor: string | undefined;
 	do {

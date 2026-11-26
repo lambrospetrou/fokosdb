@@ -151,12 +151,9 @@ describe.concurrent("FokosDBPartitionDO - putItem / getItem", () => {
 			{ expr: { ref: "v" }, as: "ver" },
 		]);
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), projection });
-		expect(result).toMatchObject({
-			found: true,
-			item: { projected: [7, null, { json: "[1,2]" }, 1], kind: "projected", version: 1 },
-			meta: { forwardCount: 0 },
-		});
-		expect(result.found && result.item.kind === "projected" ? result.item.projected : []).toHaveLength(4);
+		expect(result).toMatchObject({ found: true, meta: { forwardCount: 0 } });
+		// A projected item carries only its row: no kind, no version, and no ttlAt.
+		expect(result.found && result.item).toEqual({ projected: [7, null, { json: "[1,2]" }, 1] });
 
 		const missing = await rpc.apiGetItem(ctx, { hashKey: kb("missing"), sortKey: kb("sk"), projection });
 		expect(missing).toMatchObject({ found: false });
@@ -209,7 +206,7 @@ describe.concurrent("FokosDBPartitionDO - putItem / getItem", () => {
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 			expect(result).toMatchObject({ found: true });
-			if (result.found) {
+			if (result.found && "kind" in result.item) {
 				expect(result.item.ttlAt).toBeUndefined();
 			}
 		});
@@ -229,7 +226,7 @@ describe.concurrent("FokosDBPartitionDO - putItem / getItem", () => {
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 			expect(result).toMatchObject({ found: true, item: { data: "v2" } });
-			if (result.found) {
+			if (result.found && "kind" in result.item) {
 				expect(result.item.ttlAt).toBeUndefined();
 			}
 		});

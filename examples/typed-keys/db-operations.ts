@@ -22,8 +22,10 @@ void db.putItem({ hashKey: new Uint8Array(), data: "hi" });
 // getItem — both the option and the result's keys must be narrowed.
 async function checkGetItem() {
 	const res = await db.getItem({ hashKey: "user#1", sortKey: "profile" });
-	const hk: string = res.item.hashKey;
-	const sk: string | undefined = res.item.sortKey;
+	if (res.item) {
+		const hk: string = res.item.hashKey;
+		const sk: string | undefined = res.item.sortKey;
+	}
 }
 void checkGetItem;
 // @ts-expect-error - getItem must reject a bytes hashKey once narrowed.
@@ -51,7 +53,10 @@ void db.transactWriteItems({
 // transactGetItems — the result's keys must be narrowed too.
 async function checkTransactGetItems() {
 	const res = await db.transactGetItems({ items: [{ hashKey: "user#1", sortKey: "profile" }] });
-	const hk: string = res.items[0].hashKey;
+	const item = res.items[0].item;
+	if (item && item.kind !== "projected") {
+		const hk: string = item.hashKey;
+	}
 }
 void checkTransactGetItems;
 // @ts-expect-error - transactGetItems must reject a bytes hashKey once narrowed.

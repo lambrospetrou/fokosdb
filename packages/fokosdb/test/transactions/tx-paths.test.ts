@@ -91,7 +91,7 @@ describe("transactions - single-partition fast path", () => {
 		// The two clients use two tables, so only the items can be equal. Each read names its one partition.
 		expect(fast.items).toEqual(slow.items);
 		expect([fast.meta.partitions.length, slow.meta.partitions.length]).toEqual([1, 1]);
-		expect(fast.items.map((i) => i.found)).toEqual([true, true, false]);
+		expect(fast.items.map((i) => i.item !== undefined)).toEqual([true, true, false]);
 	});
 
 	it("reads projected items in one round trip, and answers exactly as the two-phase driver does", async () => {
@@ -116,16 +116,11 @@ describe("transactions - single-partition fast path", () => {
 		// The two clients use two tables, so only the items can be equal. Each read names its one partition.
 		expect(fast.items).toEqual(slow.items);
 		expect([fast.meta.partitions.length, slow.meta.partitions.length]).toEqual([1, 1]);
-		expect(fast.items[0]).toMatchObject({
-			found: true,
-			hashKey: keys[0].hashKey,
-			data: { tag: keys[0].hashKey },
-			kind: "projected",
-			version: 1,
+		// A projected item holds only its record, with no keys and no version.
+		expect(fast.items[0]).toEqual({ partitionIndex: 0, item: { kind: "projected", data: { tag: keys[0].hashKey } } });
+		expect(fast.items[1]).toMatchObject({
+			item: { hashKey: keys[1].hashKey, data: { n: 1, tag: keys[1].hashKey }, kind: "json", version: 1 },
 		});
-		expect(fast.items[1]).toMatchObject({ found: true, data: { n: 1, tag: keys[1].hashKey }, kind: "json", version: 1 });
-		// The envelope is uniform: `data` and `kind` are reachable on every found element, projected or not.
-		expect(fast.items.filter((i) => i.found).map((i) => (i.found ? i.kind : null))).toEqual(["projected", "json"]);
 	});
 
 	it("rejects a request in which two items name the same key", async () => {
@@ -167,7 +162,7 @@ describe("transactions - single-partition fast path", () => {
 
 		const result = await db.transactGetItems({ items: keys });
 
-		expect(result.items.map((i) => (i.found ? i.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
+		expect(result.items.map((i) => (i.item && "data" in i.item ? i.item.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
 		// Phase 1 sends three times to the first partition and once to the second, and phase 2 once to each.
 		expect(await calls()).toMatchObject({ txReadSnapshot: 0, txReadForTransaction: 6 });
 	});
@@ -188,8 +183,8 @@ describe("transactions - single-partition fast path", () => {
 		const result = await db.transactGetItems({ items: keys });
 
 		expect(await calls()).toMatchObject({ txReadSnapshot: 1, txReadForTransaction: 2 });
-		expect(result.items.map((i) => i.found)).toEqual([true, true]);
-		expect(result.items.map((i) => (i.found ? i.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
+		expect(result.items.map((i) => i.item !== undefined)).toEqual([true, true]);
+		expect(result.items.map((i) => (i.item && "data" in i.item ? i.item.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
 	});
 
 	it("surfaces a fast-path transport failure instead of starting the two-phase path", async () => {
@@ -230,9 +225,9 @@ describe("transactions - single-partition fast path", () => {
 		// The public shape is the same on both paths, so a caller cannot tell which one ran.
 		expect(result).toMatchObject({ transactionId: expect.any(String), idempotencyToken: expect.any(String) });
 
-		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: true, item: { data: "written" } });
-		await expect(db.getItem(keys[1])).resolves.toMatchObject({ found: false });
-		await expect(db.getItem(keys[2])).resolves.toMatchObject({ found: true, item: { data: "to-check" } });
+		await expect(db.getItem(keys[0])).resolves.toMatchObject({ item: { data: "written" } });
+		expect((await db.getItem(keys[1])).item).toBeUndefined();
+		await expect(db.getItem(keys[2])).resolves.toMatchObject({ item: { data: "to-check" } });
 	});
 
 	it("reports a failed condition as a cancelled transaction, writing nothing", async () => {
@@ -254,7 +249,7 @@ describe("transactions - single-partition fast path", () => {
 			outcome: "cancelled",
 			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "condition_failed", hashKey: keys[1].hashKey } }],
 		});
-		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: false });
+		expect((await db.getItem(keys[0])).item).toBeUndefined();
 	});
 
 	it("keeps a transaction that carries a clientRequestToken on the coordinator path", async () => {
@@ -332,7 +327,7 @@ describe("transactions - single-partition fast path", () => {
 		// The whole result, so that a cancel shows the reason of each operation.
 		expect(result).toMatchObject({ outcome: "committed" });
 		for (const key of keys) {
-			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: "via-coordinator" } });
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: "via-coordinator" } });
 		}
 	});
 });
@@ -374,8 +369,8 @@ describe("transactions - the item size limit is enforced before any write", () =
 			outcome: "cancelled",
 			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "item_too_large", hashKey: over.hashKey } }],
 		});
-		await expect(db.getItem(fits)).resolves.toMatchObject({ found: false });
-		await expect(db.getItem(over)).resolves.toMatchObject({ found: false });
+		expect((await db.getItem(fits)).item).toBeUndefined();
+		expect((await db.getItem(over)).item).toBeUndefined();
 	});
 
 	it("rejects an oversized put in the check pass and writes nothing on the single-shot path", async () => {
@@ -398,8 +393,8 @@ describe("transactions - the item size limit is enforced before any write", () =
 			outcome: "cancelled",
 			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "item_too_large", hashKey, sortKey: "over" } }],
 		});
-		await expect(db.getItem(fits)).resolves.toMatchObject({ found: false });
-		await expect(db.getItem(over)).resolves.toMatchObject({ found: false });
+		expect((await db.getItem(fits)).item).toBeUndefined();
+		expect((await db.getItem(over)).item).toBeUndefined();
 	});
 
 	// jsonb_set keeps a string element unescaped, while rendering it to text and re-parsing bakes the
@@ -424,7 +419,7 @@ describe("transactions - the item size limit is enforced before any write", () =
 			);
 
 			expect(res).toMatchObject({ outcome: "committed" });
-			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { version: 2, data: { k: value } } });
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { version: 2, data: { k: value } } });
 		}
 	});
 });

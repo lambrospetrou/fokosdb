@@ -103,7 +103,7 @@ describe("FokosDB queryItems over a range tree — model-based properties", () =
 		await fc.assert(
 			fc.asyncProperty(makeArbRequest(fixture), async ({ queries, budget }) => {
 				const expected = expectedAnswer(fixture.model, queries);
-				const opts: QueryItemsOptions = { queries, ...budgetFor(budget, expected, fixture) };
+				const opts: QueryItemsOptions & { projection?: undefined } = { queries, ...budgetFor(budget, expected, fixture) };
 
 				// Nothing writes to the fixture, so a cursor names one position for as long as it exists.
 				// A cursor that carries a child boundary must resolve to that same position on every send,

@@ -431,7 +431,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		});
 
 		await runDurableObjectAlarm(stub);
-		await vi.waitFor(async () => expect(await db.getItem(lockKey)).toMatchObject({ found: true, item: { data: "recovered" } }), {
+		await vi.waitFor(async () => expect(await db.getItem(lockKey)).toMatchObject({ item: { data: "recovered" } }), {
 			timeout: 10_000,
 			interval: 50,
 		});

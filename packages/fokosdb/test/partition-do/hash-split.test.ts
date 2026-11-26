@@ -275,7 +275,7 @@ describe("FokosDBPartitionDO - splitting", () => {
 
 			const projection = projectionTree([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "v" }, as: "ver" }]);
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
-			expect(result).toMatchObject({ found: true, item: { projected: [3, 1], kind: "projected" } });
+			expect(result).toMatchObject({ found: true, item: { projected: [3, 1] } });
 			expect(result.meta.forwardCount).toBe(1);
 			expect(result.meta.partitions[0].servedByActorName).not.toBe(ctx.doName);
 		});
@@ -676,7 +676,7 @@ describe("FokosDBPartitionDO - splitting", () => {
 				const projected = await alphaOwner.get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
 				expect(projected).toMatchObject({
 					found: true,
-					item: { projected: ["data-alpha-1"], kind: "projected" },
+					item: { projected: ["data-alpha-1"] },
 					meta: { forwardCount: 1, partitions: [{ servedByActorName: partition.doName }] },
 				});
 			});

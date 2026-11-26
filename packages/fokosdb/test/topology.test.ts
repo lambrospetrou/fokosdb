@@ -72,8 +72,8 @@ describe("FokosDB — encoded topology", () => {
 		const reader = new FokosDB(options(tableName, { topologyRefreshMs: 0 }));
 		// The first read enters at the root and starts the fetch. A later read enters at the leaf.
 		await vi.waitFor(async () => {
-			const { meta, found } = await reader.getItem({ hashKey: keys[0] });
-			expect(found).toBe(true);
+			const { meta, item } = await reader.getItem({ hashKey: keys[0] });
+			expect(item).toBeDefined();
 			expect(meta.forwardCount).toBe(0);
 			expect(meta.partitions[0].hashDepth).toBeGreaterThanOrEqual(1);
 		}, WAIT);
@@ -177,7 +177,7 @@ describe("FokosDB — encoded topology", () => {
 				{ hashKey: plain, operation: "put", data: "d" },
 			],
 		});
-		expect((await db.getItem({ hashKey: falsePositive! })).found).toBe(true);
+		expect((await db.getItem({ hashKey: falsePositive! })).item).toBeDefined();
 	});
 
 	it("destroy resets the topology of the coordinator, materialization, and GSI shard groups", async () => {
@@ -245,8 +245,8 @@ describe("FokosDB — two tables with the same name on two ns namespaces", () =>
 		const items = [{ hashKey: "k1", operation: "put" as const, data: "v" }];
 		await a.transactWriteItems({ items, clientRequestToken: "same-token" });
 		await b.transactWriteItems({ items, clientRequestToken: "same-token" });
-		expect((await a.getItem({ hashKey: "k1" })).found).toBe(true);
-		expect((await b.getItem({ hashKey: "k1" })).found).toBe(true);
+		expect((await a.getItem({ hashKey: "k1" })).item).toBeDefined();
+		expect((await b.getItem({ hashKey: "k1" })).item).toBeDefined();
 	});
 
 	it("the GSI entries of each table stay in its own ns namespace", async () => {

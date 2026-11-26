@@ -193,9 +193,14 @@ describe.concurrent("FokosDB.batchGetItems", () => {
 
 		const read = await db.batchGetItems({ items: keys });
 
-		expect(read.items.map((item) => item.outcome)).toEqual(["found", "not_found", "found"]);
-		expect(read.items[0]).toMatchObject({ ...keys[0], kind: "json", data: { name: "zero" }, version: 1 });
-		expect(read.items[1]).toMatchObject(keys[1]);
+		expect(read.items.map((r) => [r.outcome, r.item !== undefined])).toEqual([
+			["ok", true],
+			["ok", false],
+			["ok", true],
+		]);
+		expect(read.items[0].item).toMatchObject({ ...keys[0], kind: "json", data: { name: "zero" }, version: 1 });
+		// An absent item has no item and no keys.
+		expect(read.items[1]).toEqual({ outcome: "ok", partitionIndex: expect.any(Number) });
 		expect(read.unprocessedKeys).toEqual([]);
 		expect(read.meta.forwardCount).toBe(0);
 		expect(read.meta.partitions).toHaveLength(3);
@@ -219,9 +224,10 @@ describe.concurrent("FokosDB.batchGetItems", () => {
 			projection: NAME,
 		});
 
-		expect(read.items[0]).toMatchObject({ outcome: "found", kind: "projected", data: { name: "one" } });
-		expect(read.items[1]).toMatchObject({ outcome: "found", kind: "projected", data: { score: 2 } });
-		expect(read.items[2]).toMatchObject({ outcome: "not_found" });
+		// A projected item holds only the record of its projection.
+		expect(read.items[0]).toEqual({ outcome: "ok", partitionIndex: 0, item: { kind: "projected", data: { name: "one" } } });
+		expect(read.items[1]).toEqual({ outcome: "ok", partitionIndex: 0, item: { kind: "projected", data: { score: 2 } } });
+		expect(read.items[2]).toEqual({ outcome: "ok", partitionIndex: 0 });
 	});
 
 	it("trims the joined answers of its calls to maxResponseBytes", async () => {
@@ -234,16 +240,44 @@ describe.concurrent("FokosDB.batchGetItems", () => {
 		const maxResponseBytes = 5000;
 		const read = await db.batchGetItems({ items: keys, maxResponseBytes });
 
-		expect(read.items.map((item) => item.outcome)).toEqual(["found", "found", "unprocessed", "unprocessed"]);
+		expect(read.items.map((item) => item.outcome)).toEqual(["ok", "ok", "unprocessed", "unprocessed"]);
 		for (const item of read.items.slice(2)) {
-			expect(item).toMatchObject({ outcome: "unprocessed", code: "response_too_large", partitionIndex: expect.any(Number) });
-			expect(item).not.toHaveProperty("error_id");
+			// A failed entry has no keys: `unprocessedKeys` holds them.
+			expect(item).toEqual({ outcome: "unprocessed", code: "response_too_large", partitionIndex: expect.any(Number) });
 		}
 		expect(read.unprocessedKeys).toEqual(keys.slice(2));
 
 		const retried = await FokosDBStd.batchGetItemsWithRetry(db, { items: keys, maxResponseBytes }, { baseDelayMs: 1, maxDelayMs: 2 });
-		expect(retried.items.map((item) => item.outcome)).toEqual(keys.map(() => "found"));
+		expect(retried.items.map((item) => item.item !== undefined)).toEqual(keys.map(() => true));
 		expect(retried.unprocessedKeys).toEqual([]);
+	});
+
+	it("gives a rejected entry its code and no keys or item", async () => {
+		const db = makeDB({ controlled: true });
+		const [key] = keysAcrossPartitions(db, 1, "batch-get-rejected");
+		// The partition answers that the read of opIndex 0 fails the same way each time.
+		const value: BatchGetItemsRpcResponse = {
+			found: [],
+			notFound: [],
+			failed: [{ outcome: "rejected", code: "expression_invalid", error_id: "e-1", partitionIndex: 0, opIndexes: [0] }],
+			partitions: [{ actorId: "stand-in", hashDepth: 0 }],
+		};
+		const self = {
+			ref: { partitionId: "00", doName: "stand-in" },
+			actorId: "stand-in",
+			hashDepth: 0,
+			rangeDepth: 0,
+			role: "executed" as const,
+		};
+		await controlledPartition(db, key).testTxResponse("apiBatchGetItems", {
+			value: { value, routing: { servedBy: [self], forwardCount: 0, servedByTruncated: false } },
+			times: 1,
+		});
+
+		const read = await db.batchGetItems({ items: [key] });
+
+		expect(read.items).toEqual([{ outcome: "rejected", code: "expression_invalid", error_id: "e-1", partitionIndex: 0 }]);
+		expect(read.unprocessedKeys).toEqual([]);
 	});
 
 	it("answers the keys of a failed call unprocessed, and still reads the keys of the other calls", async () => {
@@ -255,9 +289,8 @@ describe.concurrent("FokosDB.batchGetItems", () => {
 		const items = [{ ...failing, projection: NAME }, ok];
 		const read = await db.batchGetItems({ items });
 
-		expect(read.items[0]).toMatchObject({ outcome: "unprocessed", code: "foreign_error", error_id: expect.any(String), ...failing });
-		expect(read.items[0]).not.toHaveProperty("partitionIndex");
-		expect(read.items[1]).toMatchObject({ outcome: "found", data: "ok" });
+		expect(read.items[0]).toEqual({ outcome: "unprocessed", code: "foreign_error", error_id: expect.any(String) });
+		expect(read.items[1]).toMatchObject({ outcome: "ok", item: { data: "ok" } });
 		// The entry keeps its own projection.
 		expect(read.unprocessedKeys).toEqual([items[0]]);
 		expect(read.meta.partitions).toHaveLength(1);

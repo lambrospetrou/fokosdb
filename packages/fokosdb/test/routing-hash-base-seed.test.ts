@@ -27,7 +27,7 @@ describe("FokosDB — routingHashBaseSeed", () => {
 			await db.putItem({ hashKey, data: hashKey });
 		}
 		for (const hashKey of KEYS) {
-			expect((await db.getItem({ hashKey })).found).toBe(true);
+			expect((await db.getItem({ hashKey })).item).toBeDefined();
 		}
 	});
 
@@ -48,7 +48,7 @@ describe("FokosDB — routingHashBaseSeed", () => {
 		// A key that reached its owner root by chance is stored with the seed of the partition class.
 		const db = makeClient(tableName, TEST_ROUTING_HASH_BASE_SEED);
 		for (const hashKey of KEYS) {
-			expect((await db.getItem({ hashKey })).found).toBe(!refused.has(hashKey));
+			expect((await db.getItem({ hashKey })).item !== undefined).toBe(!refused.has(hashKey));
 		}
 	});
 });

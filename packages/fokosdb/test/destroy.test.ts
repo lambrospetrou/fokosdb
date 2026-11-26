@@ -54,7 +54,7 @@ describe("FokosDB.destroy()", () => {
 		// All written items must be gone (verifies roots were destroyed).
 		// NOTE that this will actually re-initialize the DOs!
 		for (const hk of allKeys) {
-			expect((await db.getItem({ hashKey: hk })).found).toBe(false);
+			expect((await db.getItem({ hashKey: hk })).item).toBeUndefined();
 		}
 	});
 

@@ -7,7 +7,7 @@ const POLL_MS = 1_000;
 
 /**
  * Writes one item that expires in 5 seconds, then polls `getItem` every second until the row is
- * gone: an expired row still answers `found` until the TTL sweep deletes it, and the polls keep the
+ * gone: an expired row still answers with its item until the TTL sweep deletes it, and the polls keep the
  * partition's sweep armed. The point reports the observed lag from `ttlAt` to deletion.
  * `iter` doubles: total_ms, lag_ms (-1 when the budget ends first), polls_n.
  */
@@ -30,7 +30,7 @@ export const ttl: Workload = {
 				outcome = get.outcome;
 				break;
 			}
-			if (!get.result!.found) {
+			if (get.result!.item === undefined) {
 				lagMs = Date.now() - ttlAtSec * 1_000;
 				outcome = "ok";
 				break;

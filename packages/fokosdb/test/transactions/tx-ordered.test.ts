@@ -78,7 +78,7 @@ describe("transactWriteItems - executionMode", () => {
 			fokosErrorWith("transact_duplicate_key", { opIndex: 1 }),
 		);
 		await db.transactWriteItems({ items: [put(key, { n: 1 }), update(key)], ...ORDERED });
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: { n: 2 }, version: 2 } });
+		expect(await db.getItem(key)).toMatchObject({ item: { data: { n: 2 }, version: 2 } });
 	});
 
 	it.each([
@@ -137,7 +137,7 @@ async function readAll(db: FokosDB, keys: Key[]): Promise<Snapshot> {
 	const out: Snapshot = {};
 	for (const key of keys) {
 		const res = await db.getItem(key);
-		out[`${key.hashKey}/${key.sortKey}`] = res.found ? { data: res.item.data, version: res.item.version, ttlAt: res.item.ttlAt } : null;
+		out[`${key.hashKey}/${key.sortKey}`] = res.item ? { data: res.item.data, version: res.item.version, ttlAt: res.item.ttlAt } : null;
 	}
 	return out;
 }

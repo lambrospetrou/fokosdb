@@ -37,7 +37,6 @@ describe("http-api example worker", () => {
 		const get = await rpc(table, "getItem", { hashKey: "user#1", sortKey: "profile" });
 		expect(get.status).toBe(200);
 		expect(await get.json()).toMatchObject({
-			found: true,
 			item: { data: "hello fokos", dataEncoding: "utf8" },
 		});
 	});
@@ -73,7 +72,7 @@ describe("http-api example worker", () => {
 		const body = (await res.json()) as { items: Array<Record<string, unknown>>; count: number };
 		expect(body.count).toBe(3);
 		expect(body.items).toHaveLength(3);
-		expect(body.items[0]).toEqual({ id: "s1", data: "v-s1", bin: { b64: "AQID" } });
+		expect(body.items[0]).toEqual({ kind: "projected", data: { id: "s1", data: "v-s1", bin: { b64: "AQID" } } });
 	});
 
 	it("queryItems accepts a filter, in projection and in count mode", async () => {
@@ -113,7 +112,10 @@ describe("http-api example worker", () => {
 		});
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { items: Array<Record<string, unknown>>; count: number; scannedCount: number };
-		expect(body.items).toEqual([{ id: "s2" }, { id: "s3" }]);
+		expect(body.items).toEqual([
+			{ kind: "projected", data: { id: "s2" } },
+			{ kind: "projected", data: { id: "s3" } },
+		]);
 		expect(body.count).toBe(2);
 		expect(body.scannedCount).toBe(3);
 	});
@@ -133,21 +135,15 @@ describe("http-api example worker", () => {
 			],
 		});
 		expect(res.status).toBe(200);
-		expect(await res.json()).toMatchObject({
-			found: true,
-			item: {
-				hashKey: "pi",
-				sortKey: "s1",
-				data: { d: "v-s1", bin: { b64: "AQID" }, ver: 1 },
-				kind: "projected",
-				version: 1,
-				dataEncoding: "projected",
-			},
+		// A projected item is only the record of the projection.
+		expect(((await res.json()) as { item: unknown }).item).toEqual({
+			kind: "projected",
+			data: { d: "v-s1", bin: { b64: "AQID" }, ver: 1 },
 		});
 
 		const missing = await rpc(table, "getItem", { hashKey: "pi", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
 		expect(missing.status).toBe(200);
-		expect(await missing.json()).toMatchObject({ found: false });
+		expect(await missing.json()).not.toHaveProperty("item");
 	});
 
 	it("transactGetItems returns projected and complete items in request order", async () => {
@@ -163,15 +159,8 @@ describe("http-api example worker", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { items: Array<Record<string, unknown>> };
 		expect(body.items).toHaveLength(2);
-		expect(body.items[0]).toMatchObject({
-			found: true,
-			hashKey: "tx-p1",
-			data: { d: "v-tx-p1" },
-			kind: "projected",
-			version: 1,
-			dataEncoding: "projected",
-		});
-		expect(body.items[1]).toMatchObject({ found: true, hashKey: "tx-p2", data: "v-tx-p2", dataEncoding: "utf8" });
+		expect(body.items[0]).toEqual({ partitionIndex: 0, item: { kind: "projected", data: { d: "v-tx-p1" } } });
+		expect(body.items[1]).toMatchObject({ item: { hashKey: "tx-p2", data: "v-tx-p2", dataEncoding: "utf8" } });
 	});
 
 	it("batchWriteItems and batchGetItems answer each item in request order", async () => {
@@ -197,14 +186,12 @@ describe("http-api example worker", () => {
 			items: [{ hashKey: "b-1", projection: [{ expr: { ref: "data" }, as: "d" }] }, { hashKey: "b-2" }, { hashKey: "b-3" }],
 		});
 		expect(read.status).toBe(200);
-		expect(await read.json()).toMatchObject({
-			items: [
-				{ outcome: "found", hashKey: "b-1", data: { d: "v-b-1" }, kind: "projected", dataEncoding: "projected" },
-				{ outcome: "found", hashKey: "b-2", data: "v-b-2", dataEncoding: "utf8" },
-				{ outcome: "not_found", hashKey: "b-3" },
-			],
-			unprocessedKeys: [],
-		});
+		const body = (await read.json()) as { items: unknown[]; unprocessedKeys: unknown[] };
+		expect(body.items[0]).toEqual({ outcome: "ok", partitionIndex: expect.any(Number), item: { kind: "projected", data: { d: "v-b-1" } } });
+		expect(body.items[1]).toMatchObject({ outcome: "ok", item: { hashKey: "b-2", data: "v-b-2", dataEncoding: "utf8" } });
+		// An absent item has no item and no keys.
+		expect(body.items[2]).toEqual({ outcome: "ok", partitionIndex: expect.any(Number) });
+		expect(body.unprocessedKeys).toEqual([]);
 	});
 
 	it("batchWriteItems applies an operation whose condition holds and rejects one whose condition fails", async () => {
@@ -330,6 +317,6 @@ describe("http-api example worker", () => {
 			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "condition_failed", hashKey: "tx-absent" } }],
 		});
 		// A cancelled transaction applied nothing.
-		expect(await (await rpc(table, "getItem", { hashKey: "tx-1" })).json()).toMatchObject({ found: false });
+		expect(await (await rpc(table, "getItem", { hashKey: "tx-1" })).json()).not.toHaveProperty("item");
 	});
 });

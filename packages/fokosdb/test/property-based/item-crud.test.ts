@@ -42,14 +42,14 @@ describe("FokosDB item CRUD — stateless properties", () => {
 				const put = await db.putItem({ ...key, data });
 
 				const get = await db.getItem(key);
-				assert(get.found);
+				assert(get.item);
 				expect(get.item).toMatchObject({ ...key, kind: expectedDataKind(data), version: put.version });
 				// `toMatchObject` matches a SUBSET of an object value, so the data is compared exactly.
 				expect(get.item.data).toEqual(data);
 
 				const del = await db.deleteItem(key);
 				expect(del.deleted).toBe(true);
-				expect(await db.getItem(key)).toMatchObject({ found: false, item: key });
+				expect((await db.getItem(key)).item).toBeUndefined();
 			}),
 			{ numRuns: PROPERTY_RUNS },
 		);

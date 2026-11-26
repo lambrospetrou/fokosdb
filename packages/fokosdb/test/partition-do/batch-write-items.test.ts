@@ -86,7 +86,7 @@ const range = (from: number, to: number) => Array.from({ length: to - from }, (_
 
 async function readData(partition: TestPartition, hashKey: string, sortKey: string): Promise<string | undefined> {
 	const res = await partition.get({ hashKey: kb(hashKey), sortKey: kb(sortKey) });
-	return res.found && res.item.kind === "text" ? (res.item.data as string) : undefined;
+	return res.found && "kind" in res.item && res.item.kind === "text" ? (res.item.data as string) : undefined;
 }
 
 /** The same partition with a hash cap that its current file exceeds by 1.3 times, so it refuses writes. */
@@ -329,8 +329,8 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 		expect(write.unprocessedItems).toEqual([]);
 		expect(write.meta.partitions).toHaveLength(3);
 		const read = await db.getItem({ ...keys[0] });
-		expect(read).toMatchObject({ found: true, item: { data: { n: 0 }, ttlAt: 4_000_000_000, version: 1 } });
-		expect((await db.getItem(keys[1])).found).toBe(false);
+		expect(read).toMatchObject({ item: { data: { n: 0 }, ttlAt: 4_000_000_000, version: 1 } });
+		expect((await db.getItem(keys[1])).item).toBeUndefined();
 	});
 
 	it("applies each operation whose condition holds, and rejects each operation whose condition fails", async () => {
@@ -364,11 +364,11 @@ describe.concurrent("FokosDB.batchWriteItems", () => {
 			expect(write.results[i]).toHaveProperty("partitionIndex");
 		}
 		expect(write.unprocessedItems).toEqual([]);
-		expect(await db.getItem(keys[0])).toMatchObject({ found: true, item: { data: "new", version: 2 } });
-		expect(await db.getItem(keys[1])).toMatchObject({ found: true, item: { data: "old", version: 1 } });
-		expect((await db.getItem(keys[2])).found).toBe(false);
-		expect(await db.getItem(keys[3])).toMatchObject({ found: true, item: { data: "old", version: 1 } });
-		expect(await db.getItem(keys[4])).toMatchObject({ found: true, item: { data: "new", version: 1 } });
+		expect(await db.getItem(keys[0])).toMatchObject({ item: { data: "new", version: 2 } });
+		expect(await db.getItem(keys[1])).toMatchObject({ item: { data: "old", version: 1 } });
+		expect((await db.getItem(keys[2])).item).toBeUndefined();
+		expect(await db.getItem(keys[3])).toMatchObject({ item: { data: "old", version: 1 } });
+		expect(await db.getItem(keys[4])).toMatchObject({ item: { data: "new", version: 1 } });
 	});
 
 	it("returns the old image of a failed condition with all_old, and no image with none or for an absent item", async () => {
@@ -603,8 +603,8 @@ describe.concurrent("FokosDBStd.batchGetItemsWithRetry", () => {
 		);
 
 		expect(read.items).toMatchObject([
-			{ outcome: "found", ...failing, data: { name: "f" } },
-			{ outcome: "found", ...ok, data: { name: "o" } },
+			{ outcome: "ok", item: { kind: "projected", data: { name: "f" } } },
+			{ outcome: "ok", item: { kind: "projected", data: { name: "o" } } },
 		]);
 		expect(read.unprocessedKeys).toEqual([]);
 		const calls = await recordedTxCalls(controlledPartition(db, failing), "apiBatchGetItems");
@@ -628,6 +628,6 @@ describe("FokosDB.batchWriteItems — the payload limit", () => {
 
 		expect(await recordedTxCalls(controlledPartition(db, { hashKey: "big", sortKey: "sk-0" }), "apiBatchWriteItems")).toHaveLength(0);
 		const read = await db.batchGetItems({ items: items.slice(0, 5).map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
-		expect(read.items.map((r) => r.outcome)).toEqual(["not_found", "not_found", "not_found", "not_found", "not_found"]);
+		expect(read.items.map((r) => [r.outcome, r.item])).toEqual(Array.from({ length: 5 }, () => ["ok", undefined]));
 	});
 });

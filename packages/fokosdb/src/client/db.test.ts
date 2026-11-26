@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { FokosDB, isFokosDBError } from "./db.js";
 import { FokosDBStd } from "./fokos-std.js";
 import invariant from "../shared/invariant.js";
@@ -21,6 +21,8 @@ import { MAX_ITEM_BYTES, MAX_ITEMS_PER_REQUEST } from "../shared/transaction-lim
 import { KeyCodec } from "../sharding/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
 import type { JsonValue } from "../shared/json-types.js";
+import type { GsiReadItem, ProjectedItem, ProjectedReadItem, ReadItem, ReadResultItem } from "../shared/types.js";
+import type { BatchGetItemResult } from "../shared/batch-api-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 import { attachRouting } from "../sharding/envelope.js";
 import { FokosUnavailableError, type FokosError } from "../shared/errors.js";
@@ -85,12 +87,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 
 				await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v1", ttlAt });
-				expect(await db.getItem({ hashKey: "ttl", sortKey: "item" })).toMatchObject({ found: true, item: { ttlAt } });
+				expect(await db.getItem({ hashKey: "ttl", sortKey: "item" })).toMatchObject({ item: { ttlAt } });
 				expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0].ttlAt).toBe(ttlAt);
 
 				await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v2" });
 				const cleared = await db.getItem({ hashKey: "ttl", sortKey: "item" });
-				expect(cleared).toMatchObject({ found: true, item: { data: "v2" } });
+				expect(cleared).toMatchObject({ item: { data: "v2" } });
 				// An item with no TTL has no `ttlAt` key, on every read path.
 				expect(cleared.item).not.toHaveProperty("ttlAt");
 				expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0]).not.toHaveProperty("ttlAt");
@@ -112,11 +114,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				await db.putItem({ hashKey: "past-ttl", data: "v", ttlAt });
 				// The sweep can legally run before this read, so only a row that survived is checked.
 				const first = await db.getItem({ hashKey: "past-ttl" });
-				if (first.found) {
+				if (first.item) {
 					expect(first.item.ttlAt).toBe(ttlAt);
 				}
 
-				await vi.waitFor(async () => expect((await db.getItem({ hashKey: "past-ttl" })).found).toBe(false), {
+				await vi.waitFor(async () => expect((await db.getItem({ hashKey: "past-ttl" })).item).toBeUndefined(), {
 					timeout: 3_000,
 					interval: 100,
 				});
@@ -143,14 +145,14 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				});
 
 				expect(res.items).toEqual([
-					{ id: "a1", "$.n": 1, S: "X", data: { n: 1, s: "x" } },
-					{ id: "a2", S: "Y", data: { s: "y" } },
-					{ id: "a3", "$.n": 3, k: [1, 2], S: "Z", data: { n: 3, s: "z", k: [1, 2] } },
+					{ kind: "projected", data: { id: "a1", "$.n": 1, S: "X", data: { n: 1, s: "x" } } },
+					{ kind: "projected", data: { id: "a2", S: "Y", data: { s: "y" } } },
+					{ kind: "projected", data: { id: "a3", "$.n": 3, k: [1, 2], S: "Z", data: { n: 3, s: "z", k: [1, 2] } } },
 					// A path over a text item is missing. A function over a missing argument sees NULL.
-					{ id: "a4", S: null, data: "text-item" },
+					{ kind: "projected", data: { id: "a4", S: null, data: "text-item" } },
 				]);
 				// A missing cell leaves the key absent, not undefined.
-				expect(Object.keys(res.items[1])).not.toContain("$.n");
+				expect(Object.keys(res.items[1].data)).not.toContain("$.n");
 				expect(res.count).toBe(4);
 				expect(res.scannedCount).toBe(4);
 			});
@@ -171,7 +173,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const projectionB: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "sk" }];
 
 				const first = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, limit: 2 });
-				expect(first.items).toEqual([{ id: "a1" }, { id: "a2" }]);
+				expect(first.items).toEqual([
+					{ kind: "projected", data: { id: "a1" } },
+					{ kind: "projected", data: { id: "a2" } },
+				]);
 				expect(first.cursor).toBeDefined();
 
 				await expect(db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionB, cursor: first.cursor })).rejects.toThrow(
@@ -182,11 +187,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				);
 
 				// The same projection resumes without a gap or a duplicate.
-				const got: unknown[] = first.items.map((item) => item.id);
+				const got: unknown[] = first.items.map((item) => item.data.id);
 				let cursor = first.cursor;
 				for (;;) {
 					const res = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, cursor });
-					got.push(...res.items.map((item) => item.id));
+					got.push(...res.items.map((item) => item.data.id));
 					if (res.cursor === undefined) {
 						break;
 					}
@@ -211,7 +216,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				let pages = 0;
 				for (;;) {
 					const res = await db.queryItems({ queries, projection, limit: 2, cursor });
-					got.push(...res.items.map((item) => item.id));
+					got.push(...res.items.map((item) => item.data.id));
 					pages++;
 					if (res.cursor === undefined) {
 						break;
@@ -248,21 +253,14 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					],
 				});
 
+				// The item holds only the record of the projection: no keys and no version.
 				expect(res).toEqual({
-					found: true,
-					item: {
-						hashKey: "alice",
-						sortKey: "j1",
-						data: { id: "j1", "$.n": 1, name: "alpha", "$.none": null, k: [1, 2], ver: 1 },
-						kind: "projected",
-						version: 1,
-					},
+					item: { kind: "projected", data: { id: "j1", "$.n": 1, name: "alpha", "$.none": null, k: [1, 2], ver: 1 } },
 					meta: expect.anything(),
 				});
-				// The projected record sits in `data` inside the normal envelope, tagged `kind: "projected"`.
-				invariant(res.found && res.item.kind === "projected");
-				expect(Object.keys(res)).toEqual(["found", "item", "meta"]);
-				expect(Object.keys(res.item)).toEqual(["hashKey", "sortKey", "data", "kind", "version"]);
+				invariant(res.item);
+				expect(Object.keys(res)).toEqual(["item", "meta"]);
+				expect(Object.keys(res.item)).toEqual(["kind", "data"]);
 				expect(Object.keys(res.item.data)).not.toContain("missing");
 			});
 
@@ -271,14 +269,14 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
 
 				const res = await db.getItem({ hashKey: "alice", sortKey: "b1", projection: [{ expr: { ref: "data" }, as: "bytes" }] });
-				invariant(res.found && res.item.kind === "projected");
+				invariant(res.item);
 				expect(res.item.data.bytes).toEqual(new Uint8Array([1, 2, 3]));
 			});
 
-			it("returns found:false with the caller's keys for a missing item", async () => {
+			it("returns no item for a missing item", async () => {
 				const db = makeDB();
 				const res = await db.getItem({ hashKey: "alice", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
-				expect(res).toMatchObject({ found: false, item: { hashKey: "alice", sortKey: "nope" } });
+				expect(res).toEqual({ meta: expect.anything() });
 			});
 		});
 
@@ -290,7 +288,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				await db.putItem({ hashKey: "alice", sortKey: "p1", data: { name: "alpha", score: 3 } });
 
 				const whole = await db.getItem<Player>({ hashKey: "alice", sortKey: "p1" });
-				invariant(whole.found && whole.item.kind === "json");
+				invariant(whole.item?.kind === "json");
 				expect(whole.item.data.name).toBe("alpha");
 
 				const projected = await db.getItem<Pick<Player, "name">>({
@@ -298,14 +296,14 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					sortKey: "p1",
 					projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }],
 				});
-				invariant(projected.found && projected.item.kind === "projected");
+				invariant(projected.item);
 				expect(projected.item.data.name).toBe("alpha");
 
 				const page = await db.queryItems<Pick<Player, "score">>({
 					queries: [{ hashKey: "alice", sortKeyCondition: { op: "eq", value: "p1" } }],
 					projection: [{ expr: { ref: "data", path: "$.score" }, as: "score" }],
 				});
-				expect(page.items[0].score).toBe(3);
+				expect(page.items[0].data.score).toBe(3);
 
 				// One request, two unrelated items: each position is typed by its own member of the tuple.
 				await db.putItem({ hashKey: "alice", sortKey: "p2", data: { label: "beta" } });
@@ -315,10 +313,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 						{ hashKey: "alice", sortKey: "p2" },
 					],
 				});
-				const [first, second] = read.items;
-				invariant(first.found && first.kind === "json");
+				const [first, second] = [read.items[0].item, read.items[1].item];
+				invariant(first?.kind === "json");
 				expect(first.data.score).toBe(3);
-				invariant(second.found && second.kind === "json");
+				invariant(second?.kind === "json");
 				expect(second.data.label).toBe("beta");
 			});
 
@@ -330,8 +328,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				// @ts-expect-error one type named, two items passed
 				await db.transactGetItems<[Player]>({ items: [{ hashKey: "a" }, { hashKey: "b" }] });
 				const wide = await db.transactGetItems({ items: [{ hashKey: "a" }] });
-				if (wide.items[0].found && wide.items[0].kind === "json") {
-					const value: JsonValue = wide.items[0].data;
+				const item = wide.items[0].item;
+				if (item?.kind === "json") {
+					const value: JsonValue = item.data;
 					void value;
 				}
 			}
@@ -347,10 +346,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 						{ hashKey: "alice", sortKey: "p2" },
 					],
 				});
-				const [first, second] = read.items;
-				invariant(first.outcome === "found" && first.kind === "json");
+				const [first, second] = [read.items[0].item, read.items[1].item];
+				invariant(first?.kind === "json");
 				expect(first.data.score).toBe(3);
-				invariant(second.outcome === "found" && second.kind === "json");
+				invariant(second?.kind === "json");
 				expect(second.data.label).toBe("beta");
 			});
 
@@ -361,12 +360,85 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				// @ts-expect-error one type named, two items passed
 				await db.batchGetItems<[Player]>({ items: [{ hashKey: "a" }, { hashKey: "b" }] });
 				const wide = await db.batchGetItems({ items: [{ hashKey: "a" }] });
-				if (wide.items[0].outcome === "found" && wide.items[0].kind === "json") {
-					const value: JsonValue = wide.items[0].data;
+				const item = wide.items[0].item;
+				if (item?.kind === "json") {
+					const value: JsonValue = item.data;
 					void value;
 				}
 			}
 			void _batchGetItemsArity;
+
+			// Type-level contract, never executed. Each read method:
+			// - after `if (r.item)`, `r.item.data` is valid with no other check;
+			// - a request with a projection array gets the projected type, a request with no projection
+			//   gets the complete type, and a request whose projection can be `undefined` gets the union;
+			// - `item.kind` narrows the union, also in code that does not know the request.
+			async function _readItemNarrowing(db: FokosDB, maybe: ProjectionExpression[] | undefined) {
+				const projection: ProjectionExpression[] = [{ expr: { ref: "data", path: "$.name" }, as: "name" }];
+
+				const got = await db.getItem<Player>({ hashKey: "a" });
+				expectTypeOf(got.item).toEqualTypeOf<ReadItem<Player> | undefined>();
+				const gotProjected = await db.getItem<{ name: string }>({ hashKey: "a", projection });
+				expectTypeOf(gotProjected.item).toEqualTypeOf<ProjectedReadItem<{ name: string }> | undefined>();
+				const gotEither = await db.getItem({ hashKey: "a", projection: maybe });
+				expectTypeOf(gotEither.item).toEqualTypeOf<ReadResultItem | undefined>();
+				if (gotProjected.item) {
+					expectTypeOf(gotProjected.item.data.name).toEqualTypeOf<string>();
+				}
+				if (gotEither.item) {
+					expectTypeOf(gotEither.item.data).not.toBeUndefined();
+					// @ts-expect-error `version` is only on a complete item
+					void gotEither.item.version;
+					if (gotEither.item.kind === "projected") {
+						expectTypeOf(gotEither.item.data).toEqualTypeOf<ProjectedItem>();
+					} else {
+						expectTypeOf(gotEither.item.version).toEqualTypeOf<number>();
+					}
+				}
+
+				const page = await db.queryItems({ queries: [{ hashKey: "a" }] });
+				expectTypeOf(page.items).toEqualTypeOf<ReadItem[]>();
+				const pageProjected = await db.queryItems({ queries: [{ hashKey: "a" }], projection });
+				expectTypeOf(pageProjected.items).toEqualTypeOf<ProjectedReadItem[]>();
+				const pageEither = await db.queryItems({ queries: [{ hashKey: "a" }], projection: maybe });
+				expectTypeOf(pageEither.items).toEqualTypeOf<ReadItem[] | ProjectedReadItem[]>();
+
+				const scan = await db.scanItems({});
+				expectTypeOf(scan.items).toEqualTypeOf<ReadItem[]>();
+				const scanProjected = await db.scanItems({ projection });
+				expectTypeOf(scanProjected.items).toEqualTypeOf<ProjectedReadItem[]>();
+				const scanEither = await db.scanItems({ projection: maybe });
+				expectTypeOf(scanEither.items).toEqualTypeOf<ReadItem[] | ProjectedReadItem[]>();
+
+				const gsi = db.gsi("byStatus");
+				expectTypeOf((await gsi.queryItems({ queries: [{ hashKey: "a" }] })).items).toEqualTypeOf<GsiReadItem[]>();
+				expectTypeOf((await gsi.queryItems({ queries: [{ hashKey: "a" }], projection })).items).toEqualTypeOf<ProjectedReadItem[]>();
+				expectTypeOf((await gsi.queryItems({ queries: [{ hashKey: "a" }], projection: maybe })).items).toEqualTypeOf<
+					GsiReadItem[] | ProjectedReadItem[]
+				>();
+				expectTypeOf((await gsi.scanItems({})).items).toEqualTypeOf<GsiReadItem[]>();
+				expectTypeOf((await gsi.scanItems({ projection })).items).toEqualTypeOf<ProjectedReadItem[]>();
+				expectTypeOf((await gsi.scanItems({ projection: maybe })).items).toEqualTypeOf<GsiReadItem[] | ProjectedReadItem[]>();
+
+				const tx = await db.transactGetItems({ items: [{ hashKey: "a" }, { hashKey: "b", projection }] });
+				expectTypeOf(tx.items[0].item).toEqualTypeOf<ReadResultItem | undefined>();
+				if (tx.items[1].item) {
+					expectTypeOf(tx.items[1].item.data).not.toBeUndefined();
+				}
+
+				const batch = await db.batchGetItems({ items: [{ hashKey: "a" }] });
+				const entry = batch.items[0];
+				expectTypeOf(entry.item).toEqualTypeOf<ReadResultItem | undefined>();
+				if (entry.item) {
+					expectTypeOf(entry.outcome).toEqualTypeOf<"ok">();
+					expectTypeOf(entry.item.data).not.toBeUndefined();
+				}
+				const item: ProjectedReadItem = { kind: "projected", data: {} };
+				// @ts-expect-error a rejected entry has no item
+				const rejected: BatchGetItemResult = { outcome: "rejected", code: "expression_invalid", error_id: "e", item };
+				void rejected;
+			}
+			void _readItemNarrowing;
 		});
 
 		describe("FokosDB.queryItems — filters", () => {
@@ -558,8 +630,8 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				});
 
 				expect(res.items).toEqual([
-					{ id: "s3", "$.n": 3 },
-					{ id: "s4", "$.n": 4 },
+					{ kind: "projected", data: { id: "s3", "$.n": 3 } },
+					{ kind: "projected", data: { id: "s4", "$.n": 4 } },
 				]);
 				expect(res.count).toBe(2);
 				expect(res.scannedCount).toBe(5);
@@ -749,10 +821,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const gotText = await db.getItem({ hashKey: "k", sortKey: "text" });
 				const gotJson = await db.getItem({ hashKey: "k", sortKey: "json" });
 
-				expect(gotBytes).toMatchObject({ found: true, item: { kind: "bytes", data: bytes } });
-				expect(gotText).toMatchObject({ found: true, item: { kind: "text", data: "hello" } });
-				expect(gotJson).toMatchObject({ found: true, item: { kind: "json" } });
-				if (gotJson.found) {
+				expect(gotBytes).toMatchObject({ item: { kind: "bytes", data: bytes } });
+				expect(gotText).toMatchObject({ item: { kind: "text", data: "hello" } });
+				expect(gotJson).toMatchObject({ item: { kind: "json" } });
+				if (gotJson.item) {
 					expect(gotJson.item.data).toEqual(obj);
 				} // deep structural equality after JSONB round-trip
 			});
@@ -762,7 +834,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const jsonText = '{"a":1}'; // legitimate JSON *text* stored as a string stays a string
 				await db.putItem({ hashKey: "k", sortKey: "s", data: jsonText });
 				const got = await db.getItem({ hashKey: "k", sortKey: "s" });
-				expect(got).toMatchObject({ found: true, item: { kind: "text", data: jsonText } });
+				expect(got).toMatchObject({ item: { kind: "text", data: jsonText } });
 			});
 
 			it("exposes kind on queryItems results and parses json rows", async () => {
@@ -787,11 +859,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(write.idempotencyToken).toEqual(expect.any(String));
 
 				const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
-				expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
-				const item = read.items[0];
-				if (item.found) {
-					expect(item.data).toEqual(obj);
-				}
+				expect(read.items[0]).toMatchObject({ item: { kind: "json", data: obj } });
 			});
 
 			it("rejects data that is not JSON-serializable", async () => {
@@ -840,7 +908,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect((await db.putItem({ hashKey: "no-sk", data: "v" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
 
 				const got = await db.getItem({ hashKey: "no-sk" });
-				expect(got.found).toBe(true);
+				invariant(got.item);
 				expect(got.item.hashKey).toBe("no-sk");
 				expect(got.item.sortKey).toBeUndefined();
 
@@ -856,7 +924,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect((await db.putItem({ hashKey, sortKey, data: "v" })).item).toEqual({ hashKey, sortKey });
 
 				const got = await db.getItem({ hashKey, sortKey });
-				expect(got.found).toBe(true);
+				invariant(got.item);
 				expect(got.item.hashKey).toEqual(hashKey);
 				expect(got.item.sortKey).toEqual(sortKey);
 			});
@@ -884,9 +952,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					{ outcome: "ok", operation: "put", version: 1, partitionIndex: 0 },
 					{ outcome: "ok", operation: "delete", deleted: true, partitionIndex: 0 },
 				]);
-				expect(read.items.map((item) => [item.outcome, item.partitionIndex])).toEqual([
-					["found", 0],
-					["not_found", 0],
+				expect(read.items).toEqual([
+					{ outcome: "ok", partitionIndex: 0, item: expect.objectContaining({ sortKey: "new" }) },
+					{ outcome: "ok", partitionIndex: 0 },
 				]);
 				for (const meta of [write.meta, read.meta]) {
 					expect(meta).not.toHaveProperty("servedBy");
@@ -933,16 +1001,25 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				});
 
 				expect(read.items).toEqual([
-					expect.objectContaining({ outcome: "found", hashKey: "kinds", sortKey: "bytes", kind: "bytes", data: bytes }),
+					expect.objectContaining({
+						outcome: "ok",
+						item: expect.objectContaining({ hashKey: "kinds", sortKey: "bytes", kind: "bytes", data: bytes }),
+					}),
 					// The database stores a string as text. It does not parse the string as JSON, also when the string contains JSON.
-					expect.objectContaining({ outcome: "found", hashKey: "kinds", sortKey: "text", kind: "text", data: jsonText, ttlAt }),
-					expect.objectContaining({ outcome: "found", hashKey: "kinds", sortKey: "json", kind: "json", data: obj }),
-					expect.objectContaining({ outcome: "found", hashKey: "no-sk", sortKey: undefined, data: "v" }),
+					expect.objectContaining({
+						outcome: "ok",
+						item: expect.objectContaining({ hashKey: "kinds", sortKey: "text", kind: "text", data: jsonText, ttlAt }),
+					}),
+					expect.objectContaining({
+						outcome: "ok",
+						item: expect.objectContaining({ hashKey: "kinds", sortKey: "json", kind: "json", data: obj }),
+					}),
+					expect.objectContaining({ outcome: "ok", item: expect.objectContaining({ hashKey: "no-sk", sortKey: undefined, data: "v" }) }),
 					// KeyCodec adds a tag to a binary key before it stores the key. The result must show the bytes that the caller sent.
-					expect.objectContaining({ outcome: "found", ...binaryKey, data: "bin" }),
+					expect.objectContaining({ outcome: "ok", item: expect.objectContaining({ ...binaryKey, data: "bin" }) }),
 				]);
-				for (const item of [read.items[0], read.items[2], read.items[3], read.items[4]]) {
-					expect(item).not.toHaveProperty("ttlAt");
+				for (const entry of [read.items[0], read.items[2], read.items[3], read.items[4]]) {
+					expect(entry.item).not.toHaveProperty("ttlAt");
 				}
 				expect(read.unprocessedKeys).toEqual([]);
 			});
@@ -954,7 +1031,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 				const put = await db.batchWriteItems({ items: [{ operation: "put", ...key, data: "v2" }] });
 				expect(put.results).toMatchObject([{ outcome: "ok", operation: "put", version: 2 }]);
-				expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
+				expect(await db.getItem(key)).toMatchObject({ item: { data: "v2", version: 2 } });
 
 				const del = await db.batchWriteItems({
 					items: [
@@ -966,11 +1043,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					{ outcome: "ok", operation: "delete", deleted: true },
 					{ outcome: "ok", operation: "delete", deleted: false },
 				]);
-				expect((await db.batchGetItems({ items: [key] })).items).toMatchObject([{ outcome: "not_found", ...key }]);
+				expect((await db.batchGetItems({ items: [key] })).items).toEqual([{ outcome: "ok", partitionIndex: 0 }]);
 
 				// The delete removes the row at version 2 and records the delete revision 3. Thus, the new row starts at version 4.
 				expect((await db.putItem({ ...key, data: "v4" })).version).toBe(4);
-				expect((await db.batchGetItems({ items: [key] })).items).toMatchObject([{ outcome: "found", data: "v4", version: 4 }]);
+				expect((await db.batchGetItems({ items: [key] })).items).toMatchObject([{ outcome: "ok", item: { data: "v4", version: 4 } }]);
 			});
 
 			it("joins the answers of a split root and an unsplit root, and each item names its owner", async () => {
@@ -1013,7 +1090,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(read.unprocessedKeys).toEqual([]);
 				expect(read.meta.partitions).toHaveLength(3);
 				read.items.forEach((item, i) => {
-					expect(item).toMatchObject({ outcome: "found", ...keys[i], data: `v-${i}` });
+					expect(item).toMatchObject({ outcome: "ok", item: { ...keys[i], data: `v-${i}` } });
 					invariant(item.partitionIndex !== undefined, "a found item names its partition");
 					expect(read.meta.partitions[item.partitionIndex]).toEqual(entryOf(i));
 				});
@@ -1557,7 +1634,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			await expect(db.putItem({ hashKey: "over-row", data: overRow })).rejects.toThrow(
 				fokosErrorWith("item_too_large", { hashKey: "over-row" }),
 			);
-			await expect(db.getItem({ hashKey: "over-row" })).resolves.toMatchObject({ found: false });
+			expect((await db.getItem({ hashKey: "over-row" })).item).toBeUndefined();
 
 			// Exactly at the limit is accepted by both.
 			const atLimitPut = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit").byteLength);

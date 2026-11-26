@@ -4,7 +4,7 @@ import type { Workload } from "./index.js";
 const PAD = "x".repeat(200);
 
 /**
- * The single-item cycle: `putItem` → `getItem` → `deleteItem` → `getItem` (not_found).
+ * The single-item cycle: `putItem` → `getItem` → `deleteItem` → `getItem` (no item).
  * `iter` doubles: total_ms, put_ms, get_ms, delete_ms, miss_ms, forwards_n, database_bytes.
  */
 export const crud: Workload = {

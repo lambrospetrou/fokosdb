@@ -181,7 +181,8 @@ async function drainQuery(db: FokosDB, opts: QueryItemsOptions, maxPages: number
 	do {
 		// A partition that splits, or a child that still imports its share, can answer 503. A client
 		// retries that, and a query changes nothing, so the same page is safe to ask for again.
-		const page: QueryItemsResult = await untilAvailable(() => db.queryItems({ ...opts, cursor }));
+		// No suite of this harness sends a projection, so each page holds complete items.
+		const page = (await untilAvailable(() => db.queryItems({ ...opts, cursor }))) as QueryItemsResult;
 		pages++;
 		expectPageInvariants(page, opts);
 		onPage?.(page);

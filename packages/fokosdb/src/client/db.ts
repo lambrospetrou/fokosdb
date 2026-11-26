@@ -8,13 +8,15 @@ import {
 	EncodedItemData,
 	FokosMeta,
 	GetItemOptions,
+	GetItemProjectedOptions,
+	GetItemProjectedResult,
 	GetItemResult,
 	HashKey,
 	JsonComposite,
 	JsonValue,
 	PutItemOptions,
 	PutItemResult,
-	ProjectedItem,
+	ProjectedReadItem,
 	QueryItemsOptions,
 	QueryItemsProjectedOptions,
 	QueryItemsProjectedResult,
@@ -550,8 +552,8 @@ function defectErrorId(message: string, attributes: Record<string, unknown> = {}
 }
 
 /**
- * The public result of one found item of a batch read, with the caller's own keys. An error while it
- * decodes the item makes the item `unprocessed`, because the method never throws after I/O starts.
+ * The public result of one found item of a batch read. An error while it decodes the item makes the
+ * item `unprocessed`, because the method never throws after I/O starts.
  */
 function decodeFoundItem(
 	item: GetItemRpcItem,
@@ -560,22 +562,14 @@ function decodeFoundItem(
 	partitionIndex: number,
 ): BatchGetItemResult {
 	try {
-		if (item.kind === "projected") {
+		if ("projected" in item) {
 			invariant(names, "fokos/batchGetItems: projected result without a projection");
-			return {
-				outcome: "found",
-				partitionIndex,
-				...keys,
-				data: projectedItemFromWireRow(names, item.projected),
-				kind: "projected",
-				...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
-				version: item.version,
-			};
+			return { outcome: "ok", partitionIndex, item: { kind: "projected", data: projectedItemFromWireRow(names, item.projected) } };
 		}
-		return { outcome: "found", partitionIndex, ...keys, ...item, ...decodeItemData(item.kind, item.data) };
+		return { outcome: "ok", partitionIndex, item: { ...keys, ...item, ...decodeItemData(item.kind, item.data) } };
 	} catch (e) {
 		const err = FokosError.wrap(e);
-		return { outcome: "unprocessed", code: err.code as FokosErrorCode, error_id: err.error_id, partitionIndex, ...keys };
+		return { outcome: "unprocessed", code: err.code as FokosErrorCode, error_id: err.error_id, partitionIndex };
 	}
 }
 
@@ -913,10 +907,13 @@ export class FokosDB {
 		return await withFokosErrors(async () => await this.#putItem(opts));
 	}
 
-	// `T` types the json value and the projected record of the result. The store holds opaque data, so
+	// `T` types the json value or the projected record of the result. The store holds opaque data, so
 	// the library cannot check `T`: it is the caller's own statement about what the item holds.
-	async getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T>> {
-		return (await withFokosErrors(async () => await this.#getItem(opts))) as GetItemResult<T>;
+	async getItem<T = never>(opts: GetItemProjectedOptions): Promise<GetItemProjectedResult<T>>;
+	async getItem<T = never>(opts: GetItemOptions & { projection?: undefined }): Promise<GetItemResult<T>>;
+	async getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T> | GetItemProjectedResult<T>>;
+	async getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T> | GetItemProjectedResult<T>> {
+		return (await withFokosErrors(async () => await this.#getItem(opts))) as GetItemResult<T> | GetItemProjectedResult<T>;
 	}
 
 	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
@@ -937,13 +934,15 @@ export class FokosDB {
 	}
 
 	async queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
-	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T>>;
+	async queryItems<T = never>(opts: QueryItemsOptions & { projection?: undefined }): Promise<QueryItemsResult<T>>;
+	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T> | QueryItemsProjectedResult<T>>;
 	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T> | QueryItemsProjectedResult<T>> {
 		return (await withFokosErrors(async () => await this.#queryItems(opts))) as QueryItemsResult<T> | QueryItemsProjectedResult<T>;
 	}
 
 	async scanItems<T = never>(opts: ScanItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
-	async scanItems<T = never>(opts: ScanItemsOptions): Promise<ScanItemsResult<T>>;
+	async scanItems<T = never>(opts: ScanItemsOptions & { projection?: undefined }): Promise<ScanItemsResult<T>>;
+	async scanItems<T = never>(opts: ScanItemsOptions): Promise<ScanItemsResult<T> | QueryItemsProjectedResult<T>>;
 	async scanItems<T = never>(opts: ScanItemsOptions): Promise<ScanItemsResult<T> | QueryItemsProjectedResult<T>> {
 		return (await withFokosErrors(async () => await this.#scanItems(opts))) as ScanItemsResult<T> | QueryItemsProjectedResult<T>;
 	}
@@ -1035,7 +1034,7 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta };
 	}
 
-	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
+	async #getItem(opts: GetItemOptions): Promise<GetItemResult | GetItemProjectedResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
 		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
@@ -1047,29 +1046,17 @@ export class FokosDB {
 			{ hashKey, sortKey, ...(projection === undefined ? {} : { projection }) },
 		);
 		const meta = singleMeta(res.partitions, routing);
-		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
-		// json data arrives as JSON text — parse it once here to the public JsonValue.
-		return withAnswerMeta(meta, (): GetItemResult => {
+		// The DO returns no keys, so a complete item takes the caller's own keys. json data arrives as
+		// JSON text, and the client parses it once here to the public JsonValue.
+		return withAnswerMeta(meta, (): GetItemResult | GetItemProjectedResult => {
 			if (!res.found) {
-				return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta };
+				return { meta };
 			}
-			if (res.item.kind === "projected") {
+			if ("projected" in res.item) {
 				invariant(names, "fokos/getItem: projected response without a projection");
-				return {
-					found: true,
-					item: {
-						hashKey: opts.hashKey,
-						sortKey: opts.sortKey,
-						data: projectedItemFromWireRow(names, res.item.projected),
-						kind: "projected",
-						...(res.item.ttlAt === undefined ? {} : { ttlAt: res.item.ttlAt }),
-						version: res.item.version,
-					},
-					meta,
-				};
+				return { item: { kind: "projected", data: projectedItemFromWireRow(names, res.item.projected) }, meta };
 			}
 			return {
-				found: true,
 				item: { hashKey: opts.hashKey, sortKey: opts.sortKey, ...res.item, ...decodeItemData(res.item.kind, res.item.data) },
 				meta,
 			};
@@ -1276,23 +1263,16 @@ export class FokosDB {
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
 				};
 				if (!item.found) {
-					return { ...keys, found: false as const, partitionIndex };
+					return { partitionIndex };
 				}
 				if (item.kind === "projected") {
 					// items[i] answers request.items[i], so the names of the record come from the projection of that item.
 					const itemNames = names[index];
 					invariant(itemNames, "fokos/transactGetItems: projected result without a projection");
-					return {
-						...keys,
-						found: true as const,
-						data: projectedItemFromWireRow(itemNames, item.projected),
-						kind: "projected" as const,
-						version: item.version,
-						...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
-						partitionIndex,
-					};
+					return { item: { kind: "projected" as const, data: projectedItemFromWireRow(itemNames, item.projected) }, partitionIndex };
 				}
-				return { ...keys, ...item, ...decodeItemData(item.kind, item.data), partitionIndex };
+				const { found: _found, ...value } = item;
+				return { item: { ...keys, ...value, ...decodeItemData(value.kind, value.data) }, partitionIndex };
 			}),
 			meta: response.meta,
 		}));
@@ -1503,7 +1483,7 @@ export class FokosDB {
 			startInner = decoded.inner;
 		}
 
-		const items: Array<QueryItemsResult["items"][number] | ProjectedItem> = [];
+		const items: Array<QueryItemsResult["items"][number] | ProjectedReadItem> = [];
 		// Each leaf writes its own entry, so the cap of the route list cannot drop a leaf. Only a name can
 		// be absent. The entries of the sub-queries follow in order, so the items stay in entry order.
 		const pageMeta: QueryItemsResult["meta"]["partitions"] = [];
@@ -1640,7 +1620,7 @@ export class FokosDB {
 		}
 		const end = bounds.end === null ? null : { routingHash: bounds.end };
 
-		const items: Array<QueryItemsResult["items"][number] | ProjectedItem> = [];
+		const items: Array<QueryItemsResult["items"][number] | ProjectedReadItem> = [];
 		const pageMeta: QueryItemsResult["meta"]["partitions"] = [];
 		let count = 0;
 		let scannedCount = 0;
@@ -1782,7 +1762,7 @@ export class FokosDB {
 					found.push({ ...entry, partitionIndex: at(entry.partitionIndex) });
 				}
 				for (const { opIndex, partitionIndex } of value.notFound) {
-					results[opIndex] = { outcome: "not_found", partitionIndex: at(partitionIndex), ...keysOf(opIndex) };
+					results[opIndex] = { outcome: "ok", partitionIndex: at(partitionIndex) };
 				}
 			},
 			failure: (opIndex, f) => {
@@ -1793,9 +1773,8 @@ export class FokosDB {
 								...f.fields,
 								code: f.fields.code as FokosErrorCode,
 								error_id: f.fields.error_id ?? defectErrorId("a rejected read has no error_id", { opIndex }),
-								...keysOf(opIndex),
 							}
-						: { outcome: "unprocessed", ...f.fields, ...keysOf(opIndex) };
+						: { outcome: "unprocessed", ...f.fields };
 			},
 		});
 		// Each answer fits in the limit, but the answers of several calls together can go above it.
@@ -1804,7 +1783,7 @@ export class FokosDB {
 			results[opIndex] = decodeFoundItem(item, names[opIndex], keysOf(opIndex), partitionIndex);
 		}
 		for (const { opIndex, partitionIndex } of dropped) {
-			results[opIndex] = { outcome: "unprocessed", code: "response_too_large", partitionIndex, ...keysOf(opIndex) };
+			results[opIndex] = { outcome: "unprocessed", code: "response_too_large", partitionIndex };
 		}
 		const out = results.map(
 			(result, opIndex): BatchGetItemResult =>
@@ -1812,7 +1791,6 @@ export class FokosDB {
 					outcome: "unprocessed",
 					code: CORE_INTERNAL_CODES.invariant_failed.code,
 					error_id: defectErrorId("a batch read answer has no outcome for an item", { opIndex }),
-					...keysOf(opIndex),
 				},
 		);
 		return { items: out, unprocessedKeys: opts.items.filter((_, i) => out[i].outcome === "unprocessed"), meta };
@@ -2040,16 +2018,16 @@ function parseOptionsAndPrepareBudget(opts: Pick<QueryItemsOptions, "limit" | "m
 	return { select, expressions, filterIdentity, projectionIdentity, projectionNames, budget };
 }
 
-/** Appends the items of one partition answer to the public page: projected records, or decoded items. */
+/** Appends the items of one partition answer to the public page: projected items, or decoded items. */
 function appendPageItems(
-	items: Array<QueryItemsResult["items"][number] | ProjectedItem>,
+	items: Array<QueryItemsResult["items"][number] | ProjectedReadItem>,
 	rpcItems: ReadonlyArray<StoredItem | ProjectedWireRow>,
 	projectionNames: readonly string[] | null,
 	gsi: boolean,
 ): void {
 	if (projectionNames) {
 		for (const item of rpcItems) {
-			items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
+			items.push({ kind: "projected", data: projectedItemFromWireRow(projectionNames, item as ProjectedWireRow) });
 		}
 		return;
 	}

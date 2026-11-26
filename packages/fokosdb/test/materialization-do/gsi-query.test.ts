@@ -83,7 +83,7 @@ describe("db.gsi(indexName).queryItems", () => {
 				{ expr: { ref: "data", path: "$.owner" }, as: "owner" },
 			],
 		});
-		expect(page.items).toEqual([{ at: "t2", owner: "u" }]);
+		expect(page.items).toEqual([{ kind: "projected", data: { at: "t2", owner: "u" } }]);
 		// A GSI with no sort key has no sortKey value.
 		await vi.waitFor(
 			async () => expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toHaveLength(2),
@@ -105,7 +105,7 @@ describe("db.gsi(indexName).queryItems", () => {
 		await expect(db.destroy()).resolves.toEqual({ ok: true });
 		expect((await db.gsi("byStatus").queryItems({ queries: [{ hashKey: "OPEN" }] })).items).toEqual([]);
 		expect((await db.gsi("byOwner").queryItems({ queries: [{ hashKey: "u" }] })).items).toEqual([]);
-		expect((await db.getItem({ hashKey: "o1", sortKey: "s" })).found).toBe(false);
+		expect((await db.getItem({ hashKey: "o1", sortKey: "s" })).item).toBeUndefined();
 		await db.destroy();
 	});
 
@@ -197,7 +197,7 @@ describe("db.gsi(indexName).queryItems — sort key encodings", () => {
 			filter: { op: "eq", args: [{ ref: "sortKey" }, { b64: bytes(1, 0, 2).toBase64() }] },
 			projection: [{ expr: { ref: "sortKey" }, as: "sk" }],
 		});
-		expect(projected.items).toEqual([{ sk: bytes(1, 0, 2) }]);
+		expect(projected.items).toEqual([{ kind: "projected", data: { sk: bytes(1, 0, 2) } }]);
 		const prefixed = await gsi.queryItems({ queries: [{ hashKey: "h", sortKeyCondition: { op: "begins_with", prefix: bytes(1, 0) } }] });
 		expect(prefixed.items.map((i) => i.baseHashKey)).toEqual(["c", "a"]);
 	});

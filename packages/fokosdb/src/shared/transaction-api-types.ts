@@ -16,7 +16,7 @@ import type {
 	ItemPutter,
 	ItemQuerier,
 	JsonComposite,
-	ReadItem,
+	ReadResultItem,
 	ReturnValuesOnConditionCheckFailure,
 	SortKey,
 } from "./types.js";
@@ -222,21 +222,17 @@ export type TransactGetItemsOptions<Ts extends readonly unknown[] = never[]> = {
 };
 
 /**
- * One answer of a read: the item, or the keys that found nothing. Public variant surfaced by
- * FokosDB.transactGetItems, where `db.ts` has decoded the keys (the empty sentinel maps back to an
- * absent sortKey), parsed json text into a JsonValue, and dropped the 2PC internals. A found item is
- * the ordinary `ReadItem` envelope, so a projected item and a complete item have one shape and `T`
- * types both, exactly as `getItem` returns them.
+ * One answer of `transactGetItems`. `item` is absent when the item does not exist. `partitionIndex` is
+ * the index of the partition of the item in `meta.partitions`.
  */
-export type MaybeReadItem<T = never> = ({ found: true } & ReadItem<T>) | ({ found: false } & ItemKey);
+export type TransactGetItemResult<T = never> = { item?: ReadResultItem<T>; partitionIndex: number };
 
 // Public result surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts
-// boundary. Same positional guarantee as the wire response, and no outcome for the same reason the
-// write result carries none — a read that cannot answer raises a FokosError instead, for example
-// `FokosConflictError` with `read_conflict` or `pending_write`.
+// boundary. `items[i]` answers `items[i]` of the request. It has no outcome, because a read that cannot
+// answer raises a FokosError instead, for example `FokosConflictError` with `read_conflict` or
+// `pending_write`.
 export type TransactGetItemsResult<Ts extends readonly unknown[] = never[]> = {
-	/** `partitionIndex` is the index of the partition of the item in `meta.partitions`. */
-	items: { [K in keyof Ts]: MaybeReadItem<Ts[K]> & { partitionIndex: number } };
+	items: { [K in keyof Ts]: TransactGetItemResult<Ts[K]> };
 	meta: FokosMeta;
 };
 

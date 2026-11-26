@@ -20,7 +20,7 @@ describe("transactGetItems — the limits", () => {
 
 		const result = await db.transactGetItems({ items: [key] });
 
-		expect(result.items).toMatchObject([{ found: true, data: "value", version: 1 }]);
+		expect(result.items).toMatchObject([{ item: { data: "value", version: 1 } }]);
 		const calls = await recordedTxCalls(controlledPartition(db, key), "txReadForTransaction");
 		expect(calls.map((call) => call.items[0].projection)).toEqual([undefined, [{ expr: { ref: "hashKey" } }]]);
 	});
@@ -30,7 +30,7 @@ describe("transactGetItems — the limits", () => {
 		const keys = Array.from({ length: MAX_ITEMS_PER_REQUEST }, (_, i) => ({ hashKey: `max-items-${i}`, sortKey: "sk" }));
 		const result = await db.transactGetItems({ items: keys });
 		expect(result.items).toHaveLength(MAX_ITEMS_PER_REQUEST);
-		expect(result.items.every((item) => !item.found)).toBe(true);
+		expect(result.items.every((r) => r.item === undefined)).toBe(true);
 	});
 
 	// The partition stops when its items are above the limit, and the read does not send again.

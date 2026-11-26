@@ -74,7 +74,7 @@ describe.each(PATHS)("transactWriteItems on %s", (_path, pathOptions) => {
 		});
 		expect(Object.hasOwn(err, "results")).toBe(true);
 		// A cancelled transaction applied nothing.
-		expect((await db.getItem(keys[0])).found).toBe(false);
+		expect((await db.getItem(keys[0])).item).toBeUndefined();
 	});
 });
 

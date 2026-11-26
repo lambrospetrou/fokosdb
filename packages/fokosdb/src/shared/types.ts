@@ -146,20 +146,16 @@ export type DeleteItemResult = {
 	meta: SinglePartitionMeta;
 };
 
-/**
- * The value half of a read result. `kind` discriminates it, so a caller that tests `kind` also gets
- * the type of `data`. `"projected"` is a read-result tag and never a `DataKind`: that array indexes
- * the on-disk `data_kind` code, and no item is stored projected.
- */
-export type ReadItemValue<T = never> = DecodedItemData<T> | { kind: "projected"; data: CallerType<T, ProjectedItem> };
+/** The value half of a complete read result. `kind` discriminates it, so a caller that tests `kind` also gets the type of `data`. */
+export type ReadItemValue<T = never> = DecodedItemData<T>;
 
 /**
- * One item of a read result: the caller's own keys, the value, and the item metadata. A projection
- * returns its flat record in `data`, in this same envelope, so one shape serves every read: a caller
- * reaches the value through `item.data` and tests `kind` for its type, never the presence of a field.
+ * One complete item of a read result: the keys, the value, and the item metadata. A read without a
+ * projection returns this shape. A read with a projection returns `ProjectedReadItem`, with no keys and
+ * no `version`. A caller that needs them names them in the projection, for example
+ * `{ expr: { ref: "v" }, as: "version" }`.
  *
- * `T` is the caller's own type of the json value and of the projected record, for example
- * `getItem<{ name: string }>({ hashKey, projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }] })`.
+ * `T` is the caller's own type of the json value, for example `getItem<{ name: string }>({ hashKey })`.
  * The library never checks `T` against the stored item.
  */
 export type ReadItem<T = never> = ItemKey &
@@ -175,30 +171,53 @@ export type ReadItem<T = never> = ItemKey &
 		version: number;
 	};
 
+/**
+ * One item of a read with a projection: the flat record of the projection in `data`. The record holds
+ * only what the projection names. `kind` tells this shape from a complete item, so code that does not
+ * know the request can still handle the item with `switch (item.kind)`. A record field named `kind`
+ * causes no confusion, because the record is inside `data`.
+ */
+export type ProjectedReadItem<T = never> = { kind: "projected"; data: CallerType<T, ProjectedItem> };
+
+/**
+ * One item of a read result: the complete item or the projected item. Each shape has `kind` and
+ * `data`, and `kind` tells them apart. `T` types the json value of a complete item and the projected
+ * record.
+ */
+export type ReadResultItem<T = never> = ReadItem<T> | ProjectedReadItem<T>;
+
+/**
+ * Each read method that takes one request has three overloads. TypeScript uses the first that matches:
+ * a request with a projection array gets the projected type, a request with no projection gets the
+ * complete type, and a request whose projection can be `undefined` gets the union of both.
+ */
 export interface ItemGetter {
-	getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T>>;
+	getItem<T = never>(opts: GetItemProjectedOptions): Promise<GetItemProjectedResult<T>>;
+	getItem<T = never>(opts: GetItemOptions & { projection?: undefined }): Promise<GetItemResult<T>>;
+	getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T> | GetItemProjectedResult<T>>;
 }
 
 export type GetItemOptions = {
 	hashKey: HashKey;
 	sortKey?: SortKey;
-	/** The read returns a flat record in `data`, with `kind: "projected"`, in place of the complete item. */
+	/** The read returns `ProjectedReadItem` in place of the complete item. */
 	projection?: readonly ProjectionExpression[];
 };
 
-// Public result surfaced by FokosDB.getItem. The keys are the caller's own, and db.ts has parsed json
-// text into a JsonValue. The DO's counterpart is GetItemRpcResponse, which carries no keys at all.
-export type GetItemResult<T = never> =
-	| {
-			found: true;
-			item: ReadItem<T>;
-			meta: SinglePartitionMeta;
-	  }
-	| {
-			found: false;
-			item: ItemKey;
-			meta: SinglePartitionMeta;
-	  };
+/** A `getItem` request that carries a projection. The projected overload resolves on this type. */
+export type GetItemProjectedOptions = GetItemOptions & { projection: readonly ProjectionExpression[] };
+
+/** The public result of `getItem`. `item` is absent when the item does not exist. */
+export type GetItemResult<T = never> = {
+	item?: ReadItem<T>;
+	meta: SinglePartitionMeta;
+};
+
+/** The public result of a projected `getItem`. `item` is absent when the item does not exist. */
+export type GetItemProjectedResult<T = never> = {
+	item?: ProjectedReadItem<T>;
+	meta: SinglePartitionMeta;
+};
 
 /** One partition that ran a request. */
 export type PartitionMeta = {
@@ -268,9 +287,11 @@ export type SortKeyCondition =
 			upper?: { value: SortKey; inclusive: boolean };
 	  };
 
+/** The overloads follow the rule of `ItemGetter`. */
 export interface ItemQuerier {
 	queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
-	queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T>>;
+	queryItems<T = never>(opts: QueryItemsOptions & { projection?: undefined }): Promise<QueryItemsResult<T>>;
+	queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T> | QueryItemsProjectedResult<T>>;
 }
 
 /** The selection of a queryItems page: materialized items, or the matched count only. */
@@ -293,7 +314,7 @@ export type QueryItemsOptions = {
 	 * matched count of the page.
 	 */
 	filter?: ConditionExpression;
-	/** The page returns a flat record for each item in place of the complete item. It is not valid with `select: "count"`. */
+	/** The page returns a `ProjectedReadItem` for each item in place of the complete item. It is not valid with `select: "count"`. */
 	projection?: readonly ProjectionExpression[];
 };
 
@@ -303,12 +324,8 @@ export type QueryItemsProjectedOptions = QueryItemsOptions & {
 	select?: "projection";
 };
 
-/**
- * The `queryItems` result of a projected request: one flat record per item, by resolved name. The page
- * keeps bare records, because a projected request projects every item of the page, and its overload
- * therefore types every element exactly.
- */
-export type QueryItemsProjectedResult<T = never> = QueryItemsPage<CallerType<T, ProjectedItem>>;
+/** The `queryItems` and `scanItems` result of a projected request: one `ProjectedReadItem` for each item. */
+export type QueryItemsProjectedResult<T = never> = QueryItemsPage<ProjectedReadItem<T>>;
 
 // One page of a query, around whichever element the request asks for. Only that element differs
 // between a complete page and a projected one, so the counts, the cursor, and the metas are declared
@@ -347,9 +364,11 @@ export type GsiQueryItemsResult<T = never> = QueryItemsPage<GsiReadItem<T>>;
 /** The read view of one GSI of a table. */
 export interface FokosGsi {
 	queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
-	queryItems<T = never>(opts: QueryItemsOptions): Promise<GsiQueryItemsResult<T>>;
+	queryItems<T = never>(opts: QueryItemsOptions & { projection?: undefined }): Promise<GsiQueryItemsResult<T>>;
+	queryItems<T = never>(opts: QueryItemsOptions): Promise<GsiQueryItemsResult<T> | QueryItemsProjectedResult<T>>;
 	scanItems<T = never>(opts: GsiScanItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
-	scanItems<T = never>(opts: GsiScanItemsOptions): Promise<GsiQueryItemsResult<T>>;
+	scanItems<T = never>(opts: GsiScanItemsOptions & { projection?: undefined }): Promise<GsiQueryItemsResult<T>>;
+	scanItems<T = never>(opts: GsiScanItemsOptions): Promise<GsiQueryItemsResult<T> | QueryItemsProjectedResult<T>>;
 }
 
 // ─── scanItems public API ─────────────────────────────────────────────────────

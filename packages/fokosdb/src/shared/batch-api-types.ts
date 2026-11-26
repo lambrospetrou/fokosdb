@@ -8,7 +8,7 @@ import type { FokosErrorCode } from "./errors-operations.js";
 import type { ConditionExpression, ProjectionExpression } from "./expression/types.js";
 import type { JsonComposite } from "./json-types.js";
 import type { ConditionFailedReason } from "./transaction-api-types.js";
-import type { FokosMeta, HashKey, ItemKey, ReadItem, ReturnValuesOnConditionCheckFailure, SortKey } from "./types.js";
+import type { FokosMeta, HashKey, ItemKey, ReadResultItem, ReturnValuesOnConditionCheckFailure, SortKey } from "./types.js";
 import type { FokosPlatform } from "./platform.js";
 
 /** One key of `batchGetItems`. Its projection replaces the projection of the request. */
@@ -37,15 +37,17 @@ export type BatchUnprocessedCode = FokosErrorCode | "response_too_large";
  * The answer for one key of `batchGetItems`. `partitionIndex` is the index of the partition of the
  * item in `meta.partitions`. It is absent when no partition answered for the item.
  *
- * - `found` and `not_found`: the read answered with the committed state of the item.
+ * - `ok`: the read answered with the committed state of the item. `item` is absent when the item does not exist.
  * - `unprocessed`: the read did not answer. Send the key again. Only `response_too_large` has no `error_id`.
  * - `rejected`: the same key fails the same way again, for example with a projection that is not valid.
+ *
+ * The failure variants declare `item?: never`, so `if (r.item)` is the one check for a found item. No
+ * entry holds the keys of the request: `items[i]` answers `items[i]` of the request.
  */
 export type BatchGetItemResult<T = never> =
-	| ({ outcome: "found"; partitionIndex: number } & ReadItem<T>)
-	| ({ outcome: "not_found"; partitionIndex: number } & ItemKey)
-	| ({ outcome: "rejected"; code: FokosErrorCode; error_id: string; partitionIndex?: number } & ItemKey)
-	| ({ outcome: "unprocessed"; code: BatchUnprocessedCode; error_id?: string; partitionIndex?: number } & ItemKey);
+	| { outcome: "ok"; partitionIndex: number; item?: ReadResultItem<T> }
+	| { outcome: "rejected"; code: FokosErrorCode; error_id: string; partitionIndex?: number; item?: never }
+	| { outcome: "unprocessed"; code: BatchUnprocessedCode; error_id?: string; partitionIndex?: number; item?: never };
 
 export type BatchGetItemsResult<Ts extends readonly unknown[] = never[]> = {
 	/** `items[i]` answers `items[i]` of the request, with the type `Ts[i]`. */

@@ -61,7 +61,7 @@ describe("FokosDB — the client sends expression trees", () => {
 		await db.transactWriteItems({ items: [{ ...key, operation: "update", condition, update }] });
 		const read = await db.transactGetItems({ items: [{ ...key, projection }] });
 
-		expect(read.items[0]).toMatchObject({ found: true, data: { "$.count": 1 } });
+		expect(read.items[0]).toEqual({ partitionIndex: 0, item: { kind: "projected", data: { "$.count": 1 } } });
 		const [write] = await txCalls(db, [key], "txExecuteSingleShot");
 		expect(write.items[0]).toMatchObject({ condition, update });
 		expect(write.items[0].condition).toEqual(condition);
@@ -99,7 +99,7 @@ describe("FokosDB — the client validates and does not compile", () => {
 			fokosErrorWith("expression_invalid", { expressionCode: "sql_limit" }),
 		);
 
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: { state: "open" }, version: 1 } });
+		expect(await db.getItem(key)).toMatchObject({ item: { data: { state: "open" }, version: 1 } });
 	});
 });
 
@@ -115,7 +115,7 @@ describe("transactWriteItems — a broken expression from a caller that does not
 			]),
 		).rejects.toThrow(fokosErrorWith("expression_invalid", { expressionCode: "invalid_ast" }));
 
-		expect(await db.getItem(a)).toMatchObject({ found: false });
+		expect((await db.getItem(a)).item).toBeUndefined();
 		await db.putItem({ ...a, data: "after" });
 	});
 
@@ -133,9 +133,9 @@ describe("transactWriteItems — a broken expression from a caller that does not
 			outcome: "rejected",
 			reason: { code: "expression_invalid" },
 		});
-		expect(await db.getItem(a)).toMatchObject({ found: false });
+		expect((await db.getItem(a)).item).toBeUndefined();
 		await db.putItem({ ...a, data: "after" });
-		expect(await db.getItem(a)).toMatchObject({ found: true, item: { data: "after", version: 1 } });
+		expect(await db.getItem(a)).toMatchObject({ item: { data: "after", version: 1 } });
 	});
 });
 
@@ -164,7 +164,7 @@ describe("transactWriteItems — expression trees in the coordinator request", (
 		]);
 
 		expect(response).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(a)).toMatchObject({ found: true, item: { data: { state: "open", count: 2 }, version: 2 } });
+		expect(await db.getItem(a)).toMatchObject({ item: { data: { state: "open", count: 2 }, version: 2 } });
 	});
 
 	it("cancels a transaction whose tree does not compile, with the expression error as the reason, and releases the locks", async () => {
@@ -182,8 +182,8 @@ describe("transactWriteItems — expression trees in the coordinator request", (
 			reason: { code: "expression_invalid" },
 		});
 		// No lock stays on the other participant: a write with no transaction is accepted at once.
-		expect(await db.getItem(a)).toMatchObject({ found: false });
+		expect((await db.getItem(a)).item).toBeUndefined();
 		await db.putItem({ ...a, data: "after" });
-		expect(await db.getItem(a)).toMatchObject({ found: true, item: { data: "after", version: 1 } });
+		expect(await db.getItem(a)).toMatchObject({ item: { data: "after", version: 1 } });
 	});
 });

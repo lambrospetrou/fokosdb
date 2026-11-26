@@ -52,7 +52,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			}
 		}
 		for (const key of keys) {
-			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data } });
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data } });
 		}
 	});
 
@@ -86,7 +86,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		expect(replay).toMatchObject({ outcome: "committed" });
 		// Read-your-writes: every written key, on every participant, returns the new value.
 		for (const key of keys) {
-			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: `data-${key.hashKey}` } });
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: `data-${key.hashKey}` } });
 		}
 	});
 
@@ -114,7 +114,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay).toMatchObject({ outcome: "committed" });
 		for (const key of keys) {
-			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: `data-${key.hashKey}` } });
+			await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: `data-${key.hashKey}` } });
 		}
 	});
 
@@ -150,7 +150,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		// makes every non-transactional write to the key throw. Reads still answer committed state,
 		// which proves the cancelled put applied nothing.
 		await expect(db.putItem({ ...lockedKey, data: "blocked" })).rejects.toThrow(fokosErrorWith("item_locked_by_transaction"));
-		await expect(db.getItem(lockedKey)).resolves.toMatchObject({ found: false });
+		expect((await db.getItem(lockedKey)).item).toBeUndefined();
 
 		await reachable();
 		// The stale-transaction alarm releases the lock once it ages past the stale threshold,
@@ -164,7 +164,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			},
 			{ timeout: 10_000, interval: 100 },
 		);
-		await expect(db.getItem(lockedKey)).resolves.toMatchObject({ found: true, item: { data: "after-release" } });
+		await expect(db.getItem(lockedKey)).resolves.toMatchObject({ item: { data: "after-release" } });
 	});
 
 	/**

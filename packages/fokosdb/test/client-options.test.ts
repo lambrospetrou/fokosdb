@@ -50,7 +50,7 @@ describe("FokosDB — key size limits of a table", () => {
 		const hashKey = "h".repeat(MAX_HASH_KEY_BYTES + 100);
 
 		await db.putItem({ hashKey, sortKey: "sk", data: "value" });
-		await expect(db.getItem({ hashKey, sortKey: "sk" })).resolves.toMatchObject({ found: true, item: { data: "value" } });
+		await expect(db.getItem({ hashKey, sortKey: "sk" })).resolves.toMatchObject({ item: { data: "value" } });
 
 		// The same table with the default limits: the client refuses the key before any RPC.
 		const defaults = makeDB({ tableName });

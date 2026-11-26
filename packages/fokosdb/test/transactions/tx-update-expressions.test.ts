@@ -40,7 +40,7 @@ describe("transactions - an update plan at the binding limit", () => {
 
 		expect(res).toMatchObject({ outcome: "committed" });
 		const got = await db.getItem(key);
-		invariant(got.found, "expected the updated item");
+		invariant(got.item, "expected the updated item");
 		expect(Object.keys(got.item.data as Record<string, unknown>)).toHaveLength(EXPRESSION_LIMITS.updateActions);
 		expect(got.item.ttlAt).toBe(ttlAt);
 	});
@@ -95,7 +95,7 @@ describe("transactions - an update plan at the SQL limit", () => {
 			const res = await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "update", update: counters(largest) }] });
 			expect(res).toMatchObject({ outcome: "committed" });
 			const got = await db.getItem(key);
-			invariant(got.found, "expected the updated item");
+			invariant(got.item, "expected the updated item");
 			expect(got.item.data).toMatchObject({ c0: 5 + additions(0, largest), [`c${ACTIONS - 1}`]: additions(ACTIONS - 1, largest) });
 
 			const refused = await writeOutcome(
@@ -135,7 +135,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
-			found: true,
 			item: {
 				version: 2,
 				data: { b: 1, c: 2 },
@@ -158,7 +157,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
-			found: true,
 			item: {
 				version: 2,
 				data: { r: ["c", "s", "x"] },
@@ -208,13 +206,13 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		expect(await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "update", update, ttlAt }] })).toMatchObject({
 			outcome: "committed",
 		});
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1, data: { visits: 1 }, ttlAt } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 1, data: { visits: 1 }, ttlAt } });
 
 		// The second call finds the item the first one created, so the same expression increments it.
 		expect(await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "update", update }] })).toMatchObject({
 			outcome: "committed",
 		});
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 2, data: { visits: 2 } } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 2, data: { visits: 2 } } });
 	});
 
 	it("creates an absent item and updates an existing one in the same transaction", async () => {
@@ -237,8 +235,8 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 
 		// The whole result is the message, so that a cancel shows the reason of each operation.
 		expect(res).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(existing)).toMatchObject({ found: true, item: { version: 2, data: { n: 11 } } });
-		expect(await db.getItem(absent)).toMatchObject({ found: true, item: { version: 1, data: { n: 10 } } });
+		expect(await db.getItem(existing)).toMatchObject({ item: { version: 2, data: { n: 11 } } });
+		expect(await db.getItem(absent)).toMatchObject({ item: { version: 1, data: { n: 10 } } });
 	});
 
 	// A condition is how a caller keeps an update from creating the item. It is evaluated against the
@@ -275,7 +273,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			results: [{ outcome: "rejected", reason: { code: "condition_failed", hashKey: key.hashKey } }],
 		});
 		// Nothing at all was written: not the item, and not an empty document.
-		expect(await db.getItem(key)).toMatchObject({ found: false });
+		expect((await db.getItem(key)).item).toBeUndefined();
 	});
 
 	// The contrast that makes the cases above meaningful: the condition is what stops the creation, so
@@ -289,7 +287,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		});
 
 		expect(res).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1, data: { x: 1 } } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 1, data: { x: 1 } } });
 	});
 
 	it("rejects a create whose set target has no parent in the empty document", async () => {
@@ -308,7 +306,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			outcome: "cancelled",
 			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
 		});
-		expect(await db.getItem(key)).toMatchObject({ found: false });
+		expect((await db.getItem(key)).item).toBeUndefined();
 	});
 
 	it("rejects update with update_not_applicable on missing parent or index past end", async () => {
@@ -409,7 +407,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		});
 
 		// Neither rejection wrote anything.
-		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { version: 1, data: { big: 1e308 } } });
+		await expect(db.getItem(key)).resolves.toMatchObject({ item: { version: 1, data: { big: 1e308 } } });
 	});
 
 	it("remove on missing path is a no-op that still increments version", async () => {
@@ -424,7 +422,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
-			found: true,
 			item: {
 				version: 2,
 				data: { existing: "value" },
@@ -456,7 +453,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			],
 		});
 		await expect(db.getItem(key1)).resolves.toMatchObject({
-			found: true,
 			item: { ttlAt: seededTtl },
 		});
 
@@ -472,7 +468,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			],
 		});
 		await expect(db.getItem(key2)).resolves.toMatchObject({
-			found: true,
 			item: { ttlAt: replacedTtl },
 		});
 	});
@@ -559,9 +554,9 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		});
 		expect(res).toMatchObject({ outcome: "committed" });
 
-		await expect(db.getItem(kPut)).resolves.toMatchObject({ found: true, item: { data: { created: true } } });
-		await expect(db.getItem(kUpdate)).resolves.toMatchObject({ found: true, item: { data: { num: 15 } } });
-		await expect(db.getItem(kDel)).resolves.toMatchObject({ found: false });
-		await expect(db.getItem(kCheck)).resolves.toMatchObject({ found: true });
+		await expect(db.getItem(kPut)).resolves.toMatchObject({ item: { data: { created: true } } });
+		await expect(db.getItem(kUpdate)).resolves.toMatchObject({ item: { data: { num: 15 } } });
+		expect((await db.getItem(kDel)).item).toBeUndefined();
+		await expect(db.getItem(kCheck)).resolves.toMatchObject({ item: expect.any(Object) });
 	});
 });

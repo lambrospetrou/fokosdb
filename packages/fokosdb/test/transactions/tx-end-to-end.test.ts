@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../../src/client/db.js";
 import invariant from "../../src/shared/invariant.js";
-import type { ConditionExpression } from "../../src/shared/types.js";
+import type { ConditionExpression, ReadItem } from "../../src/shared/types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
@@ -81,7 +81,7 @@ describe("write conditions", () => {
 
 		await expect(db.putItem({ ...key, data: { status: "overwritten" }, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.deleteItem({ ...key, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
-		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "active" }, version } });
+		await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: { status: "active" }, version } });
 	});
 
 	it("applies the constant conditions to present and missing items", async () => {
@@ -93,8 +93,8 @@ describe("write conditions", () => {
 		await expect(db.putItem({ ...present, data: "v2", condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.deleteItem({ ...present, condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
-		await expect(db.getItem(present)).resolves.toMatchObject({ found: true, item: { data: "v1", version } });
-		await expect(db.getItem(missing)).resolves.toMatchObject({ found: false });
+		await expect(db.getItem(present)).resolves.toMatchObject({ item: { data: "v1", version } });
+		expect((await db.getItem(missing)).item).toBeUndefined();
 
 		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "true" } })).resolves.toMatchObject({ version: expect.any(Number) });
 	});
@@ -134,8 +134,8 @@ describe("transactions - end-to-end", () => {
 
 		for (const key of preExistingKeys) {
 			const result = await db.getItem(key);
-			expect(result.found).toBe(true);
-			if (result.found) {
+			expect(result.item).toBeDefined();
+			if (result.item) {
 				expect(result.item.data).toBe(`original-${key.hashKey}`);
 				expect(result.item.version).toBe(1);
 			}
@@ -169,16 +169,16 @@ describe("transactions - end-to-end", () => {
 
 		for (let i = 0; i < 10; i++) {
 			const result = await db.getItem(preExistingKeys[i]);
-			expect(result.found).toBe(true);
-			invariant(result.found);
+			expect(result.item).toBeDefined();
+			invariant(result.item);
 			expect(result.item.data).toBe(`tx-updated-${i}`);
 			expect(result.item.version).toBe(2);
 		}
 
 		for (let i = 10; i < 100; i++) {
 			const result = await db.getItem({ hashKey: `tx-hk-${i}`, sortKey: `tx-sk-${i}` });
-			expect(result.found).toBe(true);
-			invariant(result.found);
+			expect(result.item).toBeDefined();
+			invariant(result.item);
 			expect(result.item.data).toBe(`tx-data-${i}`);
 			expect(result.item.version).toBe(1);
 		}
@@ -222,14 +222,14 @@ describe("transactions - end-to-end", () => {
 		// All 5 original items must be untouched — still version 1, original data.
 		for (let i = 0; i < 5; i++) {
 			const result = await db.getItem({ hashKey: `atom-${i}` });
-			invariant(result.found);
+			invariant(result.item);
 			expect(result.item.data).toBe(`v1-${i}`);
 			expect(result.item.version).toBe(1);
 		}
 
 		// The non-existent item must still not exist.
 		const missing = await db.getItem({ hashKey: "atom-nonexistent" });
-		expect(missing.found).toBe(false);
+		expect(missing.item).toBeUndefined();
 	});
 
 	it("a check with a constant condition commits on true and cancels on false", async () => {
@@ -244,15 +244,15 @@ describe("transactions - end-to-end", () => {
 		expect(cancelled).toMatchObject({ outcome: "cancelled" });
 		invariant(cancelled.outcome === "cancelled");
 		expect(cancelled.results.at(-1)).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
-		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ found: false });
+		expect((await db.getItem({ hashKey: putKey })).item).toBeUndefined();
 
 		vi.advanceTimersByTime(1);
 		const committed = await writeOutcomeWithClockRetry(db, {
 			items: [{ hashKey: putKey, operation: "put" as const, data: "committed" }, check({ op: "true" })],
 		});
 		expect(committed).toMatchObject({ outcome: "committed" });
-		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ found: true, item: { data: "committed" } });
-		await expect(db.getItem({ hashKey: checkKey })).resolves.toMatchObject({ found: false });
+		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ item: { data: "committed" } });
+		expect((await db.getItem({ hashKey: checkKey })).item).toBeUndefined();
 	});
 
 	it("atomicity: condition failure across partitions — no partial writes", async () => {
@@ -283,8 +283,8 @@ describe("transactions - end-to-end", () => {
 
 		for (const k of keys) {
 			const result = await db.getItem(k);
-			expect(result.found).toBe(true);
-			if (result.found) {
+			expect(result.item).toBeDefined();
+			if (result.item) {
 				expect(result.item.data).toBe("original");
 				expect(result.item.version).toBe(1);
 			}
@@ -321,35 +321,35 @@ describe("transactions - end-to-end", () => {
 			// The transaction must have committed cleanly.
 			expect(tx).toMatchObject({ outcome: "committed" });
 			const shared = await db.getItem({ hashKey: "iso-shared" });
-			expect(shared.found).toBe(true);
-			invariant(shared.found);
+			expect(shared.item).toBeDefined();
+			invariant(shared.item);
 			expect(shared.item.data).toBe("tx-shared");
 			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
-			expect(txOnly.found).toBe(true);
-			invariant(txOnly.found);
+			expect(txOnly.item).toBeDefined();
+			invariant(txOnly.item);
 			expect(txOnly.item.data).toBe("tx-only-data");
 		} else if (tx.outcome === "cancelled") {
 			// putItem landed at or after the transaction's timestamp → timestamp_conflict.
 			expect(tx.results[0]).toMatchObject({ outcome: "rejected", reason: { code: "timestamp_conflict" } });
 			// Atomicity: the transaction's private write must not have landed.
 			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
-			expect(txOnly.found).toBe(false);
+			expect(txOnly.item).toBeUndefined();
 			// The shared key reflects only the non-tx write.
 			const shared = await db.getItem({ hashKey: "iso-shared" });
-			expect(shared.found).toBe(true);
-			invariant(shared.found);
+			expect(shared.item).toBeDefined();
+			invariant(shared.item);
 			expect(shared.item.data).toBe("non-tx-write");
 		} else {
 			// putItem landed strictly before the transaction stamped its own timestamp, so the
 			// transaction orders after it and commits over it. The clock advances with real time here,
 			// so which of the two branches runs depends on how the race lands.
 			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
-			expect(txOnly.found).toBe(true);
-			invariant(txOnly.found);
+			expect(txOnly.item).toBeDefined();
+			invariant(txOnly.item);
 			expect(txOnly.item.data).toBe("tx-only-data");
 			const shared = await db.getItem({ hashKey: "iso-shared" });
-			expect(shared.found).toBe(true);
-			invariant(shared.found);
+			expect(shared.item).toBeDefined();
+			invariant(shared.item);
 			expect(shared.item.data).toBe("tx-shared");
 		}
 	});
@@ -396,32 +396,32 @@ describe("transactions - end-to-end", () => {
 
 		// The cancelled transaction's unique item must not exist (atomicity).
 		if (tx1?.outcome === "cancelled") {
-			expect((await db.getItem({ hashKey: "c-only-a" })).found).toBe(false);
+			expect((await db.getItem({ hashKey: "c-only-a" })).item).toBeUndefined();
 		}
 		if (tx2?.outcome === "cancelled") {
-			expect((await db.getItem({ hashKey: "c-only-b" })).found).toBe(false);
+			expect((await db.getItem({ hashKey: "c-only-b" })).item).toBeUndefined();
 		}
 
 		// The winner's unique item must carry the transaction data.
 		if (tx1?.outcome === "committed") {
 			const a = await db.getItem({ hashKey: "c-only-a" });
-			expect(a.found).toBe(true);
-			if (a.found) {
+			expect(a.item).toBeDefined();
+			if (a.item) {
 				expect(a.item.data).toBe("tx1-a");
 			}
 		}
 		if (tx2?.outcome === "committed") {
 			const b = await db.getItem({ hashKey: "c-only-b" });
-			expect(b.found).toBe(true);
-			if (b.found) {
+			expect(b.item).toBeDefined();
+			if (b.item) {
 				expect(b.item.data).toBe("tx2-b");
 			}
 		}
 
 		// The shared key must reflect the committed transaction(s).
 		const shared = await db.getItem({ hashKey: "c-shared" });
-		expect(shared.found).toBe(true);
-		invariant(shared.found);
+		expect(shared.item).toBeDefined();
+		invariant(shared.item);
 		if (outcomes.filter((o) => o === "committed").length === 1) {
 			const expectedData = tx1?.outcome === "committed" ? "tx1-shared" : "tx2-shared";
 			expect(shared.item.data).toBe(expectedData);
@@ -504,8 +504,8 @@ describe("transactions - end-to-end", () => {
 
 		// Both applied serially: tx1(v1) → tx2(v2).
 		const result = await db.getItem({ hashKey: "ser-key" });
-		expect(result.found).toBe(true);
-		if (result.found) {
+		expect(result.item).toBeDefined();
+		if (result.item) {
 			expect(result.item.data).toBe(value === tx1 ? "tx1" : "tx2");
 			expect(result.item.version).toBe(2);
 		}
@@ -525,7 +525,7 @@ describe("transactions - end-to-end", () => {
 
 		// Applied one after the other, so the surviving value is one of the two and the item saw two writes.
 		const result = await db.getItem({ hashKey: "ser-fast-key" });
-		invariant(result.found);
+		invariant(result.item);
 		expect(["tx1", "tx2"]).toContain(result.item.data);
 		expect(result.item.version).toBe(2);
 	});
@@ -545,9 +545,9 @@ describe("transactions - end-to-end", () => {
 		const readResult = await db.transactGetItems({ items: keys });
 
 		expect(readResult.items).toHaveLength(10);
-		for (const item of readResult.items) {
-			expect(item.found).toBe(true);
-			invariant(item.found);
+		for (const r of readResult.items) {
+			const item = r.item as ReadItem | undefined;
+			invariant(item);
 			const hashKey = item.hashKey;
 			if (typeof hashKey !== "string") {
 				throw new Error("expected a string hash key");
@@ -623,18 +623,13 @@ describe("transactions - end-to-end", () => {
 
 		const readResult = await db.transactGetItems({ items: keys });
 		expect(readResult.items).toHaveLength(keys.length);
-		readResult.items.forEach((item, i) => {
-			expect(item).toMatchObject({
-				hashKey: keys[i].hashKey,
-				sortKey: keys[i].sortKey,
-				found: isWritten(i),
-			});
-		});
-		for (const [i, item] of readResult.items.entries()) {
-			if (item.found) {
-				expect(item.data).toBe(`data-${keys[i].hashKey}`);
+		readResult.items.forEach((r, i) => {
+			if (isWritten(i)) {
+				expect(r.item).toMatchObject({ hashKey: keys[i].hashKey, sortKey: keys[i].sortKey, data: `data-${keys[i].hashKey}` });
+			} else {
+				expect(r.item).toBeUndefined();
 			}
-		}
+		});
 
 		// Two items naming one key are rejected: the two-phase driver pairs the phases by key, so a
 		// duplicate could hand one item the other's record.
@@ -709,9 +704,9 @@ describe("transactions - end-to-end", () => {
 		expect(await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "put", data: "value", ttlAt }] })).toMatchObject({
 			outcome: "committed",
 		});
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "value", ttlAt } });
+		expect(await db.getItem(key)).toMatchObject({ item: { data: "value", ttlAt } });
 		const read = await db.transactGetItems({ items: [key] });
-		expect(read).toMatchObject({ items: [{ found: true, data: "value", ttlAt }] });
+		expect(read).toMatchObject({ items: [{ item: { data: "value", ttlAt } }] });
 	});
 
 	it("includes ttlAt in idempotent transaction identity", async () => {
@@ -726,7 +721,7 @@ describe("transactions - end-to-end", () => {
 		await expect(
 			writeOutcome(db.transactWriteItems({ items: [{ ...operation, ttlAt: ttlAt + 1 }], clientRequestToken: token })),
 		).rejects.toThrow(fokosErrorWith("idempotent_parameter_mismatch"));
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt, version: 1 } });
+		expect(await db.getItem(key)).toMatchObject({ item: { ttlAt, version: 1 } });
 	});
 
 	it("idempotency: retrying transactWriteItems with same clientRequestToken returns same result", async () => {
@@ -749,8 +744,8 @@ describe("transactions - end-to-end", () => {
 
 		// Item was created once by the transaction — version 1, not 2.
 		const item = await db.getItem({ hashKey: "idemp-1" });
-		expect(item.found).toBe(true);
-		invariant(item.found);
+		expect(item.item).toBeDefined();
+		invariant(item.item);
 		expect(item.item.version).toBe(1);
 	});
 
@@ -771,7 +766,7 @@ describe("transactions - end-to-end", () => {
 		const replay = await writeOutcome(db.transactWriteItems({ items: [operation], clientRequestToken: token }));
 
 		expect(replay).toEqual(first);
-		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "updated" }, version: 2 } });
+		await expect(db.getItem(key)).resolves.toMatchObject({ item: { data: { status: "updated" }, version: 2 } });
 	});
 
 	// A token identifies one request, not one caller. Answering a different request with the stored
@@ -807,7 +802,7 @@ describe("transactions - end-to-end", () => {
 
 		// The stored transaction is untouched: still the original value, still version 1.
 		const item = await db.getItem({ hashKey: "mismatch-1" });
-		invariant(item.found);
+		invariant(item.item);
 		expect(item.item.data).toBe("original");
 		expect(item.item.version).toBe(1);
 
@@ -837,19 +832,19 @@ describe("transactions - end-to-end", () => {
 
 		expect(txResult).toMatchObject({ outcome: "committed" });
 
-		expect((await db.getItem({ hashKey: "del-0" })).found).toBe(false);
-		expect((await db.getItem({ hashKey: "del-1" })).found).toBe(false);
-		expect((await db.getItem({ hashKey: "del-4" })).found).toBe(false);
+		expect((await db.getItem({ hashKey: "del-0" })).item).toBeUndefined();
+		expect((await db.getItem({ hashKey: "del-1" })).item).toBeUndefined();
+		expect((await db.getItem({ hashKey: "del-4" })).item).toBeUndefined();
 
 		const item2 = await db.getItem({ hashKey: "del-2" });
-		expect(item2.found).toBe(true);
-		invariant(item2.found);
+		expect(item2.item).toBeDefined();
+		invariant(item2.item);
 		expect(item2.item.data).toBe("updated");
 		expect(item2.item.version).toBe(2);
 
 		const item3 = await db.getItem({ hashKey: "del-3" });
-		expect(item3.found).toBe(true);
-		invariant(item3.found);
+		expect(item3.item).toBeDefined();
+		invariant(item3.item);
 		expect(item3.item.data).toBe("updated");
 		expect(item3.item.version).toBe(2);
 	});
@@ -876,8 +871,8 @@ describe("transactions - end-to-end", () => {
 		expect(txResult).toMatchObject({ outcome: "cancelled" });
 
 		const result = await db.getItem({ hashKey: "rollback-put" });
-		expect(result.found).toBe(true);
-		invariant(result.found);
+		expect(result.item).toBeDefined();
+		invariant(result.item);
 		expect(result.item.data).toBe("original");
 		expect(result.item.version).toBe(version);
 	});
@@ -953,6 +948,6 @@ describe("transactions - end-to-end", () => {
 		const rerouted = await writeOutcome(db3.transactWriteItems({ items: [operation], clientRequestToken: token }));
 		expect(rerouted).toMatchObject({ outcome: "committed" });
 		expect(rerouted.transactionId).not.toBe(first.transactionId);
-		await expect(db3.getItem({ hashKey: operation.hashKey })).resolves.toMatchObject({ found: true, item: { version: 2 } });
+		await expect(db3.getItem({ hashKey: operation.hashKey })).resolves.toMatchObject({ item: { version: 2 } });
 	});
 });

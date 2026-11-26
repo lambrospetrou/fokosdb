@@ -35,7 +35,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			},
 			() => db.transactGetItems({ items: [key] }),
 		);
-		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ item: { data: "value", version: 1 } }] });
 	});
 
 	it("a pending check on the item does not abort the read", async () => {
@@ -46,7 +46,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const release = await holdPendingLock(db, key, { operation: "check", condition: itemExists() });
 		try {
 			const result = await db.transactGetItems({ items: [key] });
-			expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
+			expect(result).toMatchObject({ items: [{ item: { data: "value", version: 1 } }] });
 		} finally {
 			await release();
 		}
@@ -133,7 +133,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			},
 			() => db.transactGetItems({ items: [key] }),
 		);
-		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ item: { data: "value", version: 1 } }] });
 	});
 
 	it("a TTL sweep between the phases does not abort the read", async () => {
@@ -153,7 +153,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			},
 			() => db.transactGetItems({ items: [key] }),
 		);
-		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ item: { data: "value", version: 1 } }] });
 	});
 
 	it("a user delete in a different partition does not abort the read", async () => {
@@ -171,7 +171,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			},
 			() => db.transactGetItems({ items: [key] }),
 		);
-		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ item: { data: "value", version: 1 } }] });
 	});
 
 	it("the single-partition read fast path applies the same pending-lock classification", async () => {
@@ -186,10 +186,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const releaseCheck = await holdPendingLock(db, key, { operation: "check", condition: itemExists() });
 		try {
 			const result = await db.transactGetItems({ items: [key, sibling] });
-			expect(result.items).toMatchObject([
-				{ found: true, data: "value" },
-				{ found: true, data: "sibling" },
-			]);
+			expect(result.items).toMatchObject([{ item: { data: "value" } }, { item: { data: "sibling" } }]);
 		} finally {
 			await releaseCheck();
 		}

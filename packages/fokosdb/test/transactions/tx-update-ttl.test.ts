@@ -35,7 +35,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		await db.putItem({ ...key, data: { n: 1 } });
 
 		expect(await update(key, setTtl({ val: ttlAt }))).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 2, ttlAt, data: { n: 1 } } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 2, ttlAt, data: { n: 1 } } });
 	});
 
 	it("extends the stored TTL and changes the data in the same write", async () => {
@@ -48,7 +48,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 			{ action: "set", target: TTL, value: add(TTL, 3600) },
 		]);
 		expect(res).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt: ttlAt + 3600, data: { renewals: 1 } } });
+		expect(await db.getItem(key)).toMatchObject({ item: { ttlAt: ttlAt + 3600, data: { renewals: 1 } } });
 	});
 
 	it("rejects with update_not_applicable when the item has no TTL to extend", async () => {
@@ -56,7 +56,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		await db.putItem({ ...key, data: {} });
 
 		expect(await update(key, setTtl(add(TTL, 3600)))).toMatchObject(rejected(key, "update_not_applicable"));
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1 } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 1 } });
 	});
 
 	it("sets a TTL with if_not_exists on an item with no TTL and on an item with a TTL", async () => {
@@ -69,8 +69,8 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 
 		expect(await update(without, actions)).toMatchObject({ outcome: "committed" });
 		expect(await update(withTtl, actions)).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(without)).toMatchObject({ found: true, item: { ttlAt: start + 60 } });
-		expect(await db.getItem(withTtl)).toMatchObject({ found: true, item: { ttlAt: start + 1060 } });
+		expect(await db.getItem(without)).toMatchObject({ item: { ttlAt: start + 60 } });
+		expect(await db.getItem(withTtl)).toMatchObject({ item: { ttlAt: start + 1060 } });
 	});
 
 	it("copies a TTL from a document attribute", async () => {
@@ -79,7 +79,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		await db.putItem({ ...key, data: { expiresAt } });
 
 		expect(await update(key, setTtl({ ref: "data", path: "$.expiresAt" }))).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt: expiresAt } });
+		expect(await db.getItem(key)).toMatchObject({ item: { ttlAt: expiresAt } });
 	});
 
 	it.each([
@@ -96,7 +96,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		await db.putItem({ ...key, data: { expiresAt }, ttlAt });
 
 		expect(await update(key, setTtl({ ref: "data", path: "$.expiresAt" }))).toMatchObject(rejected(key, "update_ttl_invalid"));
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1, ttlAt } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 1, ttlAt } });
 	});
 
 	it("rejects with update_value_is_bytes when the value is bytes for this item", async () => {
@@ -107,7 +107,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		const value: ExpressionValue = { fn: "sqlite.coalesce", args: [{ fn: "sqlite.unhex", args: [{ val: "01" }] }, TTL] };
 
 		expect(await update(key, setTtl(value))).toMatchObject(rejected(key, "update_value_is_bytes"));
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1, ttlAt } });
+		expect(await db.getItem(key)).toMatchObject({ item: { version: 1, ttlAt } });
 	});
 
 	it("removes the TTL, and a remove on an item with no TTL changes only the version", async () => {
@@ -121,7 +121,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		expect(await update(without, actions)).toMatchObject({ outcome: "committed" });
 		for (const key of [withTtl, without]) {
 			const got = await db.getItem(key);
-			invariant(got.found, "expected the item");
+			invariant(got.item, "expected the item");
 			expect(got.item).toMatchObject({ version: 2, data: { a: 1 } });
 			expect(got.item.ttlAt).toBeUndefined();
 		}
@@ -131,11 +131,11 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		const created = newKey("absent-literal");
 		const ttlAt = nowSec() + 3600;
 		expect(await update(created, setTtl({ val: ttlAt }))).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(created)).toMatchObject({ found: true, item: { version: 1, ttlAt, data: {} } });
+		expect(await db.getItem(created)).toMatchObject({ item: { version: 1, ttlAt, data: {} } });
 
 		const absent = newKey("absent-read");
 		expect(await update(absent, setTtl(add(TTL, 60)))).toMatchObject(rejected(absent, "update_not_applicable"));
-		expect(await db.getItem(absent)).toMatchObject({ found: false });
+		expect((await db.getItem(absent)).item).toBeUndefined();
 	});
 
 	it("refuses the ttlAt field and an action on ttlAt in one operation before any I/O", async () => {
@@ -143,7 +143,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 		await expect(
 			db.transactWriteItems({ items: [{ ...key, operation: "update", ttlAt: nowSec() + 60, update: setTtl({ val: nowSec() + 3600 }) }] }),
 		).rejects.toThrow(fokosErrorWith("transact_operation_fields_invalid"));
-		expect(await db.getItem(key)).toMatchObject({ found: false });
+		expect((await db.getItem(key)).item).toBeUndefined();
 	});
 
 	it("reads ttlAt after a put of the same item in an ordered_per_item transaction", async () => {
@@ -157,7 +157,7 @@ describe.each([true, false])("transactions - an update action on ttlAt (singlePa
 			],
 		});
 		expect(res).toMatchObject({ outcome: "committed" });
-		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt: ttlAt + 10, data: { a: 1 } } });
+		expect(await db.getItem(key)).toMatchObject({ item: { ttlAt: ttlAt + 10, data: { a: 1 } } });
 	});
 
 	it("the TTL sweep deletes an item after the TTL that an update computed", async () => {
