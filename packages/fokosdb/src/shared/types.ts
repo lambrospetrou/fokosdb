@@ -36,6 +36,9 @@ export type DataKind = (typeof DATA_KINDS)[number]; // "bytes" | "text" | "json"
  */
 export type ReturnValuesOnConditionCheckFailure = "none" | "all_old";
 
+/** What a `putItem` or `deleteItem` that succeeds returns in `item`: nothing, or the old item. */
+export type ReturnValues = "none" | "all_old";
+
 /**
  * Empty by default, so `HashKey`/`SortKey` below are `string | Uint8Array` for every caller. An
  * application that only ever uses one of the two can narrow both across its whole codebase — every
@@ -99,11 +102,11 @@ export type DecodedItemData<T = never> =
 	| { kind: "json"; data: CallerType<T, JsonValue> };
 
 export interface ItemPutter {
-	putItem(opts: PutItemOptions): Promise<PutItemResult>;
+	putItem<T = never>(opts: PutItemOptions): Promise<PutItemResult<T>>;
 }
 
 export interface ItemDeleter {
-	deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult>;
+	deleteItem<T = never>(opts: DeleteItemOptions): Promise<DeleteItemResult<T>>;
 }
 
 export type PutItemOptions = {
@@ -118,6 +121,9 @@ export type PutItemOptions = {
 	condition?: ConditionExpression;
 
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+
+	/** With "all_old", the result has the old item in `item`, when one existed. Defaults to "none". */
+	returnValues?: ReturnValues;
 };
 
 export type DeleteItemOptions = {
@@ -127,6 +133,9 @@ export type DeleteItemOptions = {
 	condition?: ConditionExpression;
 
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+
+	/** With "all_old", the result has the deleted item in `item`, when one existed. Defaults to "none". */
+	returnValues?: ReturnValues;
 };
 
 export type ItemKey = {
@@ -134,14 +143,20 @@ export type ItemKey = {
 	sortKey?: SortKey;
 };
 
-export type PutItemResult = {
-	item: ItemKey;
+/**
+ * The result of `putItem`. `item` is the old item, present only with `returnValues: "all_old"` when an
+ * old item existed. `T` is the caller's own type of its json value. The result has no keys: the caller
+ * has them.
+ */
+export type PutItemResult<T = never> = {
+	item?: ReadItem<T>;
 	version: number;
 	meta: SinglePartitionMeta;
 };
 
-export type DeleteItemResult = {
-	item: ItemKey;
+/** The result of `deleteItem`. `item` is as in `PutItemResult`. `deleted` tells whether an item existed. */
+export type DeleteItemResult<T = never> = {
+	item?: ReadItem<T>;
 	deleted: boolean;
 	meta: SinglePartitionMeta;
 };

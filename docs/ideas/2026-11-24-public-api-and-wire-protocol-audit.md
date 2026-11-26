@@ -61,8 +61,9 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 6. **No single-item `updateItem` method** (`client/db.ts`).
    `UpdateExpression` exists only in `transactWriteItems`. A single-item update must use a one-item transaction, returns no `version`, and raises `FokosTransactionCancelledError` instead of single-item errors.
 
-7. **No `returnValues` option on successful writes** (`shared/types.ts`, `shared/transaction-api-types.ts`).
+7. (DONE) **No `returnValues` option on successful writes** (`shared/types.ts`, `shared/transaction-api-types.ts`).
    Write operations support `returnValuesOnConditionCheckFailure?: "none" | "all_old"`, and have no option to return `all_old` or `all_new` when a write commits.
+   `docs/agent-plans/2026-11-26-write-return-values.md` adds `returnValues?: "none" | "all_old"` to `putItem` and `deleteItem`, and the write results no longer echo the keys. `batchWriteItems` and `transactWriteItems` do not get the option, as in DynamoDB. `all_new` belongs to a future `updateItem` (item 6).
 
 8. (DONE) **Asymmetric result envelopes and outcome tags across read and batch methods** (`shared/types.ts`, `shared/transaction-api-types.ts`, `shared/batch-api-types.ts`).
    `getItem` nests keys and data under `res.item`, `transactGetItems` flattens them onto `res.items[i]`, and `batchGetItems` uses `outcome: "found" | "not_found"` instead of `found: boolean`. `batchGetItems` returns `{ items, unprocessedKeys }`, while `batchWriteItems` returns `{ results, unprocessedItems }`. Success outcomes use four different literals across public types: `"ok"` (while its doc comment says `applied`), `"passed"`, `"found"`, and `"applied"`.

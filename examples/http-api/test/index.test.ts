@@ -33,12 +33,22 @@ describe("http-api example worker", () => {
 
 		const put = await rpc(table, "putItem", { hashKey: "user#1", sortKey: "profile", data: "hello fokos" });
 		expect(put.status).toBe(200);
+		// A write result has no keys, and no old item without returnValues.
+		expect(await put.json()).toEqual({ version: 1, meta: expect.anything() });
 
 		const get = await rpc(table, "getItem", { hashKey: "user#1", sortKey: "profile" });
 		expect(get.status).toBe(200);
 		expect(await get.json()).toMatchObject({
 			item: { data: "hello fokos", dataEncoding: "utf8" },
 		});
+
+		const again = await rpc(table, "putItem", { hashKey: "user#1", sortKey: "profile", data: "second", returnValues: "all_old" });
+		expect(await again.json()).toMatchObject({
+			item: { hashKey: "user#1", sortKey: "profile", kind: "text", data: "hello fokos", dataEncoding: "utf8", version: 1 },
+			version: 2,
+		});
+		const del = await rpc(table, "deleteItem", { hashKey: "user#1", sortKey: "profile", returnValues: "all_old" });
+		expect(await del.json()).toMatchObject({ item: { data: "second", dataEncoding: "utf8", version: 2 }, deleted: true });
 	});
 
 	it("queryItems returns the items of a projection page", async () => {

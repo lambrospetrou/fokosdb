@@ -8,6 +8,8 @@ import {
 	EncodedItemData,
 	FokosMeta,
 	GetItemOptions,
+	ItemKey,
+	ReadItem,
 	GetItemProjectedOptions,
 	GetItemProjectedResult,
 	GetItemResult,
@@ -57,6 +59,7 @@ import type {
 	GetItemRpcItem,
 	ItemRpcPartitions,
 	PartitionOps,
+	WriteOldItem,
 } from "../server/do-partition.js";
 import type { CoordinatorOps } from "../server/do-transaction-coordinator.js";
 import type {
@@ -100,6 +103,7 @@ import {
 	wireBytes,
 	validateItemDataSize,
 	validateItemKeys,
+	validateReturnValues,
 	validateReturnValuesOnConditionCheckFailure,
 	validateTransactGetItemCount,
 	validateTransactGetItemKeys,
@@ -455,6 +459,26 @@ function undecidedOnRuntimeFault(err: FokosError, idempotencyToken: string): Fok
 	// The routing is an own property of the error object, so it moves to the new object.
 	const routed = routedError(err);
 	return routed ? attachRouting(undecided, routed.routing) : undecided;
+}
+
+/**
+ * The `item` field of a write result: the old item, with the caller's own keys, because the DO returns
+ * no keys. json data arrives as JSON text, and the client parses it once here.
+ */
+function oldItem(keys: ItemKey, old: WriteOldItem | undefined): { item?: ReadItem } {
+	if (old === undefined) {
+		return {};
+	}
+	const { ttlAt, version } = old;
+	return {
+		item: {
+			hashKey: keys.hashKey,
+			sortKey: keys.sortKey,
+			...decodeItemData(old.kind, old.data),
+			...(ttlAt === undefined ? {} : { ttlAt }),
+			version,
+		},
+	};
 }
 
 /** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
@@ -940,8 +964,9 @@ export class FokosDB {
 
 	// Each public method wraps its body, so every error that leaves FokosDB is a FokosError.
 
-	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
-		return await withFokosErrors(async () => await this.#putItem(opts));
+	// `T` types the json value of the old item, as in `getItem`.
+	async putItem<T = never>(opts: PutItemOptions): Promise<PutItemResult<T>> {
+		return (await withFokosErrors(async () => await this.#putItem(opts))) as PutItemResult<T>;
 	}
 
 	// `T` types the json value or the projected record of the result. The store holds opaque data, so
@@ -953,8 +978,8 @@ export class FokosDB {
 		return (await withFokosErrors(async () => await this.#getItem(opts))) as GetItemResult<T> | GetItemProjectedResult<T>;
 	}
 
-	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
-		return await withFokosErrors(async () => await this.#deleteItem(opts));
+	async deleteItem<T = never>(opts: DeleteItemOptions): Promise<DeleteItemResult<T>> {
+		return (await withFokosErrors(async () => await this.#deleteItem(opts))) as DeleteItemResult<T>;
 	}
 
 	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
@@ -1042,6 +1067,7 @@ export class FokosDB {
 		validateTtlAt(opts.ttlAt, "putItem");
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
+		validateReturnValues(opts.returnValues);
 		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
 		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
@@ -1061,14 +1087,14 @@ export class FokosDB {
 				ttlAt: opts.ttlAt,
 				condition: opts.condition,
 				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
+				returnValues: opts.returnValues,
 			},
 		);
 		const meta = singleMeta(res.partitions, routing);
 		if (res.outcome === "rejected") {
 			throw conditionCheckError(opts, res, meta);
 		}
-		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta };
+		return { ...withAnswerMeta(meta, () => oldItem(opts, res.old)), version: res.version, meta };
 	}
 
 	async #getItem(opts: GetItemOptions): Promise<GetItemResult | GetItemProjectedResult> {
@@ -1103,20 +1129,26 @@ export class FokosDB {
 	async #deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
+		validateReturnValues(opts.returnValues);
 		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
 		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
 		this.#checkCondition(opts.condition);
 		const { value: res, routing } = await this.#partitions.point(
 			"apiDeleteItem",
 			{ hashKey, sortKey },
-			{ hashKey, sortKey, condition: opts.condition, returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure },
+			{
+				hashKey,
+				sortKey,
+				condition: opts.condition,
+				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
+				returnValues: opts.returnValues,
+			},
 		);
 		const meta = singleMeta(res.partitions, routing);
 		if (res.outcome === "rejected") {
 			throw conditionCheckError(opts, res, meta);
 		}
-		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta };
+		return { ...withAnswerMeta(meta, () => oldItem(opts, res.old)), deleted: res.deleted, meta };
 	}
 
 	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {

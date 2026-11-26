@@ -55,6 +55,7 @@ export type {
 	ReadItemValue,
 	ProjectedReadItem,
 	ReadResultItem,
+	ReturnValues,
 	ReturnValuesOnConditionCheckFailure,
 	ScanItemsOptions,
 	ScanItemsProjectedOptions,

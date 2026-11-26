@@ -62,6 +62,7 @@ const ProjectionEntrySchema: v.GenericSchema<ProjectionExpression> = v.strictObj
 });
 
 const ReturnValuesOnConditionCheckFailureSchema = v.optional(v.picklist(["none", "all_old"]));
+const ReturnValuesSchema = v.optional(v.picklist(["none", "all_old"]));
 
 export const PutItemBodySchema = v.strictObject({
 	hashKey: v.string(),
@@ -70,6 +71,7 @@ export const PutItemBodySchema = v.strictObject({
 	data: v.string(),
 	condition: v.optional(ConditionExpressionSchema),
 	returnValuesOnConditionCheckFailure: ReturnValuesOnConditionCheckFailureSchema,
+	returnValues: ReturnValuesSchema,
 	partitionOptions: PartitionOptionsSchema,
 });
 
@@ -85,6 +87,7 @@ export const DeleteItemBodySchema = v.strictObject({
 	sortKey: v.optional(v.string()),
 	condition: v.optional(ConditionExpressionSchema),
 	returnValuesOnConditionCheckFailure: ReturnValuesOnConditionCheckFailureSchema,
+	returnValues: ReturnValuesSchema,
 	partitionOptions: PartitionOptionsSchema,
 });
 

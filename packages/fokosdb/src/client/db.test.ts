@@ -905,14 +905,21 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			it("reports an absent sortKey as undefined on put, get and delete", async () => {
 				const db = makeDB();
 
-				expect((await db.putItem({ hashKey: "no-sk", data: "v" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
+				await db.putItem({ hashKey: "no-sk", data: "v" });
+				expect((await db.putItem({ hashKey: "no-sk", data: "v", returnValues: "all_old" })).item).toMatchObject({
+					hashKey: "no-sk",
+					sortKey: undefined,
+				});
 
 				const got = await db.getItem({ hashKey: "no-sk" });
 				invariant(got.item);
 				expect(got.item.hashKey).toBe("no-sk");
 				expect(got.item.sortKey).toBeUndefined();
 
-				expect((await db.deleteItem({ hashKey: "no-sk" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
+				expect((await db.deleteItem({ hashKey: "no-sk", returnValues: "all_old" })).item).toMatchObject({
+					hashKey: "no-sk",
+					sortKey: undefined,
+				});
 			});
 
 			it("returns a binary key as the bytes the caller passed, not the encoded form", async () => {
@@ -921,7 +928,8 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const hashKey = new Uint8Array([1, 2, 3]);
 				const sortKey = new Uint8Array([9]);
 
-				expect((await db.putItem({ hashKey, sortKey, data: "v" })).item).toEqual({ hashKey, sortKey });
+				await db.putItem({ hashKey, sortKey, data: "v" });
+				expect((await db.putItem({ hashKey, sortKey, data: "v", returnValues: "all_old" })).item).toMatchObject({ hashKey, sortKey });
 
 				const got = await db.getItem({ hashKey, sortKey });
 				invariant(got.item);

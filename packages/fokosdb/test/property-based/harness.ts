@@ -753,9 +753,8 @@ async function expectKeyUnlocked(m: Model, db: FokosDB, key: ItemKey, stats: Tra
 		item === undefined ? db.deleteItem(key) : db.putItem({ ...key, data: item.data }),
 	);
 	if (item === undefined) {
-		expect(value).toMatchObject({ item: key, deleted: false });
+		expect(value).toMatchObject({ deleted: false });
 	} else {
-		expect(value).toMatchObject({ item: key });
 		applyPut(m, key, item.data);
 		expectVersion(m, key, (value as PutItemResult).version);
 	}
@@ -785,7 +784,6 @@ export class PutItem extends ModelCommand {
 	}
 	async run(m: Model, db: FokosDB): Promise<void> {
 		const res = await untilAvailable(() => db.putItem({ ...this.key, data: this.data }));
-		expect(res).toMatchObject({ item: this.key });
 		applyPut(m, this.key, this.data);
 		expectVersion(m, this.key, res.version);
 	}
@@ -814,7 +812,7 @@ export class DeleteItem extends ModelCommand {
 	async run(m: Model, db: FokosDB): Promise<void> {
 		const id = keyId(this.key);
 		const res = await untilAvailable(() => db.deleteItem(this.key));
-		expect(res).toMatchObject({ item: this.key, deleted: m.items.has(id) });
+		expect(res).toMatchObject({ deleted: m.items.has(id) });
 		applyDelete(m, this.key);
 	}
 	toString(): string {

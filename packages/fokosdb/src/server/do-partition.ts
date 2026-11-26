@@ -1,6 +1,13 @@
 import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
 import { DurableObject } from "cloudflare:workers";
-import type { DataKind, OperationMetrics, QuerySelect, ReturnValuesOnConditionCheckFailure, WirePartitionMeta } from "../shared/types.js";
+import type {
+	DataKind,
+	OperationMetrics,
+	QuerySelect,
+	ReturnValues,
+	ReturnValuesOnConditionCheckFailure,
+	WirePartitionMeta,
+} from "../shared/types.js";
 import type { ConditionExpression, ProjectionExpression, QueryExpressions } from "../shared/expression/types.js";
 import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import type {
@@ -157,19 +164,27 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 	ttlAt?: number;
 	condition?: ConditionExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+	returnValues?: ReturnValues;
 };
 
+/**
+ * The old item of a write that asked for `returnValues: "all_old"`: the row that the partition read
+ * before the write. It has no keys, because db.ts has them, and db.ts drops `imageBytes`.
+ */
+export type WriteOldItem = NonNullable<ItemImageRead["row"]>;
+
 export type PutItemRpcResponse =
-	| { outcome: "ok"; version: number; partitions: ItemRpcPartitions }
+	| { outcome: "ok"; version: number; old?: WriteOldItem; partitions: ItemRpcPartitions }
 	| { outcome: "rejected"; reason: RejectionReasonEncoded; partitions: ItemRpcPartitions };
 
 export type DeleteItemRpcRequest = ItemRpcKeys & {
 	condition?: ConditionExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+	returnValues?: ReturnValues;
 };
 
 export type DeleteItemRpcResponse =
-	| { outcome: "ok"; deleted: boolean; partitions: ItemRpcPartitions }
+	| { outcome: "ok"; deleted: boolean; old?: WriteOldItem; partitions: ItemRpcPartitions }
 	| { outcome: "rejected"; reason: RejectionReasonEncoded; partitions: ItemRpcPartitions };
 
 export type GetItemRpcRequest = ItemRpcKeys & { projection?: readonly ProjectionExpression[] };
@@ -259,7 +274,7 @@ export type BatchWriteItemsRpcResponse = {
 /** The answer of `conditionalWrite`. `image` is present only when the caller asked for it and the item exists. */
 type ConditionalWriteResult<W> =
 	| { outcome: "rejected"; conditionRes: ConditionEvaluationResult; image?: ItemImageRead }
-	| { outcome: "ok"; writeRes: W; conditionRes: ConditionEvaluationResult | null };
+	| { outcome: "ok"; writeRes: W; conditionRes: ConditionEvaluationResult | null; old?: ItemImageRead };
 
 export type { BatchFailure } from "../shared/batch-merge.js";
 
@@ -1398,7 +1413,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 	/**
 	 * Writes one item in its own `transactionSync`: the lock check, then the condition, then `write`.
 	 * A failed condition writes nothing. It reads the old image when `wantsImage` is true and the item
-	 * exists. `putItem`, `deleteItem`, and each operation of a batch write share it.
+	 * exists. With `readOld`, a condition that passes reads the old row before `write`, so `old` is the
+	 * row that the write replaced. `putItem`, `deleteItem`, and each operation of a batch write share it.
 	 */
 	private conditionalWrite<W>(
 		routingHash: RoutingHash,
@@ -1407,6 +1423,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		condition: ConditionExpression | undefined,
 		wantsImage: boolean,
 		write: () => W,
+		readOld = false,
 	): ConditionalWriteResult<W> {
 		return this.#store.transactionSync((): ConditionalWriteResult<W> => {
 			this.assertNotLocked(routingHash, hashKey, sortKey);
@@ -1417,7 +1434,9 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 				return { outcome: "rejected", conditionRes, image };
 			}
 
-			return { outcome: "ok", writeRes: write(), conditionRes };
+			// A condition that read the key already tells whether a row exists.
+			const old = readOld && conditionRes?.itemPresent !== false ? this.#store.getItemImage(routingHash, hashKey, sortKey) : undefined;
+			return { outcome: "ok", writeRes: write(), conditionRes, old };
 		});
 	}
 
@@ -1427,8 +1446,14 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
 		const routingHash = this.fokos.routingHashForKey(hashKey);
-		const localRes = this.conditionalWrite(routingHash, hashKey, sortKey, req.condition, wantsImage, () =>
-			this.upsertNow(routingHash, req),
+		const localRes = this.conditionalWrite(
+			routingHash,
+			hashKey,
+			sortKey,
+			req.condition,
+			wantsImage,
+			() => this.upsertNow(routingHash, req),
+			req.returnValues === "all_old",
 		);
 
 		if (localRes.outcome === "rejected") {
@@ -1439,14 +1464,16 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			};
 		}
 
-		const { writeRes, conditionRes } = localRes;
+		const { writeRes, conditionRes, old } = localRes;
 		// The row is committed. The handler learns `keyEstBytes` from the upsert result, and the response
 		// does not carry it, so the promotion candidate is reported from here.
 		this.signalGrowth(call, [{ hashKey, keyEstBytes: writeRes.keyEstBytes }]);
+		const metrics = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 		return {
 			outcome: "ok",
 			version: writeRes.version,
-			partitions: this.answered(conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
+			old: old?.row,
+			partitions: this.answered(old ? sumSqlMetrics(metrics, old) : metrics),
 		};
 	}
 
@@ -1454,8 +1481,14 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const { hashKey, sortKey } = req;
 		const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
 		const routingHash = this.fokos.routingHashForKey(hashKey);
-		const localRes = this.conditionalWrite(routingHash, hashKey, sortKey, req.condition, wantsImage, () =>
-			this.deleteNow(routingHash, hashKey, sortKey),
+		const localRes = this.conditionalWrite(
+			routingHash,
+			hashKey,
+			sortKey,
+			req.condition,
+			wantsImage,
+			() => this.deleteNow(routingHash, hashKey, sortKey),
+			req.returnValues === "all_old",
 		);
 
 		if (localRes.outcome === "rejected") {
@@ -1466,11 +1499,13 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			};
 		}
 
-		const { writeRes, conditionRes } = localRes;
+		const { writeRes, conditionRes, old } = localRes;
+		const metrics = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 		return {
 			outcome: "ok",
 			deleted: writeRes.deleted,
-			partitions: this.answered(conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
+			old: old?.row,
+			partitions: this.answered(old ? sumSqlMetrics(metrics, old) : metrics),
 		};
 	}
 

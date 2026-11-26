@@ -18,6 +18,7 @@ import {
 	serializeGetItemResult,
 	serializeQueryItemsResult,
 	serializeTransactGetItemsResult,
+	serializeWriteResult,
 } from "./serialize.js";
 
 export const rpcRoutes = new Hono<AppEnv>();
@@ -50,7 +51,7 @@ rpcRoutes.post("/:tableName/:rpcAction", async (c) => {
 			const { partitionOptions, ...opts } = parseBody(PutItemBodySchema);
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).putItem(opts);
 			c.set("dbItemMeta", result.meta);
-			return c.json(result);
+			return c.json(serializeWriteResult(result));
 		}
 		case "getItem": {
 			const { partitionOptions, ...opts } = parseBody(GetItemBodySchema);
@@ -62,7 +63,7 @@ rpcRoutes.post("/:tableName/:rpcAction", async (c) => {
 			const { partitionOptions, ...opts } = parseBody(DeleteItemBodySchema);
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).deleteItem(opts);
 			c.set("dbItemMeta", result.meta);
-			return c.json(result);
+			return c.json(serializeWriteResult(result));
 		}
 		case "transactWriteItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactWriteItemsBodySchema);

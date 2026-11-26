@@ -2,11 +2,13 @@ import { HTTPException } from "hono/http-exception";
 import type {
 	BatchGetItemsResult,
 	BatchWriteItemsResult,
+	DeleteItemResult,
 	FokosConditionCheckError,
 	GetItemProjectedResult,
 	GetItemResult,
 	JsonValue,
 	ProjectedItem,
+	PutItemResult,
 	QueryItemsProjectedResult,
 	QueryItemsResult,
 	ReadResultItem,
@@ -28,6 +30,11 @@ function encodeData(data: string | Uint8Array | JsonValue): { data: string; data
 }
 
 export function serializeGetItemResult(result: GetItemResult | GetItemProjectedResult) {
+	return { ...result, ...(result.item === undefined ? {} : { item: serializeReadResultItem(result.item) }) };
+}
+
+// The old item of a write result, when the write asked for it, takes the encodeData step of a read.
+export function serializeWriteResult(result: PutItemResult | DeleteItemResult) {
 	return { ...result, ...(result.item === undefined ? {} : { item: serializeReadResultItem(result.item) }) };
 }
 

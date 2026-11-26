@@ -740,6 +740,15 @@ export function validateReturnValuesOnConditionCheckFailure(value?: string): voi
 	}
 }
 
+export function validateReturnValues(value?: string): void {
+	if (value !== undefined && value !== "none" && value !== "all_old") {
+		throw new FokosValidationError(VALIDATION_CODES.return_values_option_invalid, {
+			message: "returnValues must be 'none' or 'all_old'",
+			attributes: { value },
+		});
+	}
+}
+
 /**
  * The public form of an item's keys, for a result the caller reads. The empty sort-key sentinel maps
  * back to an absent sortKey, and an absent sortKey is left off the object entirely rather than
