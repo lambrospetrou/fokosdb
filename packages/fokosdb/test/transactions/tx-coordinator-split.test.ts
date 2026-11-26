@@ -7,6 +7,7 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
+import type { FokosDB } from "../../src/client/db.js";
 import type { FokosDBTransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
@@ -20,6 +21,7 @@ import {
 } from "../../src/shared/transaction-limits.js";
 import { asRoutingHash, compareRoutingHashes, type RoutingHash } from "../../src/sharding/hash-primitives.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
 import type { FokosStorageInterval, RouteKey } from "../../src/sharding/runtime-types.js";
@@ -48,16 +50,23 @@ function tokenKey(token: string) {
 	return { hashKey: encodeHashKey(token, DEFAULT_LIMITS), sortKey: KeyCodec.encodeOptional(undefined) };
 }
 
+/** The participant groups of a ledger row that a test writes: one group, the table of `db`. */
+function participantGroupsJson(db: FokosDB): string {
+	const { rootTreesN, hashSplitN } = db.options().table;
+	return JSON.stringify({ v: 1, g: [{ rootTreesN, hashSplitN }] });
+}
+
 /** Writes a committed ledger row under a new token, as a transaction that completed now writes it. */
-function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState, token: string): void {
+function insertCommittedToken(db: FokosDB, instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState, token: string): void {
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash, image_cap_bytes)
-		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000', 0)`,
+		`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash, image_cap_bytes, participant_groups_json)
+		 VALUES (?, ?, ?, 'COMMITTED', 1, ?, ?, '[]', '0000000000000000', 0, ?)`,
 		instance.fokos.routingHashForKey(tokenKey(token).hashKey),
 		`tx-${crypto.randomUUID()}`,
 		token,
 		Date.now(),
 		Date.now(),
+		participantGroupsJson(db),
 	);
 }
 
@@ -65,11 +74,11 @@ function insertCommittedToken(instance: FokosDBTransactionCoordinatorDO, state: 
  * Queues a hash split of the coordinator. The coordinator must already hold its identity. A split
  * needs two routingHashes, so the helper adds a committed token of its own.
  */
-async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<void> {
+async function queueCoordinatorSplit(db: FokosDB, coordinator: FokosDBRouteContext): Promise<void> {
 	await runInDurableObject(
 		coordinatorStub(coordinator.doName),
 		async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
-			insertCommittedToken(instance, state, `tc-split-filler-${crypto.randomUUID()}`);
+			insertCommittedToken(db, instance, state, `tc-split-filler-${crypto.randomUUID()}`);
 			const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 			try {
 				instance.fokos.requestSplitEvaluation();
@@ -141,7 +150,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		expect(first).toMatchObject({ outcome: "committed" });
 
 		const root = coordinatorRouter(db).allRoots()[0];
-		await queueCoordinatorSplit(root);
+		await queueCoordinatorSplit(db, root);
 		const owner = await awaitSplitSettled(root, token);
 
 		await runInDurableObject(coordinatorStub(owner.doName), (_instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
@@ -174,7 +183,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const root = coordinatorRouter(db).allRoots()[0];
 		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			for (const filler of tokens.slice(1)) {
-				insertCommittedToken(instance, state, filler);
+				insertCommittedToken(db, instance, state, filler);
 			}
 			const host = instance as unknown as { buildMigrationPage: PageRead };
 			const read = host.buildMigrationPage.bind(instance);
@@ -190,7 +199,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				),
 			);
 		});
-		await queueCoordinatorSplit(root);
+		await queueCoordinatorSplit(db, root);
 		await awaitSplitSettled(root, token);
 
 		const children = await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO) =>
@@ -239,7 +248,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			write.catch(() => {});
 			await vi.waitFor(async () => expect(await held.testPrepareParked()).toBe(true), { timeout: 5_000, interval: 10 });
 
-			await queueCoordinatorSplit(root);
+			await queueCoordinatorSplit(db, root);
 			await vi.waitFor(async () => expect(await roleOf(root)).toBe("router"), { timeout: SPLIT_TIMEOUT_MS, interval: 20 });
 			await held.testReleasePrepare();
 
@@ -273,17 +282,18 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const transactionId = `tx-${crypto.randomUUID()}`;
 		await runInDurableObject(coordinatorStub(root.doName), (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash, image_cap_bytes)
-				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000', 0)`,
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, participant_groups_json)
+				 VALUES (?, ?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000', 0, ?)`,
 				instance.fokos.routingHashForKey(tokenKey(token).hashKey),
 				transactionId,
 				token,
 				Date.now() - 60_000,
 				Date.now() - 55_000,
+				participantGroupsJson(db),
 			);
 		});
 
-		await queueCoordinatorSplit(root);
+		await queueCoordinatorSplit(db, root);
 		const owner = await awaitSplitSettled(root, token);
 
 		await vi.waitFor(
@@ -327,19 +337,20 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			const now = Date.now();
 			// The next recovery is far away, so no drive changes the transaction during the test.
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash, image_cap_bytes)
-				 VALUES (?, ?, ?, 'PREPARING', 1, ?, ?, '0000000000000000', ?)`,
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash, image_cap_bytes, participant_groups_json)
+				 VALUES (?, ?, ?, 'PREPARING', 1, ?, ?, '0000000000000000', ?, ?)`,
 				routingHash,
 				transactionId,
 				token,
 				now,
 				now + 3_600_000,
 				MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
+				participantGroupsJson(db),
 			);
 			for (let i = 0; i < PUTS; i++) {
 				state.storage.sql.exec(
-					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, partition_do_name)
-					 VALUES (?, ?, ?, x'', ?, 'put', ?, 1, 'p1')`,
+					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, participant_idx)
+					 VALUES (?, ?, ?, x'', ?, 'put', ?, 1, 0)`,
 					routingHash,
 					transactionId,
 					KeyCodec.encode(`put-${i}`),
@@ -351,14 +362,15 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				`{"opIndex":${i},"outcome":"rejected","reason":{"code":"condition_failed","hashKey":"key-${i}"},"imageBytes":${MAX_ITEM_BYTES}}`;
 			const answer = (from: number, to: number) => `[${Array.from({ length: to - from }, (_, j) => entry(from + j)).join(",")}]`;
 			state.storage.sql.exec(
-				`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
-				 VALUES (?, ?, 'p1', '{}', 'rejected', ?)`,
+				`INSERT INTO tc_participants (routing_hash, transaction_id, participant_idx, partition_id, prepare_outcome, answer_json)
+				 VALUES (?, ?, 0, ?, 'rejected', ?)`,
 				routingHash,
 				transactionId,
+				PartitionIdHelper.hashId("unused", 0).opaque,
 				answer(0, ENTRIES / 2),
 			);
 			state.storage.sql.exec(
-				`INSERT INTO tc_answer_chunks (routing_hash, transaction_id, partition_do_name, chunk_index, answer_json) VALUES (?, ?, 'p1', 1, ?)`,
+				`INSERT INTO tc_answer_chunks (routing_hash, transaction_id, participant_idx, chunk_index, answer_json) VALUES (?, ?, 0, 1, ?)`,
 				routingHash,
 				transactionId,
 				answer(ENTRIES / 2, ENTRIES),
@@ -376,7 +388,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const before = await counts(root.doName);
 		expect(before).toEqual([PUTS, 1, 1, images]);
 
-		await queueCoordinatorSplit(root);
+		await queueCoordinatorSplit(db, root);
 		const owner = await awaitSplitSettled(root, token);
 
 		expect(await counts(owner.doName)).toEqual(before);
@@ -390,7 +402,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		expect(first).toMatchObject({ outcome: "committed" });
 
 		const root = coordinatorRouter(db).allRoots()[0];
-		await queueCoordinatorSplit(root);
+		await queueCoordinatorSplit(db, root);
 		await awaitSplitSettled(root, token);
 
 		// A stale lock of the committed transaction whose commit never reached its partition. The lock
@@ -436,7 +448,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 
 		const root = coordinatorRouter(db).allRoots()[0];
 		await runInDurableObject(coordinatorStub(root.doName), async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
-			insertCommittedToken(instance, state, `${token}-second`);
+			insertCommittedToken(db, instance, state, `${token}-second`);
 			const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 			try {
 				await expect(
@@ -513,7 +525,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const first = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 
 		const root = coordinatorRouter(db).allRoots()[0];
-		await queueCoordinatorSplit(root);
+		await queueCoordinatorSplit(db, root);
 		const owner = await awaitSplitSettled(root, token);
 		const child = coordinatorStub(owner.doName);
 

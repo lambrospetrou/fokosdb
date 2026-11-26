@@ -98,6 +98,7 @@ export const RESERVED_SHARD_GROUP_PREFIX = "fokos.";
 export const NAMESPACE_FINGERPRINT_LENGTH = 43;
 
 const PARTITION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}p.`;
+const COORDINATOR_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}tc.`;
 const MATERIALIZATION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}m.`;
 
 /**
@@ -106,7 +107,22 @@ const MATERIALIZATION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}m.`;
  * namespaces thus get different coordinators, also when they share one `nsTx` namespace.
  */
 export function coordinatorShardGroup(topology: FokosTopology, fp: string): string {
-	return `${RESERVED_SHARD_GROUP_PREFIX}tc.${tableNameOf(topology)}.${checkedFingerprint(fp)}`;
+	return `${COORDINATOR_SHARD_GROUP_PREFIX}${tableNameOf(topology)}.${checkedFingerprint(fp)}`;
+}
+
+/**
+ * The partition group of a table, `fokos.p.<tableName>`, from its coordinator group
+ * `fokos.tc.<tableName>.<fp>`. The fingerprint has a fixed length, so a table name with "." is safe.
+ */
+export function partitionShardGroupOfCoordinator(coordinatorGroup: string): string {
+	const tableNameEnd = coordinatorGroup.length - NAMESPACE_FINGERPRINT_LENGTH - 1;
+	invariant(
+		coordinatorGroup.startsWith(COORDINATOR_SHARD_GROUP_PREFIX) &&
+			tableNameEnd > COORDINATOR_SHARD_GROUP_PREFIX.length &&
+			coordinatorGroup[tableNameEnd] === ".",
+		() => `fokos/partition-context: ${coordinatorGroup} is not a coordinator group "${COORDINATOR_SHARD_GROUP_PREFIX}<tableName>.<fp>"`,
+	);
+	return `${PARTITION_SHARD_GROUP_PREFIX}${coordinatorGroup.slice(COORDINATOR_SHARD_GROUP_PREFIX.length, tableNameEnd)}`;
 }
 
 /**
@@ -193,7 +209,6 @@ export function gsiTableConfig(table: FokosDBTableConfig, indexName: string): Fo
 	};
 }
 
-const COORDINATOR_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}tc.`;
 const GSI_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}gsiv1.`;
 
 /**

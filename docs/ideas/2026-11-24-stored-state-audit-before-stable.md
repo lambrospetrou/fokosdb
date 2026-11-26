@@ -15,11 +15,15 @@ reference, or the restore must rewrite it. The RFC (§1.2, M2) already lists `__
 targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_participants.partition_do_name`,
 `ancestor_fences`, `producer_fences`, and the rows of the topology keeper. The items below are not in the RFC.
 
-1. **`tc_participants.partition_context_json`** — It stores the full route context of the participant: `doName`,
+1. (DONE) **`tc_participants.partition_context_json`** — It stores the full route context of the participant: `doName`,
    `shardGroup`, `jurisdiction`, the binding names of the policy, and `policyVersion`. Commit, cancel, and recovery
    make the stub from it. After a restore into another jurisdiction, the coordinator sends commits to the DOs of the
    source table. Store only the `partitionId`, and build the context from the route context of the coordinator.
    `tc_items.partition_do_name` also holds the full name.
+   Fix: `tc_participants` stores `participant_idx`, `group_idx`, and `partition_id`. `tc_items` and
+   `tc_answer_chunks` store `participant_idx`. `tc_state.participant_groups_json` (`{v: 1, g: [...]}`) stores the
+   tree shape of each group (`rootTreesN`, `hashSplitN`). The coordinator builds the shard group, the DO name, the
+   jurisdiction, and the policy from its own route context.
 2. (DONE) **The admin outbox** — The event id is `<source doName>/r<seq>` (`#recordCompletion` in
    `sharding/runtime.ts`). The event holds `shardGroup`, the names of the source and the targets, and DO IDs. A
    restored DO sends a pending event with the old shard group, and the keeper stores rows under that group. Make
@@ -51,15 +55,15 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
 
 ## B. General problems
 
-1. **No reader checks a `schema` field** — `__fokos/identity`, `__fokos/import`, the plan head, and the route
+1. (FUTURE-ISSUE) **No reader checks a `schema` field** — `__fokos/identity`, `__fokos/import`, the plan head, and the route
    context have one, but no code compares it. Add a reader for each record that refuses or upgrades an unknown
    version.
-2. **`__fokos/cache/hash_arena` has no version** — A wrong layout routes to the wrong children with no error. Add a
+2. (FUTURE-ISSUE) **`__fokos/cache/hash_arena` has no version** — A wrong layout routes to the wrong children with no error. Add a
    version, and drop a snapshot with another version. `__fokos/policy` also has no version.
 3. (NON-ISSUE) **No guard against a rollback** — `SQLSchemaMigrations` of `durable-utils` does nothing when the stored migration
    id is higher than the last migration of the code. Older code then runs on a newer schema. Each of the six
    migration trackers must refuse this case with `partition_init_failed`.
-4. **JSON columns with no version** — `tc_items.conditions_json` and `update_json` (expression trees),
+4. (FUTURE-ISSUE) **JSON columns with no version** — `tc_items.conditions_json` and `update_json` (expression trees),
    `answer_json`, `error_json`, `results_json`, and `op_list`. Only `coordinator_json` has a version. Freeze each
    format, or add a version.
 5. (DONE) **`operations_hash` has no fixed test value** — The test compares the hash only with itself. A change of the
@@ -72,8 +76,8 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
 8. (NON-ISSUE) **Two KV key prefixes** — The sharding store uses `__fokos/`, and the partition, coordinator, materialization,
    and item-stats stores use `__fokosdb/`. A rename costs nothing now.
 9. **A wrong topology hint cancels a transaction** — The coordinator stores the participant address from the hint
-   (FIXME in the prepare fan-out of `do-transaction-coordinator.ts`). The fix writes `partition_context_json`, so do
-   it with A1.
+   (FIXME in the prepare fan-out of `do-transaction-coordinator.ts`). The fix writes `tc_participants.partition_id`
+   after A1.
 10. (NON-ISSUE) **A split router keeps its item rows** — The rows stay after a hash split (FIXME in `cleanupSourceStep`,
     `do-partition.ts`). This adds storage cost, and a snapshot restore copies the rows. It is not a format change.
 11. (DONE) **Job names are stored** — `__fokos/jobs` keeps an entry of a removed or renamed job. This does no harm, but a

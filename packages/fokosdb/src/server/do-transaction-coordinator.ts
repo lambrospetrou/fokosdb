@@ -3,11 +3,13 @@ import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import {
 	fokosDBRoutingHashSeedResolverOf,
+	partitionShardGroupOfCoordinator,
 	type FokosDBPolicy,
 	type FokosDBRouteContext,
 	type FokosDBTableConfig,
 } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
+import { PartitionIdHelper } from "../sharding/partition-id.js";
 import { asRoutingHash, maxHashDepth, type RoutingHash, type RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import { INIT_RETRY_ALARM_MS } from "../sharding/scheduler.js";
@@ -130,12 +132,18 @@ type TcStateRow = {
 	image_cap_bytes: number;
 	/** The bytes of the images in tc_results while the transaction is PREPARING (`storePrepareAnswer`). */
 	image_bytes_stored: number;
+	/** The JSON text of the `ParticipantGroups` of the transaction (`parseParticipantGroups`). */
+	participant_groups_json: string;
 };
 
 type TcParticipantRow = {
 	transaction_id: string;
-	partition_do_name: string;
-	partition_context_json: string;
+	/** The index of the participant in its transaction, from 0. `tc_items` and `tc_answer_chunks` refer to it. */
+	participant_idx: number;
+	/** The index of the group of the participant in `participant_groups_json`. */
+	group_idx: number;
+	/** The partition ID of the participant. `participantContext` builds its route context from it. */
+	partition_id: string;
 	prepare_outcome: string | null;
 	commit_outcome: string | null;
 	cancel_outcome: string | null;
@@ -153,10 +161,22 @@ type TcParticipantRow = {
 
 /** One participant of the prepare fan-out: the partition and the items of the transaction it owns. */
 type PrepareParticipant = {
-	doName: string;
+	index: number;
 	context: FokosDBRouteContext;
 	items: TransactionItem[];
 };
+
+/**
+ * The shape of the partition tree of one participant table: the values of its route context that the
+ * coordinator cannot get from its own identity. The entry holds no name: the entry is for the table
+ * that this coordinator serves, so the coordinator computes the shard group from its own shard group.
+ */
+type ParticipantGroup = { rootTreesN: number; hashSplitN: number };
+
+/** The participant groups of a transaction, as `tc_state.participant_groups_json` stores them. */
+type ParticipantGroups = { v: 1; g: ParticipantGroup[] };
+
+const PARTICIPANT_GROUPS_VERSION = 1;
 
 /** One answer of a participant, as the partition client returns it. */
 type ParticipantAnswer<T extends TransactionPartitionsAnswer> = { value: T; routing: FokosPublicRouting };
@@ -224,7 +244,8 @@ type TcItemRow = {
 	ttl_epoch_utc_seconds: number | null;
 	conditions_json: string | null;
 	update_json: string | null;
-	partition_do_name: string;
+	/** The `participant_idx` of the participant that owns the item. */
+	participant_idx: number;
 	/** 1 for "all_old", 0 for "none". Reconstructs TransactionItem during initial prepare and recovery. */
 	return_values_on_condition_check_failure: number;
 };
@@ -233,7 +254,7 @@ type TcItemRow = {
 type TcResultChunkRow = { transaction_id: string; chunk_index: number; results_json: string };
 
 /** One later chunk of the results of a rejected prepare answer (`tc_answer_chunks`). */
-type TcAnswerChunkRow = { transaction_id: string; partition_do_name: string; chunk_index: number; answer_json: string };
+type TcAnswerChunkRow = { transaction_id: string; participant_idx: number; chunk_index: number; answer_json: string };
 
 type TcResultRow = {
 	transaction_id: string;
@@ -321,11 +342,11 @@ function transactionImageCap(
 		data?: string | Uint8Array;
 		conditionJson: string | null;
 		updateJson: string | null;
-		doName: string;
 	}[],
-	participants: readonly { doName: string; contextJson: string }[],
+	participantIds: readonly string[],
+	participantGroupsJson: string,
 ): number {
-	let fixed = 0;
+	let fixed = wireBytes(participantGroupsJson);
 	let entries = 0;
 	for (const op of items) {
 		// The structured-clone overhead of the rows of this operation, with their column names: 128 for its
@@ -337,15 +358,14 @@ function transactionImageCap(
 			op.sortKey.byteLength +
 			wireBytes(op.data) +
 			wireBytes(op.conditionJson) +
-			wireBytes(op.updateJson) +
-			wireBytes(op.doName);
+			wireBytes(op.updateJson);
 		// 256: the most characters of one entry other than its keys. These are the outcome, the reason
 		// code, the indexes, `imageBytes`, `itemOmitted`, and a transaction id or an `error_id`.
 		entries += wireBytes(stringifyTagged(decodeItemKeys(op.hashKey, op.sortKey))) + 2 * 256;
 	}
-	for (const p of participants) {
+	for (const partitionId of participantIds) {
 		// 512: the overhead of one `tc_participants` row, with a stored prepare error in it.
-		fixed += 512 + wireBytes(p.contextJson) + wireBytes(p.doName);
+		fixed += 512 + wireBytes(partitionId);
 	}
 	const room = (WORKERS_RPC_MAX_BYTES * 3) / 4 - fixed - entries;
 	return Math.max(0, Math.min(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, Math.floor(room / 2)));
@@ -465,6 +485,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 image_cap_bytes         INTEGER NOT NULL,
                 -- The bytes of the images in tc_results while the transaction is PREPARING.
                 image_bytes_stored      INTEGER NOT NULL DEFAULT 0,
+                -- The shape of the partition tree of each participant table, as JSON:
+                -- {"v":1,"g":[{"rootTreesN":1,"hashSplitN":4}]}. tc_participants.group_idx is an index into
+                -- "g". It holds no name, so the stored rows of a transaction name no table.
+                participant_groups_json TEXT    NOT NULL,
                 PRIMARY KEY (routing_hash, transaction_id)
 			) WITHOUT ROWID, STRICT;
 
@@ -476,8 +500,14 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE TABLE IF NOT EXISTS tc_participants (
                 routing_hash      BLOB    NOT NULL,
                 transaction_id          TEXT    NOT NULL,
-                partition_do_name       TEXT    NOT NULL,
-                partition_context_json  TEXT    NOT NULL DEFAULT '',
+                -- The index of the participant in its transaction, from 0. tc_items and tc_answer_chunks
+                -- refer to it.
+                participant_idx         INTEGER NOT NULL,
+                -- The index of the group of the participant in tc_state.participant_groups_json.
+                group_idx               INTEGER NOT NULL DEFAULT 0,
+                -- The coordinator builds the route context of the participant from its partition ID, its
+                -- group, and the identity of the coordinator.
+                partition_id            TEXT    NOT NULL,
                 prepare_outcome         TEXT,
                 commit_outcome          TEXT,
                 cancel_outcome          TEXT,
@@ -490,7 +520,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 -- FokosValidationError or a FokosExpressionError) stays: no later error replaces it, and no
                 -- later answer is stored.
                 error_json              TEXT,
-                PRIMARY KEY (routing_hash, transaction_id, partition_do_name)
+                PRIMARY KEY (routing_hash, transaction_id, participant_idx)
             ) WITHOUT ROWID, STRICT;
 
             CREATE TABLE IF NOT EXISTS tc_items (
@@ -506,7 +536,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 ttl_epoch_utc_seconds INTEGER,
                 conditions_json     TEXT,
                 update_json         TEXT,
-                partition_do_name   TEXT    NOT NULL,
+                participant_idx     INTEGER NOT NULL,
                 -- 1 for "all_old", 0 for "none". Reconstructs TransactionItem during prepare recovery.
                 return_values_on_condition_check_failure INTEGER NOT NULL DEFAULT 0,
                 -- One row for each operation. More than one operation can have the same (hk, sk).
@@ -526,10 +556,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE TABLE IF NOT EXISTS tc_answer_chunks (
                 routing_hash      BLOB    NOT NULL,
                 transaction_id    TEXT    NOT NULL,
-                partition_do_name TEXT    NOT NULL,
+                participant_idx   INTEGER NOT NULL,
                 chunk_index       INTEGER NOT NULL,
                 answer_json       TEXT    NOT NULL,
-                PRIMARY KEY (routing_hash, transaction_id, partition_do_name, chunk_index)
+                PRIMARY KEY (routing_hash, transaction_id, participant_idx, chunk_index)
             ) WITHOUT ROWID, STRICT;
 
             -- Stores raw item images for rejected operations requesting all_old.
@@ -950,17 +980,15 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// The coordinator stores each address, and later sends to it from another client, after a restart
 		// too. Only the client that resolved an address can fall back after a miss, so each address must
 		// name a partition that exists: no speculative range root of a Bloom hit.
-		const participants: PrepareParticipant[] = partitions.resolveAll(request.items, { speculative: false }).map(({ ctx, indexes }) => ({
-			doName: ctx.doName,
-			context: ctx,
-			items: indexes.map((i) => request.items[i]),
-		}));
-		const participantOf: string[] = [];
+		const participants: PrepareParticipant[] = partitions
+			.resolveAll(request.items, { speculative: false })
+			.map(({ ctx, indexes }, index) => ({ index, context: ctx, items: indexes.map((i) => request.items[i]) }));
+		const participantOf: number[] = [];
 		for (const p of participants) {
-			invariant(p.items.length > 0, () => `fokos/tc: participant ${p.doName} of transaction ${transactionId} has no items`);
+			invariant(p.items.length > 0, () => `fokos/tc: participant ${p.context.doName} of transaction ${transactionId} has no items`);
 			for (const item of p.items) {
 				invariant(participantOf[item.opIndex] === undefined, () => `fokos/tc: operation ${item.opIndex} routes to two participants`);
-				participantOf[item.opIndex] = p.doName;
+				participantOf[item.opIndex] = p.index;
 			}
 		}
 		// results_json is positional to the request, and each commit and cancel sends a participant the
@@ -976,20 +1004,20 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			...op,
 			conditionJson: op.condition ? JSON.stringify(op.condition) : null,
 			updateJson: op.update ? JSON.stringify(op.update) : null,
-			doName: participantOf[op.opIndex],
+			participantIdx: participantOf[op.opIndex],
 		}));
-		const contexts = participants.map((p) => ({
-			doName: p.doName,
-			// TODO Skip the doName since it can be generated by partitionId to save bytes?
-			contextJson: JSON.stringify(p.context),
-		}));
-		const imageCap = transactionImageCap(rows, contexts);
+		const participantGroupsJson = this.participantGroupsOf(request.table);
+		const imageCap = transactionImageCap(
+			rows,
+			participants.map((p) => p.context.partitionId),
+			participantGroupsJson,
+		);
 
 		const createdAt = this.#platform.now();
 		this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
-				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash, image_cap_bytes)
-                 VALUES (?, ?, ?, 'CREATED', ?, ?, ?, ?, ?)`,
+				`INSERT INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash, image_cap_bytes, participant_groups_json)
+                 VALUES (?, ?, ?, 'CREATED', ?, ?, ?, ?, ?, ?)`,
 				routingHash,
 				transactionId,
 				idempotencyToken,
@@ -998,10 +1026,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				createdAt + this.config().staleTransactionMs,
 				operationsHash,
 				imageCap,
+				participantGroupsJson,
 			);
 			for (const op of rows) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
+					`INSERT INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, participant_idx, return_values_on_condition_check_failure)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					routingHash,
 					transactionId,
@@ -1015,17 +1044,17 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					op.ttlAt ?? null,
 					op.conditionJson,
 					op.updateJson,
-					op.doName,
+					op.participantIdx,
 					op.returnValuesOnConditionCheckFailure === "all_old" ? 1 : 0,
 				);
 			}
-			for (const p of contexts) {
+			for (const p of participants) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?, ?)`,
+					`INSERT INTO tc_participants (routing_hash, transaction_id, participant_idx, partition_id) VALUES (?, ?, ?, ?)`,
 					routingHash,
 					transactionId,
-					p.doName,
-					p.contextJson,
+					p.index,
+					p.context.partitionId,
 				);
 			}
 		});
@@ -1252,7 +1281,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 *
 	 * Returns true when it stored the answer.
 	 */
-	private storePrepareAnswer(routingHash: RoutingHash, transactionId: string, partitionDoName: string, answer: PrepareOutcome): boolean {
+	private storePrepareAnswer(routingHash: RoutingHash, transactionId: string, participantIdx: number, answer: PrepareOutcome): boolean {
 		return this.ctx.storage.transactionSync(() => {
 			const stateRow = this.loadStateRow(routingHash, transactionId);
 			if (stateRow?.state !== "PREPARING") {
@@ -1262,10 +1291,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			// must not hide that error, or let markCommitting record a commit decision.
 			const stored = tryOne(
 				this.ctx.storage.sql.exec<{ error_json: string | null }>(
-					`SELECT error_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
+					`SELECT error_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND participant_idx = ?`,
 					routingHash,
 					transactionId,
-					partitionDoName,
+					participantIdx,
 				),
 			);
 			if (isFatalPrepareError(stored?.error_json ?? null)) {
@@ -1274,22 +1303,22 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const chunks = answer.outcome === "rejected" ? chunkResults(stripImagesFromResults(answer.results)) : [];
 			const written = this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
-				  WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
+				  WHERE routing_hash = ? AND transaction_id = ? AND participant_idx = ? AND prepare_outcome IS NULL`,
 				answer.outcome,
 				chunks[0] ?? null,
 				routingHash,
 				transactionId,
-				partitionDoName,
+				participantIdx,
 			);
 			if (written.rowsWritten === 0) {
 				return false;
 			}
 			for (let i = 1; i < chunks.length; i++) {
 				this.ctx.storage.sql.exec(
-					`INSERT OR REPLACE INTO tc_answer_chunks (routing_hash, transaction_id, partition_do_name, chunk_index, answer_json) VALUES (?, ?, ?, ?, ?)`,
+					`INSERT OR REPLACE INTO tc_answer_chunks (routing_hash, transaction_id, participant_idx, chunk_index, answer_json) VALUES (?, ?, ?, ?, ?)`,
 					routingHash,
 					transactionId,
-					partitionDoName,
+					participantIdx,
 					i,
 					chunks[i],
 				);
@@ -1365,18 +1394,18 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * for example a transport failure, must not replace it, because recovery cancels on it. A new error
 	 * can replace a transient one. The read and the write run in one storage transaction.
 	 */
-	private storePrepareError(routingHash: RoutingHash, transactionId: string, partitionDoName: string, err: unknown): void {
+	private storePrepareError(routingHash: RoutingHash, transactionId: string, participantIdx: number, err: unknown): void {
 		dropCallCost(err);
 		this.ctx.storage.transactionSync(() => {
 			const row = tryOne(
 				this.ctx.storage.sql.exec<{ error_json: string | null }>(
 					`SELECT p.error_json FROM tc_participants p
 					   JOIN tc_state s ON s.routing_hash = p.routing_hash AND s.transaction_id = p.transaction_id
-					  WHERE p.routing_hash = ? AND p.transaction_id = ? AND p.partition_do_name = ? AND p.prepare_outcome IS NULL
+					  WHERE p.routing_hash = ? AND p.transaction_id = ? AND p.participant_idx = ? AND p.prepare_outcome IS NULL
 					    AND s.state = 'PREPARING'`,
 					routingHash,
 					transactionId,
-					partitionDoName,
+					participantIdx,
 				),
 			);
 			if (!row || isFatalPrepareError(row.error_json)) {
@@ -1386,11 +1415,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			const wire = FokosError.toWire(err);
 			delete wire.fields?.routing;
 			this.ctx.storage.sql.exec(
-				`UPDATE tc_participants SET error_json = ? WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
+				`UPDATE tc_participants SET error_json = ? WHERE routing_hash = ? AND transaction_id = ? AND participant_idx = ?`,
 				JSON.stringify(wire),
 				routingHash,
 				transactionId,
-				partitionDoName,
+				participantIdx,
 			);
 		});
 	}
@@ -1409,7 +1438,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				return;
 			}
 			const items = this.loadItems(routingHash, transactionId);
-			const itemsByPartition = groupByPartition(items);
+			const itemsByParticipant = groupByParticipant(items);
 			const answers = this.loadAnswerResults(routingHash, transactionId);
 
 			// results_json is positional to the request: entry i answers the operation the caller sent at
@@ -1418,8 +1447,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			// An operation no participant reported stays not_evaluated rather than shifting its neighbours.
 			const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
 			for (const p of this.loadParticipants(routingHash, transactionId)) {
-				const owned = itemsByPartition.get(p.partition_do_name) ?? [];
-				const answer = p.prepare_outcome === "rejected" ? answers.get(p.partition_do_name) : undefined;
+				const owned = itemsByParticipant.get(p.participant_idx) ?? [];
+				const answer = p.prepare_outcome === "rejected" ? answers.get(p.participant_idx) : undefined;
 				let answered: ParticipantOperationResultEncoded[];
 				if (p.prepare_outcome === "accepted") {
 					// An accepted participant sends no array: the lock it holds is the proof that its check
@@ -1516,7 +1545,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		return FokosError.toWire(
 			new FokosUnavailableError(UNAVAILABLE_CODES.prepare_unanswered, {
 				message: "a participant did not answer the prepare",
-				attributes: { partitionDoName: p.partition_do_name },
+				attributes: { partitionId: p.partition_id },
 			}),
 		);
 	}
@@ -1541,6 +1570,48 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			platform: this.#platform,
 			...(topologyCache === undefined ? {} : { topologyCache }),
 		});
+	}
+
+	/**
+	 * The `participant_groups_json` of a new transaction of `table`: one group, the table of this
+	 * coordinator. `participantContext` later builds the shard group and the jurisdiction from the
+	 * identity of this coordinator, so the table must be the table that this coordinator serves.
+	 */
+	private participantGroupsOf(table: FokosDBTableConfig): string {
+		const own = this.fokos.routeContext().topology;
+		invariant(
+			table.topology.shardGroup === partitionShardGroupOfCoordinator(own.shardGroup) && table.topology.jurisdiction === own.jurisdiction,
+			() => `fokos/tc: the table ${table.topology.shardGroup} is not the table of the coordinator group ${own.shardGroup}`,
+		);
+		const groups: ParticipantGroups = {
+			v: PARTICIPANT_GROUPS_VERSION,
+			g: [{ rootTreesN: table.topology.rootTreesN, hashSplitN: table.topology.hashSplitN }],
+		};
+		return JSON.stringify(groups);
+	}
+
+	/**
+	 * The route context of a stored participant. The shard group, the jurisdiction, the range
+	 * configuration, and the policy come from the identity of this coordinator, and the tree shape from
+	 * the group of the participant. A restore that rewrites the identity thus also moves every participant.
+	 */
+	private participantContext(
+		groups: readonly ParticipantGroup[],
+		p: Pick<TcParticipantRow, "group_idx" | "partition_id">,
+	): FokosDBRouteContext {
+		const group = groups[p.group_idx];
+		invariant(group !== undefined, () => `fokos/tc: participant ${p.partition_id} has the group ${p.group_idx}, which is not stored`);
+		const own = this.fokos.routeContext();
+		const shardGroup = partitionShardGroupOfCoordinator(own.topology.shardGroup);
+		return {
+			schema: own.schema,
+			partitionId: p.partition_id,
+			doName: PartitionIdHelper.doName(shardGroup, PartitionIdHelper.partitionIdToBytes(p.partition_id)),
+			topology: { ...own.topology, shardGroup, rootTreesN: group.rootTreesN, hashSplitN: group.hashSplitN },
+			rangeConfig: own.rangeConfig,
+			policy: own.policy,
+			policyVersion: own.policyVersion,
+		};
 	}
 
 	private topologyRefreshSettings() {
@@ -1654,16 +1725,16 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						// The fix, on a miss at `p.context.doName`:
 						// 1. Compute the root context of the participant from the hash key of its first item. All
 						//    the keys of one participant are under one root.
-						// 2. In one SQL transaction, while `prepare_outcome IS NULL`, write the root context to
-						//    `partition_context_json` of the participant row. `partition_do_name` stays the key.
+						// 2. In one SQL transaction, while `prepare_outcome IS NULL`, write the partition ID of the
+						//    root to `partition_id` of the participant row. `participant_idx` stays the key.
 						// 3. Set `p.context` to the root context, and send `txPrepare` again.
-						// The commit, the cancel, and the recovery read `partition_context_json`, so they also
-						// go to the root. Two drives that miss at the same time write the same root context.
-						this.storePrepareError(routingHash, transactionId, p.doName, err);
+						// The commit, the cancel, and the recovery read `partition_id`, so they also go to the
+						// root. Two drives that miss at the same time write the same root.
+						this.storePrepareError(routingHash, transactionId, p.index, err);
 						throw err;
 					});
-				seen.addPrepare(answer, this.storePrepareAnswer(routingHash, transactionId, p.doName, answer.value));
-				return { partitionDoName: p.doName, result: answer.value };
+				seen.addPrepare(answer, this.storePrepareAnswer(routingHash, transactionId, p.index, answer.value));
+				return { participantIdx: p.index, result: answer.value };
 			}),
 		);
 
@@ -1718,14 +1789,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Keys only, as in runCancel: every participant applies the payload from its own
 		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
 		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
-		const keysByPartition = groupByPartition(this.loadItemKeys(routingHash, transactionId));
+		const keysByParticipant = groupByParticipant(this.loadItemKeys(routingHash, transactionId));
 		const deadlineMs = this.#platform.now() + requestBudgetMs;
 
 		// A participant with a stored 'committed' outcome got its commit from an earlier drive, and this
 		// drive does not send it again.
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
-				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
+				`SELECT transaction_id, participant_idx, group_idx, partition_id, prepare_outcome, commit_outcome, cancel_outcome
                  FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND commit_outcome IS NULL`,
 				routingHash,
 				transactionId,
@@ -1738,25 +1809,26 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			invariant(
 				p.prepare_outcome === "accepted" && p.cancel_outcome === null,
 				() =>
-					`fokos/tc: participant ${p.partition_do_name} of committing transaction ${transactionId} has prepare ${p.prepare_outcome} and cancel ${p.cancel_outcome}`,
+					`fokos/tc: participant ${p.partition_id} of committing transaction ${transactionId} has prepare ${p.prepare_outcome} and cancel ${p.cancel_outcome}`,
 			);
-			const keys = keysByPartition.get(p.partition_do_name);
+			const keys = keysByParticipant.get(p.participant_idx);
 			// initiateWrite makes a participant only from the items that route to it, and nothing deletes
 			// an item before completeTransaction. A commit with no keys does not release the locks.
-			invariant(keys?.length, () => `fokos/tc: participant ${p.partition_do_name} of transaction ${transactionId} has no items`);
+			invariant(keys?.length, () => `fokos/tc: participant ${p.partition_id} of transaction ${transactionId} has no items`);
 			return toTransactionItemKeys(keys);
 		});
 
-		// Each result is the DO name of a participant that confirmed the commit, or null.
+		// Each result is the index of a participant that confirmed the commit, or null.
+		const groups = parseParticipantGroups(stateRow.participant_groups_json);
 		const results = await Promise.allSettled(
-			pendingParticipants.map(async (p, i): Promise<string | null> => {
+			pendingParticipants.map(async (p, i): Promise<number | null> => {
 				// Past the request budget, stop dispatching: this participant stays unconfirmed, the
 				// transaction stays in COMMITTING, the caller receives the commit-pending error, and the
 				// `tx_recovery` job finishes the fan-out.
 				if (this.#platform.now() > deadlineMs) {
 					return null;
 				}
-				const pCtx = deserializePartitionContext(p.partition_context_json);
+				const pCtx = this.participantContext(groups, p);
 				seen.add(
 					await this.partitionClient(pCtx).send(
 						"txCommit",
@@ -1766,7 +1838,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						{ retry: this.fanoutRetry(deadlineMs) },
 					),
 				);
-				return p.partition_do_name;
+				return p.participant_idx;
 			}),
 		);
 		const confirmed = results.flatMap((r) => (r.status === "fulfilled" && r.value !== null ? [r.value] : []));
@@ -1782,14 +1854,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// the outcomes that this drive did not get.
 		if (confirmed.length < pendingParticipants.length) {
 			const uncommitted = this.ctx.storage.transactionSync(() => {
-				for (const partitionDoName of confirmed) {
+				for (const participantIdx of confirmed) {
 					this.ctx.storage.sql.exec(
 						`UPDATE tc_participants SET commit_outcome = 'committed'
-						  WHERE routing_hash = ?1 AND transaction_id = ?2 AND partition_do_name = ?3 AND commit_outcome IS NULL
+						  WHERE routing_hash = ?1 AND transaction_id = ?2 AND participant_idx = ?3 AND commit_outcome IS NULL
 						    AND EXISTS (SELECT 1 FROM tc_state WHERE routing_hash = ?1 AND transaction_id = ?2 AND state = 'COMMITTING')`,
 						routingHash,
 						transactionId,
-						partitionDoName,
+						participantIdx,
 					);
 				}
 				return one(
@@ -1818,13 +1890,15 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Sends cancels only when the stored decision is cancel, to avoid racy runs breaking atomicity.
 		// A cancel after a commit decision makes a participant release a lock that the commit must apply,
 		// and the participant then answers that commit with the idempotent success.
-		if (this.loadStateRow(routingHash, transactionId)?.state !== "CANCELLING") {
+		const stateRow = this.loadStateRow(routingHash, transactionId);
+		if (stateRow?.state !== "CANCELLING") {
 			return;
 		}
+		const groups = parseParticipantGroups(stateRow.participant_groups_json);
 		// Keys only: cancel routes on them but never reads the payload, and this path runs on every
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
-		const keysByPartition = groupByPartition(this.loadItemKeys(routingHash, transactionId));
+		const keysByParticipant = groupByParticipant(this.loadItemKeys(routingHash, transactionId));
 		const deadlineMs = this.#platform.now() + requestBudgetMs;
 
 		// Cancel any participant not yet cancelled — this includes both
@@ -1833,7 +1907,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// to a participant that never prepared is safe.
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
-				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
+				`SELECT transaction_id, participant_idx, group_idx, partition_id, prepare_outcome, commit_outcome, cancel_outcome
                  FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND cancel_outcome IS NULL`,
 				routingHash,
 				transactionId,
@@ -1844,7 +1918,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		for (const p of pendingParticipants) {
 			invariant(
 				p.commit_outcome === null,
-				() => `fokos/tc: participant ${p.partition_do_name} of cancelling transaction ${transactionId} has commit ${p.commit_outcome}`,
+				() => `fokos/tc: participant ${p.partition_id} of cancelling transaction ${transactionId} has commit ${p.commit_outcome}`,
 			);
 		}
 
@@ -1856,18 +1930,18 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				if (this.#platform.now() > deadlineMs) {
 					return;
 				}
-				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const keys = toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []);
+				const pCtx = this.participantContext(groups, p);
+				const keys = toTransactionItemKeys(keysByParticipant.get(p.participant_idx) ?? []);
 				seen.add(
 					await this.partitionClient(pCtx).send("txCancel", pCtx, { transactionId, items: keys }, keys, {
 						retry: this.fanoutRetry(deadlineMs),
 					}),
 				);
 				this.ctx.storage.sql.exec(
-					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE routing_hash = ? AND transaction_id = ? AND partition_do_name = ?`,
+					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE routing_hash = ? AND transaction_id = ? AND participant_idx = ?`,
 					routingHash,
 					transactionId,
-					p.partition_do_name,
+					p.participant_idx,
 				);
 			}),
 		);
@@ -1898,8 +1972,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			return;
 		}
 
-		const items = this.loadItems(routingHash, transactionId);
-		const itemsByPartition = groupByPartition(items);
+		const itemsByParticipant = groupByParticipant(this.loadItems(routingHash, transactionId));
+		const groups = parseParticipantGroups(stateRow.participant_groups_json);
 		const coordinator = this.coordinatorRef(idempotencyToken);
 
 		const existingParticipants = this.loadParticipants(routingHash, transactionId);
@@ -1916,8 +1990,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 
 		await Promise.allSettled(
 			nullParticipants.map(async (p) => {
-				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const partitionItems = toTransactionItems(itemsByPartition.get(p.partition_do_name) ?? []);
+				const pCtx = this.participantContext(groups, p);
+				const partitionItems = toTransactionItems(itemsByParticipant.get(p.participant_idx) ?? []);
 				const answer = await this.partitionClient(pCtx)
 					.send(
 						"txPrepare",
@@ -1928,10 +2002,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 						{ retry: prepareRetry(retry, retry.prepareRecoveryMaxAttempts) },
 					)
 					.catch((err: unknown) => {
-						this.storePrepareError(routingHash, transactionId, p.partition_do_name, err);
+						this.storePrepareError(routingHash, transactionId, p.participant_idx, err);
 						throw err;
 					});
-				seen.addPrepare(answer, this.storePrepareAnswer(routingHash, transactionId, p.partition_do_name, answer.value));
+				seen.addPrepare(answer, this.storePrepareAnswer(routingHash, transactionId, p.participant_idx, answer.value));
 			}),
 		);
 
@@ -2186,7 +2260,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			params.push(interval.end.routingHash);
 		}
 		const rows = this.ctx.storage.sql.exec<TcStateRow & { routing_hash: ArrayBuffer }>(
-			`SELECT routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored
+			`SELECT routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored, participant_groups_json
              FROM tc_state WHERE ${conds.join(" AND ")} ORDER BY routing_hash, transaction_id LIMIT ?`,
 			...params,
 			budget.scanRows + 1,
@@ -2237,8 +2311,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		for (const { state, items, participants, results, resultChunks, answerChunks } of page) {
 			const routingHash = this.routingHashOfToken(state.idempotency_token);
 			sql.exec(
-				`INSERT OR REPLACE INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT OR REPLACE INTO tc_state (routing_hash, transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored, participant_groups_json)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				routingHash,
 				state.transaction_id,
 				state.idempotency_token,
@@ -2251,10 +2325,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 				state.operations_hash,
 				state.image_cap_bytes,
 				state.image_bytes_stored,
+				state.participant_groups_json,
 			);
 			for (const r of items) {
 				sql.exec(
-					`INSERT OR REPLACE INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
+					`INSERT OR REPLACE INTO tc_items (routing_hash, transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, participant_idx, return_values_on_condition_check_failure)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					routingHash,
 					r.transaction_id,
@@ -2267,18 +2342,19 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					r.ttl_epoch_utc_seconds,
 					r.conditions_json,
 					r.update_json,
-					r.partition_do_name,
+					r.participant_idx,
 					r.return_values_on_condition_check_failure,
 				);
 			}
 			for (const r of participants) {
 				sql.exec(
-					`INSERT OR REPLACE INTO tc_participants (routing_hash, transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT OR REPLACE INTO tc_participants (routing_hash, transaction_id, participant_idx, group_idx, partition_id, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					routingHash,
 					r.transaction_id,
-					r.partition_do_name,
-					r.partition_context_json,
+					r.participant_idx,
+					r.group_idx,
+					r.partition_id,
 					r.prepare_outcome,
 					r.commit_outcome,
 					r.cancel_outcome,
@@ -2310,10 +2386,10 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			}
 			for (const r of answerChunks) {
 				sql.exec(
-					`INSERT OR REPLACE INTO tc_answer_chunks (routing_hash, transaction_id, partition_do_name, chunk_index, answer_json) VALUES (?, ?, ?, ?, ?)`,
+					`INSERT OR REPLACE INTO tc_answer_chunks (routing_hash, transaction_id, participant_idx, chunk_index, answer_json) VALUES (?, ?, ?, ?, ?)`,
 					routingHash,
 					r.transaction_id,
-					r.partition_do_name,
+					r.participant_idx,
 					r.chunk_index,
 					r.answer_json,
 				);
@@ -2347,7 +2423,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadStateRow(routingHash: RoutingHash, transactionId: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored, participant_groups_json
                  FROM tc_state WHERE routing_hash = ? AND transaction_id = ?`,
 				routingHash,
 				transactionId,
@@ -2376,7 +2452,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadStateRowByToken(routingHash: RoutingHash, idempotencyToken: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash, image_cap_bytes, image_bytes_stored, participant_groups_json
                  FROM tc_state WHERE routing_hash = ? AND idempotency_token = ?`,
 				routingHash,
 				idempotencyToken,
@@ -2388,13 +2464,14 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadPrepareFanout(routingHash: RoutingHash, transactionId: string): PrepareFanout {
 		const stateRow = this.loadStateRow(routingHash, transactionId);
 		invariant(stateRow, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
-		const itemsByPartition = groupByPartition(this.loadItems(routingHash, transactionId));
+		const itemsByParticipant = groupByParticipant(this.loadItems(routingHash, transactionId));
+		const groups = parseParticipantGroups(stateRow.participant_groups_json);
 		return {
 			transactionTs: stateRow.transaction_ts,
 			participants: this.loadParticipants(routingHash, transactionId).map((p) => ({
-				doName: p.partition_do_name,
-				context: deserializePartitionContext(p.partition_context_json),
-				items: toTransactionItems(itemsByPartition.get(p.partition_do_name) ?? []),
+				index: p.participant_idx,
+				context: this.participantContext(groups, p),
+				items: toTransactionItems(itemsByParticipant.get(p.participant_idx) ?? []),
 			})),
 		};
 	}
@@ -2406,7 +2483,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 			: "NULL AS data, NULL AS data_kind, ttl_epoch_utc_seconds, NULL AS conditions_json, NULL AS update_json";
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
-				`SELECT transaction_id, hk, sk, op_index, operation, ${payload}, partition_do_name, return_values_on_condition_check_failure
+				`SELECT transaction_id, hk, sk, op_index, operation, ${payload}, participant_idx, return_values_on_condition_check_failure
                  FROM tc_items WHERE routing_hash = ? AND transaction_id = ? ORDER BY op_index`,
 				routingHash,
 				transactionId,
@@ -2418,11 +2495,11 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	 * The routing half of loadItems: no data, no conditions — see runCancel. Each key comes one time,
 	 * because commit and cancel send each key one time. SQLite compares the BLOB keys by bytes.
 	 */
-	private loadItemKeys(routingHash: RoutingHash, transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
+	private loadItemKeys(routingHash: RoutingHash, transactionId: string): Pick<TcItemRow, "hk" | "sk" | "participant_idx">[] {
 		return this.ctx.storage.sql
 			.exec<
-				Pick<TcItemRow, "hk" | "sk" | "partition_do_name">
-			>(`SELECT DISTINCT hk, sk, partition_do_name FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId)
+				Pick<TcItemRow, "hk" | "sk" | "participant_idx">
+			>(`SELECT DISTINCT hk, sk, participant_idx FROM tc_items WHERE routing_hash = ? AND transaction_id = ?`, routingHash, transactionId)
 			.toArray();
 	}
 
@@ -2444,26 +2521,26 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	}
 
 	/** The stored results of each rejected prepare answer, by the participant that gave it. */
-	private loadAnswerResults(routingHash: RoutingHash, transactionId: string): Map<string, ParticipantOperationResultEncoded[]> {
-		const texts = new Map<string, string[]>();
-		for (const { partition_do_name, answer_json } of this.ctx.storage.sql.exec<{ partition_do_name: string; answer_json: string }>(
-			`SELECT partition_do_name, answer_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
+	private loadAnswerResults(routingHash: RoutingHash, transactionId: string): Map<number, ParticipantOperationResultEncoded[]> {
+		const texts = new Map<number, string[]>();
+		for (const { participant_idx, answer_json } of this.ctx.storage.sql.exec<{ participant_idx: number; answer_json: string }>(
+			`SELECT participant_idx, answer_json FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? AND answer_json IS NOT NULL`,
 			routingHash,
 			transactionId,
 		)) {
-			texts.set(partition_do_name, [answer_json]);
+			texts.set(participant_idx, [answer_json]);
 		}
 		for (const chunk of this.loadAnswerChunks(routingHash, transactionId)) {
-			const parts = texts.get(chunk.partition_do_name);
+			const parts = texts.get(chunk.participant_idx);
 			invariant(
 				parts,
-				() => `fokos/tc: transaction ${transactionId} has an answer chunk of ${chunk.partition_do_name} without its first chunk`,
+				() => `fokos/tc: transaction ${transactionId} has an answer chunk of participant ${chunk.participant_idx} without its first chunk`,
 			);
 			parts.push(chunk.answer_json);
 		}
-		const answers = new Map<string, ParticipantOperationResultEncoded[]>();
-		for (const [doName, parts] of texts) {
-			answers.set(doName, parseTagged<ParticipantOperationResultEncoded[]>(parts.join("")));
+		const answers = new Map<number, ParticipantOperationResultEncoded[]>();
+		for (const [participantIdx, parts] of texts) {
+			answers.set(participantIdx, parseTagged<ParticipantOperationResultEncoded[]>(parts.join("")));
 		}
 		return answers;
 	}
@@ -2482,8 +2559,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadAnswerChunks(routingHash: RoutingHash, transactionId: string): TcAnswerChunkRow[] {
 		return this.ctx.storage.sql
 			.exec<TcAnswerChunkRow>(
-				`SELECT transaction_id, partition_do_name, chunk_index, answer_json FROM tc_answer_chunks
-				  WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name, chunk_index`,
+				`SELECT transaction_id, participant_idx, chunk_index, answer_json FROM tc_answer_chunks
+				  WHERE routing_hash = ? AND transaction_id = ? ORDER BY participant_idx, chunk_index`,
 				routingHash,
 				transactionId,
 			)
@@ -2493,8 +2570,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	private loadParticipants(routingHash: RoutingHash, transactionId: string): TcParticipantRow[] {
 		return this.ctx.storage.sql
 			.exec<TcParticipantRow>(
-				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json
-                 FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name`,
+				`SELECT transaction_id, participant_idx, group_idx, partition_id, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json
+                 FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? ORDER BY participant_idx`,
 				routingHash,
 				transactionId,
 			)
@@ -2590,20 +2667,12 @@ function assertMigratedTransaction({ state, items, participants, results, result
  * the overhead of each row with its column names (64 to 256 bytes).
  */
 function migratedTransactionBytes(tx: MigratedTransaction): number {
-	let bytes = 256 + wireBytes(tx.state.results_json);
+	let bytes = 256 + wireBytes(tx.state.results_json) + wireBytes(tx.state.participant_groups_json);
 	for (const r of tx.items) {
-		bytes +=
-			128 +
-			r.hk.byteLength +
-			r.sk.byteLength +
-			wireBytes(r.data) +
-			wireBytes(r.conditions_json) +
-			wireBytes(r.update_json) +
-			wireBytes(r.partition_do_name);
+		bytes += 128 + r.hk.byteLength + r.sk.byteLength + wireBytes(r.data) + wireBytes(r.conditions_json) + wireBytes(r.update_json);
 	}
 	for (const r of tx.participants) {
-		bytes +=
-			128 + wireBytes(r.partition_context_json) + wireBytes(r.answer_json) + wireBytes(r.error_json) + wireBytes(r.partition_do_name);
+		bytes += 128 + wireBytes(r.partition_id) + wireBytes(r.answer_json) + wireBytes(r.error_json);
 	}
 	for (const r of tx.results) {
 		bytes += 64 + wireBytes(r.image_data);
@@ -2612,22 +2681,31 @@ function migratedTransactionBytes(tx: MigratedTransaction): number {
 		bytes += 64 + wireBytes(r.results_json);
 	}
 	for (const r of tx.answerChunks) {
-		bytes += 64 + wireBytes(r.answer_json) + wireBytes(r.partition_do_name);
+		bytes += 64 + wireBytes(r.answer_json);
 	}
 	return bytes;
 }
 
-function deserializePartitionContext(json: string): FokosDBRouteContext {
-	return JSON.parse(json) as FokosDBRouteContext;
+/**
+ * The groups of `tc_state.participant_groups_json`. Refuses a version that this code does not know, so
+ * a later format cannot be read as this one.
+ */
+function parseParticipantGroups(json: string): ParticipantGroup[] {
+	const groups = JSON.parse(json) as Partial<ParticipantGroups> | null;
+	invariant(
+		groups?.v === PARTICIPANT_GROUPS_VERSION && Array.isArray(groups.g) && groups.g.length > 0,
+		() => `fokos/tc: participant_groups_json has an unknown form: ${json}`,
+	);
+	return groups.g;
 }
 
-function groupByPartition<T extends Pick<TcItemRow, "partition_do_name">>(items: T[]): Map<string, T[]> {
-	const map = new Map<string, T[]>();
+function groupByParticipant<T extends Pick<TcItemRow, "participant_idx">>(items: T[]): Map<number, T[]> {
+	const map = new Map<number, T[]>();
 	for (const item of items) {
-		let arr = map.get(item.partition_do_name);
+		let arr = map.get(item.participant_idx);
 		if (!arr) {
 			arr = [];
-			map.set(item.partition_do_name, arr);
+			map.set(item.participant_idx, arr);
 		}
 		arr.push(item);
 	}

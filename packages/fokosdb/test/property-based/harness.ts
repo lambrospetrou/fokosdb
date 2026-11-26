@@ -338,7 +338,7 @@ async function describeLock(db: FokosDB, e: unknown): Promise<string> {
 			const coordinatorName = (JSON.parse(info.coordinator_json) as { doName: string }).doName;
 			const coordinator = await read(env[nsTx].getByName(coordinatorName), {
 				transaction: `SELECT state, created_at, completed_at, next_recovery_at FROM tc_state WHERE transaction_id = ?`,
-				participants: `SELECT partition_do_name, prepare_outcome, commit_outcome, cancel_outcome, error_json FROM tc_participants WHERE transaction_id = ?`,
+				participants: `SELECT participant_idx, partition_id, prepare_outcome, commit_outcome, cancel_outcome, error_json FROM tc_participants WHERE transaction_id = ?`,
 			});
 			lines.push(`coordinator ${coordinatorName}: ${JSON.stringify(coordinator)}`);
 		}

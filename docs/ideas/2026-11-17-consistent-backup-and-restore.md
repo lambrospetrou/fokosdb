@@ -142,7 +142,7 @@ Stored state names the table in these places today:
 | Each `routing_hash` column | `xxh64(hashKey, seed)`, with a seed from the whole shard group name today |
 | `fokos_repartition_targets.do_name`, the repartition plans in KV, `__fokos/import` | The names of peer DOs |
 | `pending_tx_info.coordinator_json` | The `doName` of the coordinator |
-| `tc_participants.partition_do_name`, `partition_context_json` | The names and contexts of the participants |
+| `tc_participants.partition_do_name`, `partition_context_json` | The names and contexts of the participants. NOTE: these columns no longer exist. `tc_participants` now stores only `partition_id`, and the coordinator builds each context from its own route context. Read the code again before you write this part of the restore. |
 | `ancestor_fences.ancestor_id`, `producer_fences.producer_id` | DurableObjectId hex, which depends on the name |
 | The tables of the topology keeper | Rows keyed by `shard_group` |
 

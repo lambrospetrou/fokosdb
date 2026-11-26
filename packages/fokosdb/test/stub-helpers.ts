@@ -5,9 +5,12 @@
 import { env } from "cloudflare:workers";
 import type { FokosDBPartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBTransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
+import { tableFingerprint } from "../src/shared/do-stubs.js";
 import {
+	coordinatorShardGroup,
 	createTableConfig,
 	type FokosDBRouteContext,
+	type FokosDBTableConfig,
 	type PartitionNamespaceKey,
 	type TransactionCoordinatorNamespaceKey,
 } from "../src/shared/partition-context.js";
@@ -40,13 +43,33 @@ export function testControlledCoordinatorStub(doName: string): DurableObjectStub
 	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(doName);
 }
 
-/** The route context of a root coordinator in a new coordinator group. */
-export function testCoordinatorContext(nsTx: TransactionCoordinatorNamespaceKey = "TRANSACTION_COORDINATOR_DO"): FokosDBRouteContext {
-	const table = createTableConfig({
+/**
+ * The table of a new coordinator group: one hash root of `PARTITION_DO` with two children for each
+ * split.
+ */
+export function testCoordinatorTable(nsTx: TransactionCoordinatorNamespaceKey = "TRANSACTION_COORDINATOR_DO"): FokosDBTableConfig {
+	return createTableConfig({
 		table: { name: `tc-test.${crypto.randomUUID()}`, ns: "PARTITION_DO", nsTx, rootTreesN: 1, hashSplitN: 2 },
 		hashSplitConditions: { maxSizeMb: 100 },
 	});
-	return new FokosRouter(table.topology, table.rangeConfig, table.policy, undefined, testRoutingHashSeedResolver).allRoots()[0];
+}
+
+/**
+ * The route context of the root coordinator of the coordinator group of `table`, named as FokosDB
+ * names it: `fokos.tc.<tableName>.<fp>`.
+ */
+export function testCoordinatorContext(
+	nsTx: TransactionCoordinatorNamespaceKey = "TRANSACTION_COORDINATOR_DO",
+	table: FokosDBTableConfig = testCoordinatorTable(nsTx),
+): FokosDBRouteContext {
+	const shardGroup = coordinatorShardGroup(table.topology, tableFingerprint(env, table));
+	return new FokosRouter(
+		{ ...table.topology, shardGroup },
+		table.rangeConfig,
+		table.policy,
+		undefined,
+		testRoutingHashSeedResolver,
+	).allRoots()[0];
 }
 
 /**

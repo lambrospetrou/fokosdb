@@ -588,8 +588,8 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(tcStub, async (instance: FokosDBTransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, operations_hash, image_cap_bytes)
-				 VALUES (?, ?, ?, 'COMMITTED', ?, ?, ?, ?, 0)`,
+				`INSERT INTO tc_state (routing_hash, idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, operations_hash, image_cap_bytes, participant_groups_json)
+				 VALUES (?, ?, ?, 'COMMITTED', ?, ?, ?, ?, 0, '{"v":1,"g":[{"rootTreesN":1,"hashSplitN":2}]}')`,
 				instance.fokos.routingHashForKey(KeyCodec.encode(`stale-${transactionId}`)),
 				`stale-${transactionId}`,
 				transactionId,
