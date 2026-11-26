@@ -20,13 +20,17 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    make the stub from it. After a restore into another jurisdiction, the coordinator sends commits to the DOs of the
    source table. Store only the `partitionId`, and build the context from the route context of the coordinator.
    `tc_items.partition_do_name` also holds the full name.
-2. **The admin outbox** — The event id is `<source doName>/r<seq>` (`#recordCompletion` in
+2. (DONE) **The admin outbox** — The event id is `<source doName>/r<seq>` (`#recordCompletion` in
    `sharding/runtime.ts`). The event holds `shardGroup`, the names of the source and the targets, and DO IDs. A
    restored DO sends a pending event with the old shard group, and the keeper stores rows under that group. Make
    the id from the `partitionId`, and let the keeper use the shard group of its own name.
-3. **`fokos_topo_repartitions.actor_id` and `data`** — They hold DO IDs and full names, and no code reads them.
+   Fix: the id is `<source partitionId>/r<seq>`, the event holds only partition IDs, and the outbox row does not
+   store `shardGroup`: the send adds the current shard group.
+   (FUTURE-ISSUE) The keeper keeps its `shard_group` columns, so the rows of a restored keeper hold the old shard
+   group. The restore RFC must rewrite them (M2, "Topology rows by kind").
+3. (DONE) **`fokos_topo_repartitions.actor_id` and `data`** — They hold DO IDs and full names, and no code reads them.
    Remove both columns.
-4. **`__fokos/policy`** — A restore copies the `policyVersion` of the source table, but each table has its own
+4. (FUTURE-ISSUE) **`__fokos/policy`** — A restore copies the `policyVersion` of the source table, but each table has its own
    counter. When the target table sends a lower version, the stored policy of the source stays: wrong binding names
    and wrong split conditions. The stale-transaction job also reads `nsTx` from it. Reset the key at restore, or
    do not store binding names in it.
@@ -34,9 +38,12 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
    `topologiesEqual` compares the jurisdiction, so a restore into another jurisdiction refuses every request. The
    namespace fingerprint also uses the jurisdiction, so the names of the coordinators and the materialization DOs
    change with it.
-6. **`PushTargetBatch.producerId`** — It is `ctx.id.toString()` of the materialization DO, and a push sink of the
-   user stores it as a fence key. A restore changes it. Select a logical producer id before the API is stable, or
-   document the DO ID as the contract.
+6. (NON-ISSUE) **`PushTargetBatch.producerId`** — It is `ctx.id.toString()` of the materialization DO, and a push
+   sink of the user stores it as a fence key with the `targetId`. The DO ID is the contract (`targets.ts`). A restore
+   into a new table gives new IDs, and that is correct, because the table is new. A logical id from the position
+   would hold user key bytes, and two tables or namespaces could have the same id.
+   (FUTURE-ISSUE) An in-place restore keeps the IDs and moves the target epochs back, so a sink that checks the
+   epoch refuses the restored producer. The in-place restore must set a floor for the target epochs.
 
 ## B. General problems
 
@@ -73,4 +80,4 @@ targets and plans, `__fokos/import`, `pending_tx_info.coordinator_json`, `tc_par
 1. A1, A2, A3: they change SQL columns and keys.
 2. B1, B2, B3, B5: they make later releases safe.
 3. B6, B7: they freeze formats.
-4. A4, A5, A6: they need a decision in the restore RFC.
+4. A4, A5: they need a decision in the restore RFC.

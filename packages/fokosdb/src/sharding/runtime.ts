@@ -111,7 +111,7 @@ import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfi
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
 import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
 import { cachedHashTopology, cutTopologyHint, type TopologyEntry } from "./topology-cache.js";
-import { findLeaf, TOPOLOGY_EVENT_TYPE, type FokosTopologyEvent, type HashTopologyView } from "./topology-codec.js";
+import { findLeaf, TOPOLOGY_EVENT_TYPE, type FokosStoredTopologyEvent, type HashTopologyView } from "./topology-codec.js";
 import { topologyEventToJson } from "./topology-encode.js";
 import type { RangeAncestorInfo } from "./types.js";
 
@@ -2462,26 +2462,24 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/**
 	 * Writes the report of a completed repartition to the admin outbox. It runs inside the completion
 	 * transaction, so the report exists exactly when the state is `completed`. The outbox keeps its
-	 * own copy of the event, because the cleanup deletes the plan before it writes `cleaned`.
+	 * own copy of the event, because the cleanup deletes the plan before it writes `cleaned`. The copy
+	 * holds no name of the table: the send adds the shard group of this partition at that time.
 	 */
 	#recordCompletion(plan: FokosRepartitionPlan, completedAt: number): void {
 		if (!this.#adminOutbox?.()) {
 			return;
 		}
-		const ctx = this.routeContext();
-		// The local repartition id repeats on other partitions, and the source DO name makes it unique.
-		const id = `${plan.source.doName}/${plan.id}`;
-		const event: FokosTopologyEvent = {
+		const { topology } = this.routeContext();
+		// The local repartition id repeats on other partitions, and the source partition ID makes it unique.
+		const id = `${plan.source.partitionId}/${plan.id}`;
+		const event: FokosStoredTopologyEvent = {
 			schema: 1,
 			id,
 			kind: plan.kind,
-			shardGroup: ctx.topology.shardGroup,
-			rootTreesN: ctx.topology.rootTreesN,
-			hashSplitN: ctx.topology.hashSplitN,
-			source: plan.source,
-			actorId: this.#actorId,
-			// A stub is not an RPC: its ID comes from the name and the jurisdiction that the host applies.
-			targets: plan.targets.map((t) => ({ ref: t.ref, slice: t.slice, actorId: this.#stub(ctx, t.ref.doName).id.toString() })),
+			rootTreesN: topology.rootTreesN,
+			hashSplitN: topology.hashSplitN,
+			sourcePartitionId: plan.source.partitionId,
+			targets: plan.targets.map((t) => ({ partitionId: t.ref.partitionId, slice: t.slice })),
 			completedAt,
 		};
 		this.#store.insertAdminOutbox(TOPOLOGY_EVENT_TYPE, id, topologyEventToJson(event), completedAt);
@@ -2510,13 +2508,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				reject(new Error("fokos/runtime: admin outbox step timed out"));
 			}, ADMIN_OUTBOX_TIMEOUT_MS);
 		});
+		const { shardGroup } = this.routeContext().topology;
 		try {
 			for (const row of this.#store.selectDueAdminOutbox(this.#platform.now(), ADMIN_OUTBOX_BATCH)) {
 				if (expired || this.#store.isDestroying()) {
 					return;
 				}
 				try {
-					const delivery = outbox.send({ eventType: row.eventType, id: row.id, event: JSON.parse(row.eventJson) }).then(() => {
+					const event = { ...(JSON.parse(row.eventJson) as FokosStoredTopologyEvent), shardGroup };
+					const delivery = outbox.send({ eventType: row.eventType, id: row.id, event }).then(() => {
 						if (!this.#store.isDestroying()) {
 							this.#store.transactionSync(() => this.#store.deleteAdminOutbox(row.eventType, row.id, row.eventJson));
 						}

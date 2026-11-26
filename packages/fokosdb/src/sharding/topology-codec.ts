@@ -15,7 +15,6 @@ import { layerHas } from "../shared/bloom-filter.js";
 import { ROUTING_HASH_BYTES, RoutingHashDigitCursor, type RoutingHash } from "./hash-primitives.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
-import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
 import type { SkInterval } from "./sk-interval.js";
 
@@ -26,9 +25,16 @@ export const TOPOLOGY_EVENT_TYPE = "topology.repartition_completed";
 
 export type FokosTopologyEvent = {
 	schema: 1;
-	/** The repartition id. The keeper is idempotent by (shardGroup, id). */
+	/**
+	 * `<source partition ID>/<repartition id>`. A repartition id is unique only inside its source
+	 * partition. The keeper is idempotent by (shardGroup, id).
+	 */
 	id: string;
 	kind: RepartitionKind;
+	/**
+	 * The shard group of the sender when it sends. The outbox row does not store it, so the report
+	 * contains no name of the table.
+	 */
 	shardGroup: string;
 	/**
 	 * The immutable topology values of the shard group. The keeper cannot get `rootTreesN` from a
@@ -36,15 +42,14 @@ export type FokosTopologyEvent = {
 	 */
 	rootTreesN: number;
 	hashSplitN: number;
-	/** `source.doName` is the name of the source object. */
-	source: FokosPartitionRef;
-	/** `ctx.id.toString()` of the source. */
-	actorId: string;
-	/** `actorId` is `idFromName(ref.doName).toString()`, which the source computes with no RPC. */
-	targets: Array<{ ref: FokosPartitionRef; slice: FokosSlice; actorId: string }>;
+	sourcePartitionId: string;
+	targets: Array<{ partitionId: string; slice: FokosSlice }>;
 	/** `Date.now()` of the source when it wrote `completed`. */
 	completedAt: number;
 };
+
+/** The report as the admin outbox row stores it. */
+export type FokosStoredTopologyEvent = Omit<FokosTopologyEvent, "shardGroup">;
 
 // ─── the body framing ────────────────────────────────────────────────────────
 

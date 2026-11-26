@@ -80,7 +80,7 @@ export type { RepartitionKind } from "./sharding-store.js";
 // ─── Encoded topology ─────────────────────────────────────────────────────────
 
 export { TOPOLOGY_EVENT_TYPE } from "./topology-codec.js";
-export type { FokosTopologyEvent } from "./topology-codec.js";
+export type { FokosStoredTopologyEvent, FokosTopologyEvent } from "./topology-codec.js";
 export { TOPOLOGY_CACHE_BUDGET_BYTES, topologyGetForRangePath, topologyGetPath } from "./topology-cache.js";
 export type { FokosTopologyCacheOptions } from "./topology-cache.js";
 

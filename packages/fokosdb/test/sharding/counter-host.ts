@@ -227,9 +227,11 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 	}
 
 	/** The rows of the admin outbox, and the number of sends that the hook received. */
-	async debugOutbox(): Promise<{ rows: Array<{ id: string; attempt: number }>; sends: number }> {
+	async debugOutbox(): Promise<{ rows: Array<{ id: string; attempt: number; event: string }>; sends: number }> {
 		return {
-			rows: this.ctx.storage.sql.exec<{ id: string; attempt: number }>("SELECT id, attempt FROM fokos_admin_outbox").toArray(),
+			rows: this.ctx.storage.sql
+				.exec<{ id: string; attempt: number; event: string }>("SELECT id, attempt, json(event) AS event FROM fokos_admin_outbox")
+				.toArray(),
 			sends: this.readMeta("outboxSends"),
 		};
 	}

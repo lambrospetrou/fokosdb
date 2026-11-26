@@ -14,14 +14,14 @@ function wire(event: FokosTopologyEvent): unknown {
 	return JSON.parse(topologyEventToJson(event));
 }
 
-function common(shardGroup: string, sourceDoName: string, completedAt: number, rootTreesN: number, hashSplitN: number) {
+function common(shardGroup: string, sourcePartitionId: string, completedAt: number, rootTreesN: number, hashSplitN: number) {
 	return {
 		schema: 1 as const,
-		id: `${sourceDoName}/r${++nextId}`,
+		id: `${sourcePartitionId}/r${++nextId}`,
 		shardGroup,
 		rootTreesN,
 		hashSplitN,
-		actorId: `actor-of-${sourceDoName}`,
+		sourcePartitionId,
 		completedAt,
 	};
 }
@@ -36,23 +36,17 @@ export function hashSplitReport(
 ): unknown {
 	const source = PartitionIdHelper.hashId(shardGroup, root, path);
 	return wire({
-		...common(shardGroup, source.doName, completedAt, topology.rootTreesN, topology.hashSplitN),
+		...common(shardGroup, source.opaque, completedAt, topology.rootTreesN, topology.hashSplitN),
 		kind: "hash_split",
-		source: { partitionId: source.opaque, doName: source.doName },
-		targets: Array.from({ length: topology.hashSplitN }, (_, c) => {
-			const target = PartitionIdHelper.hashId(shardGroup, root, [...path, c]);
-			return {
-				ref: { partitionId: target.opaque, doName: target.doName },
-				slice: { kind: "hash_child", childIndex: c, depth: path.length + 1 },
-				actorId: `actor-of-${target.doName}`,
-			};
-		}),
+		targets: Array.from({ length: topology.hashSplitN }, (_, c) => ({
+			partitionId: PartitionIdHelper.hashId(shardGroup, root, [...path, c]).opaque,
+			slice: { kind: "hash_child", childIndex: c, depth: path.length + 1 },
+		})),
 	});
 }
 
-function rangeRef(shardGroup: string, routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null) {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(shardGroup, routingHash, start, end).encode(true);
-	return { partitionId: opaque, doName: doName! };
+function rangePartitionId(shardGroup: string, routingHash: RoutingHash, start: FokosCompositeKey | null, end: FokosCompositeKey | null) {
+	return PartitionIdHelper.fromRangePartition(shardGroup, routingHash, start, end).encode(false).opaque;
 }
 
 /** The report of the promotion of the routingHash of `hashKey` from the hash root 0. */
@@ -74,13 +68,12 @@ export function routingHashPromotionReport(
 	rootTreesN = 1,
 	hashSplitN = 4,
 ): unknown {
-	const source = PartitionIdHelper.hashId(shardGroup, 0);
-	const target = rangeRef(shardGroup, routingHash, null, null);
 	return wire({
-		...common(shardGroup, source.doName, completedAt, rootTreesN, hashSplitN),
+		...common(shardGroup, PartitionIdHelper.hashId(shardGroup, 0).opaque, completedAt, rootTreesN, hashSplitN),
 		kind: "key_promotion",
-		source: { partitionId: source.opaque, doName: source.doName },
-		targets: [{ ref: target, slice: { kind: "promoted_routing_hash", routingHash }, actorId: `actor-of-${target.doName}` }],
+		targets: [
+			{ partitionId: rangePartitionId(shardGroup, routingHash, null, null), slice: { kind: "promoted_routing_hash", routingHash } },
+		],
 	});
 }
 
@@ -94,15 +87,13 @@ export function rangeSplitReport(
 	completedAt = Date.now(),
 ): unknown {
 	const routingHash = routingHashOf(hashKey, shardGroup, testRoutingHashSeedResolver);
-	const source = rangeRef(shardGroup, routingHash, start, end);
 	const edges = [start, ...boundaries, end];
 	return wire({
-		...common(shardGroup, source.doName, completedAt, 1, 4),
+		...common(shardGroup, rangePartitionId(shardGroup, routingHash, start, end), completedAt, 1, 4),
 		kind: "range_split",
-		source,
-		targets: Array.from({ length: boundaries.length + 1 }, (_, i) => {
-			const ref = rangeRef(shardGroup, routingHash, edges[i], edges[i + 1]);
-			return { ref, slice: { kind: "range", routingHash, start: edges[i], end: edges[i + 1] }, actorId: `actor-of-${ref.doName}` };
-		}),
+		targets: Array.from({ length: boundaries.length + 1 }, (_, i) => ({
+			partitionId: rangePartitionId(shardGroup, routingHash, edges[i], edges[i + 1]),
+			slice: { kind: "range", routingHash, start: edges[i], end: edges[i + 1] },
+		})),
 	});
 }

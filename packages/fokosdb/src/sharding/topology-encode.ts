@@ -7,7 +7,6 @@ import { BloomFilter, bloomInitialLayerBytes } from "../shared/bloom-filter.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosSlice } from "./repartition-slice.js";
-import type { FokosPartitionRef } from "./route-context.js";
 import type { RepartitionKind } from "./sharding-store.js";
 import { asRoutingHash, compareRoutingHashes, ROUTING_HASH_BYTES, type RoutingHash } from "./hash-primitives.js";
 import {
@@ -19,6 +18,7 @@ import {
 	promotedRoutingHashesInOrder,
 	RANGE_BODY_MAGIC,
 	TOPOLOGY_RANK_BLOCK_WORDS,
+	type FokosStoredTopologyEvent,
 	type FokosTopologyEvent,
 	type HashTopologyView,
 } from "./topology-codec.js";
@@ -36,17 +36,12 @@ function fromBase64Url(text: string): Uint8Array {
 }
 
 /** The JSON text of an event. Each key byte array is a base64url string. */
-export function topologyEventToJson(event: FokosTopologyEvent): string {
+export function topologyEventToJson(event: FokosTopologyEvent | FokosStoredTopologyEvent): string {
 	return JSON.stringify(event, (_key, value: unknown) => (value instanceof Uint8Array ? toBase64Url(value) : value));
 }
 
 function invalidEvent(message: string, attributes: Record<string, unknown> = {}): FokosValidationError {
 	return new FokosValidationError(SHARDING_VALIDATION_CODES.topology_event_invalid, { message, attributes });
-}
-
-function isRef(value: unknown): value is FokosPartitionRef {
-	const ref = value as FokosPartitionRef | null;
-	return typeof ref === "object" && ref !== null && typeof ref.partitionId === "string" && typeof ref.doName === "string";
 }
 
 const KINDS: ReadonlySet<string> = new Set<RepartitionKind>(["hash_split", "range_split", "key_promotion"]);
@@ -118,14 +113,14 @@ export function topologyEventFromWire(value: unknown): FokosTopologyEvent {
 	if (!Number.isInteger(e.rootTreesN) || !Number.isInteger(e.hashSplitN) || typeof e.completedAt !== "number") {
 		throw invalidEvent("a topology event needs rootTreesN, hashSplitN, and completedAt", { id: e.id });
 	}
-	if (!isRef(e.source) || typeof e.actorId !== "string" || !Array.isArray(e.targets) || e.targets.length === 0) {
-		throw invalidEvent("a topology event needs a source, an actorId, and targets", { id: e.id });
+	if (typeof e.sourcePartitionId !== "string" || !Array.isArray(e.targets) || e.targets.length === 0) {
+		throw invalidEvent("a topology event needs a sourcePartitionId and targets", { id: e.id });
 	}
 	const targets = e.targets.map((t: Record<string, unknown> | null) => {
-		if (typeof t !== "object" || t === null || !isRef(t.ref) || typeof t.actorId !== "string") {
-			throw invalidEvent("a target needs a ref and an actorId", { id: e.id });
+		if (typeof t !== "object" || t === null || typeof t.partitionId !== "string") {
+			throw invalidEvent("a target needs a partitionId", { id: e.id });
 		}
-		return { ref: { partitionId: t.ref.partitionId, doName: t.ref.doName }, slice: sliceFromWire(t.slice), actorId: t.actorId };
+		return { partitionId: t.partitionId, slice: sliceFromWire(t.slice) };
 	});
 	return {
 		schema: 1,
@@ -134,8 +129,7 @@ export function topologyEventFromWire(value: unknown): FokosTopologyEvent {
 		shardGroup: e.shardGroup,
 		rootTreesN: e.rootTreesN as number,
 		hashSplitN: e.hashSplitN as number,
-		source: { partitionId: e.source.partitionId, doName: e.source.doName },
-		actorId: e.actorId,
+		sourcePartitionId: e.sourcePartitionId,
 		targets,
 		completedAt: e.completedAt,
 	};

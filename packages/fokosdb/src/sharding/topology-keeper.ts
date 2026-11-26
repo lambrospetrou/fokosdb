@@ -33,7 +33,6 @@ import {
 	promotedKeysBloom,
 	promotedSectionRoutingHashes,
 	topologyEventFromWire,
-	topologyEventToJson,
 } from "./topology-encode.js";
 
 /** The size of one stored chunk of a body. The documented limit of a row is 2 MB. */
@@ -112,18 +111,14 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// - One row for each report of a completed repartition, of every kind. The source partition
 		//   writes the report to its admin outbox in the completion transaction, and the outbox sends
 		//   it to this keeper until the keeper accepts it. The row makes a repeated report a no-op.
-		// - `id` is `<source DO name>/<repartition id>`. A repartition id is unique only inside its
-		//   source partition, so the source DO name makes it unique in the shard group. The primary key
-		//   `(shard_group, id)` is the idempotency check.
+		// - `id` is `<source partition ID>/<repartition id>`. A repartition id is unique only inside its
+		//   source partition, so the source partition ID makes it unique in the shard group. The primary
+		//   key `(shard_group, id)` is the idempotency check.
 		// - `kind` is `hash_split`, `range_split`, or `key_promotion`.
 		// - `seq` is the `version` of the shard group after the report: the new version when the report
 		//   wrote a new fact, or the current version when it wrote none.
 		// - `completed_at` is the clock of the source when it wrote `completed`. `received_at` is the
 		//   clock of this keeper when it accepted the report. The two clocks are different.
-		// - `actor_id` is the Durable Object ID of the source (`ctx.id.toString()`).
-		// - `data` is the JSONB of the full event: the source, the targets with their slices and
-		//   actor IDs, and the topology values. No build and no query reads it. It is there to examine
-		//   a report later.
 		//
 		// fokos_topo_hash_nodes:
 		// - One row for each split hash partition, and for each of its ancestors, also when the report
@@ -171,8 +166,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 seq             INTEGER NOT NULL,
                 completed_at    INTEGER NOT NULL,
                 received_at     INTEGER NOT NULL,
-                actor_id        TEXT    NOT NULL,
-                data            BLOB    NOT NULL,
                 PRIMARY KEY (shard_group, id)
             ) STRICT;
 
@@ -331,16 +324,14 @@ export class FokosTopologyKeeper {
 			const version = changed ? previous + 1 : previous;
 			sql.exec(
 				`INSERT INTO fokos_topo_repartitions
-				   (shard_group, id, kind, seq, completed_at, received_at, actor_id, data)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8))`,
+				   (shard_group, id, kind, seq, completed_at, received_at)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
 				event.shardGroup,
 				event.id,
 				event.kind,
 				version,
 				event.completedAt,
 				now,
-				event.actorId,
-				topologyEventToJson(event),
 			);
 			const buildDueAt = group?.build_due_at ?? (changed ? now + this.#buildDelayMs : null);
 			sql.exec(
@@ -493,7 +484,7 @@ export class FokosTopologyKeeper {
 	#checkSource(event: FokosTopologyEvent): DecodedId {
 		let source: DecodedId;
 		try {
-			source = decodePartitionId(event.source.partitionId);
+			source = decodePartitionId(event.sourcePartitionId);
 		} catch {
 			throw invalidEvent("the source partition ID is not valid", { id: event.id });
 		}

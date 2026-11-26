@@ -42,28 +42,15 @@ async function splitRoot(table: ReturnType<typeof makeCounterTable>) {
 }
 
 describe.concurrent("Sharding runtime — admin outbox and topology", () => {
-	it("reports a completed split with the actor IDs, and a client with the topology enters at the leaf", async () => {
+	it("reports a completed split by partition ID, and a client with the topology enters at the leaf", async () => {
 		const { table, shardGroup } = await splitTable();
-		const nodes = await splitRoot(table);
+		await splitRoot(table);
 		await vi.waitFor(async () => expect((await servedTopology(shardGroup)).bitCount).toBe(1 + 4), WAIT);
 
 		const reports = await runInDurableObject(admin(shardGroup), async (_i, state) =>
-			state.storage.sql
-				.exec<{ actor_id: string; data: string }>("SELECT actor_id, json(data) AS data FROM fokos_topo_repartitions")
-				.toArray(),
+			state.storage.sql.exec<{ id: string }>("SELECT id FROM fokos_topo_repartitions").toArray(),
 		);
-		expect(reports).toHaveLength(1);
-		expect(reports[0].actor_id).toBe(env.COUNTER_PARTITION_DO.idFromName(table.root.doName).toString());
-		const event = JSON.parse(reports[0].data) as { targets: Array<{ ref: { doName: string }; actorId: string }> };
-		expect(event.targets.map((t) => t.ref.doName).sort()).toEqual(
-			table
-				.childrenOf(nodes, nodes[0])
-				.map((c) => c.ref.doName)
-				.sort(),
-		);
-		for (const t of event.targets) {
-			expect(t.actorId).toBe(env.COUNTER_PARTITION_DO.idFromName(t.ref.doName).toString());
-		}
+		expect(reports).toEqual([{ id: `${table.root.partitionId}/r1` }]);
 		await vi.waitFor(async () => expect((await root(table).debugOutbox()).rows).toEqual([]), WAIT);
 
 		const pending: Promise<unknown>[] = [];
@@ -134,6 +121,12 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 		await root(table).debugSetOutbox({ failures: 1_000 });
 		await splitRoot(table);
 		await vi.waitFor(async () => expect((await root(table).debugOutbox()).rows[0]?.attempt).toBeGreaterThanOrEqual(1), WAIT);
+		// The stored report holds no name of the table. The send adds the shard group.
+		const [stored] = (await root(table).debugOutbox()).rows;
+		expect(Object.keys(JSON.parse(stored.event)).sort()).toEqual(
+			["completedAt", "hashSplitN", "id", "kind", "rootTreesN", "schema", "sourcePartitionId", "targets"].sort(),
+		);
+		expect(stored.event).not.toContain(shardGroup);
 		await root(table).debugSetOutbox({ failures: 0 });
 		const failedSends = (await root(table).debugOutbox()).sends;
 		await root(table)
