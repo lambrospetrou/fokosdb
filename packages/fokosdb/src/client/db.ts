@@ -77,6 +77,7 @@ import { fitBatchResponse } from "../shared/batch-response.js";
 import type { FokosErrorCode } from "../shared/errors-operations.js";
 import type {
 	ExecutionFailureCode,
+	FokosDBAPI,
 	RejectionReason,
 	TransactGetItemKey,
 	TransactGetItemsOptions,
@@ -772,7 +773,7 @@ function validateRetryOptions(retry: Required<FokosDBRetryOptions>): void {
 	}
 }
 
-export class FokosDB {
+export class FokosDB implements FokosDBAPI {
 	#options: FokosDBResolvedOptions;
 	/** The route context parts of the table, which every coordinator request carries. */
 	#table: FokosDBTableConfig;

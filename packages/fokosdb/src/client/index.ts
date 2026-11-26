@@ -36,6 +36,8 @@ export type {
 	ItemKey,
 	ItemPutter,
 	ItemQuerier,
+	ItemScanner,
+	GsiReader,
 	OperationMetrics,
 	PartitionMeta,
 	PutItemOptions,

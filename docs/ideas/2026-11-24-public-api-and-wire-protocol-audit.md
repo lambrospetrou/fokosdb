@@ -73,8 +73,9 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 9. **Split pagination rules between `queryItems` and `scanItems`, and single-version cursors** (`shared/query/cursor.ts`, `shared/query/scan-cursor.ts`).
    `queryItems` takes only `cursor` and fingerprints `filter` and `projection`, so neither can change between pages. `scanItems` takes `exclusiveStartKey` or `cursor` (with no `lastEvaluatedKey`) and fingerprints only `shardGroup` and `segment`, so `filter` and `projection` can change between pages. Both decoders accept only version `1`, so a format bump breaks in-flight pagination during a gradual deploy.
 
-10. **`FokosDBAPI` omits `scanItems` and `gsi`** (`shared/transaction-api-types.ts`).
+10. (DONE) **`FokosDBAPI` omits `scanItems` and `gsi`** (`shared/transaction-api-types.ts`).
     `FokosDBAPI` includes put, get, delete, query, transaction, and batch interfaces, and omits `scanItems` and `gsi(indexName)`.
+    `FokosDBAPI` now also extends the new `ItemScanner` and `GsiReader` interfaces, and `FokosDB` declares `implements FokosDBAPI`, so the compiler checks that the class and the interface match.
 
 11. **`FokosDBStd` ignores `db.options().retry` and backs off on `response_too_large`** (`client/fokos-std.ts`).
     `batchGetItemsWithRetry` and `batchWriteItemsWithRetry` take `db: ItemBatcher` and default to `DEFAULT_RETRY` instead of `db.options().retry`. `batchGetItemsWithRetry` also treats `code: "response_too_large"` as an error: it sleeps backoff delays between pages and stops after `maxAttempts` (default 5) even when zero errors occurred. `FokosDBStd` also has an implicit public constructor.

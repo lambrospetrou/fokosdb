@@ -419,3 +419,15 @@ export type GsiScanItemsProjectedOptions = GsiScanItemsOptions & { projection: r
 
 /** A page of `scanItems`. `cursor` is absent when the scan of the table, or of the segment, is complete. */
 export type ScanItemsResult<T = never> = QueryItemsPage<ReadItem<T>>;
+
+/** The overloads follow the rule of `ItemGetter`. */
+export interface ItemScanner {
+	scanItems<T = never>(opts: ScanItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
+	scanItems<T = never>(opts: ScanItemsOptions & { projection?: undefined }): Promise<ScanItemsResult<T>>;
+	scanItems<T = never>(opts: ScanItemsOptions): Promise<ScanItemsResult<T> | QueryItemsProjectedResult<T>>;
+}
+
+/** The read view of a GSI of the table. */
+export interface GsiReader {
+	gsi(indexName: string): FokosGsi;
+}

@@ -14,7 +14,9 @@ import type {
 	ItemGetter,
 	ItemKey,
 	ItemPutter,
+	GsiReader,
 	ItemQuerier,
+	ItemScanner,
 	JsonComposite,
 	ReadResultItem,
 	ReturnValuesOnConditionCheckFailure,
@@ -254,4 +256,4 @@ export interface ItemTransactor {
 // The whole contract composes the single-item halves in `types.ts`, the transaction half above, and the
 // batch half in `batch-api-types.ts`, so it lives here: `types.ts` holds the item primitives that this
 // module builds on and must not import back from it.
-export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemTransactor, ItemBatcher {}
+export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemScanner, GsiReader, ItemTransactor, ItemBatcher {}
