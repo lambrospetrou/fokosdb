@@ -375,17 +375,14 @@ describe("FokosScheduler - lifecycle reads", () => {
 describe("FokosScheduler - unregistered jobs", () => {
 	it("deletes the scheduled run of a job that is not registered, and keeps the registered one", async () => {
 		const at = Date.now() + 30_000;
-		await withScheduler(
-			{ name: "work", deadline: () => null, runStep: () => ({ nextRunAt: null }) },
-			async (scheduler, state) => {
-				const store = new FokosShardingStore(state.storage);
-				store.putJobs({ work: { nextRunAt: at }, removed: { nextRunAt: 0 } });
+		await withScheduler({ name: "work", deadline: () => null, runStep: () => ({ nextRunAt: null }) }, async (scheduler, state) => {
+			const store = new FokosShardingStore(state.storage);
+			store.putJobs({ work: { nextRunAt: at }, removed: { nextRunAt: 0 } });
 
-				await scheduler.runDueWork();
+			await scheduler.runDueWork();
 
-				expect(store.getJobs()).toEqual({ work: { nextRunAt: at } });
-			},
-		);
+			expect(store.getJobs()).toEqual({ work: { nextRunAt: at } });
+		});
 	});
 
 	it("keeps the scheduled run of a registered job that cannot run now", async () => {
