@@ -12,6 +12,7 @@ import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { DATA_KINDS } from "../../src/shared/types.js";
 import { MaterializationStore } from "../../src/server/materialization/materialization-store.js";
+import type { MaterializationDOConfig, MaterializationDOConfigOverrides } from "../../src/server/host-config.js";
 import { kb } from "../partition-do/helpers.js";
 import { testRoutingHashSeedResolver } from "../routing-hash.js";
 
@@ -266,5 +267,27 @@ describe("FokosDBMaterializationDO — applyLatestImages size and routing", () =
 		for (const k of keys) {
 			expect(await storedImage(mat.at(k).stub, k)).toMatchObject({ revision: 1 });
 		}
+	});
+});
+
+describe("FokosDBMaterializationDO — fokosConfig", () => {
+	it("resolves the settings again after the partition stores its identity", async () => {
+		const m = makeMaterialization().at("x");
+		// The override goes on this instance, never on the prototype. It reads the state of the partition
+		// only through `initialized()`, as the contract of `fokosConfig` tells.
+		const promotionFraction = async () =>
+			await runInDurableObject(m.stub, (instance: FokosDBMaterializationDO) => {
+				const hooks = instance as unknown as {
+					fokosConfig: () => MaterializationDOConfigOverrides;
+					config: () => MaterializationDOConfig;
+				};
+				hooks.fokosConfig = () => ({ promotionFraction: instance.fokos?.initialized() ? 0.25 : 0.75 });
+				return hooks.config().promotionFraction;
+			});
+
+		expect(await promotionFraction()).toBe(0.75);
+		// The first call stores the identity of the root.
+		expect(await apply(m, { items: [live(0, "x", 1)] })).toMatchObject({ failed: [] });
+		expect(await promotionFraction()).toBe(0.25);
 	});
 });

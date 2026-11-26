@@ -587,20 +587,30 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		return undefined;
 	}
 
-	/** The active settings: the overrides of `fokosConfig()` over the defaults, validated. */
-	private __cachedConfig?: MaterializationDOConfig;
+	/**
+	 * The active settings: the overrides of `fokosConfig()` over the defaults, validated. The cache
+	 * holds the route context that it was resolved for. The runtime replaces that object each time it
+	 * stores a new identity or policy, so the first read after that resolves the settings again. Before
+	 * the initialization the key is `undefined`, and the constructor can read this before `this.fokos`
+	 * is assigned.
+	 */
+	private __cachedConfig?: { key: object | undefined; config: MaterializationDOConfig };
 	private config(): MaterializationDOConfig {
-		if (!this.__cachedConfig) {
-			try {
-				this.__cachedConfig = resolveMaterializationConfig(this.fokosConfig());
-			} catch (error) {
-				// A config that cannot resolve behaves as a failed initialization: the dispatch entries
-				// answer it and the alarm retries it, so a fixed deploy heals the object.
-				this.#initError = error;
-				throw error;
-			}
+		const key = this.fokos?.initialized() ? this.fokos.routeContext() : undefined;
+		const cached = this.__cachedConfig;
+		if (cached !== undefined && cached.key === key) {
+			return cached.config;
 		}
-		return this.__cachedConfig;
+		try {
+			const config = resolveMaterializationConfig(this.fokosConfig());
+			this.__cachedConfig = { key, config };
+			return config;
+		} catch (error) {
+			// A config that cannot resolve behaves as a failed initialization: the dispatch entries
+			// answer it and the alarm retries it, so a fixed deploy heals the object.
+			this.#initError = error;
+			throw error;
+		}
 	}
 
 	private logParams(): Record<string, unknown> {

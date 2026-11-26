@@ -44,7 +44,7 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 2. **Coordinator pending errors omit `idempotencyToken`** (`server/do-transaction-coordinator.ts`, `client/db.ts`).
    When the caller omits `clientRequestToken`, `db.ts` generates `idempotencyToken` internally. When `loadFinalResponse` raises `transaction_commit_pending` or `transaction_undecided`, `attributes` holds `{ transactionId, state }` and omits `idempotencyToken`. The caller never gets the generated token and cannot replay the transaction.
 
-3. **`FokosDBPartitionDO` and `FokosDBMaterializationDO` cache pre-init `fokosConfig()` forever** (`server/do-partition.ts`, `server/materialization/do-materialization.ts`).
+3. (DONE) **`FokosDBPartitionDO` and `FokosDBMaterializationDO` cache pre-init `fokosConfig()` forever** (`server/do-partition.ts`, `server/materialization/do-materialization.ts`).
    In `FokosDBPartitionDO.#api`, `this.#ttl.arm()` reads `this.config()` before `this.fokos.dispatch` writes the identity of a new root partition. `config()` caches the pre-init fallback result in `this.__cachedConfig` for the life of the isolate. A subclass override that checks `this.fokos?.initialized()` never runs with the initialized identity or policy.
 
 4. **Coordinator `txPrepare` has no fallback when a cached topology hint misses** (`server/do-transaction-coordinator.ts`).
