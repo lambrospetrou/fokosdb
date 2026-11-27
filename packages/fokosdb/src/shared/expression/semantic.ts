@@ -533,7 +533,7 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 		throw new ExpressionError("invalid_function", "unknown expression function");
 	}
 
-	if (operation.name.startsWith("sqlite.") && args.length > EXPRESSION_LIMITS.sqliteFunctionArguments) {
+	if (operation.name.startsWith("sqlite.") && args.length > EXPRESSION_LIMITS.functionArguments) {
 		throw new ExpressionError("complexity_limit", "SQLite function argument limit exceeded");
 	}
 	assertArity(args, operation.arity[0], operation.arity[1]);

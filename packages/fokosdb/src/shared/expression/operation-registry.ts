@@ -213,7 +213,7 @@ function validatePatternArguments(name: string, args: readonly unknown[]): void 
 	if (pattern === undefined) {
 		throw new ExpressionError("invalid_type", `${name} pattern must be a string literal`);
 	}
-	if (!utf8WithinLimit(pattern, EXPRESSION_LIMITS.sqlitePatternBytes)) {
+	if (!utf8WithinLimit(pattern, EXPRESSION_LIMITS.patternBytes)) {
 		throw new ExpressionError("complexity_limit", "SQLite pattern limit exceeded");
 	}
 	if (name === "like" && args.length === 3 && stringLiteral(args[2]) === undefined) {

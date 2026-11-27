@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { compileConditionExpression, compileProjectionExpression, compileUpdateExpression } from "../../src/shared/expression/compiler.js";
-import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
+import { EXPRESSION_LIMITS, STATEMENT_LIMITS } from "../../src/shared/expression/limits.js";
 import { OPERATION_REGISTRY } from "../../src/shared/expression/operation-registry.js";
 import { CONDITION_FIXED_BINDING_COUNT } from "../../src/shared/expression/plan.js";
 import type { ConditionExpression, ExpressionValue, UpdateExpression } from "../../src/shared/expression/types.js";
@@ -45,7 +45,7 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 
 	it("an `in` with the largest count of choices of more than one type", async () => {
 		// The path takes one binding, and each distinct choice takes one.
-		const distinct = EXPRESSION_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT - 1;
+		const distinct = STATEMENT_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT - 1;
 		const choices = Array.from({ length: EXPRESSION_LIMITS.inChoices }, (_, i) => {
 			const n = i % distinct;
 			return { val: n % 2 === 0 ? n : `t${n}` };

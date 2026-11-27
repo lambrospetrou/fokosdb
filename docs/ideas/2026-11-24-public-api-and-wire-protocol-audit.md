@@ -100,6 +100,7 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 
 16. **SQLite limits in `EXPRESSION_LIMITS` and `{ ref: "v" }` naming mismatch** (`shared/expression/limits.ts`, `shared/expression/types.ts`).
     `EXPRESSION_LIMITS` exports SQLite implementation keys (`sqliteFunctionArguments`, `sqlitePatternBytes`, `compiledSqlBytes`, `completeStatementBindings`). `ExpressionReference` uses `{ ref: "v" }` (the SQLite column name) while `ReadItem` names the field `version`.
+    `sqliteFunctionArguments` is now `functionArguments`, and `sqlitePatternBytes` is now `patternBytes`. `compiledSqlBytes` and `completeStatementBindings` moved to `STATEMENT_LIMITS`, which the package does not export, because a caller cannot measure the compiled statement.
 
 17. (DONE) **Unmarked `fokosdb/sharding/*` exports and `ScanCursor` leak** (`sharding/exports-client.ts`, `sharding/index-server.ts`, `sharding/runtime-types.ts`, `sharding/sk-interval.ts`).
     Both sharding entry points export internal stores, KV keys, schedulers, Bloom filters, and codecs without an `@experimental` marker. `FokosRangeInput.cursor` imports `ScanCursor` from `shared/partition/partition-store.ts` into the sharding type surface. `sharding/sk-interval.ts` also imports `ScanCursor`, and its exported `normalizeSkInterval` takes the FokosDB type `SortKeyCondition`. The bundle check in `tsdown.config.ts` sees only runtime imports, so these type imports got into the published sharding types.

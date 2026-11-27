@@ -11,7 +11,7 @@ import { compileConditionExpression, compileProjectionExpression, compileQueryEx
 import { composeProjectionStatement, composeQueryStatement, type CompiledProjectionPlan, type CompiledQueryPlan } from "./plan.js";
 import { decodeProjectedRow, projectedItemFromWireRow, type ProjectedItem } from "./projection.js";
 import { evaluateConditionPlan } from "./runtime.js";
-import { EXPRESSION_LIMITS } from "./limits.js";
+import { EXPRESSION_LIMITS, STATEMENT_LIMITS } from "./limits.js";
 import { estimateProjectedRowBytes } from "../partition/item-wire-bytes.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, PROJECTION_PRESENCE_FIXTURES } from "./test-fixtures.js";
@@ -539,7 +539,7 @@ describe("query statement", () => {
 					})),
 				],
 			});
-			expect(plan.completeBindingCount).toBeLessThanOrEqual(EXPRESSION_LIMITS.completeStatementBindings);
+			expect(plan.completeBindingCount).toBeLessThanOrEqual(STATEMENT_LIMITS.completeStatementBindings);
 
 			const scanned = scan(state, plan, "projection");
 			expect(scanned.map((row) => row.matched)).toEqual([1]);
@@ -629,7 +629,7 @@ describe("projected point read — limits", () => {
 					as: `k${i + 3}`,
 				})),
 			]);
-			expect(plan.completeBindingCount).toBeLessThanOrEqual(EXPRESSION_LIMITS.completeStatementBindings);
+			expect(plan.completeBindingCount).toBeLessThanOrEqual(STATEMENT_LIMITS.completeStatementBindings);
 
 			const record = readProjected(state, plan, hashKey, sortKey);
 			expect(Object.keys(record!)).toHaveLength(EXPRESSION_LIMITS.projectionEntries);

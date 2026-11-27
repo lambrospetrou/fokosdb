@@ -38,13 +38,11 @@ describe("expression public types", () => {
 			projectionEntries: 48,
 			jsonPathDereferences: 32,
 			inChoices: 100,
-			sqliteFunctionArguments: 32,
-			sqlitePatternBytes: 50,
+			functionArguments: 32,
+			patternBytes: 50,
 			projectionAliasBytes: 256,
 			jsonPathBytes: 4 * 1024,
 			canonicalPayloadBytes: 512 * 1024,
-			compiledSqlBytes: 100_000,
-			completeStatementBindings: 100,
 		});
 	});
 });

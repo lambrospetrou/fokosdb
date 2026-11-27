@@ -2,13 +2,16 @@
  * The limits of one expression: one condition, one update, one projection, or one query filter with
  * its projection.
  *
- * Five values come from limits of SQLite in a Durable Object, from the "SQL storage limits" table of
+ * Three values come from limits of SQLite in a Durable Object, from the "SQL storage limits" table of
  * https://developers.cloudflare.com/durable-objects/platform/limits/. A statement above one of them
  * fails in SQLite with an error that does not name the cause, so the expression engine refuses the
  * expression first. Do not make one of these values larger than the platform limit permits.
  *
  * The other values are budgets of this library. Each one bounds the work that one expression can
  * cause, and none comes from the platform.
+ *
+ * A caller can check each value before it sends the expression. `STATEMENT_LIMITS` holds the limits
+ * of the compiled statement, which only the compiler can measure.
  */
 export const EXPRESSION_LIMITS = {
 	/**
@@ -38,16 +41,16 @@ export const EXPRESSION_LIMITS = {
 	jsonPathDereferences: 32,
 	/**
 	 * The choices of one `in`. A budget of this library. Each distinct choice binds one parameter, so a
-	 * condition with 100 distinct choices is already above `completeStatementBindings`.
+	 * condition with 100 distinct choices is already above `STATEMENT_LIMITS.completeStatementBindings`.
 	 */
 	inChoices: 100,
-	/** The arguments of one SQLite function call. Platform limit: "Maximum arguments per SQL function", 32. */
-	sqliteFunctionArguments: 32,
+	/** The arguments of one `sqlite.*` function call. Platform limit: "Maximum arguments per SQL function", 32. */
+	functionArguments: 32,
 	/**
 	 * The UTF-8 bytes of one `like` or `glob` pattern. Platform limit: "Maximum characters (bytes) in a
 	 * LIKE or GLOB pattern", 50 bytes.
 	 */
-	sqlitePatternBytes: 50,
+	patternBytes: 50,
 	/** The UTF-8 bytes of one `as` name of a projection entry. A budget of this library. */
 	projectionAliasBytes: 256,
 	/** The UTF-8 bytes of one JSON path. A budget of this library. */
@@ -68,6 +71,16 @@ export const EXPRESSION_LIMITS = {
 	 * large as an item: a put writes such a value.
 	 */
 	canonicalPayloadBytes: 512 * 1024,
+} as const;
+
+export type ExpressionLimitName = keyof typeof EXPRESSION_LIMITS;
+
+/**
+ * The limits of the complete SQL statement that runs a compiled expression. They come from the "SQL
+ * storage limits" table, as the platform limits of `EXPRESSION_LIMITS` do. They are not exported from
+ * the package: a caller cannot measure the compiled statement.
+ */
+export const STATEMENT_LIMITS = {
 	/**
 	 * The UTF-8 bytes of the complete statement that runs a compiled expression. Platform limit:
 	 * "Maximum SQL statement length", 100 KB.
@@ -80,5 +93,3 @@ export const EXPRESSION_LIMITS = {
 	 */
 	completeStatementBindings: 100,
 } as const;
-
-export type ExpressionLimitName = keyof typeof EXPRESSION_LIMITS;

@@ -4,7 +4,7 @@ import type { FokosDBPartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
-import { EXPRESSION_LIMITS } from "./limits.js";
+import { EXPRESSION_LIMITS, STATEMENT_LIMITS } from "./limits.js";
 import {
 	composeConditionStatement,
 	CONDITION_FIXED_BINDING_COUNT,
@@ -115,10 +115,10 @@ describe("condition SQLite compiler", () => {
 				op: "in",
 				args: [{ ref: "v" }, ...Array.from({ length: choices }, (_, value) => ({ val: value }))],
 			}) as unknown as ConditionExpression;
-		const plan = compileConditionExpression(makeIn(EXPRESSION_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT));
-		expect(plan.completeBindingCount).toBe(EXPRESSION_LIMITS.completeStatementBindings);
+		const plan = compileConditionExpression(makeIn(STATEMENT_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT));
+		expect(plan.completeBindingCount).toBe(STATEMENT_LIMITS.completeStatementBindings);
 		expect(() =>
-			compileConditionExpression(makeIn(EXPRESSION_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT + 1)),
+			compileConditionExpression(makeIn(STATEMENT_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT + 1)),
 		).toThrow(/binding limit/);
 	});
 
@@ -387,7 +387,7 @@ describe("update SQLite compiler", () => {
 	// it and the widest statement appends its own tail. Charging both at compile time turns what would
 	// be an opaque failure inside a transaction into a limit error the caller gets before it starts.
 	it("rejects an update whose widest statement would exceed the binding limit", () => {
-		const planCap = EXPRESSION_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
+		const planCap = STATEMENT_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
 		// One binding for each target path, one shared binding for the "$" parent that the target guards
 		// test, and one for each distinct literal. Only the literal count is free to vary.
 		const literalsAtCap = planCap - EXPRESSION_LIMITS.updateActions - 1;
@@ -404,7 +404,7 @@ describe("update SQLite compiler", () => {
 		};
 
 		const atCap = compileUpdateExpression(withLiterals(literalsAtCap));
-		expect(atCap.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT).toBe(EXPRESSION_LIMITS.completeStatementBindings);
+		expect(atCap.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT).toBe(STATEMENT_LIMITS.completeStatementBindings);
 
 		expect(() => compileUpdateExpression(withLiterals(literalsAtCap + 1))).toThrow(/complete statement exceeds the binding limit/);
 	});
@@ -637,7 +637,7 @@ describe("update SQLite compiler", () => {
 		// The budget belongs to the widest statement that embeds the plan, so the compiler charges the
 		// keys before the plan and the widest statement tail after it. One binding more must fail here,
 		// in the client, rather than at the partition with no useful error.
-		const budget = EXPRESSION_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
+		const budget = STATEMENT_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
 		// The action count is capped well below the binding budget, so the bindings come from the values.
 		// One action at every allowed slot binds its own target path, one literal, and the parent path
 		// they all share. An arithmetic value binds two literals instead of one, so each one adds exactly
@@ -654,7 +654,7 @@ describe("update SQLite compiler", () => {
 
 		const plan = compileUpdateExpression(planWithBindings(budget));
 		expect(plan.bindingCount).toBe(budget);
-		expect(plan.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT).toBe(EXPRESSION_LIMITS.completeStatementBindings);
+		expect(plan.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT).toBe(STATEMENT_LIMITS.completeStatementBindings);
 		expect(() => compileUpdateExpression(planWithBindings(budget + 1))).toThrow(/binding limit/);
 	});
 });

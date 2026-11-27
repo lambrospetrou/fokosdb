@@ -99,10 +99,10 @@ describe("function validation", () => {
 
 	it("enforces the SQLite function argument limit", () => {
 		expect(() =>
-			value({ fn: "sqlite.concat", args: Array.from({ length: EXPRESSION_LIMITS.sqliteFunctionArguments }, () => ({ val: "a" })) }),
+			value({ fn: "sqlite.concat", args: Array.from({ length: EXPRESSION_LIMITS.functionArguments }, () => ({ val: "a" })) }),
 		).not.toThrow();
 		expect(() =>
-			value({ fn: "sqlite.concat", args: Array.from({ length: EXPRESSION_LIMITS.sqliteFunctionArguments + 1 }, () => ({ val: "a" })) }),
+			value({ fn: "sqlite.concat", args: Array.from({ length: EXPRESSION_LIMITS.functionArguments + 1 }, () => ({ val: "a" })) }),
 		).toThrow(/argument limit/);
 	});
 
@@ -134,12 +134,10 @@ describe("glob and like validation", () => {
 	});
 
 	it("accepts a pattern at the byte limit and rejects one byte above it", () => {
-		expect(() =>
-			value({ fn: "sqlite.like", args: [{ val: "x".repeat(EXPRESSION_LIMITS.sqlitePatternBytes) }, { val: "value" }] }),
-		).not.toThrow();
-		expect(() =>
-			value({ fn: "sqlite.like", args: [{ val: "x".repeat(EXPRESSION_LIMITS.sqlitePatternBytes + 1) }, { val: "value" }] }),
-		).toThrow(/pattern limit/);
+		expect(() => value({ fn: "sqlite.like", args: [{ val: "x".repeat(EXPRESSION_LIMITS.patternBytes) }, { val: "value" }] })).not.toThrow();
+		expect(() => value({ fn: "sqlite.like", args: [{ val: "x".repeat(EXPRESSION_LIMITS.patternBytes + 1) }, { val: "value" }] })).toThrow(
+			/pattern limit/,
+		);
 		expect(() => value({ fn: "sqlite.glob", args: [{ val: "é".repeat(25) }, { val: "value" }] })).not.toThrow();
 		expect(() => value({ fn: "sqlite.glob", args: [{ val: `${"é".repeat(25)}x` }, { val: "value" }] })).toThrow(/pattern limit/);
 	});

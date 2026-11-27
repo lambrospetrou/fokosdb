@@ -4,7 +4,7 @@ import type { ConditionExpression, UpdateExpression } from "../../src/shared/typ
 import type { ExpressionValue } from "../../src/shared/expression/types.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { compileUpdateExpression } from "../../src/shared/expression/compiler.js";
-import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
+import { EXPRESSION_LIMITS, STATEMENT_LIMITS } from "../../src/shared/expression/limits.js";
 import { UPDATE_FIXED_BINDING_COUNT, UPDATE_MAX_TRAILING_BINDING_COUNT } from "../../src/shared/expression/plan.js";
 import { keysAcrossPartitions, makeDB, writeOutcome, writeOutcomeWithClockRetry } from "./tx-helpers.js";
 
@@ -19,7 +19,7 @@ describe("transactions - an update plan at the binding limit", () => {
 	// statement, insertPendingUpdateLock, binds its sixth and last tail parameter. The two together are
 	// exactly completeStatementBindings, which is the case that must run rather than merely compile.
 	const widestUpdate = (): UpdateExpression => {
-		const planCap = EXPRESSION_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
+		const planCap = STATEMENT_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
 		const literals = planCap - EXPRESSION_LIMITS.updateActions - 1;
 		const paired = literals - EXPRESSION_LIMITS.updateActions;
 		let next = 0;

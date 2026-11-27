@@ -31,7 +31,7 @@ import type { JsonPrimitive } from "../json-types.js";
 import { materializeExpressionBindings } from "./bindings.js";
 import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
-import { EXPRESSION_LIMITS } from "./limits.js";
+import { EXPRESSION_LIMITS, STATEMENT_LIMITS } from "./limits.js";
 import {
 	type ExpressionContext,
 	type OperationRenderers,
@@ -164,11 +164,11 @@ export function compileConditionExpression(
 	const analysis = validateConditionExpression(condition);
 	const context = createContext("condition", STORED_PRE_IMAGE, "direct", fixedBindingCount);
 	const sql = compactParameters(compileCondition(condition, context), context);
-	if (!utf8WithinLimit(composeConditionStatement(sql), EXPRESSION_LIMITS.compiledSqlBytes)) {
+	if (!utf8WithinLimit(composeConditionStatement(sql), STATEMENT_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
 	const completeBindingCount = fixedBindingCount + context.bindings.length;
-	if (completeBindingCount > EXPRESSION_LIMITS.completeStatementBindings) {
+	if (completeBindingCount > STATEMENT_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");
 	}
 	return {
@@ -281,14 +281,14 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		},
 	);
 	const probeSql = composeUpdateProbeStatement({ documentSql, applicableSql, valueTypeSql, ttlValidSql: ttlValidSqlText });
-	if (!utf8WithinLimit(probeSql, EXPRESSION_LIMITS.compiledSqlBytes) || !utf8WithinLimit(widestWrite, EXPRESSION_LIMITS.compiledSqlBytes)) {
+	if (!utf8WithinLimit(probeSql, STATEMENT_LIMITS.compiledSqlBytes) || !utf8WithinLimit(widestWrite, STATEMENT_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
 	// The budget belongs to the WIDEST statement that runs this plan, not to the plan alone. Workers
 	// SQLite caps one query at completeStatementBindings parameters, and every such statement binds the
 	// keys before the plan and its own tail after it. Charging both here rejects an over-budget update
 	// with a limit error, before a statement of the partition fails on it.
-	if (completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT > EXPRESSION_LIMITS.completeStatementBindings) {
+	if (completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT > STATEMENT_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");
 	}
 
@@ -325,7 +325,7 @@ export function compileProjectionExpression(projection: readonly ProjectionExpre
 	const valueSql = fragments.slice(0, projection.length);
 	const typeSql = fragments.slice(projection.length);
 	assertPoolWithinLimit(context);
-	if (!utf8WithinLimit(composeProjectionStatement({ valueSql, typeSql }), EXPRESSION_LIMITS.compiledSqlBytes)) {
+	if (!utf8WithinLimit(composeProjectionStatement({ valueSql, typeSql }), STATEMENT_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
 	// The pool ?1 is bound always, with the text "[]" when the plan has no descriptor. Workers
@@ -379,7 +379,7 @@ export function compileQueryExpression(
 		{ filterSql, projection: projectionFragments },
 		{ select: "projection", direction: "desc", scanConditions: QUERY_WIDEST_SCAN_CONDITIONS },
 	);
-	if (!utf8WithinLimit(widest, EXPRESSION_LIMITS.compiledSqlBytes)) {
+	if (!utf8WithinLimit(widest, STATEMENT_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
 	return {

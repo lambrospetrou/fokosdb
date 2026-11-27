@@ -260,11 +260,9 @@ export const EXPRESSION_LIMIT_FIXTURES = [
 	{ name: "jsonPathDereferences", atLimit: 32, aboveLimit: 33 },
 	{ name: "inChoices", atLimit: 100, aboveLimit: 101 },
 	{ name: "projectionEntries", atLimit: 48, aboveLimit: 49 },
-	{ name: "sqliteFunctionArguments", atLimit: 32, aboveLimit: 33 },
-	{ name: "sqlitePatternBytes", atLimit: 50, aboveLimit: 51 },
+	{ name: "functionArguments", atLimit: 32, aboveLimit: 33 },
+	{ name: "patternBytes", atLimit: 50, aboveLimit: 51 },
 	{ name: "projectionAliasBytes", atLimit: 256, aboveLimit: 257 },
 	{ name: "jsonPathBytes", atLimit: 4 * 1024, aboveLimit: 4 * 1024 + 1 },
 	{ name: "canonicalPayloadBytes", atLimit: 512 * 1024, aboveLimit: 512 * 1024 + 1 },
-	{ name: "compiledSqlBytes", atLimit: 100_000, aboveLimit: 100_001 },
-	{ name: "completeStatementBindings", atLimit: 100, aboveLimit: 101 },
 ] as const satisfies readonly ExpressionLimitFixture[];
