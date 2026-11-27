@@ -1,6 +1,10 @@
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-import type { ScanCursor } from "../shared/partition/partition-store.js";
-import type { SortKeyCondition } from "../shared/types.js";
+
+/**
+ * A resume position of a range read inside one hash key. `hk` and `sk` are encoded keys. With
+ * `inclusive: true`, the read starts at `sk`. Without it, the read starts after `sk` in the read direction.
+ */
+export type FokosRangeCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
 /** Byte-space sort-key interval. Both ends are optional (absent = unbounded). */
 export type SkInterval = {
@@ -69,7 +73,7 @@ export function clipToChildRange(interval: SkInterval, childStart: KeyBytes | nu
 export function isChildFullyBeforeCursor(
 	childStart: KeyBytes,
 	childEnd: KeyBytes | null,
-	cursor: ScanCursor,
+	cursor: FokosRangeCursor,
 	direction: "asc" | "desc",
 ): boolean {
 	if (direction === "asc") {
@@ -84,7 +88,7 @@ export function isChildFullyBeforeCursor(
  * True means the child receives the cursor and resumes the scan. False means the child starts a new
  * scan from the bound of the interval.
  */
-export function cursorFallsInChild(childStart: KeyBytes, childEnd: KeyBytes | null, cursor: ScanCursor): boolean {
+export function cursorFallsInChild(childStart: KeyBytes, childEnd: KeyBytes | null, cursor: FokosRangeCursor): boolean {
 	return KeyCodec.compare(cursor.sk, childStart) >= 0 && (childEnd === null || KeyCodec.compare(cursor.sk, childEnd) < 0);
 }
 
@@ -101,62 +105,9 @@ export function makeBoundaryCursor(
 	childStart: KeyBytes,
 	childEnd: KeyBytes | null,
 	direction: "asc" | "desc",
-): ScanCursor {
+): FokosRangeCursor {
 	if (direction === "asc") {
 		return { hk: hashKey, sk: childEnd ?? KeyCodec.encodeOptional(undefined), inclusive: true };
 	}
 	return { hk: hashKey, sk: childStart, inclusive: false };
-}
-
-/**
- * Normalize a public `SortKeyCondition` into a byte-space `SkInterval`, or `null` for an
- * unsatisfiable (empty) interval. The `encode` callback handles key encoding + size validation
- * (the interval module is agnostic to key-length policy).
- */
-export function normalizeSkInterval(sort: SortKeyCondition | undefined, encode: (k: string | Uint8Array) => KeyBytes): SkInterval | null {
-	if (sort === undefined) {
-		return { lower: { value: KeyCodec.encodeOptional(undefined), inclusive: true } };
-	}
-	switch (sort.op) {
-		case "eq": {
-			const v = encode(sort.value);
-			return { lower: { value: v, inclusive: true }, upper: { value: v, inclusive: true } };
-		}
-		case "gt":
-			return { lower: { value: encode(sort.value), inclusive: false } };
-		case "gte":
-			return { lower: { value: encode(sort.value), inclusive: true } };
-		case "lt":
-			return { upper: { value: encode(sort.value), inclusive: false } };
-		case "lte":
-			return { upper: { value: encode(sort.value), inclusive: true } };
-		case "between": {
-			const lo = encode(sort.lower);
-			const hi = encode(sort.upper);
-			if (KeyCodec.compare(lo, hi) > 0) {
-				return null;
-			}
-			return { lower: { value: lo, inclusive: true }, upper: { value: hi, inclusive: true } };
-		}
-		case "begins_with": {
-			const prefix = sort.prefix;
-			if ((typeof prefix === "string" && prefix.length === 0) || (prefix instanceof Uint8Array && prefix.byteLength === 0)) {
-				return { lower: { value: KeyCodec.encodeOptional(undefined), inclusive: true } };
-			}
-			const p = encode(prefix);
-			const succ = KeyCodec.successor(p);
-			return { lower: { value: p, inclusive: true }, upper: succ ? { value: succ, inclusive: false } : undefined };
-		}
-		case "range": {
-			const lo = sort.lower ? { value: encode(sort.lower.value), inclusive: sort.lower.inclusive } : undefined;
-			const up = sort.upper ? { value: encode(sort.upper.value), inclusive: sort.upper.inclusive } : undefined;
-			if (lo && up) {
-				const cmp = KeyCodec.compare(lo.value, up.value);
-				if (cmp > 0 || (cmp === 0 && (!lo.inclusive || !up.inclusive))) {
-					return null;
-				}
-			}
-			return { lower: lo, upper: up };
-		}
-	}
 }

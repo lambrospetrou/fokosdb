@@ -5,6 +5,8 @@
  *
  * Nothing here reads FokosDB items, expressions, or transactions. The `check-client-bundle` plugin in
  * `tsdown.config.ts` fails the build when a module of this entry reaches one of those.
+ *
+ * @experimental A minor version can change or remove a name that this entry exports.
  */
 
 export * from "./exports-client.js";

@@ -91,10 +91,9 @@ export {
 	cursorFallsInChild,
 	isChildFullyBeforeCursor,
 	makeBoundaryCursor,
-	normalizeSkInterval,
 	rangeIntersects,
 } from "./sk-interval.js";
-export type { SkInterval } from "./sk-interval.js";
+export type { FokosRangeCursor, SkInterval } from "./sk-interval.js";
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 

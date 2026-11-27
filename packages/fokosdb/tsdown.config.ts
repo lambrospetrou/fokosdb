@@ -40,7 +40,7 @@ const SHARDING_CLIENT_FORBIDDEN_SRC = [
 
 /**
  * The generic `src/shared/` modules that the sharding entries may reach. Every other `src/shared/`
- * module is FokosDB code.
+ * module is FokosDB code. Keep this list equal to `SHARDING_ALLOWED_SHARED` in `oxlint.config.ts`.
  */
 const SHARDING_ALLOWED_SHARED = [
 	"src/shared/errors.ts",

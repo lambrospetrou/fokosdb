@@ -12,9 +12,8 @@ import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } fro
 import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosImportState, MigrationHost, RouteKey } from "./repartition-types.js";
 import type { RepartitionKind, RepartitionState } from "./sharding-store.js";
-import type { SkInterval } from "./sk-interval.js";
+import type { FokosRangeCursor, SkInterval } from "./sk-interval.js";
 import type { FokosRuntimeConfigOverrides } from "./runtime-config.js";
-import type { ScanCursor } from "../shared/partition/partition-store.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type { FokosTopologyCacheOptions } from "./topology-cache.js";
 import type { FokosPlatform } from "../shared/platform.js";
@@ -127,7 +126,7 @@ export type FokosRangeInput = {
 	interval: SkInterval;
 	descending: boolean;
 	/** The resume cursor of the request, when it carries one. The read-through gate validates it against the caller slice. */
-	cursor?: ScanCursor | null;
+	cursor?: FokosRangeCursor | null;
 };
 
 /**

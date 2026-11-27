@@ -32,6 +32,7 @@ import { factsAggregateSql, factsOfRow, itemFacts, ITEMS_MODEL, type ItemFacts, 
 import { RANGE_BUCKET_MIN_ITEMS, ItemStats, type ItemSource } from "./item-stats.js";
 import type { TransactionOperationType } from "../transaction-wire-types.js";
 import type { FokosStorageInterval } from "../../sharding/runtime-types.js";
+import type { FokosRangeCursor } from "../../sharding/sk-interval.js";
 
 // Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
 const DATA_SELECT_DECODED = `CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END AS data`;
@@ -255,7 +256,7 @@ const TTL_SCAN_ROWS_PER_DELETED_ROW = 10;
 export type PendingTxKey = { routingHash: RoutingHash; hashKey: KeyBytes; sortKey: KeyBytes };
 
 /** A position of a query scan inside one hash key. */
-export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
+export type ScanCursor = FokosRangeCursor;
 
 /** A half-open interval of the storage order `(routingHash, hk, sk)`: the rows of one migration read. */
 export type KeyRange = FokosStorageInterval;

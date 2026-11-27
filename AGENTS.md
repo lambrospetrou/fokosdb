@@ -30,7 +30,7 @@ This is a pnpm workspace. Run the scripts of the root `package.json` from the re
 - `client/` — the `FokosDB` client. Published as `fokosdb/client`.
 - `server/` — the Durable Object classes. Published as `fokosdb/server`.
 - `shared/` — what both sides use.
-- `sharding/` — the sharding library. It uses no FokosDB module. Published as `fokosdb/sharding/client` and `fokosdb/sharding/server`.
+- `sharding/` — the sharding library. It uses no FokosDB module, also not as `import type` (enforced by `oxlint.config.ts`). Published as `fokosdb/sharding/client` and `fokosdb/sharding/server`.
 
 **The client must never import a Durable Object class or a server runtime module as a value.** Keep each such import `import type`. `pnpm build` enforces this rule and a size budget on the client bundle.
 

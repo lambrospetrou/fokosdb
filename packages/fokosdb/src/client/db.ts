@@ -152,7 +152,7 @@ import { KeyCodec, KeyPairMap, type KeyBytes } from "../sharding/key-codec.js";
 import { attachRouting, routedError } from "../sharding/envelope.js";
 import type { FokosPublicRouting } from "../sharding/runtime-types.js";
 import type { WirePartitionMeta } from "../shared/types.js";
-import { normalizeSkInterval } from "../sharding/sk-interval.js";
+import { normalizeSkInterval } from "../shared/query/sort-key-interval.js";
 import { answerMeta, PartitionMetaJoin, routeNodeMeta } from "../shared/partition-meta.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { estimateReadItemBytes } from "../shared/partition/item-wire-bytes.js";

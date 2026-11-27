@@ -42,6 +42,10 @@ only `fokosdb/client` and `fokosdb/server`.
 | `fokosdb/sharding/client` | `FokosShardingClient`, routing types and errors                   | Your Worker's request path |
 | `fokosdb/sharding/server` | `FokosShardingRuntime`, for your own sharded Durable Object class | Your Durable Objects       |
 
+> [!WARNING]
+> `fokosdb/sharding/client` and `fokosdb/sharding/server` are experimental. A minor version can change
+> or remove a name that they export.
+
 Every entry runs inside `workerd`. "Client" means the Worker-side caller that routes requests to the
 partitions — not a browser. Only `fokosdb/server` carries the Durable Object implementations, so a
 Worker that talks to an already-deployed FokosDB deployment can import `fokosdb/client` alone.
