@@ -52,13 +52,13 @@ describe("the categories of errors-operations", () => {
 	});
 	const transaction = cancelled([conditionFailed]);
 
-	it("declare no prototype member, and use the category as name, _tag and type", () => {
-		for (const [e, Category, type] of [
-			[condition, FokosConditionCheckError, "condition_check_error"],
-			[transaction, FokosTransactionCancelledError, "transaction_cancelled_error"],
+	it("declare no prototype member, and use the category as name and _tag", () => {
+		for (const [e, Category] of [
+			[condition, FokosConditionCheckError],
+			[transaction, FokosTransactionCancelledError],
 		] as const) {
 			expect(Object.getOwnPropertyNames(Category.prototype)).toEqual(["constructor"]);
-			expect([e.name, e._tag, e.type]).toEqual([Category.tag, Category.tag, type]);
+			expect([e.name, e._tag]).toEqual([Category.tag, Category.tag]);
 			expect(isFokosAnyError(e)).toBe(true);
 		}
 	});

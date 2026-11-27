@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { FokosError, FokosExpressionError } from "../src/shared/errors.js";
 import { FokosConditionCheckError, isFokosAnyError, type FokosAnyError, type FokosErrorCode } from "../src/shared/errors-operations.js";
+import type { ExpressionErrorCode } from "../src/shared/expression/errors.js";
 import { CURSOR_VERSION, encodeCursor } from "../src/shared/query/cursor.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_REQUEST } from "../src/shared/transaction-limits.js";
 import type { ConditionExpression } from "../src/shared/types.js";
@@ -170,6 +171,12 @@ describe("the expression codes of the item operations", () => {
 		expect([err.code, err.origin, err.httpStatusHint]).toEqual(["expression_invalid", "caller", 400]);
 		expect((err.cause as Error).name).toBe("ExpressionError");
 		expect(err.attributes.expressionCode).toBe((err.cause as { code: string }).code);
+		// A check on `_tag` gives `expressionCode` its type, so this assignment compiles with no cast.
+		expect(isFokosAnyError(err) && err._tag === "FokosExpressionError").toBe(true);
+		if (isFokosAnyError(err) && err._tag === "FokosExpressionError") {
+			const code: ExpressionErrorCode = err.attributes.expressionCode;
+			expect(code).toBe((err.cause as { code: string }).code);
+		}
 	});
 });
 

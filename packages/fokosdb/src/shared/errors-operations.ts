@@ -29,7 +29,7 @@ import {
 	type FokosErrorOptions,
 } from "./errors.js";
 import { FOKOS_SHARDING_CODE_TABLES, type FokosShardingError } from "../sharding/errors.js";
-import type { ExpressionError } from "./expression/errors.js";
+import type { ExpressionError, ExpressionErrorCode } from "./expression/errors.js";
 import type { ConditionFailedReason, TransactWriteOperationResult } from "./transaction-api-types.js";
 import type { AnsweredPartitionMeta, FokosMeta } from "./types.js";
 
@@ -112,7 +112,7 @@ export class FokosTransactionCancelledError<C extends string = string> extends F
 /** Every error the library raises. `_tag` and `code` are literals here, so a switch narrows and stays exhaustive. */
 export type FokosAnyError =
 	| FokosValidationError<FokosCodesOf<typeof VALIDATION_CODES>>
-	| FokosExpressionError<FokosCodesOf<typeof EXPRESSION_CODES>>
+	| (FokosExpressionError<FokosCodesOf<typeof EXPRESSION_CODES>> & { readonly attributes: { readonly expressionCode: ExpressionErrorCode } })
 	| FokosConditionCheckError<FokosCodesOf<typeof CONDITION_CHECK_CODES>>
 	| FokosConflictError<FokosCodesOf<typeof CONFLICT_CODES>>
 	| FokosTransactionCancelledError<FokosCodesOf<typeof TRANSACTION_CANCELLED_CODES>>

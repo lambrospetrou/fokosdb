@@ -131,8 +131,6 @@ export type FokosCauseWire =
 /** `T` is the category and `C` is the union of the codes the error can carry. */
 export abstract class FokosError<T extends string = string, C extends string = string> extends Error {
 	readonly _tag: T;
-	/** The category in snake case, for example `validation_error`. */
-	readonly type: string;
 	readonly code: C;
 	/** `e_<segment>_<32 hex>`. The node that first detects the failure mints it, and every later hop keeps it. */
 	readonly error_id: string;
@@ -145,11 +143,6 @@ export abstract class FokosError<T extends string = string, C extends string = s
 		super(`fokos/${code.code}: ${options.message}`, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = code.tag;
 		this._tag = code.tag;
-		// "FokosConditionCheckError" becomes "condition_check_error".
-		this.type = code.tag
-			.replace(/^Fokos/, "")
-			.replace(/\B[A-Z]/g, "_$&")
-			.toLowerCase();
 		this.code = code.code;
 		this.error_id = options.error_id ?? newErrorId(code);
 		this.origin = options.origin ?? code.origin;
@@ -253,7 +246,6 @@ const BASE_FIELD_NAMES = [
 	"stack",
 	"cause",
 	"_tag",
-	"type",
 	"code",
 	"error_id",
 	"origin",

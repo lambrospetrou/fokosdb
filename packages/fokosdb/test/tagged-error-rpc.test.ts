@@ -44,7 +44,7 @@ describe("a FokosError across an RPC hop", () => {
 			const { tag, segment, origin, httpStatusHint } = CODE_DEFS[code];
 
 			expect(err).toBeInstanceOf(Error);
-			for (const key of ["name", "_tag", "type", "code", "error_id", "origin", "httpStatusHint", "attributes"]) {
+			for (const key of ["name", "_tag", "code", "error_id", "origin", "httpStatusHint", "attributes"]) {
 				expect(Object.hasOwn(err, key), `${code}.${key}`).toBe(true);
 			}
 			expect(err.name).toBe(tag);
@@ -97,10 +97,9 @@ describe("a FokosError across an RPC hop", () => {
 			expect(back).toBeInstanceOf(FOKOS_ERROR_CATEGORIES.get(err._tag)!);
 			const fromRecord = FokosError.fromWire(FokosError.toWire(err));
 			for (const e of [back, fromRecord]) {
-				expect([e.name, e._tag, e.type, e.code, e.error_id, e.origin, e.httpStatusHint, e.attributes, e.message]).toEqual([
+				expect([e.name, e._tag, e.code, e.error_id, e.origin, e.httpStatusHint, e.attributes, e.message]).toEqual([
 					err.name,
 					err._tag,
-					err.type,
 					err.code,
 					err.error_id,
 					err.origin,

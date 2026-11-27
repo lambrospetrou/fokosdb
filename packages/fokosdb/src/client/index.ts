@@ -121,8 +121,7 @@ export type {
 	UpdateTarget,
 } from "../shared/expression/types.js";
 export type { ProjectedItem, ProjectedValue } from "../shared/expression/projection.js";
-
-export { ExpressionError } from "../shared/expression/errors.js";
+export type { ExpressionErrorCode } from "../shared/expression/errors.js";
 
 // ─── Table options ────────────────────────────────────────────────────────────
 

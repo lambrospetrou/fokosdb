@@ -39,7 +39,6 @@ function contractOf(e: FokosError) {
 	return {
 		name: e.name,
 		_tag: e._tag,
-		type: e.type,
 		code: e.code,
 		error_id: e.error_id,
 		origin: e.origin,
@@ -99,28 +98,17 @@ describe("the category classes", () => {
 	it("assign every field as an own property", () => {
 		for (const def of DEFS) {
 			const e = errorOf(def, { cause: new Error("inner") });
-			for (const key of ["name", "message", "_tag", "type", "code", "error_id", "origin", "httpStatusHint", "attributes", "cause"]) {
+			for (const key of ["name", "message", "_tag", "code", "error_id", "origin", "httpStatusHint", "attributes", "cause"]) {
 				expect(Object.hasOwn(e, key), `${def.code}.${key}`).toBe(true);
 			}
 		}
 	});
 
-	it("use the category as name and _tag, and its snake case as type", () => {
-		const types = [...FOKOS_ERROR_CATEGORIES.entries()].map(([tag, Category]) => {
+	it("use the category as name and _tag", () => {
+		for (const [tag, Category] of FOKOS_ERROR_CATEGORIES) {
 			const e = new Category(DEFS.find((def) => def.tag === tag)!, { message: "x" });
-			expect(e.name).toBe(tag);
-			expect(e._tag).toBe(tag);
-			return e.type;
-		});
-		expect(types).toEqual([
-			"validation_error",
-			"expression_error",
-			"conflict_error",
-			"unavailable_error",
-			"transaction_pending_error",
-			"routing_error",
-			"internal_error",
-		]);
+			expect([e.name, e._tag]).toEqual([tag, tag]);
+		}
 	});
 
 	it("accept only a code definition of their category, and take its code as a literal", () => {
@@ -476,7 +464,6 @@ describe("FokosError.toWire and FokosError.fromWire", () => {
 			"stack",
 			"cause",
 			"_tag",
-			"type",
 			"code",
 			"error_id",
 			"origin",
