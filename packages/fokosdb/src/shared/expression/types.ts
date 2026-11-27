@@ -7,7 +7,7 @@ export type ExpressionNativeType = (typeof EXPRESSION_NATIVE_TYPES)[number];
 export type ExpressionReference =
 	| { ref: "hashKey" }
 	| { ref: "sortKey" }
-	| { ref: "v" }
+	| { ref: "version" }
 	| { ref: "ttlAt" }
 	| { ref: "data"; path?: string };
 

@@ -96,7 +96,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				// An item with no TTL has no `ttlAt` key, on every read path.
 				expect(cleared.item).not.toHaveProperty("ttlAt");
 				expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0]).not.toHaveProperty("ttlAt");
-				const projected = await db.getItem({ hashKey: "ttl", sortKey: "item", projection: [{ expr: { ref: "v" } }] });
+				const projected = await db.getItem({ hashKey: "ttl", sortKey: "item", projection: [{ expr: { ref: "version" } }] });
 				expect(projected.item).not.toHaveProperty("ttlAt");
 			});
 
@@ -249,7 +249,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 						{ expr: { ref: "data", path: "$.none" } },
 						{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
 						{ expr: { ref: "data", path: "$.k" }, as: "k" },
-						{ expr: { ref: "v" }, as: "ver" },
+						{ expr: { ref: "version" }, as: "ver" },
 					],
 				});
 

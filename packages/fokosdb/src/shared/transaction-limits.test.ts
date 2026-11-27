@@ -344,8 +344,8 @@ describe("resolveLimits", () => {
 });
 
 describe("validateVersionReferences", () => {
-	const readsV = conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 3 }] });
-	const setPrevVersion = updateTree([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }]);
+	const readsV = conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 3 }] });
+	const setPrevVersion = updateTree([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "version" } }]);
 	const op = (
 		opIndex: number,
 		operation: TransactWriteOperationLike["operation"],
@@ -368,8 +368,8 @@ describe("validateVersionReferences", () => {
 	});
 
 	it("refuses a version reference of an expression tree after a write of the same item", () => {
-		const condition = { op: "eq", args: [{ ref: "v" }, { val: 3 }] } as const;
-		const update = [{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }] as const;
+		const condition = { op: "eq", args: [{ ref: "version" }, { val: 3 }] } as const;
+		const update = [{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "version" } }] as const;
 		expect(() => validateVersionReferences([op(0, "put"), op(1, "check", { condition })])).toThrow(
 			fokosErrorWith("transact_version_after_write", { opIndex: 1, earlierOpIndex: 0 }),
 		);

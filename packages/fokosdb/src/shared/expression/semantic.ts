@@ -491,7 +491,7 @@ function analyzeReferenceNode(expression: Record<string, unknown>, context: Anal
 			}
 			context.requiredColumns.add("sk");
 			return sortKeyValue;
-		case "v":
+		case "version":
 			if (hasPath) {
 				throw new ExpressionError("invalid_ast", "only data references can have a path");
 			}

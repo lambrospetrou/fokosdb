@@ -79,7 +79,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 							hashKey: hk,
 							sortKey: "item-2",
 							data: "updated-2",
-							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 							returnValuesOnConditionCheckFailure: "all_old",
 						},
 					],
@@ -129,7 +129,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 							hashKey: hk,
 							sortKey: "s1",
 							data: "data-2",
-							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 							returnValuesOnConditionCheckFailure: "none",
 						},
 					],
@@ -175,14 +175,14 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 							operation: "put",
 							...k1,
 							data: "new-1",
-							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 							returnValuesOnConditionCheckFailure: "all_old",
 						},
 						{
 							operation: "put",
 							...k2,
 							data: { count: 43 },
-							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 							returnValuesOnConditionCheckFailure: "all_old",
 						},
 						{
@@ -251,14 +251,14 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 							operation: "put",
 							...k1,
 							data: "new-1",
-							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 							returnValuesOnConditionCheckFailure: "all_old",
 						},
 						{
 							operation: "put",
 							...k2,
 							data: { count: 43 },
-							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 							returnValuesOnConditionCheckFailure: "all_old",
 						},
 						{
@@ -313,7 +313,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				operation: "put" as const,
 				...k1,
 				data: "new-1",
-				condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] as const },
+				condition: { op: "eq" as const, args: [{ ref: "version" as const }, { val: 999 }] as const },
 			};
 			const op2 = { operation: "put" as const, ...k2, data: "v2" };
 
@@ -354,7 +354,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 							hashKey: binHk,
 							sortKey: binSk,
 							data: new Uint8Array([0x00]),
-							condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] as const },
+							condition: { op: "eq" as const, args: [{ ref: "version" as const }, { val: 999 }] as const },
 							returnValuesOnConditionCheckFailure: "all_old",
 						},
 						{
@@ -461,7 +461,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 							data: `new-${i}`,
 							...(i % 2 === 0
 								? {
-										condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] },
+										condition: { op: "eq" as const, args: [{ ref: "version" as const }, { val: 999 }] },
 										returnValuesOnConditionCheckFailure: "all_old" as const,
 									}
 								: {}),

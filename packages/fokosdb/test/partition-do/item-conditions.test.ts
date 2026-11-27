@@ -75,7 +75,7 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "second",
-				condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+				condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 				kind: "text",
 			});
 
@@ -94,7 +94,7 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "stale",
-						condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+						condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 						kind: "text",
 					}),
 				);
@@ -114,7 +114,7 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "value",
-						condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+						condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 						kind: "text",
 					}),
 				);
@@ -132,7 +132,7 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v2",
-				condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+				condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 				kind: "text",
 			});
 			expect(r2).toMatchObject({ outcome: "ok", version: 2 });
@@ -141,7 +141,7 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v3",
-				condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 2 }] }),
+				condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 2 }] }),
 				kind: "text",
 			});
 			expect(r3).toMatchObject({ outcome: "ok", version: 3 });
@@ -160,8 +160,8 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 				condition: conditionTree({
 					op: "and",
 					args: [
-						{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-						{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+						{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
+						{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 					],
 				}),
 				kind: "text",
@@ -187,7 +187,7 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 							op: "and",
 							args: [
 								{ op: "not_exists", args: [{ ref: "hashKey" }] },
-								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+								{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 							],
 						}),
 						kind: "text",
@@ -216,8 +216,8 @@ describe("FokosDBPartitionDO - conditional putItem", () => {
 						condition: conditionTree({
 							op: "and",
 							args: [
-								{ op: "eq", args: [{ ref: "v" }, { val: 2 }] },
-								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+								{ op: "eq", args: [{ ref: "version" }, { val: 2 }] },
+								{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 							],
 						}),
 						kind: "text",
@@ -304,7 +304,7 @@ describe("FokosDBPartitionDO - deleteItem", () => {
 				const result = await rpc.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+					condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 				});
 
 				expect(result).toMatchObject({ outcome: "ok", deleted: true });
@@ -321,7 +321,7 @@ describe("FokosDBPartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+							condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 						}),
 					);
 					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -341,7 +341,7 @@ describe("FokosDBPartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+							condition: conditionTree({ op: "eq", args: [{ ref: "version" }, { val: 1 }] }),
 						}),
 					);
 					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -361,7 +361,7 @@ describe("FokosDBPartitionDO - deleteItem", () => {
 						op: "and",
 						args: [
 							{ op: "exists", args: [{ ref: "hashKey" }] },
-							{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+							{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 						],
 					}),
 				});
@@ -383,7 +383,7 @@ describe("FokosDBPartitionDO - deleteItem", () => {
 								op: "and",
 								args: [
 									{ op: "exists", args: [{ ref: "hashKey" }] },
-									{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+									{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 								],
 							}),
 						}),
@@ -408,7 +408,7 @@ describe("FokosDBPartitionDO - deleteItem", () => {
 								op: "and",
 								args: [
 									{ op: "exists", args: [{ ref: "hashKey" }] },
-									{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+									{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 								],
 							}),
 						}),

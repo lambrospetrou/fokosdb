@@ -291,7 +291,7 @@ describe("FokosDBPartitionDO — range split", () => {
 				await runInDurableObject(stub, async (instance: FokosDBPartitionDO, state: DurableObjectState) => {
 					seed45(state, hashKey);
 					const plan = queryTree({
-						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }],
+						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "version" } }],
 					});
 
 					const result = opened(await instance.apiQueryItems(ctx, request(direction, { hashKey, plan, remainingEvaluatedItems: 10 })));
@@ -1126,7 +1126,7 @@ describe("FokosDBPartitionDO — range split", () => {
 			const { root, writes } = shared;
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
-			const plan = queryTree({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }] });
+			const plan = queryTree({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "version" } }] });
 			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
 
 			expect(res.count).toBe(expected);

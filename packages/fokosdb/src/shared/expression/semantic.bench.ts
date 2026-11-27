@@ -13,7 +13,7 @@ const cases = [
 			op: "and",
 			args: [
 				{ op: "exists", args: [{ ref: "hashKey" }] },
-				{ op: "eq", args: [{ ref: "v" }, { val: 42 }] },
+				{ op: "eq", args: [{ ref: "version" }, { val: 42 }] },
 			],
 		},
 	},

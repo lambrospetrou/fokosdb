@@ -23,7 +23,7 @@ import {
 } from "./tx-helpers.js";
 
 const TTL_AT = Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
-const readsV = { op: "eq", args: [{ ref: "v" }, { val: 1 }] } as const;
+const readsV = { op: "eq", args: [{ ref: "version" }, { val: 1 }] } as const;
 const exists = { op: "exists", args: [{ ref: "hashKey" }] } as const;
 const notExists = { op: "not_exists", args: [{ ref: "hashKey" }] } as const;
 
@@ -91,7 +91,7 @@ describe("transactWriteItems - executionMode", () => {
 		const setPrev: TransactWriteItem = {
 			...keys[0],
 			operation: "update",
-			update: [{ action: "set", target: { ref: "data", path: "$.prev" }, value: { ref: "v" } }],
+			update: [{ action: "set", target: { ref: "data", path: "$.prev" }, value: { ref: "version" } }],
 		};
 		for (const later of [{ ...check(keys[0], true), condition: readsV }, setPrev]) {
 			await expect(db.transactWriteItems({ items: [earlier(keys[0]), later], ...ORDERED })).rejects.toThrow(

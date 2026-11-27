@@ -100,7 +100,7 @@ describe("condition SQLite compiler", () => {
 	});
 
 	it("emits direct placeholders for a homogeneous in expression", () => {
-		const plan = compileConditionExpression({ op: "in", args: [{ ref: "v" }, { val: 1 }, { val: 2 }, { val: 3 }] });
+		const plan = compileConditionExpression({ op: "in", args: [{ ref: "version" }, { val: 1 }, { val: 2 }, { val: 3 }] });
 		expect(plan.sql).toMatch(/ IN \(CAST\(\?4 AS INTEGER\), CAST\(\?5 AS INTEGER\), CAST\(\?6 AS INTEGER\)\)/);
 		expect(plan.bindings.filter((binding) => binding.kind === "val")).toEqual([
 			{ kind: "val", value: 1 },
@@ -113,7 +113,7 @@ describe("condition SQLite compiler", () => {
 		const makeIn = (choices: number) =>
 			({
 				op: "in",
-				args: [{ ref: "v" }, ...Array.from({ length: choices }, (_, value) => ({ val: value }))],
+				args: [{ ref: "version" }, ...Array.from({ length: choices }, (_, value) => ({ val: value }))],
 			}) as unknown as ConditionExpression;
 		const plan = compileConditionExpression(makeIn(STATEMENT_LIMITS.completeStatementBindings - CONDITION_FIXED_BINDING_COUNT));
 		expect(plan.completeBindingCount).toBe(STATEMENT_LIMITS.completeStatementBindings);
@@ -123,7 +123,7 @@ describe("condition SQLite compiler", () => {
 	});
 
 	it("normalizes negative zero for a lossless JSON round trip", () => {
-		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: -0 }] });
+		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "version" }, { val: -0 }] });
 		expect(plan.bindings).toContainEqual({ kind: "val", value: 0 });
 		expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
 	});
@@ -172,7 +172,7 @@ describe("condition SQLite compiler", () => {
 	});
 
 	it("folds literal-side guards out of the generated SQL", () => {
-		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: 1 }] });
+		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "version" }, { val: 1 }] });
 		expect(plan.bindings).toEqual([{ kind: "val", value: 1 }]);
 		expect(plan.sql).not.toContain("1 AND");
 		expect(plan.sql).not.toContain("IN ('null', 'boolean', 'number', 'text', 'bytes')");

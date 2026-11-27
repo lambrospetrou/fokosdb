@@ -66,7 +66,7 @@ describe("compiled condition runtime", () => {
 		for (const [condition, expected] of [
 			[{ op: "eq", args: [{ ref: "hashKey" }, { val: "item" }] }, true],
 			[{ op: "eq", args: [{ ref: "sortKey" }, { val: "sort" }] }, true],
-			[{ op: "eq", args: [{ ref: "v" }, { val: 1 }] }, true],
+			[{ op: "eq", args: [{ ref: "version" }, { val: 1 }] }, true],
 			[{ op: "eq", args: [{ ref: "ttlAt" }, { val: 2_000_000_000 }] }, true],
 			[{ op: "eq", args: [{ ref: "data", path: "$.nullValue" }, { val: null }] }, true],
 			[{ op: "eq", args: [{ ref: "data", path: "$.enabled" }, { val: true }] }, true],

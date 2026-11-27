@@ -58,13 +58,13 @@ describe("returnValues for putItem and deleteItem", () => {
 		const db = makeDB();
 		const key = newKey("condition");
 		await db.putItem({ ...key, data: "v1" });
-		const condition = { op: "eq", args: [{ ref: "v" }, { val: 1 }] } as const;
+		const condition = { op: "eq", args: [{ ref: "version" }, { val: 1 }] } as const;
 
 		const plain = await db.putItem({ ...key, data: "v2", condition });
 		const put = await db.putItem({
 			...key,
 			data: "v3",
-			condition: { op: "eq", args: [{ ref: "v" }, { val: 2 }] },
+			condition: { op: "eq", args: [{ ref: "version" }, { val: 2 }] },
 			returnValues: "all_old",
 		});
 

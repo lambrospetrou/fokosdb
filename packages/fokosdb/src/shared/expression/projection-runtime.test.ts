@@ -144,13 +144,13 @@ describe("projected point read", () => {
 		const projection: readonly ProjectionExpression[] = [
 			{ expr: { ref: "hashKey" } },
 			{ expr: { ref: "sortKey" } },
-			{ expr: { ref: "v" } },
+			{ expr: { ref: "version" } },
 			{ expr: { ref: "ttlAt" } },
 		];
 		expect(await project({ hashKey: "item", sortKey: "s", kind: "text", data: "v", ttlAt: 2_000_000_000 }, projection)).toEqual({
 			hashKey: "item",
 			sortKey: "s",
-			v: 1,
+			version: 1,
 			ttlAt: 2_000_000_000,
 		});
 
@@ -298,7 +298,7 @@ describe("projected point read", () => {
 
 	it("sees a missing reference as NULL inside a function argument", async () => {
 		const record = await project({ hashKey: "item", kind: "json", data: { n: 7 }, ttlAt: 2_000_000_000 }, [
-			{ expr: { fn: "sqlite.nullif", args: [{ ref: "v" }, { val: "1" }] }, as: "nullifAffinity" },
+			{ expr: { fn: "sqlite.nullif", args: [{ ref: "version" }, { val: "1" }] }, as: "nullifAffinity" },
 			{ expr: { fn: "sqlite.nullif", args: [{ ref: "ttlAt" }, { val: "2000000000" }] }, as: "nullifTtl" },
 			{ expr: { fn: "sqlite.nullif", args: [{ val: 1 }, { val: 1 }] }, as: "nullifEqual" },
 			{ expr: { fn: "sqlite.iif", args: [{ val: 1 }, { ref: "data", path: "$.missing" }, { val: 0 }] }, as: "iifMissing" },
@@ -328,7 +328,7 @@ describe("projected point read", () => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "json", data: { n: 7 }, ttlAt: 2_000_000_000 });
 			const conditions: readonly ConditionExpression[] = [
-				{ op: "eq", args: [{ fn: "sqlite.nullif", args: [{ ref: "v" }, { val: "1" }] }, { val: 1 }] },
+				{ op: "eq", args: [{ fn: "sqlite.nullif", args: [{ ref: "version" }, { val: "1" }] }, { val: 1 }] },
 				{ op: "eq", args: [{ fn: "sqlite.iif", args: [{ val: 1 }, { ref: "data", path: "$.missing" }, { val: 0 }] }, { val: null }] },
 				{ op: "eq", args: [{ fn: "sqlite.coalesce", args: [{ ref: "sortKey" }, { val: "x" }] }, { val: "x" }] },
 			];
@@ -527,12 +527,12 @@ describe("query statement", () => {
 			const plan = compileQueryExpression({
 				filter: {
 					op: "in",
-					args: [{ ref: "v" }, ...Array.from({ length: EXPRESSION_LIMITS.inChoices }, (_, i) => ({ val: i }))],
+					args: [{ ref: "version" }, ...Array.from({ length: EXPRESSION_LIMITS.inChoices }, (_, i) => ({ val: i }))],
 				} as unknown as ConditionExpression,
 				projection: [
 					{ expr: { ref: "sortKey" }, as: "k0" },
 					{ expr: { ref: "data", path: "$.n" }, as: "k1" },
-					{ expr: { ref: "v" }, as: "k2" },
+					{ expr: { ref: "version" }, as: "k2" },
 					...Array.from({ length: EXPRESSION_LIMITS.projectionEntries - 3 }, (_, i) => ({
 						expr: { val: i + 3 } as const,
 						as: `k${i + 3}`,
@@ -623,7 +623,7 @@ describe("projected point read — limits", () => {
 			const plan = compileProjectionExpression([
 				{ expr: { ref: "sortKey" }, as: "k0" },
 				{ expr: { ref: "data", path: "$.n" }, as: "k1" },
-				{ expr: { ref: "v" }, as: "k2" },
+				{ expr: { ref: "version" }, as: "k2" },
 				...Array.from({ length: EXPRESSION_LIMITS.projectionEntries - 3 }, (_, i) => ({
 					expr: { val: i + 3 } as const,
 					as: `k${i + 3}`,

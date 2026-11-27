@@ -26,7 +26,7 @@ const MB = 1024 * 1024;
 
 const exists: ConditionExpression = { op: "exists", args: [{ ref: "hashKey" }] };
 const notExists: ConditionExpression = { op: "not_exists", args: [{ ref: "hashKey" }] };
-const versionIs = (v: number): ConditionExpression => ({ op: "eq", args: [{ ref: "v" }, { val: v }] });
+const versionIs = (v: number): ConditionExpression => ({ op: "eq", args: [{ ref: "version" }, { val: v }] });
 
 /** A condition that is valid and that compiles to more SQL than `compiledSqlBytes`. */
 const ABOVE_SQL_LIMIT: ConditionExpression = {

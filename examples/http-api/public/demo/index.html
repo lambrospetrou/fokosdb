@@ -692,7 +692,7 @@
 										hashKey: item.id,
 										operation: "put",
 										data: JSON.stringify({ balance: newBalances[i] }),
-										condition: { op: "eq", args: [{ ref: "v" }, { val: item.version }] },
+										condition: { op: "eq", args: [{ ref: "version" }, { val: item.version }] },
 									})),
 									partitionOptions: getPartitionOptions(),
 								}),

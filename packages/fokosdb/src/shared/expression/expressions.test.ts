@@ -163,7 +163,7 @@ describe("expression showcase: comparison operators", () => {
 			condition: { op: "lte", args: [{ ref: "data", path: "$.quantity" }, { val: 3 }] },
 		},
 		{ name: "gt on a nested number", item: shippedOrder, condition: { op: "gt", args: [{ ref: "data", path: "$.total" }, { val: 100 }] } },
-		{ name: "gte on the item version", item: shippedOrder, condition: { op: "gte", args: [{ ref: "v" }, { val: 1 }] } },
+		{ name: "gte on the item version", item: shippedOrder, condition: { op: "gte", args: [{ ref: "version" }, { val: 1 }] } },
 		{
 			name: "between on a nested number",
 			item: shippedOrder,
@@ -609,7 +609,7 @@ describe("expression showcase: complex expressions", () => {
 					{ op: "not_exists", args: [{ ref: "data", path: "$.cancelledAt" }] },
 					{ op: "eq", args: [{ fn: "attribute_type", args: [{ ref: "data", path: "$.tags" }] }, { val: "array" }] },
 					{ op: "in", args: [{ ref: "data", path: "$.status" }, { val: "shipped" }, { val: "delivered" }] },
-					{ op: "gte", args: [{ ref: "v" }, { val: 1 }] },
+					{ op: "gte", args: [{ ref: "version" }, { val: 1 }] },
 				],
 			},
 		},
@@ -636,7 +636,7 @@ describe("expression showcase: complex expressions", () => {
 			condition: {
 				op: "and",
 				args: [
-					{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+					{ op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 					{ op: "gt", args: [{ ref: "ttlAt" }, { val: 1_900_000_000 }] },
 				],
 			},
@@ -1023,7 +1023,7 @@ describe("expression showcase: update values", () => {
 		},
 		{
 			name: "the item version of the pre-image becomes a stored member",
-			update: [{ action: "set", target: { ref: "data", path: "$.rev" }, value: { ref: "v" } }],
+			update: [{ action: "set", target: { ref: "data", path: "$.rev" }, value: { ref: "version" } }],
 			after: { ...account, rev: 1 },
 		},
 		{

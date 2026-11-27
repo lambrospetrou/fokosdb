@@ -178,7 +178,7 @@ describe("a failed condition of putItem and deleteItem", () => {
 		const db = makeDB();
 		const key = { hashKey: `cond-${crypto.randomUUID()}`, sortKey: "s" };
 		await db.putItem({ ...key, data: "stored" });
-		const condition: ConditionExpression = { op: "eq", args: [{ ref: "v" }, { val: 999 }] };
+		const condition: ConditionExpression = { op: "eq", args: [{ ref: "version" }, { val: 999 }] };
 
 		const err = await errorOf(() =>
 			api === "putItem"

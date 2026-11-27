@@ -526,7 +526,7 @@ describe("ordered per-item execution: versions", () => {
 	});
 
 	it("refuses a plan that reads v after a write of its item, on both paths, and writes nothing", async () => {
-		const setPrevVersion = updateTree([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }]);
+		const setPrevVersion = updateTree([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "version" } }]);
 		const ops = withOpIndex([put("X", { n: 1 }), { ...update("X"), update: setPrevVersion }]);
 		await withPartition(({ participant, store, storage }) => {
 			seed(store);

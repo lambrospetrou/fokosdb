@@ -1060,7 +1060,7 @@ function referencePresent(reference: ExpressionReference, context: CompileContex
 			context.completeData = true;
 			return `(${context.preImage.dataPresent})`;
 		case "hashKey":
-		case "v":
+		case "version":
 			return "(i.hk IS NOT NULL)";
 		case "sortKey":
 			return context.gsiSortKey ? GSI_SORT_KEY_PRESENT : `(i.hk IS NOT NULL AND length(i.sk) > 0)`;
@@ -1077,7 +1077,7 @@ function referenceType(reference: ExpressionReference, context: CompileContext):
 			return context.gsiSortKey
 				? keyType(GSI_SORT_KEY_VALUE, GSI_SORT_KEY_PRESENT)
 				: keyType("i.sk", "i.hk IS NOT NULL AND length(i.sk) > 0");
-		case "v":
+		case "version":
 			return `CASE WHEN i.hk IS NOT NULL THEN 'number' ELSE 'missing' END`;
 		case "ttlAt":
 			return `CASE WHEN i.hk IS NOT NULL AND i.ttl_epoch_utc_seconds IS NOT NULL THEN 'number' ELSE 'missing' END`;
@@ -1100,7 +1100,7 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 			const column = context.gsiSortKey ? GSI_SORT_KEY_VALUE : "i.sk";
 			return mode === "key" ? column : logicalKeyValue(column);
 		}
-		case "v":
+		case "version":
 			return "i.v";
 		case "ttlAt":
 			return "i.ttl_epoch_utc_seconds";

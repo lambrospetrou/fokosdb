@@ -141,7 +141,7 @@ describe("http-api example worker", () => {
 			projection: [
 				{ expr: { ref: "data" }, as: "d" },
 				{ expr: { b64: "AQID" }, as: "bin" },
-				{ expr: { ref: "v" }, as: "ver" },
+				{ expr: { ref: "version" }, as: "ver" },
 			],
 		});
 		expect(res.status).toBe(200);

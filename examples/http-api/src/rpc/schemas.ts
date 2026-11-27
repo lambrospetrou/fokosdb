@@ -18,7 +18,7 @@ const JsonValueSchema: v.GenericSchema<JsonValue> = v.lazy(() =>
 const ExpressionReferenceSchema: v.GenericSchema<ExpressionReference> = v.union([
 	v.strictObject({ ref: v.literal("hashKey") }),
 	v.strictObject({ ref: v.literal("sortKey") }),
-	v.strictObject({ ref: v.literal("v") }),
+	v.strictObject({ ref: v.literal("version") }),
 	v.strictObject({ ref: v.literal("ttlAt") }),
 	v.strictObject({ ref: v.literal("data"), path: v.optional(v.string()) }),
 ]);

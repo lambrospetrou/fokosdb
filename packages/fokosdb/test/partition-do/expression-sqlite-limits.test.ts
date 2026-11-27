@@ -18,7 +18,7 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 	const key = { hashKey: kb("hk"), sortKey: kb("sk") };
 	const ok = { outcome: "ok" };
 	const rejected = { outcome: "rejected", reason: { code: "condition_failed" } };
-	const vIs = (value: number): ConditionExpression => ({ op: "eq", args: [{ ref: "v" }, { val: value }] });
+	const vIs = (value: number): ConditionExpression => ({ op: "eq", args: [{ ref: "version" }, { val: value }] });
 
 	/** A put of version 1, then a put with the condition. The condition reads `v` = 1. */
 	async function passes(condition: ConditionExpression, n = "t95"): Promise<unknown> {
@@ -70,7 +70,13 @@ describe("FokosDBPartitionDO — an expression at the limits of the engine runs 
 		const { ctx, stub, rpc } = makeStub();
 		await rpc.apiPutItem(ctx, { ...key, data: JSON.stringify({ n: 1, s: "a", out: 0 }), kind: "json" });
 
-		const seeds: ExpressionValue[] = [{ val: 1 }, { val: "a" }, { ref: "data", path: "$.n" }, { ref: "data", path: "$.s" }, { ref: "v" }];
+		const seeds: ExpressionValue[] = [
+			{ val: 1 },
+			{ val: "a" },
+			{ ref: "data", path: "$.n" },
+			{ ref: "data", path: "$.s" },
+			{ ref: "version" },
+		];
 		const fillers: ExpressionValue[] = [{ val: 1 }, { val: "a" }];
 		/** The operation `depth` times around the seed, each time at argument `position`. */
 		const nest = (fn: string, arity: number, position: number, seed: ExpressionValue, filler: ExpressionValue, depth: number) => {

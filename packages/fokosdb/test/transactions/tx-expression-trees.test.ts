@@ -75,7 +75,7 @@ describe("FokosDB — the client validates and does not compile", () => {
 	it("fails a tree that is not valid before any I/O", async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "tree-invalid");
-		const notValid = { op: "eq", args: [{ ref: "v" }] } as unknown as ConditionExpression;
+		const notValid = { op: "eq", args: [{ ref: "version" }] } as unknown as ConditionExpression;
 
 		await expect(
 			db.transactWriteItems({
@@ -125,7 +125,7 @@ describe("transactWriteItems — a broken expression from a caller that does not
 
 		const response = await initiateWrite(db, [
 			{ ...a, operation: "put", data: "never", kind: "text" },
-			{ ...b, operation: "check", condition: { op: "bogus", args: [{ ref: "v" }] } as unknown as ConditionExpression },
+			{ ...b, operation: "check", condition: { op: "bogus", args: [{ ref: "version" }] } as unknown as ConditionExpression },
 		]);
 
 		expect(response).toMatchObject({ outcome: "cancelled" });

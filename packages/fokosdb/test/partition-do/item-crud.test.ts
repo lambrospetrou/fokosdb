@@ -148,7 +148,7 @@ describe.concurrent("FokosDBPartitionDO - putItem / getItem", () => {
 			{ expr: { ref: "data", path: "$.n" } },
 			{ expr: { ref: "data", path: "$.none" } },
 			{ expr: { ref: "data", path: "$.k" }, as: "k" },
-			{ expr: { ref: "v" }, as: "ver" },
+			{ expr: { ref: "version" }, as: "ver" },
 		]);
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), projection });
 		expect(result).toMatchObject({ found: true, meta: { forwardCount: 0 } });

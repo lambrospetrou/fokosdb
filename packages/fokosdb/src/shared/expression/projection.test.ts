@@ -44,12 +44,12 @@ describe("projection validation", () => {
 		const analysis = validateProjectionExpression([
 			{ expr: { ref: "hashKey" } },
 			{ expr: { ref: "sortKey" } },
-			{ expr: { ref: "v" } },
+			{ expr: { ref: "version" } },
 			{ expr: { ref: "ttlAt" } },
 			{ expr: { ref: "data" } },
 			{ expr: { ref: "data", path: "$.a.b" } },
 		]);
-		expect(analysis.names).toEqual(["hashKey", "sortKey", "v", "ttlAt", "data", "$.a.b"]);
+		expect(analysis.names).toEqual(["hashKey", "sortKey", "version", "ttlAt", "data", "$.a.b"]);
 	});
 
 	it("prefers the alias over the reference name", () => {
@@ -122,7 +122,7 @@ describe("projection validation", () => {
 			{ fn: "if_not_exists", args: [{ ref: "data", path: "$.x" }, { val: 0 }] },
 			{ fn: "+", args: [{ val: 1 }, { val: 1 }] },
 			{ fn: "-", args: [{ ref: "data", path: "$.x" }, { val: 1 }] },
-			{ fn: "*", args: [{ ref: "v" }, { val: 2 }] },
+			{ fn: "*", args: [{ ref: "version" }, { val: 2 }] },
 		] as const;
 		for (const fn of fns) {
 			expect(validateProjectionExpression([entry(fn, "x")]).names).toEqual(["x"]);
@@ -201,7 +201,7 @@ describe("projection compiler", () => {
 		// The type of an absent reference is already 'missing', so its fragment reads the path one time.
 		expect(plan.typeSql[0].split("json_type(").length - 1).toBe(1);
 		expect(plan.typeSql[0].startsWith("CASE WHEN (i.hk IS NOT NULL AND i.data_kind = 2) THEN CASE json_type(")).toBe(true);
-		for (const ref of ["hashKey", "sortKey", "v", "ttlAt", "data"] as const) {
+		for (const ref of ["hashKey", "sortKey", "version", "ttlAt", "data"] as const) {
 			expect(compileProjectionExpression([entry({ ref })]).typeSql[0]).toContain("ELSE 'missing' END");
 		}
 	});
@@ -248,7 +248,7 @@ describe("query compiler", () => {
 		const plan = compileQueryExpression({
 			filter: {
 				op: "in",
-				args: [{ ref: "v" }, ...Array.from({ length: EXPRESSION_LIMITS.inChoices }, (_, i) => ({ val: i }))],
+				args: [{ ref: "version" }, ...Array.from({ length: EXPRESSION_LIMITS.inChoices }, (_, i) => ({ val: i }))],
 			} as unknown as ConditionExpression,
 			projection: Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, i) => entry({ val: i }, `k${i}`)),
 		});

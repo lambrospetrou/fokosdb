@@ -168,7 +168,7 @@ export type ReadItemValue<T = never> = DecodedItemData<T>;
  * One complete item of a read result: the keys, the value, and the item metadata. A read without a
  * projection returns this shape. A read with a projection returns `ProjectedReadItem`, with no keys and
  * no `version`. A caller that needs them names them in the projection, for example
- * `{ expr: { ref: "v" }, as: "version" }`.
+ * `{ expr: { ref: "version" }, as: "version" }`.
  *
  * `T` is the caller's own type of the json value, for example `getItem<{ name: string }>({ hashKey })`.
  * The library never checks `T` against the stored item.

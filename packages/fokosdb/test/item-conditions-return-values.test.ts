@@ -39,7 +39,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				await db.putItem({
 					...key,
 					data: "new text",
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
@@ -77,7 +77,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				await db.putItem({
 					...key,
 					data: new Uint8Array([1]),
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
@@ -160,7 +160,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			await db.putItem({
 				...key,
 				data: "stale",
-				condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+				condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 				returnValuesOnConditionCheckFailure: "none",
 			});
 		} catch (e) {
@@ -176,7 +176,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			await db.putItem({
 				...key,
 				data: "stale",
-				condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+				condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 				returnValuesOnConditionCheckFailure: "all_old",
 			});
 		} catch (e) {
@@ -199,14 +199,14 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		const resNone = await db.putItem({
 			...key1,
 			data: "updated",
-			condition: { op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+			condition: { op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 			returnValuesOnConditionCheckFailure: "none",
 		});
 
 		const resAllOld = await db.putItem({
 			...key2,
 			data: "updated",
-			condition: { op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+			condition: { op: "eq", args: [{ ref: "version" }, { val: 1 }] },
 			returnValuesOnConditionCheckFailure: "all_old",
 		});
 
@@ -226,7 +226,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			try {
 				await db.deleteItem({
 					...keyText,
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
@@ -249,7 +249,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			try {
 				await db.deleteItem({
 					...keyBytes,
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
@@ -271,7 +271,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			try {
 				await db.deleteItem({
 					...keyJson,
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
@@ -316,7 +316,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			try {
 				await db.deleteItem({
 					...key,
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "none",
 				});
 			} catch (e) {
@@ -330,7 +330,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			try {
 				await db.deleteItem({
 					...key,
-					condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+					condition: { op: "eq", args: [{ ref: "version" }, { val: 999 }] },
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {

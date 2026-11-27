@@ -228,7 +228,7 @@ describe("update expression validation", () => {
 
 	it("tracks required columns from set values", () => {
 		const update: readonly UpdateAction[] = [
-			{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } },
+			{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "version" } },
 			{ action: "set", target: { ref: "data", path: "$.expireAt" }, value: { ref: "ttlAt" } },
 		];
 		const analysis = validateUpdateExpression(update);

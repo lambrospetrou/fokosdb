@@ -273,7 +273,7 @@ describe("PartitionStore - items", () => {
 				{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
 				{ expr: { ref: "data", path: "$.none" } },
 				{ expr: { ref: "data", path: "$.k" }, as: "k" },
-				{ expr: { ref: "v" }, as: "ver" },
+				{ expr: { ref: "version" }, as: "ver" },
 			]);
 
 			const res = store.getItemProjected(plan, P(kb("hk")), kb("hk"), kb("j"));

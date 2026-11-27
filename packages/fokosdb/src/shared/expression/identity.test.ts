@@ -3,15 +3,15 @@ import type { ConditionExpression, ExpressionValue, ProjectionExpression, Update
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalUpdateIdentity, canonicalValueIdentity } from "./identity.js";
 
-const versionEqualsOne: ConditionExpression = { op: "eq", args: [{ ref: "v" }, { val: 1 }] };
+const versionEqualsOne: ConditionExpression = { op: "eq", args: [{ ref: "version" }, { val: 1 }] };
 
 describe("canonical expression identity", () => {
 	it("uses fixed field order", () => {
-		expect(canonicalConditionIdentity(versionEqualsOne)).toBe('{"op":"eq","args":[{"ref":"v"},{"val":1}]}');
+		expect(canonicalConditionIdentity(versionEqualsOne)).toBe('{"op":"eq","args":[{"ref":"version"},{"val":1}]}');
 	});
 
 	it("does not depend on caller object field insertion order", () => {
-		const reordered = { args: [{ ref: "v" }, { val: 1 }], op: "eq" } as ConditionExpression;
+		const reordered = { args: [{ ref: "version" }, { val: 1 }], op: "eq" } as ConditionExpression;
 		expect(canonicalConditionIdentity(reordered)).toBe(canonicalConditionIdentity(versionEqualsOne));
 	});
 
@@ -34,7 +34,7 @@ describe("canonical expression identity", () => {
 	});
 
 	it("preserves argument order", () => {
-		const reversed: ConditionExpression = { op: "eq", args: [{ val: 1 }, { ref: "v" }] };
+		const reversed: ConditionExpression = { op: "eq", args: [{ val: 1 }, { ref: "version" }] };
 		expect(canonicalConditionIdentity(reversed)).not.toBe(canonicalConditionIdentity(versionEqualsOne));
 	});
 

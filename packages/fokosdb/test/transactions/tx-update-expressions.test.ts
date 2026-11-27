@@ -256,7 +256,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 				],
 			},
 		],
-		["a version guard", { op: "eq", args: [{ ref: "v" }, { val: 1 }] }],
+		["a version guard", { op: "eq", args: [{ ref: "version" }, { val: 1 }] }],
 		["exists on a data path", { op: "exists", args: [{ ref: "data", path: "$.x" }] }],
 	];
 

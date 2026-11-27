@@ -9,7 +9,7 @@ const value = (expression: unknown) => analyzeExpressionValue(expression);
 const condition = (expression: unknown) => validateConditionExpression(expression);
 
 function nestedNot(depth: number): unknown {
-	let result: unknown = { op: "exists", args: [{ ref: "v" }] };
+	let result: unknown = { op: "exists", args: [{ ref: "version" }] };
 	for (let i = 1; i < depth; i++) {
 		result = { op: "not", args: [result] };
 	}
@@ -19,7 +19,7 @@ function nestedNot(depth: number): unknown {
 function repeatedConditions(count: number): unknown {
 	return {
 		op: "and",
-		args: Array.from({ length: count - 1 }, () => ({ op: "exists", args: [{ ref: "v" }] })),
+		args: Array.from({ length: count - 1 }, () => ({ op: "exists", args: [{ ref: "version" }] })),
 	};
 }
 
@@ -35,12 +35,12 @@ describe("condition shape validation", () => {
 	it.each([
 		["missing args", { op: "eq" }],
 		["non-array args", { op: "eq", args: {} }],
-		["a scalar logical argument", { op: "and", args: [{ val: true }, { op: "exists", args: [{ ref: "v" }] }] }],
-		["an unknown value field", { op: "eq", args: [{ ref: "v", extra: true }, { val: 1 }] }],
+		["a scalar logical argument", { op: "and", args: [{ val: true }, { op: "exists", args: [{ ref: "version" }] }] }],
+		["an unknown value field", { op: "eq", args: [{ ref: "version", extra: true }, { val: 1 }] }],
 		["an unknown literal field", { op: "eq", args: [{ val: 1, extra: true }, { val: 1 }] }],
 		["an unknown function field", { op: "eq", args: [{ fn: "size", args: [{ ref: "data" }], extra: true }, { val: 1 }] }],
 		["an unknown reference", { op: "exists", args: [{ ref: "internal" }] }],
-		["a path on a non-data reference", { op: "exists", args: [{ ref: "v", path: "$" }] }],
+		["a path on a non-data reference", { op: "exists", args: [{ ref: "version", path: "$" }] }],
 		["a malformed data path", { op: "exists", args: [{ ref: "data", path: "$." }] }],
 	] as const)("rejects %s", (_name, expression) => {
 		expect(() => condition(expression)).toThrow();
@@ -152,20 +152,20 @@ describe("glob and like validation", () => {
 
 describe("static condition types", () => {
 	it.each([
-		["different equality types", { op: "eq", args: [{ ref: "v" }, { val: "1" }] }],
+		["different equality types", { op: "eq", args: [{ ref: "version" }, { val: "1" }] }],
 		["Boolean and number equality", { op: "eq", args: [{ val: true }, { val: 1 }] }],
 		["null ordering", { op: "lt", args: [{ ref: "data", path: "$.value" }, { val: null }] }],
 		["Boolean ordering", { op: "gte", args: [{ val: true }, { val: false }] }],
-		["incompatible between bounds", { op: "between", args: [{ ref: "v" }, { val: 1 }, { val: "3" }] }],
-		["an incompatible in choice", { op: "in", args: [{ ref: "v" }, { val: 1 }, { val: "2" }] }],
-		["a numeric prefix", { op: "begins_with", args: [{ ref: "v" }, { val: 1 }] }],
+		["incompatible between bounds", { op: "between", args: [{ ref: "version" }, { val: 1 }, { val: "3" }] }],
+		["an incompatible in choice", { op: "in", args: [{ ref: "version" }, { val: 1 }, { val: "2" }] }],
+		["a numeric prefix", { op: "begins_with", args: [{ ref: "version" }, { val: 1 }] }],
 		["a null text search", { op: "contains", args: [{ val: "text" }, { val: null }] }],
 	] as const)("rejects %s", (_name, expression) => {
 		expect(() => condition(expression)).toThrow(/type/);
 	});
 
 	it.each([
-		["number equality", { op: "eq", args: [{ ref: "v" }, { val: 1 }] }],
+		["number equality", { op: "eq", args: [{ ref: "version" }, { val: 1 }] }],
 		["text ordering", { op: "lt", args: [{ val: "a" }, { val: "b" }] }],
 		["a dynamic scalar comparison", { op: "eq", args: [{ ref: "data", path: "$.value" }, { val: true }] }],
 		["a text prefix", { op: "begins_with", args: [{ ref: "hashKey" }, { val: "prefix" }] }],
@@ -213,7 +213,7 @@ describe("expression limits and required columns", () => {
 	it("enforces the in choice limit", () => {
 		const makeIn = (choices: number) => ({
 			op: "in",
-			args: [{ ref: "v" }, ...Array.from({ length: choices }, (_, index) => ({ val: index }))],
+			args: [{ ref: "version" }, ...Array.from({ length: choices }, (_, index) => ({ val: index }))],
 		});
 		expect(() => condition(makeIn(EXPRESSION_LIMITS.inChoices))).not.toThrow();
 		expect(() => condition(makeIn(EXPRESSION_LIMITS.inChoices + 1))).toThrow(/choice limit/);
@@ -225,7 +225,7 @@ describe("expression limits and required columns", () => {
 			args: [
 				{ op: "eq", args: [{ ref: "hashKey" }, { val: "key" }] },
 				{ op: "eq", args: [{ ref: "sortKey" }, { val: "sort" }] },
-				{ op: "gte", args: [{ ref: "v" }, { val: 1 }] },
+				{ op: "gte", args: [{ ref: "version" }, { val: 1 }] },
 				{ op: "exists", args: [{ ref: "ttlAt" }] },
 				{ op: "eq", args: [{ fn: "attribute_type", args: [{ ref: "data", path: "$.value" }] }, { val: "text" }] },
 				{ op: "exists", args: [{ ref: "data" }] },
@@ -293,7 +293,7 @@ describe("byte literal validation", () => {
 	});
 
 	it.each([
-		["a number", { op: "eq", args: [{ ref: "v" }, { b64: "YQ==" }] }],
+		["a number", { op: "eq", args: [{ ref: "version" }, { b64: "YQ==" }] }],
 		["text", { op: "eq", args: [{ val: "ab" }, { b64: "YWI=" }] }],
 		["a byte search on a JSON array", { op: "contains", args: [{ ref: "data", path: "$.tags" }, { b64: "YQ==" }] }],
 	] as const)("rejects a byte literal against %s", (_name, expression) => {

@@ -46,7 +46,7 @@ export function matchesContext(operationContexts: number, context: ExpressionCon
 	return (operationContexts & contextToFlag(context)) !== 0;
 }
 
-export type DirectReference = "hashKey" | "sortKey" | "v" | "ttlAt" | "data";
+export type DirectReference = "hashKey" | "sortKey" | "version" | "ttlAt" | "data";
 
 /** Inferred type facts for an expression value node during semantic analysis. */
 export type ValueFacts = {
@@ -146,7 +146,7 @@ export const nullTextValue: ValueFacts = { types: nullTextTypes };
 export const nullBytesValue: ValueFacts = { types: nullBytesTypes };
 export const hashKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference: "hashKey" };
 export const sortKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference: "sortKey" };
-export const versionValue: ValueFacts = { types: missingNumberTypes, directReference: "v" };
+export const versionValue: ValueFacts = { types: missingNumberTypes, directReference: "version" };
 export const ttlValue: ValueFacts = { types: missingNumberTypes, directReference: "ttlAt" };
 export const dataValue: ValueFacts = { types: allTypes, directReference: "data" };
 export const dataPathValue: ValueFacts = { types: dataPathTypes, directReference: "data" };

@@ -273,7 +273,7 @@ describe("FokosDBPartitionDO - splitting", () => {
 				kind: "json",
 			});
 
-			const projection = projectionTree([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "v" }, as: "ver" }]);
+			const projection = projectionTree([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "version" }, as: "ver" }]);
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
 			expect(result).toMatchObject({ found: true, item: { projected: [3, 1] } });
 			expect(result.meta.forwardCount).toBe(1);

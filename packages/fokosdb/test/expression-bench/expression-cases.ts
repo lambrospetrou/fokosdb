@@ -66,7 +66,7 @@ export const CASES: readonly ExpressionCase[] = [
 			op: "and",
 			args: [
 				{ op: "exists", args: [{ ref: "hashKey" }] },
-				{ op: "eq", args: [{ ref: "v" }, val(1)] },
+				{ op: "eq", args: [{ ref: "version" }, val(1)] },
 			],
 		},
 	},
@@ -137,7 +137,7 @@ export const CASES: readonly ExpressionCase[] = [
 	{
 		name: "proj: 3 paths and v",
 		kind: "projection",
-		tree: [{ expr: path("$.status") }, { expr: path("$.region") }, { expr: path("$.total") }, { expr: { ref: "v" } }],
+		tree: [{ expr: path("$.status") }, { expr: path("$.region") }, { expr: path("$.total") }, { expr: { ref: "version" } }],
 	},
 	{ name: "proj: 48 paths", kind: "projection", tree: FORTY_EIGHT_PROJECTIONS },
 	{ name: "query: one path eq filter", kind: "query", tree: { filter: { op: "eq", args: [path("$.status"), val("pending")] } } },
@@ -151,7 +151,7 @@ export const CASES: readonly ExpressionCase[] = [
 				{ expr: path("$.region") },
 				{ expr: path("$.total") },
 				{ expr: path("$.owner") },
-				{ expr: { ref: "v" } },
+				{ expr: { ref: "version" } },
 			],
 		},
 	},
