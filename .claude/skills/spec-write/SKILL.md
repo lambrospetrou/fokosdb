@@ -26,6 +26,10 @@ You rewrite the form. You do not change the design.
 - **No moving target code references.** If you have to reference code, refer to file and function names,
   not to a line number or a commit hash. The code may change, but the function name is stable.
 - **Use 120 characters per line.** If a sentence is longer, break it into two or more sentences.
+- **Do not update older specs.** A dated spec in `docs/agent-plans/` records the design at its date. Rewrite only
+  the document the user gives. Do not edit another spec to match it. When the new spec alters the behavior or a key
+  decision of an older spec, add only a one-line reference in the older spec to the new spec. When the new spec only
+  extends a feature, change nothing in the older spec.
 
 ## Procedure
 

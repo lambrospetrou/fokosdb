@@ -21,6 +21,10 @@ You implement the approved specification. You do not redesign the architecture.
 - **Verify before pause.** Run the project build, type checks, and tests before you ask for review. All checks must pass.
 - **Write minimal code.** Write only the code necessary to satisfy the milestone. Do not add unused abstractions.
 - **No dead discussion references.** Comments must not refer to discussions, meeting labels, or rejected ideas.
+- **Do not update older specs.** A dated spec in `docs/agent-plans/` records the design at its date. Do not edit it to
+  match a later change. When the change alters the behavior or a key decision of an older spec, add only a one-line
+  reference in the older spec to the newer spec. When the change only extends a feature, change nothing in the older
+  spec.
 
 ## Procedure
 
