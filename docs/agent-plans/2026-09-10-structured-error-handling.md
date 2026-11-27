@@ -3,6 +3,7 @@
 **State:** Completed
 **Date:** 2026-09-10
 **Author:** Lambros
+**Change:** The public error types get open codes. Refer to [the open error codes RFC](2026-11-27-open-error-codes.md).
 
 ---
 
