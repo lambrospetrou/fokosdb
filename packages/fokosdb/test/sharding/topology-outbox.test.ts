@@ -15,6 +15,7 @@ import type { FokosAdminOutbox } from "../../src/sharding/runtime-types.js";
 import { counterAdminName, type CounterOps, type CounterPolicy } from "./counter-host.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
 import { hashSplitReport } from "./topology-events.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 const WAIT = { timeout: 20_000, interval: 50 };
 
@@ -156,7 +157,7 @@ describe.concurrent("Sharding runtime — admin outbox and topology", () => {
 		await root(table).debugSetOutbox({ failures: 1_000 });
 		await splitRoot(table);
 		await vi.waitFor(async () => expect((await root(table).debugOutbox()).rows).toHaveLength(1), WAIT);
-		await root(table).fokosPrepareDestroy({});
+		await callFokosRpc(root(table), "prepareDestroy", {});
 		const before = await root(table).debugOutbox();
 		// Longer than the first backoff delay of the outbox job (at most 3 s).
 		await scheduler.wait(3_500);
@@ -210,7 +211,7 @@ async function withOutboxRuntime(
 			},
 			adminOutbox: () => ({ send }),
 		});
-		await runtime.fokosStatus({ rootContext: table.root });
+		await runtime.fokosRpc("status", { rootContext: table.root });
 		try {
 			await fn({
 				runtime,
@@ -230,7 +231,7 @@ async function withOutboxRuntime(
 						.toArray(),
 			});
 		} finally {
-			await runtime.fokosPrepareDestroy({});
+			await runtime.fokosRpc("prepareDestroy", {});
 		}
 	});
 }
@@ -281,7 +282,7 @@ describe.concurrent("Sharding runtime — admin outbox timeout", () => {
 			try {
 				await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1), WAIT);
 				let finished = false;
-				destroy = runtime.fokosPrepareDestroy({}).then(() => {
+				destroy = runtime.fokosRpc("prepareDestroy", {}).then(() => {
 					finished = true;
 				});
 				await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_500, interval: 50 });

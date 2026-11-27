@@ -20,6 +20,7 @@ import {
 	TestPartition,
 	withMigrationHeld,
 } from "./partition-harness.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
@@ -96,13 +97,13 @@ describe("FokosDBPartitionDO - splitting", () => {
 		}
 	});
 
-	it("status() reports a target after fokosInit as migration_initialized, with its parent", async ({ expect }) => {
+	it("status() reports a target after the init action as migration_initialized, with its parent", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub();
 		// The DO name and the partition ID of a target must match, so the target is the real child 0.
 		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
 		const childStub = testPartitionStub(childCtx.doName);
 
-		await childStub.fokosInit({
+		await callFokosRpc(childStub, "init", {
 			repartitionId: "r1",
 			source: refOf(parentCtx),
 			target: childCtx,
@@ -129,7 +130,7 @@ describe("FokosDBPartitionDO - splitting", () => {
 			notCutOverRetryMs: minute,
 			nonRetryableRetryMs: minute,
 		});
-		await child.fokosInit({
+		await callFokosRpc(child, "init", {
 			repartitionId: "r1",
 			source: refOf(parentCtx),
 			target: childCtx,
@@ -148,22 +149,22 @@ describe("FokosDBPartitionDO - splitting", () => {
 		await vi.waitFor(async () => expect(await attempts()).toBe(1), { timeout: 5_000, interval: 10 });
 	});
 
-	it("a matching fokosInit retry stores the latest policy of the target context", async ({ expect }) => {
+	it("a matching init action retry stores the latest policy of the target context", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub({ hashSplitConditions: { maxSizeMb: 100 } });
 		// The DO name and the partition ID of a target must match, so the target is the real child 0.
 		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
 		const childStub = testPartitionStub(childCtx.doName);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 
-		await childStub.fokosInit({ repartitionId: "r1", source: refOf(parentCtx), target: childCtx, slice });
-		await childStub.fokosInit({
+		await callFokosRpc(childStub, "init", { repartitionId: "r1", source: refOf(parentCtx), target: childCtx, slice });
+		await callFokosRpc(childStub, "init", {
 			repartitionId: "r1",
 			source: refOf(parentCtx),
 			target: { ...childCtx, policy: { ...childCtx.policy, hashSplitConditions: { maxSizeMb: 25 } } },
 			slice,
 		});
 
-		// Read the stored policy WITHOUT a request, so the assertion observes what fokosInit stored rather
+		// Read the stored policy WITHOUT a request, so the assertion observes what the init action stored rather
 		// than writing the threshold itself.
 		const stored = await runInDurableObject(childStub, (instance: FokosDBPartitionDO) => instance.fokos.policy());
 		expect(stored.hashSplitConditions.maxSizeMb).toBe(25);

@@ -5,7 +5,7 @@ type tLockRow = (tx: int, op: tTxOp);
 // of the stale job.
 type tPendingTxInfo = (ts: int, coordinator: machine, createdAt: int, nextRecoveryAt: int, guarded: bool);
 
-// One target row of a split: the child, whether its fokosInit succeeded, and whether it acknowledged
+// One target row of a split: the child, whether its the init action succeeded, and whether it acknowledged
 // its import.
 type tSplitTarget = (child: machine, initialized: bool, acked: bool);
 
@@ -89,7 +89,7 @@ machine Partition {
       fanouts = default(map[int, tFanout]);
       step = default(tStaleStep);
       CheckAlarm();
-      // The alarm runs the import job again. A target in awaiting_data waits for fokosStartImport.
+      // The alarm runs the import job again. A target in awaiting_data waits for the startImport action.
       if (durable.importState != AWAITING_DATA) {
         ImportStep();
       }
@@ -144,7 +144,7 @@ machine Partition {
     }
 
     // apiGetItem: readItemLocally reads the committed row. A lock does not block it. A target that
-    // imports reads through its source (fokosExecuteLocal), and a router forwards to the owner.
+    // imports reads through its source (the executeLocal action), and a router forwards to the owner.
     on eGetItem do (req: tGetItemReq) {
       if (Importing()) {
         Forward(req.caller, durable.source, eExecuteLocal, req);
@@ -157,7 +157,7 @@ machine Partition {
       ReadItemLocally(req);
     }
 
-    // fokosExecuteLocal: the source runs the local handler of apiGetItem for a target that imports,
+    // the executeLocal action: the source runs the local handler of apiGetItem for a target that imports,
     // with no owner resolution. A split source keeps its item rows for life.
     on eExecuteLocal do (req: tGetItemReq) {
       ReadItemLocally(req);
@@ -494,7 +494,7 @@ machine Partition {
         SetSplit(SPLIT_PLANNED);
         send this, eSourceStep;
       } else if (durable.split == SPLIT_PLANNED) {
-        // #initializeTargets: calls fokosInit on each target that is not initialized. #cutover: when
+        // #initializeTargets: calls the init action on each target that is not initialized. #cutover: when
         // every target is initialized, the source becomes a router.
         while (i < sizeof(durable.children)) {
           if (!durable.children[i].initialized) {
@@ -518,7 +518,7 @@ machine Partition {
       }
     }
 
-    // The answer of fokosInit: the source marks the target `initialized`.
+    // The answer of the init action: the source marks the target `initialized`.
     on eFokosInitResp do (slice: int) {
       var target: tSplitTarget;
       if (durable.split != SPLIT_PLANNED) {
@@ -533,7 +533,7 @@ machine Partition {
       send this, eSourceStep;
     }
 
-    // fokosInit: initAsTarget writes the identity of the target and its import record in
+    // the init action: initAsTarget writes the identity of the target and its import record in
     // `awaiting_data`. A repeated call changes nothing.
     on eFokosInit do (req: tFokosInitReq) {
       if (durable.importState == NOT_TARGET) {
@@ -544,14 +544,14 @@ machine Partition {
       send req.caller, eFokosInitResp, durable.slice;
     }
 
-    // fokosStartImport: the target starts its import. In the code a target in awaiting_data also
+    // the startImport action: the target starts its import. In the code a target in awaiting_data also
     // starts from its own alarm, and the source refuses a pull before the cutover. The model sends
     // this event one time at the cutover and does not lose it, so that alarm is not necessary.
     on eStartImport do {
       ImportStep();
     }
 
-    // fokosMigrationPull: servePage refuses a pull before the cutover (repartition_not_cut_over) and
+    // the migrationPull action: servePage refuses a pull before the cutover (repartition_not_cut_over) and
     // after the completion (partition_migrating).
     on eMigrationPull do (req: tMigrationPullReq) {
       if (durable.split != SPLIT_CUTOVER) {
@@ -607,7 +607,7 @@ machine Partition {
       ImportStep();
     }
 
-    // fokosMigrationAck: acceptAck records the acknowledgement of a target. When every target
+    // the migrationAck action: acceptAck records the acknowledgement of a target. When every target
     // acknowledged, the same transaction writes `completed`. A repeated acknowledgement after that is
     // a success.
     on eMigrationAck do (req: tMigrationAckReq) {
@@ -627,7 +627,7 @@ machine Partition {
       send req.caller, eMigrationAckResp;
     }
 
-    // The answer of fokosMigrationAck: sendAck writes `active`.
+    // The answer of the migrationAck action: sendAck writes `active`.
     on eMigrationAckResp do {
       if (durable.importState == IMPORTED) {
         SetImport(ACTIVE);

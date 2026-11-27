@@ -16,10 +16,10 @@ import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
 import type { FokosRuntimeConfigOverrides } from "../src/sharding/runtime-config.js";
 import type { PartitionDOConfigOverrides } from "../src/server/host-config.js";
 import type {
-	FokosInitRequest,
-	FokosMigrationAckRequest,
 	FokosMigrationPage,
 	FokosMigrationPullRequest,
+	FokosShardingAction,
+	FokosShardingActions,
 } from "../src/sharding/repartition-types.js";
 
 export type MigrationStream = "overrides" | "items" | "pending_tx";
@@ -193,7 +193,27 @@ export class ControlledPartitionDO extends FokosDBPartitionDO {
 		return #runtimeConfig in this ? this.#runtimeConfig : super.fokosRuntimeConfig();
 	}
 
-	override async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
+	override async fokosRpc<A extends FokosShardingAction>(
+		action: A,
+		req: FokosShardingActions[A]["req"],
+	): Promise<FokosShardingActions[A]["res"]> {
+		if (action === "migrationPull") {
+			return (await this.#migrationPull(req as FokosMigrationPullRequest)) as FokosShardingActions[A]["res"];
+		}
+		if (action === "migrationAck" && this.#refuseAcks) {
+			throw new Error("the test refuses the acknowledgement");
+		}
+		const result = await super.fokosRpc(action, req);
+		if (action === "init") {
+			this.#initCalls++;
+			if (this.#initGate) {
+				await this.#initGate.held;
+			}
+		}
+		return result;
+	}
+
+	async #migrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
 		this.#pullStats.calls++;
 		const pullGate = this.#pullGate;
 		const matches =
@@ -201,7 +221,7 @@ export class ControlledPartitionDO extends FokosDBPartitionDO {
 		let page: FokosMigrationPage | undefined;
 		if (matches) {
 			if (pullGate.spec.afterRead) {
-				page = await super.fokosMigrationPull(req);
+				page = await super.fokosRpc("migrationPull", req);
 			}
 			if (!this.#pullStats.heldTargets.includes(req.target.doName)) {
 				this.#pullStats.heldTargets.push(req.target.doName);
@@ -209,25 +229,10 @@ export class ControlledPartitionDO extends FokosDBPartitionDO {
 			await pullGate.held;
 		}
 		const receivedAt = Date.now();
-		page ??= await super.fokosMigrationPull(req);
+		page ??= await super.fokosRpc("migrationPull", req);
 		const rows = page.phase === "overrides" ? page.overrides.length : pageRows(page.page);
 		this.#pullStats.pulls.push({ target: req.target.doName, stream: streamOf(req), receivedAt, answeredAt: Date.now(), rows });
 		return page;
-	}
-
-	override async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		if (this.#refuseAcks) {
-			throw new Error("the test refuses the acknowledgement");
-		}
-		return await super.fokosMigrationAck(req);
-	}
-
-	override async fokosInit(req: FokosInitRequest): Promise<void> {
-		await super.fokosInit(req);
-		this.#initCalls++;
-		if (this.#initGate) {
-			await this.#initGate.held;
-		}
 	}
 
 	/** Holds each pull that matches `spec` until `testReleasePulls`. */
@@ -253,7 +258,7 @@ export class ControlledPartitionDO extends FokosDBPartitionDO {
 		this.#refuseAcks = refuse;
 	}
 
-	/** Holds each `fokosInit` on this partition after it applies, until `testReleaseInit`. */
+	/** Holds each `init` action on this partition after it applies, until `testReleaseInit`. */
 	async testHoldInit(): Promise<void> {
 		this.#initGate = gate();
 	}

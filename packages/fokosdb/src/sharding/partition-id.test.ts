@@ -720,7 +720,7 @@ describe("partitionIdentityFrom", () => {
 		);
 	});
 
-	it("decodes a range identity and takes the depth and ancestors from fokosInit", () => {
+	it("decodes a range identity and takes the depth and ancestors from the init action", () => {
 		const root = makeRouter().allRoots()[0];
 		const range = resolveRangePartitionContext(root, ROUTING_HASH, c("alice", "b1"), null);
 		const ancestors = [{ depth: 0, startBoundary: c("alice", "a"), endBoundary: c("alice", "z") }];

@@ -10,6 +10,7 @@ import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
 import { kb, makeStub, type PartitionOptions } from "../partition-do/helpers.js";
 import type { ReceivedPush } from "./push-target-host.js";
 import { testRoutingHashSeedResolver } from "../routing-hash.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 /** The producer of the test exports. */
 const PRODUCER_ID = "dd".repeat(32);
@@ -101,13 +102,13 @@ describe("FokosDBMaterializationDO — splits", () => {
 		}
 
 		const children = async () => {
-			const { split } = await root.stub.fokosStatus({});
+			const { split } = await callFokosRpc(root.stub, "status", {});
 			return split.flatMap((entry) => (entry.target ? [stubOf(root, entry.target.ref)] : []));
 		};
 		await driveUntil(
 			async () => [root.stub, ...(await children())],
 			async () => {
-				const { split } = await root.stub.fokosStatus({});
+				const { split } = await callFokosRpc(root.stub, "status", {});
 				return split.length > 0 && split.every((entry) => DONE_STATES.includes(entry.repartition.state));
 			},
 		);
@@ -150,9 +151,9 @@ describe("FokosDBMaterializationDO — splits", () => {
 				ttlAt: null,
 			}) as const;
 		await apply(root, [item("hot", "s0"), item("hot", "s1"), item("hot", "s2"), item("cold", "s0")]);
-		await root.stub.fokosRequestPromotion({ target: root.ref, hashKey: kb("hot") });
+		await callFokosRpc(root.stub, "requestPromotion", { target: root.ref, hashKey: kb("hot") });
 
-		const promotion = async () => (await root.stub.fokosPromotions({ cursor: null })).entries[0];
+		const promotion = async () => (await callFokosRpc(root.stub, "promotions", { cursor: null })).entries[0];
 		const child = async () => {
 			const ref = (await promotion())?.target?.ref;
 			return ref ? [stubOf(root, ref)] : [];

@@ -50,7 +50,7 @@ import type { FokosTopologyCacheOptions } from "../sharding/topology-cache.js";
 import { FOKOS_HASH_PARTITIONS_MAX, type FokosPartitionRef } from "../sharding/route-context.js";
 import { asRoutingHash, type RoutingHash, type RoutingHashSeedResolver } from "../sharding/hash-primitives.js";
 import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
-import { FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
+import { callFokosRpc, FokosShardingClient, dropCallCost, type FokosCallResult, type FokosRetryPolicy } from "../sharding/client.js";
 import type {
 	BatchFailure,
 	BatchGetItemsRpcRequest,
@@ -1789,7 +1789,7 @@ export class FokosDB implements FokosDBAPI {
 		const ids = new Set<string>();
 		for await (const node of materializations.walk()) {
 			const stub = materializationStubByName(env, node.ctx, node.ctx.doName);
-			await stub.fokosPrepareDestroy({ rootContext: node.parent === null ? node.ctx : undefined });
+			await callFokosRpc(stub, "prepareDestroy", { rootContext: node.parent === null ? node.ctx : undefined });
 			for (const id of (await stub.fokosGsiTargetIds()) ?? []) {
 				ids.add(id);
 			}

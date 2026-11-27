@@ -202,7 +202,7 @@ type Partition = {
 	role?: "owner" | "router";
 	initialized?: boolean;
 	targets?: Array<{ ref: FokosPartitionRef; state?: RepartitionState }>;
-	/** The count of `fokosDestroy` calls that throw before one succeeds. */
+	/** The count of `destroy` actions that throw before one succeeds. */
 	failDestroy?: number;
 };
 
@@ -235,44 +235,51 @@ function makeCluster(partitions: Record<string, Partition>) {
 		target: { index, ref: target.ref, initialization: "initialized", acknowledged: true },
 	});
 	const isPromotion = (target: { ref: FokosPartitionRef }) => target.ref.partitionId.startsWith("01");
-	const stub = (_ctx: FokosRouteContext<unknown>, doName: string) => ({
-		async fokosPrepareDestroy(req: { rootContext?: FokosRouteContext<unknown> }) {
-			events.push(`fence:${doName}`);
-			contexts.push(req.rootContext?.doName);
-		},
-		async fokosStatus(req: { rootContext?: FokosRouteContext<unknown> }): Promise<FokosStatusPage> {
-			const p = partitions[doName] ?? {};
-			events.push(`status:${doName}`);
-			statusContexts.push(req.rootContext?.doName);
-			const initialized = p.initialized ?? true;
-			return {
-				initialized,
-				destroying: false,
-				ref: initialized ? ref(doName) : null,
-				role: initialized ? (p.role ?? "owner") : null,
-				importState: null,
-				split: (p.targets ?? []).filter((t) => !isPromotion(t)).map((t, i) => entryOf(0, i, t, "hash_split")),
-			};
-		},
-		async fokosPromotions(req: { cursor: { seq: number } | null }): Promise<FokosPromotionsPage> {
-			const promotions = (partitions[doName]?.targets ?? []).filter(isPromotion);
-			const seq = req.cursor ? req.cursor.seq + 1 : 0;
-			events.push(`page:${doName}#${seq}`);
-			const target = promotions[seq];
-			return {
-				entries: target ? [entryOf(seq, 0, target, "key_promotion")] : [],
-				nextCursor: seq + 1 < promotions.length ? { seq } : null,
-			};
-		},
-		async fokosDestroy() {
-			const p = partitions[doName];
-			if (p?.failDestroy) {
-				p.failDestroy -= 1;
-				throw new Error(`the destroy of ${doName} failed`);
-			}
-			events.push(`destroy:${doName}`);
-		},
-	});
+	const stub = (_ctx: FokosRouteContext<unknown>, doName: string) => {
+		const actions = {
+			async prepareDestroy(req: { rootContext?: FokosRouteContext<unknown> }) {
+				events.push(`fence:${doName}`);
+				contexts.push(req.rootContext?.doName);
+			},
+			async status(req: { rootContext?: FokosRouteContext<unknown> }): Promise<FokosStatusPage> {
+				const p = partitions[doName] ?? {};
+				events.push(`status:${doName}`);
+				statusContexts.push(req.rootContext?.doName);
+				const initialized = p.initialized ?? true;
+				return {
+					initialized,
+					destroying: false,
+					ref: initialized ? ref(doName) : null,
+					role: initialized ? (p.role ?? "owner") : null,
+					importState: null,
+					split: (p.targets ?? []).filter((t) => !isPromotion(t)).map((t, i) => entryOf(0, i, t, "hash_split")),
+				};
+			},
+			async promotions(req: { cursor: { seq: number } | null }): Promise<FokosPromotionsPage> {
+				const promotions = (partitions[doName]?.targets ?? []).filter(isPromotion);
+				const seq = req.cursor ? req.cursor.seq + 1 : 0;
+				events.push(`page:${doName}#${seq}`);
+				const target = promotions[seq];
+				return {
+					entries: target ? [entryOf(seq, 0, target, "key_promotion")] : [],
+					nextCursor: seq + 1 < promotions.length ? { seq } : null,
+				};
+			},
+			async destroy() {
+				const p = partitions[doName];
+				if (p?.failDestroy) {
+					p.failDestroy -= 1;
+					throw new Error(`the destroy of ${doName} failed`);
+				}
+				events.push(`destroy:${doName}`);
+			},
+		};
+		return {
+			async fokosRpc(action: keyof typeof actions, req: never): Promise<unknown> {
+				return await actions[action](req);
+			},
+		};
+	};
 	const of = (kind: string) => events.filter((e) => e.startsWith(`${kind}:`)).map((e) => e.slice(kind.length + 1));
 	const beforeDestroy = async (r: FokosPartitionRef, promoted: RoutingHash[]) => {
 		events.push(`before:${r.doName}[${promoted.map((b) => new TextDecoder().decode(b)).join(",")}]`);

@@ -43,9 +43,12 @@ import {
 } from "../../src/sharding/repartition-flow.js";
 import type {
 	FokosInitRequest,
+	FokosMigrationAckRequest,
 	FokosMigrationPage,
+	FokosMigrationPullRequest,
 	FokosPartitionRef,
 	FokosRepartitionPeer,
+	FokosStartImportRequest,
 } from "../../src/sharding/repartition-types.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { promotedRoutingHashOf } from "../../src/sharding/repartition-slice.js";
@@ -96,9 +99,9 @@ export type Cluster = {
 	/** Per-node counts of the side effects the flow asks its DO for. */
 	scheduled(doName: string): number;
 	alarms(doName: string): number[];
-	/** Makes the next `fokosInit` this node serves fail, once. */
+	/** Makes the next `init` action this node serves fail, once. */
 	failNextInit(doName: string, message?: string): void;
-	/** Makes the next `fokosMigrationPull` this node serves answer with `page`, once. */
+	/** Makes the next `migrationPull` action this node serves answer with `page`, once. */
 	nextPullPage(doName: string, page: FokosMigrationPage): void;
 	/** Each `onRepartitionCutover` call of a node, with the stored state of the repartition during the call. */
 	cutovers(doName: string): Array<{ id: string; kind: string; state: string | undefined }>;
@@ -190,7 +193,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				});
 				sharding.runMigrations();
 				store.runMigrations();
-				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
+				// The stored identity is what the flow reads back, so a target has none until the init action. A
 				// node that has none yet answers with the identity its context decodes to, as a root does.
 				const deps = makeDeps(ctx.doName, sharding, store, ctx);
 				const source = new RepartitionSource(sharding, deps);
@@ -203,32 +206,36 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			ref: { partitionId: ctx.partitionId, doName: ctx.doName },
 			doName: ctx.doName,
 			enter,
-			// The peer surface of a real flow over a real store — the same four methods a remote
+			// The peer surface of a real flow over a real store — the same four actions a remote
 			// participant would reach over Workers RPC, with the transport taken out.
 			peer: {
-				async fokosInit(req) {
-					const failure = initFailures.get(ctx.doName);
-					if (failure !== undefined) {
-						initFailures.delete(ctx.doName);
-						throw new Error(failure);
+				async fokosRpc(action: string, req: unknown): Promise<unknown> {
+					switch (action) {
+						case "init": {
+							const failure = initFailures.get(ctx.doName);
+							if (failure !== undefined) {
+								initFailures.delete(ctx.doName);
+								throw new Error(failure);
+							}
+							return await enter((e) => e.target.initAsTarget(req as FokosInitRequest));
+						}
+						case "startImport":
+							return await enter((e) => e.target.startImport(req as FokosStartImportRequest));
+						case "migrationPull": {
+							const canned = cannedPages.get(ctx.doName);
+							if (canned !== undefined) {
+								cannedPages.delete(ctx.doName);
+								return canned;
+							}
+							return await enter((e) => e.source.servePage(req as FokosMigrationPullRequest));
+						}
+						case "migrationAck":
+							return await enter((e) => e.source.acceptAck(req as FokosMigrationAckRequest));
+						default:
+							throw new Error(`the repartition flow does not send the action ${action}`);
 					}
-					await enter((e) => e.target.initAsTarget(req));
 				},
-				async fokosStartImport(req) {
-					await enter((e) => e.target.startImport(req));
-				},
-				async fokosMigrationPull(req) {
-					const canned = cannedPages.get(ctx.doName);
-					if (canned !== undefined) {
-						cannedPages.delete(ctx.doName);
-						return canned;
-					}
-					return await enter((e) => e.source.servePage(req));
-				},
-				async fokosMigrationAck(req) {
-					await enter((e) => e.source.acceptAck(req));
-				},
-			},
+			} as FokosRepartitionPeer,
 		};
 	}
 

@@ -81,22 +81,7 @@ import type {
 	FokosShardingHooks,
 	FokosStorageKey,
 } from "../sharding/runtime-types.js";
-import type {
-	FokosExecuteLocalRequest,
-	FokosImportState,
-	FokosInitRequest,
-	FokosMigrationAckRequest,
-	FokosMigrationPage,
-	FokosMigrationPullRequest,
-	FokosPrepareDestroyRequest,
-	FokosPromotionsPage,
-	FokosPromotionsRequest,
-	FokosRequestPromotionRequest,
-	FokosShardingRpc,
-	FokosStartImportRequest,
-	FokosStatusPage,
-	FokosStatusRequest,
-} from "../sharding/repartition-types.js";
+import type { FokosImportState, FokosShardingAction, FokosShardingActions, FokosShardingRpc } from "../sharding/repartition-types.js";
 import {
 	clipToChildRange,
 	cursorFallsInChild,
@@ -669,40 +654,18 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		return await this.#api("promotedKeyStatus", ctx, req);
 	}
 
-	async fokosInit(req: FokosInitRequest): Promise<void> {
-		return await this.fokos.fokosInit(req);
-	}
-	async fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return await this.fokos.fokosStartImport(req);
-	}
-	async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return await this.fokos.fokosMigrationPull(req);
-	}
-	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return await this.fokos.fokosMigrationAck(req);
-	}
-	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		return await this.fokos.fokosExecuteLocal(req);
-	}
-	async fokosRequestPromotion(req: FokosRequestPromotionRequest) {
-		return await this.fokos.fokosRequestPromotion(req);
-	}
-	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
-		return await this.fokos.fokosStatus(req);
-	}
-	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
-		return await this.fokos.fokosPromotions(req);
-	}
-	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		await this.fokos.fokosPrepareDestroy(req);
-		// After the pass the fence waited for, never before it: the pass can arm the sweep.
-		this.#ttl.disarm();
-		// The fence stops the export loop. No export call of this instance stays in flight after it.
-		await this.#exporter.settled();
-	}
-	async fokosDestroy(): Promise<void> {
-		this.#ttl.disarm();
-		return await this.fokos.fokosDestroy();
+	async fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]): Promise<FokosShardingActions[A]["res"]> {
+		if (action === "destroy") {
+			this.#ttl.disarm();
+		}
+		const result = await this.fokos.fokosRpc(action, req);
+		if (action === "prepareDestroy") {
+			// After the pass the fence waited for, never before it: the pass can arm the sweep.
+			this.#ttl.disarm();
+			// The fence stops the export loop. No export call of this instance stays in flight after it.
+			await this.#exporter.settled();
+		}
+		return result;
 	}
 
 	/**
@@ -766,8 +729,8 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 
 	/**
 	 * Every request arms the TTL sweep, so a partition that serves traffic expires its rows. A fenced
-	 * partition arms nothing: `fokosPrepareDestroy` disarms the sweep, and a request that arrives
-	 * between the fence and `fokosDestroy` must not start the timer again.
+	 * partition arms nothing: the `prepareDestroy` action disarms the sweep, and a request that
+	 * arrives between the fence and the `destroy` action must not start the timer again.
 	 */
 	#api<K extends keyof PartitionOps>(op: K, ctx: FokosDBRouteContext, req: PartitionOps[K]["req"]) {
 		this.#checkInit(op);
@@ -1862,7 +1825,7 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 		const identity = this.fokos.identity();
 		const routeContext = this.fokos.routeContext();
 		const importInfo = this.fokos.lifecycle().import;
-		const entries = (await this.fokos.fokosStatus({})).split;
+		const entries = (await this.fokos.fokosRpc("status", {})).split;
 
 		const split = entries[0]?.repartition;
 		let splitStatus: SplitStatusView | undefined;

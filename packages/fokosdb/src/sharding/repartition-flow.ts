@@ -11,9 +11,9 @@
  * The source and the target run separate state machines:
  *
  *   source: (none) -> queued -> planned -> cutover -> completed -> cleaned
- *   target: fokosInit -> awaiting_data -> importing -> imported -> active
+ *   target: init -> awaiting_data -> importing -> imported -> active
  *
- * The source persists the plan and every target before it calls `fokosInit`, persists `initializing`
+ * The source persists the plan and every target before it sends the `init` action, persists `initializing`
  * before each call, and changes routing only once every target is `initialized`. The target commits
  * one bounded page with its cursor at a time, persists `imported` before it acknowledges, and then
  * retries that acknowledgement until the source accepts it.
@@ -469,7 +469,7 @@ export class RepartitionSource {
 	/**
 	 * Initializes up to six due targets. Each target moves to `initializing` BEFORE its call, so a
 	 * call that is in flight or lost its reply is indistinguishable from one that never started, and
-	 * the retry repeats the same idempotent `fokosInit`.
+	 * the retry repeats the same idempotent `init` action.
 	 */
 	async #initializeTargets(row: RepartitionRow, now: number): Promise<StepOutcome> {
 		// Consulted before the FIRST target exists, so a key that cannot move yet gets no range root. The
@@ -503,7 +503,7 @@ export class RepartitionSource {
 		const results = await Promise.allSettled(
 			due.map(async (target) => {
 				const peer = this.deps.getPeer({ partitionId: target.partitionId, doName: target.doName });
-				await peer.fokosInit({
+				await peer.fokosRpc("init", {
 					repartitionId: row.id,
 					source: refOf(ctx),
 					target: this.#targetContext(ctx, target),
@@ -531,7 +531,7 @@ export class RepartitionSource {
 				this.store.refreshRepartitionDue(row.id, now);
 			});
 			if (result.status === "rejected") {
-				this.#logStepFailure("fokosInit", row, target, result.reason);
+				this.#logStepFailure("init", row, target, result.reason);
 			}
 		});
 		return "progressed";
@@ -599,7 +599,7 @@ export class RepartitionSource {
 		const results = await Promise.allSettled(
 			due.map(async (target) => {
 				const peer = this.deps.getPeer({ partitionId: target.partitionId, doName: target.doName });
-				await peer.fokosStartImport({ repartitionId: row.id, source: sourceRef });
+				await peer.fokosRpc("startImport", { repartitionId: row.id, source: sourceRef });
 			}),
 		);
 
@@ -611,7 +611,7 @@ export class RepartitionSource {
 					this.store.refreshRepartitionDue(row.id, now);
 				});
 			} else {
-				this.#logStepFailure("fokosStartImport", row, target, result.reason);
+				this.#logStepFailure("startImport", row, target, result.reason);
 			}
 		});
 		return "progressed";
@@ -936,7 +936,7 @@ export class RepartitionSource {
 /**
  * The target half: the partition that receives ownership.
  *
- * It is created by `fokosInit`, pulls one bounded page at a time until its copy is complete, persists
+ * It is created by the `init` action, pulls one bounded page at a time until its copy is complete, persists
  * `imported` BEFORE it acknowledges, and then retries that acknowledgement until its source accepts
  * it. It never reads a repartition row of its own; the only row it writes is the promotion it adopts
  * from an overrides page, which its own source half reads later through the same store.
@@ -964,7 +964,7 @@ export class RepartitionTarget {
 		const peer = this.deps.getPeer(rec.source);
 		let page: FokosMigrationPage;
 		try {
-			page = await peer.fokosMigrationPull({
+			page = await peer.fokosRpc("migrationPull", {
 				repartitionId: rec.repartitionId,
 				target: refOf(this.deps.identity().ctx),
 				cursor: rec.cursor,
@@ -1182,7 +1182,7 @@ export class RepartitionTarget {
 		commitIdentity();
 		// The alarm only. The source is still `planned` here, because it cuts over after EVERY target is
 		// initialized. A pull now would earn a `repartition_not_cut_over` and put this target behind a
-		// retry deadline for no reason. `fokosStartImport` starts the import, and the alarm starts it
+		// retry deadline for no reason. The `startImport` action starts the import, and the alarm starts it
 		// when that call never arrives.
 		await this.deps.ensureAlarmSet(now + this.deps.config().importRetryBaseMs);
 	}
@@ -1196,7 +1196,7 @@ export class RepartitionTarget {
 			!sameSlice
 		) {
 			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_context_mismatch, {
-				message: "fokosInit conflicts with the import this partition already holds",
+				message: "the init action conflicts with the import this partition already holds",
 				attributes: {
 					repartitionId: [existing.repartitionId, req.repartitionId],
 					source: [existing.source.doName, req.source.doName],
@@ -1217,7 +1217,7 @@ export class RepartitionTarget {
 		}
 		if (rec.source.partitionId !== req.source.partitionId || rec.source.doName !== req.source.doName) {
 			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_context_mismatch, {
-				message: "fokosStartImport came from a different source than the stored one",
+				message: "the startImport action came from a different source than the stored one",
 				attributes: { repartitionId: req.repartitionId, stored: rec.source.doName, received: req.source.doName },
 			});
 		}
@@ -1253,7 +1253,7 @@ export class RepartitionTarget {
 
 		const peer = this.deps.getPeer(rec.source);
 		try {
-			await peer.fokosMigrationAck({
+			await peer.fokosRpc("migrationAck", {
 				repartitionId: rec.repartitionId,
 				target: refOf(this.deps.identity().ctx),
 			});

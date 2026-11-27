@@ -9,6 +9,7 @@ import { FokosRouter } from "../../src/sharding/router.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { TARGET_WAIT } from "../partition-do/helpers.js";
 import { testRoutingHashSeedResolver } from "../routing-hash.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 function makeDB() {
 	return new FokosDB({
@@ -131,7 +132,7 @@ describe("db.gsi(indexName).queryItems", () => {
 			routingHashSeedResolver: testRoutingHashSeedResolver,
 		});
 		for await (const node of materializations.walk()) {
-			await materializationStubByName(env, node.ctx, node.ctx.doName).fokosPrepareDestroy({
+			await callFokosRpc(materializationStubByName(env, node.ctx, node.ctx.doName), "prepareDestroy", {
 				rootContext: node.parent === null ? node.ctx : undefined,
 			});
 		}

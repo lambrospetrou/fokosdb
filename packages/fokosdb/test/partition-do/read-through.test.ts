@@ -1,5 +1,5 @@
 /**
- * `fokosExecuteLocal`: the read a repartition target sends its source while the target is still
+ * The `executeLocal` action: the read a repartition target sends its source while the target is still
  * importing. The source reads local rows only — no forwarding, no lifecycle gate — so the caller
  * check and the slice it resolves are the only things standing between a target and data it does
  * not own.
@@ -30,6 +30,7 @@ import {
 	rangeOf,
 	type TestPartition,
 } from "./partition-harness.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 const batchRequest = (keys: Array<[string, string]>): BatchGetItemsRpcRequest => ({
 	items: keys.map(([hashKey, sortKey], opIndex) => ({ opIndex, hashKey: kb(hashKey), sortKey: kb(sortKey) })),
@@ -54,7 +55,7 @@ const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> 
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
 // operates at the same time cannot remove it.
-describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
+describe("FokosDBPartitionDO — the executeLocal action", () => {
 	// The two hash-split tests exercise the same two-child topology, so the split runs once.
 	let shared: { partition: TestPartition; children: TestPartition[]; repartitionId: string };
 	beforeAll(async () => {
@@ -80,12 +81,12 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			for (const caller of impostors) {
 				await expect(
-					instance.fokosExecuteLocal({ op: "apiGetItem", repartitionId, caller, request: { hashKey: kb("hk"), sortKey: kb("sk") } }),
+					instance.fokosRpc("executeLocal", { op: "apiGetItem", repartitionId, caller, request: { hashKey: kb("hk"), sortKey: kb("sk") } }),
 				).rejects.toThrow(fokosErrorWith("repartition_target_unknown", { caller: caller.doName }));
 			}
 			// An id that no repartition carries is a different defect, and it says so.
 			await expect(
-				instance.fokosExecuteLocal({
+				instance.fokosRpc("executeLocal", {
 					op: "apiGetItem",
 					repartitionId: "r999",
 					caller: { partitionId: children[0].ctx.partitionId, doName: children[0].doName },
@@ -102,12 +103,12 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 		expect(sibling, "a two-way split should have a sibling").toBeDefined();
 
 		const mine = await Promise.resolve(
-			partition.stub.fokosExecuteLocal({
+			callFokosRpc(partition.stub, "executeLocal", {
 				op: "apiGetItem",
 				repartitionId,
 				caller: { partitionId: owner.ctx.partitionId, doName: owner.doName },
 				request: { hashKey: kb("alpha"), sortKey: kb("s1") },
-			}) as FokosEnvelope<GetItemRpcResponse>,
+			}) as Promise<FokosEnvelope<GetItemRpcResponse>>,
 		);
 		expect(mine.value).toMatchObject({ found: true, item: { data: "alpha-value" } });
 
@@ -115,7 +116,7 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 		// would let it cache "absent" for a key another child owns.
 		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(
-				instance.fokosExecuteLocal({
+				instance.fokosRpc("executeLocal", {
 					op: "apiGetItem",
 					repartitionId,
 					caller: { partitionId: sibling!.ctx.partitionId, doName: sibling!.doName },
@@ -137,7 +138,7 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 		});
 
 		const mine = await Promise.resolve(
-			partition.stub.fokosExecuteLocal(request(owner, [["alpha", "s1"]])) as FokosEnvelope<BatchGetItemsRpcResponse>,
+			callFokosRpc(partition.stub, "executeLocal", request(owner, [["alpha", "s1"]])) as Promise<FokosEnvelope<BatchGetItemsRpcResponse>>,
 		);
 		expect(mine.value.found).toEqual([
 			{ opIndex: 0, item: expect.objectContaining({ data: "alpha-value" }), bytes: expect.any(Number), partitionIndex: 0 },
@@ -146,7 +147,9 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 
 		// One key outside the caller slice refuses the whole request, before any read.
 		await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
-			await expect(instance.fokosExecuteLocal(request(sibling, [["alpha", "s1"]]))).rejects.toThrow(fokosErrorWith("partition_misrouted"));
+			await expect(instance.fokosRpc("executeLocal", request(sibling, [["alpha", "s1"]]))).rejects.toThrow(
+				fokosErrorWith("partition_misrouted"),
+			);
 		});
 	});
 
@@ -196,12 +199,12 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 
 			const page = opened(
 				await Promise.resolve(
-					partition.stub.fokosExecuteLocal({
+					callFokosRpc(partition.stub, "executeLocal", {
 						op: "apiQueryItems",
 						repartitionId: await partition.splitRepartitionId(),
 						caller: { partitionId: child.ctx.partitionId, doName: child.doName },
 						request: queryRequest("alice"),
-					}) as FokosEnvelope<QueryItemsRpcResponse>,
+					}) as Promise<FokosEnvelope<QueryItemsRpcResponse>>,
 				),
 			);
 			expect(page.items.length, "a query of a promoted key must reach the range tree too").toBeGreaterThan(0);
@@ -212,7 +215,7 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 			const repartitionId = await partition.splitRepartitionId();
 			await runInDurableObject(partition.stub, async (instance: FokosDBPartitionDO) => {
 				await expect(
-					instance.fokosExecuteLocal({
+					instance.fokosRpc("executeLocal", {
 						op: "apiGetItem",
 						repartitionId,
 						caller: { partitionId: sibling!.ctx.partitionId, doName: sibling!.doName },
@@ -237,13 +240,13 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 
 		const page = opened(
 			await Promise.resolve(
-				root.stub.fokosExecuteLocal({
+				callFokosRpc(root.stub, "executeLocal", {
 					op: "apiQueryItems",
 					repartitionId,
 					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
 					// The caller asks for the whole key; the source narrows it to what this child owns.
 					request: queryRequest("alice"),
-				}) as FokosEnvelope<QueryItemsRpcResponse>,
+				}) as Promise<FokosEnvelope<QueryItemsRpcResponse>>,
 			),
 		);
 
@@ -256,7 +259,7 @@ describe("FokosDBPartitionDO — fokosExecuteLocal", () => {
 		// A cursor that sits in a sibling's slice is a routing defect, not an empty page.
 		await runInDurableObject(root.stub, async (instance: FokosDBPartitionDO) => {
 			await expect(
-				instance.fokosExecuteLocal({
+				instance.fokosRpc("executeLocal", {
 					op: "apiQueryItems",
 					repartitionId,
 					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },

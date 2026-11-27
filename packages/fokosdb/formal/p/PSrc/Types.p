@@ -223,15 +223,15 @@ event eRequestSplit;
 // One step of the source_repartition job, from the alarm of the source.
 event eSourceStep;
 
-// fokosInit and its answer. `slice` is the child index of the target, and the answer repeats it.
+// the init action and its answer. `slice` is the child index of the target, and the answer repeats it.
 type tFokosInitReq = (caller: machine, reqId: int, source: machine, slice: int);
 event eFokosInit: tFokosInitReq;
 event eFokosInitResp: int;
 
-// fokosStartImport: the source cut over, and the target starts its import.
+// the startImport action: the source cut over, and the target starts its import.
 event eStartImport;
 
-// fokosMigrationPull and its page. A cursor is a stream and the index of the next row of the slice
+// the migrationPull action and its page. A cursor is a stream and the index of the next row of the slice
 // in it. A page holds at most one row. Each page of the pending_tx stream carries the deletion
 // metadata of the source. `cursor` is the cursor of the request, and `done` marks the last page.
 enum tStream { STREAM_ITEMS, STREAM_PENDING_TX }
@@ -243,12 +243,12 @@ type tMigrationPage = (cursor: tCursor, items: map[tKey, tItemRow], locks: map[t
 event eMigrationPull: tMigrationPullReq;
 event eMigrationPage: tMigrationPage;
 
-// fokosMigrationAck and its answer.
+// the migrationAck action and its answer.
 type tMigrationAckReq = (caller: machine, reqId: int, slice: int);
 event eMigrationAck: tMigrationAckReq;
 event eMigrationAckResp;
 
-// fokosExecuteLocal for apiGetItem: the read-through of a target that imports. The answer is the
+// the executeLocal action for apiGetItem: the read-through of a target that imports. The answer is the
 // answer of apiGetItem.
 event eExecuteLocal: tGetItemReq;
 

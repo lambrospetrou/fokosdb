@@ -62,7 +62,7 @@ describe("FokosDBPartitionDO - partitionId encoding", () => {
 			routingHashSeed: fokosDBRoutingHashSeedResolver(partition.ctx.topology.shardGroup),
 		});
 
-		// Split so children are initialized through fokosInit. splitHash drains the whole tree, rather
+		// Split so children are initialized through the init action. splitHash drains the whole tree, rather
 		// than only the parent's alarm, so no child is still migrating when this file ends: background
 		// migration work that outlives the test worker breaks its teardown.
 		const children = await partition.splitHash();

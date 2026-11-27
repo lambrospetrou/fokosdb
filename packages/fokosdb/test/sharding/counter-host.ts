@@ -4,23 +4,12 @@ import {
 	KeyCodec,
 	routedError,
 	type FokosEnvelope,
-	type FokosExecuteLocalRequest,
-	type FokosInitRequest,
-	type FokosMigrationAckRequest,
-	type FokosMigrationPage,
-	type FokosMigrationPullRequest,
 	type FokosOperations,
-	type FokosPrepareDestroyRequest,
-	type FokosPromotionsPage,
-	type FokosPromotionsRequest,
-	type FokosRequestPromotionRequest,
-	type FokosRequestPromotionResult,
 	type FokosRouteContext,
+	type FokosShardingAction,
+	type FokosShardingActions,
 	type FokosShardingHooks,
 	type FokosShardingRpc,
-	type FokosStartImportRequest,
-	type FokosStatusPage,
-	type FokosStatusRequest,
 	type FokosStorageKey,
 	type KeyBytes,
 	fokosTopologyEntrypointFetch,
@@ -157,46 +146,10 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 	}
 
 	// ── The runtime RPCs ──────────────────────────────────────────────────────
-	// The runtime calls these methods on the other partitions of this class.
+	// The runtime calls `fokosRpc` on the other partitions of this class.
 
-	async fokosInit(req: FokosInitRequest): Promise<void> {
-		return await this.fokos.fokosInit(req);
-	}
-
-	async fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return await this.fokos.fokosStartImport(req);
-	}
-
-	async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return await this.fokos.fokosMigrationPull(req);
-	}
-
-	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return await this.fokos.fokosMigrationAck(req);
-	}
-
-	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		return await this.fokos.fokosExecuteLocal(req);
-	}
-
-	async fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult> {
-		return await this.fokos.fokosRequestPromotion(req);
-	}
-
-	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
-		return await this.fokos.fokosStatus(req);
-	}
-
-	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
-		return await this.fokos.fokosPromotions(req);
-	}
-
-	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		return await this.fokos.fokosPrepareDestroy(req);
-	}
-
-	async fokosDestroy(): Promise<void> {
-		return await this.fokos.fokosDestroy();
+	async fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]): Promise<FokosShardingActions[A]["res"]> {
+		return await this.fokos.fokosRpc(action, req);
 	}
 
 	async alarm(info: AlarmInvocationInfo): Promise<void> {

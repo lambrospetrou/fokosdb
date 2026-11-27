@@ -29,6 +29,7 @@ import {
 	useSmallBloom,
 } from "./partition-harness.js";
 import { testRoutingHashSeedResolver } from "../routing-hash.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 describe.concurrent("FokosDBPartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and cuts it over to 'promoting'", async () => {
@@ -305,7 +306,7 @@ describe.concurrent("FokosDBPartitionDO — debugForcePromoteKey", () => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		const rangeRoot = partition.rangeRoot("alice");
 
-		// The held `fokosInit` of the range root keeps the promotion unfinished. The background pass of
+		// The held `init` action of the range root keeps the promotion unfinished. The background pass of
 		// the source waits inside that call, so it cannot set the alarm again between the two checks below.
 		await rangeRoot.controlled.testHoldInit();
 		try {
@@ -338,7 +339,7 @@ describe.concurrent("FokosDBPartitionDO — a range root before its first page",
 		// A sender learns a promoted key only from an answer of its range root, and that answer comes
 		// after the cutover. Thus before the cutover, only a false positive of the filter names the range
 		// root. This test makes the rare case: the false positive is on a key whose promotion waits for
-		// the `fokosInit` reply, thus the range root answers `partition_awaiting_data`. The usual false
+		// the reply to the `init` action, thus the range root answers `partition_awaiting_data`. The usual false
 		// positive names a range root that does not exist. The Bloom tests of the transaction shapes cover it.
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.splitHash();
@@ -393,7 +394,7 @@ describe.concurrent("FokosDBPartitionDO — a range root before its first page",
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "v", kind: "text" });
 		const rangeRoot = partition.rangeRoot("alice");
-		// The source cuts over only after the range root answers `fokosInit`.
+		// The source cuts over only after the range root answers the `init` action.
 		await rangeRoot.controlled.testHoldInit();
 		try {
 			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
@@ -755,11 +756,11 @@ describe.concurrent("FokosDBPartitionDO — the Bloom step of the transaction sh
 
 		// The commit went to the range root first, and the range root stays without an identity.
 		expect(await recordedTxCalls(rangeRoot.controlled, "txCommit")).toHaveLength(1);
-		expect(await rangeRoot.stub.fokosStatus({})).toMatchObject({ initialized: false });
+		expect(await callFokosRpc(rangeRoot.stub, "status", {})).toMatchObject({ initialized: false });
 	}, 30_000);
 
 	it("prepares and commits at the hash leaf when a Bloom hit names a range root before its cutover", async () => {
-		// The rare case of a false positive: the promotion of the key waits for the `fokosInit` reply, thus
+		// The rare case of a false positive: the promotion of the key waits for the reply to the `init` action, thus
 		// the range root answers `partition_awaiting_data`. The previous test covers the usual case, a range
 		// root that does not exist.
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
@@ -773,7 +774,7 @@ describe.concurrent("FokosDBPartitionDO — the Bloom step of the transaction sh
 		const key = { hashKey: kb(hashKey), sortKey: kb("sk2") };
 		try {
 			// The range root has its identity and no page yet, because the source cuts over only after
-			// `fokosInit` answers.
+			// the `init` action answers.
 			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb(hashKey) });
 			await vi.waitFor(async () => expect(await rangeRoot.controlled.testInitCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
 

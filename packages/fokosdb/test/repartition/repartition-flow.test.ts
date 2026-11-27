@@ -229,7 +229,7 @@ describe("Repartition — initialization and cutover", () => {
 			for (const [name, t] of byName) {
 				if (name === failing) {
 					// It stays `initializing`: the call may have arrived and lost its reply, so the retry
-					// repeats the same idempotent fokosInit rather than treating it as never started.
+					// repeats the same idempotent the init action rather than treating it as never started.
 					expect(t.initialization).toBe("initializing");
 					expect(t.attempts).toBe(1);
 					expectBackoffWindow(t.nextAttemptAt, T0, 1);
@@ -255,7 +255,7 @@ describe("Repartition — initialization and cutover", () => {
 		const child = await firstChild(c, root);
 		const req = await initRequestFor(root, child);
 		// The child holds the import of a different repartition, so the init of r1 conflicts with it.
-		await child.peer.fokosInit({ ...req, repartitionId: "conflict" });
+		await child.peer.fokosRpc("init", { ...req, repartitionId: "conflict" });
 
 		await root.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep(T0)).toBe("progressed");
@@ -705,7 +705,7 @@ describe("Repartition — the migration protocol", () => {
 	});
 });
 
-describe("Repartition — fokosInit and fokosStartImport", () => {
+describe("Repartition — the init action and the startImport action", () => {
 	it("is idempotent and restores the fallback alarm on every call", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -715,7 +715,7 @@ describe("Repartition — fokosInit and fokosStartImport", () => {
 		const before = c.alarms(child.doName).length;
 		expect(before).toBeGreaterThan(0);
 		const req = await initRequestFor(root, child);
-		await child.peer.fokosInit(req);
+		await child.peer.fokosRpc("init", req);
 		// A lost reply leaves the source believing the target is initialized; without a restored alarm
 		// the target would have nothing to start itself with.
 		expect(c.alarms(child.doName).length).toBe(before + 1);
@@ -728,11 +728,13 @@ describe("Repartition — fokosInit and fokosStartImport", () => {
 		const child = await firstChild(c, root);
 		const req = await initRequestFor(root, child);
 
-		await expect(child.peer.fokosInit({ ...req, repartitionId: "r99" })).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
-		await expect(child.peer.fokosInit({ ...req, source: { ...req.source, doName: "impostor" } })).rejects.toThrow(
+		await expect(child.peer.fokosRpc("init", { ...req, repartitionId: "r99" })).rejects.toThrow(
 			fokosErrorWith("partition_context_mismatch"),
 		);
-		await expect(child.peer.fokosInit({ ...req, slice: { kind: "hash_child", childIndex: 9, depth: 1 } })).rejects.toThrow(
+		await expect(child.peer.fokosRpc("init", { ...req, source: { ...req.source, doName: "impostor" } })).rejects.toThrow(
+			fokosErrorWith("partition_context_mismatch"),
+		);
+		await expect(child.peer.fokosRpc("init", { ...req, slice: { kind: "hash_child", childIndex: 9, depth: 1 } })).rejects.toThrow(
 			fokosErrorWith("partition_context_mismatch"),
 		);
 	});
@@ -743,11 +745,11 @@ describe("Repartition — fokosInit and fokosStartImport", () => {
 		await cutOver(root, { kind: "hash_split" });
 		const child = await firstChild(c, root);
 
-		await expect(child.peer.fokosStartImport({ repartitionId: "r99", source: root.ref })).rejects.toThrow(
+		await expect(child.peer.fokosRpc("startImport", { repartitionId: "r99", source: root.ref })).rejects.toThrow(
 			fokosErrorWith("repartition_unknown"),
 		);
 		await expect(
-			child.peer.fokosStartImport({ repartitionId: "r1", source: { partitionId: root.ctx.partitionId, doName: "impostor" } }),
+			child.peer.fokosRpc("startImport", { repartitionId: "r1", source: { partitionId: root.ctx.partitionId, doName: "impostor" } }),
 		).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 	});
 });
@@ -829,7 +831,7 @@ describe("Repartition — promotions", () => {
 		});
 
 		// A repeat of the last acknowledgement deletes nothing and changes no state.
-		await root.peer.fokosMigrationAck(ack);
+		await root.peer.fokosRpc("migrationAck", ack);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			expect(lockCount(store, "alice")).toBe(WIDE_TX_KEYS + 1);

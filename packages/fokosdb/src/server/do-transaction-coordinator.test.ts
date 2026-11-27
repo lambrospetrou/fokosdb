@@ -2277,7 +2277,7 @@ describe("FokosDBTransactionCoordinatorDO - recoverTransactionForParticipant", (
 	});
 });
 
-describe("FokosDBTransactionCoordinatorDO - fokosDestroy", () => {
+describe("FokosDBTransactionCoordinatorDO - the destroy action", () => {
 	// The idempotency window lives in tc_state. A coordinator that survives FokosDB.destroy() answers a
 	// replayed clientRequestToken with the old transaction's outcome — "committed" for data that was
 	// wiped with the partitions.
@@ -2294,7 +2294,7 @@ describe("FokosDBTransactionCoordinatorDO - fokosDestroy", () => {
 			// the next caller re-run the migrations) without killing the run.
 			const abort = vi.spyOn(state, "abort").mockImplementation(() => {});
 
-			await (tc as unknown as FokosDBTransactionCoordinatorDO).fokosDestroy();
+			await (tc as unknown as FokosDBTransactionCoordinatorDO).fokosRpc("destroy", {});
 
 			expect(abort).toHaveBeenCalledWith("__special_destroy_sentinel");
 			// deleteAll() drops the tables themselves, migration bookkeeping included — which is exactly

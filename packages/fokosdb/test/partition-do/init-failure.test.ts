@@ -1,6 +1,6 @@
 /**
  * A failed initialization degrades the Durable Object instead of rejecting its construction:
- * `partition_init_failed` answers the storage paths, `fokosStatus` and the destroy pair stay
+ * `partition_init_failed` answers the storage paths, the `status` action and the destroy pair stay
  * available as the diagnosis and the recovery path, and the alarm re-arms at INIT_RETRY_ALARM_MS so
  * a fixed deployment heals the object on a later run.
  */
@@ -16,6 +16,7 @@ import { fokosErrorWith } from "../errors-matchers.js";
 import { TEST_ROUTING_HASH_BASE_SEED } from "../routing-hash.js";
 import { kb } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 const ALARM_INFO = { retryCount: 0, isRetry: false, scheduledTime: 0 } satisfies AlarmInvocationInfo;
 
@@ -65,18 +66,18 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 				fokosErrorWith("partition_init_failed"),
 			);
 			// Status stays live: it is the diagnosis path, and it reads KV before it reads a table.
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: false, destroying: false });
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ initialized: false, destroying: false });
 
 			await instance.alarm({ ...ALARM_INFO, scheduledTime: Date.now() });
 			expectInitRetry(await state.storage.getAlarm());
 
 			// The destroy pair is the way out of a poisoned object.
-			await instance.fokosPrepareDestroy({});
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ destroying: true });
+			await instance.fokosRpc("prepareDestroy", {});
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ destroying: true });
 		});
-		// `fokosDestroy` deletes all storage and aborts the instance, so its caller sees the abort
+		// The `destroy` action deletes all storage and aborts the instance, so its caller sees the abort
 		// sentinel the destroy raises for itself.
-		const err = await broken.stub.fokosDestroy().then(
+		const err = await callFokosRpc(broken.stub, "destroy", {}).then(
 			() => null,
 			(e) => e,
 		);
@@ -103,14 +104,14 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 				fokosErrorWith("partition_init_failed"),
 			);
 			// The sharding schema is not the failure: the runtime reports the identity it loaded.
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true, destroying: false });
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ initialized: true, destroying: false });
 			// The runtime RPCs take the gate of the host error too: a child with a broken host schema must
 			// not accept a repartition that it cannot serve.
-			await expect(instance.fokosPromotions({ cursor: null })).rejects.toThrow(fokosErrorWith("partition_init_failed"));
+			await expect(instance.fokosRpc("promotions", { cursor: null })).rejects.toThrow(fokosErrorWith("partition_init_failed"));
 			await instance.alarm({ ...ALARM_INFO, scheduledTime: Date.now() });
 			expectInitRetry(await state.storage.getAlarm());
 		});
-		const err = await broken.stub.fokosDestroy().then(
+		const err = await callFokosRpc(broken.stub, "destroy", {}).then(
 			() => null,
 			(e) => e,
 		);
@@ -133,10 +134,10 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 			await expect(instance.apiGetItem(broken.ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).rejects.toThrow(
 				fokosErrorWith("partition_init_failed"),
 			);
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true, destroying: false });
-			await instance.fokosPrepareDestroy({});
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ initialized: true, destroying: false });
+			await instance.fokosRpc("prepareDestroy", {});
 		});
-		const err = await broken.stub.fokosDestroy().then(
+		const err = await callFokosRpc(broken.stub, "destroy", {}).then(
 			() => null,
 			(e) => e,
 		);
@@ -160,10 +161,10 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 			await expect(instance.apiGetItem(broken.ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).rejects.toThrow(
 				fokosErrorWith("partition_init_failed"),
 			);
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true, destroying: false });
-			await instance.fokosPrepareDestroy({});
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ initialized: true, destroying: false });
+			await instance.fokosRpc("prepareDestroy", {});
 		});
-		const err = await broken.stub.fokosDestroy().then(
+		const err = await callFokosRpc(broken.stub, "destroy", {}).then(
 			() => null,
 			(e) => e,
 		);
@@ -183,7 +184,7 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 			await expect(instance.apiGetItem(partition.ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).rejects.toThrow(
 				fokosErrorWith("partition_init_failed"),
 			);
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true });
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ initialized: true });
 			await instance.alarm({ ...ALARM_INFO, scheduledTime: Date.now() });
 			expectInitRetry(await state.storage.getAlarm());
 		});
@@ -206,7 +207,7 @@ describe("FokosDBPartitionDO — failed initialization", () => {
 			await expect(instance.apiGetItem(partition.ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).rejects.toThrow(
 				fokosErrorWith("partition_init_failed"),
 			);
-			await expect(instance.fokosStatus({})).resolves.toMatchObject({ initialized: true });
+			await expect(instance.fokosRpc("status", {})).resolves.toMatchObject({ initialized: true });
 		});
 	});
 });

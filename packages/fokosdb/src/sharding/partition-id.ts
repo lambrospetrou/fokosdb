@@ -238,7 +238,7 @@ export function resolveDescendantHashPartitionContext<P>(parent: FokosRouteConte
 /**
  * Decodes the stored identity of a partition from its route context. `seedResolver` gives the stored
  * routingHash seed. A range partition also needs the depth and the ancestors that only its
- * `fokosInit` carries.
+ * `init` action carries.
  */
 export function partitionIdentityFrom(
 	ctx: FokosRouteContext<unknown>,
@@ -278,7 +278,7 @@ export function partitionIdentityFrom(
 	};
 }
 
-/** The depth of a partition in its tree: the hash child path length, or the range depth its `fokosInit` gave it. */
+/** The depth of a partition in its tree: the hash child path length, or the range depth its `init` action gave it. */
 export function identityDepth(identity: FokosPartitionIdentity): number {
 	return identity.hash ? identity.hash.path.length : identity.range!.depth;
 }

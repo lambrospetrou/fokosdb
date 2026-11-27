@@ -54,15 +54,14 @@ import {
 import type {
 	FokosExecuteLocalRequest,
 	FokosInitRequest,
-	FokosMigrationAckRequest,
-	FokosMigrationPage,
-	FokosMigrationPullRequest,
 	FokosPrepareDestroyRequest,
 	FokosPromotionsPage,
 	FokosPromotionsRequest,
 	FokosRequestPromotionRequest,
+	FokosShardingAction,
+	FokosShardingActions,
 	FokosShardingRpc,
-	FokosStartImportRequest,
+	FokosShardingRpcRequest,
 	FokosStatusPage,
 	FokosStatusRequest,
 	RouteKey,
@@ -119,6 +118,24 @@ const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 const LOCAL: OwnedResolution = { kind: "local" };
 /** The in-memory step of an identity check that changed nothing. */
 const NO_COMMIT = (): void => {};
+
+/**
+ * The operation name of each control-plane action, in `#guard` and in error attributes. The names are
+ * constants, because `#guard` compares them on every request. A host operation cannot have one of
+ * them, because the runtime refuses a host operation name with the `fokos` prefix.
+ */
+const RPC_OPERATION_NAMES: { readonly [A in FokosShardingAction]: `fokosRpc.${A}` } = {
+	init: "fokosRpc.init",
+	startImport: "fokosRpc.startImport",
+	migrationPull: "fokosRpc.migrationPull",
+	migrationAck: "fokosRpc.migrationAck",
+	executeLocal: "fokosRpc.executeLocal",
+	requestPromotion: "fokosRpc.requestPromotion",
+	status: "fokosRpc.status",
+	promotions: "fokosRpc.promotions",
+	prepareDestroy: "fokosRpc.prepareDestroy",
+	destroy: "fokosRpc.destroy",
+};
 
 /** The names of the built-in jobs. They run first, in this order. */
 const BUILTIN_JOBS = ["target_import", "target_ack", "source_repartition", "source_cleanup", "admin_outbox"] as const;
@@ -230,7 +247,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * `#guard` answers `partition_init_failed` and `runDueWork` re-arms at `INIT_RETRY_ALARM_MS`.
 	 */
 	#initError?: unknown;
-	/** The immutable identity, from `__fokos/identity`. Absent until the first request or `fokosInit`. */
+	/** The immutable identity, from `__fokos/identity`. Absent until the first request or the `init` action. */
 	#identity?: FokosPartitionIdentity;
 	/** The mutable part of the last route context this partition received, from `__fokos/policy`. */
 	#stored?: FokosStoredPolicy<TPolicy>;
@@ -301,7 +318,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				const stored = this.#store.getPolicy<TPolicy>();
 				if (identity && stored) {
 					this.#setIdentity(identity, stored);
-					// The identity stays in memory, so `fokosStatus` and the destroy RPCs still work.
+					// The identity stays in memory, so the `status` and destroy actions still work.
 					const seed = this.#routingHashSeedResolver(identity.topology.shardGroup);
 					if (identity.routingHashSeed !== seed) {
 						throw contextMismatch({ doName: identity.ref.doName, routingHashSeed: identity.routingHashSeed, expected: seed });
@@ -432,7 +449,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		collector.countForward();
 		let result: FokosEnvelope<unknown>;
 		try {
-			result = await this.#peer(record.source).fokosExecuteLocal({
+			result = await this.#peer(record.source).fokosRpc("executeLocal", {
 				op,
 				repartitionId: record.repartitionId,
 				caller: this.identity().ref,
@@ -1086,7 +1103,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * True once `fokosInit` or a first routed request gave this partition its identity, which the
+	 * True once the `init` action or a first routed request gave this partition its identity, which the
 	 * constructor then loads into memory and nothing clears. It reads no storage and allocates nothing,
 	 * so a caller that must not touch storage asks it first: a partition with no identity holds no
 	 * rows, owns no keys, and can have neither an import nor a repartition.
@@ -1305,26 +1322,67 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	// ═══ the control-plane RPCs ═════════════════════════════════════════════
 
 	/**
-	 * Creates this partition as the target of a repartition, or confirms an identical earlier call.
-	 * Only this call creates a range partition, and only this call tells a hash child that it exists.
+	 * The one control-plane RPC. The host delegates its `fokosRpc` method to it. The action selects
+	 * the handler, and every action goes through the lifecycle gate of `#guard`:
+	 *
+	 * - `init`: creates this partition as the target of a repartition, or confirms an identical
+	 *   earlier call. Only this action creates a range partition, and only this action tells a hash
+	 *   child that it exists.
+	 * - `startImport`: asks this target to start its import now, instead of at its own fallback alarm.
+	 * - `migrationPull`: serves one bounded migration page to a target that is still catching up.
+	 * - `migrationAck`: records that one target holds a complete copy of its slice.
+	 * - `executeLocal`: serves one read for a repartition target that is still importing from this
+	 *   partition (see `#executeLocal`).
+	 * - `requestPromotion`: queues a key promotion on the partition that owns the key now (see
+	 *   `#requestPromotionRpc`).
+	 * - `status`: the identity of this partition and its split with the target links (see `#status`).
+	 * - `promotions`: one bounded page of the key promotions of this partition.
+	 * - `prepareDestroy`: fences this partition for destroy (see `#prepareDestroy`).
+	 * - `destroy`: cancels the schedule, deletes all storage, and aborts the instance (see `#destroy`).
 	 */
-	async fokosInit(req: FokosInitRequest): Promise<void> {
-		return await this.#guard("fokosInit", async () => await this.#target.initAsTarget(req));
-	}
-
-	/** Asks this target to start its import now, instead of at its own fallback alarm. */
-	async fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return await this.#guard("fokosStartImport", async () => await this.#target.startImport(req));
-	}
-
-	/** Serves one bounded migration page to a target that is still catching up. */
-	async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return await this.#guard("fokosMigrationPull", async () => this.#source.servePage(req));
-	}
-
-	/** Records that one target holds a complete copy of its slice. */
-	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return await this.#guard("fokosMigrationAck", async () => this.#source.acceptAck(req));
+	async fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]): Promise<FokosShardingActions[A]["res"]> {
+		const call = { action, req } as FokosShardingRpcRequest;
+		let collector: RouteCollector | undefined;
+		const result = await this.#guard(
+			// A caller of another version can send an action that this version does not know.
+			Object.hasOwn(RPC_OPERATION_NAMES, action) ? RPC_OPERATION_NAMES[action] : `fokosRpc.${String(action)}`,
+			async (): Promise<FokosShardingActions[FokosShardingAction]["res"]> => {
+				switch (call.action) {
+					case "init":
+						return await this.#target.initAsTarget(call.req);
+					case "startImport":
+						return await this.#target.startImport(call.req);
+					case "migrationPull":
+						return this.#source.servePage(call.req);
+					case "migrationAck":
+						return this.#source.acceptAck(call.req);
+					case "executeLocal":
+						collector = new RouteCollector();
+						return await this.#executeLocal(call.req, collector);
+					case "requestPromotion":
+						return await this.#requestPromotionRpc(call.req);
+					case "status":
+						return this.#status(call.req);
+					case "promotions":
+						return this.#promotions(call.req);
+					case "prepareDestroy":
+						return await this.#prepareDestroy(call.req);
+					case "destroy":
+						return await this.#destroy();
+					default: {
+						// The type is `never`, so an action without a case does not compile. At runtime, a caller of
+						// another version can send an action that this version does not know.
+						const unknownCall: never = call;
+						throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
+							message: "the control-plane action is not known",
+							attributes: { action: String((unknownCall as { action: unknown }).action) },
+						});
+					}
+				}
+			},
+			() => collector,
+		);
+		return result as FokosShardingActions[A]["res"];
 	}
 
 	/**
@@ -1335,18 +1393,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * that sent it. This runs the local handler only, with no owner resolution and no lifecycle gate,
 	 * for the slice the caller owns. A caller this partition cannot place is rejected outright.
 	 */
-	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		let collector: RouteCollector | undefined;
-		return await this.#guard(
-			"fokosExecuteLocal",
-			async () => {
-				collector = new RouteCollector();
-				return await this.#executeLocal(req, collector);
-			},
-			() => collector,
-		);
-	}
-
 	async #executeLocal(req: FokosExecuteLocalRequest, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
 		const slice = this.#source.resolveCallerSlice(req.repartitionId, req.caller);
 		const descriptor = this.#ops[req.op];
@@ -1434,16 +1480,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * because a promotion queued on a router would migrate a stale snapshot and then shadow the live
 	 * rows in the child.
 	 */
-	async fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult> {
-		return await this.#guard("fokosRequestPromotion", async () => {
-			if (!this.#identity) {
-				throw this.#notInitialized(req.target);
-			}
-			if (this.#identity.ref.partitionId !== req.target.partitionId || this.#identity.ref.doName !== req.target.doName) {
-				throw contextMismatch({ doName: req.target.doName, expected: this.#identity.ref.doName });
-			}
-			return await this.#requestPromotion(req.hashKey, req.data);
-		});
+	async #requestPromotionRpc(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult> {
+		if (!this.#identity) {
+			throw this.#notInitialized(req.target);
+		}
+		if (this.#identity.ref.partitionId !== req.target.partitionId || this.#identity.ref.doName !== req.target.doName) {
+			throw contextMismatch({ doName: req.target.doName, expected: this.#identity.ref.doName });
+		}
+		return await this.#requestPromotion(req.hashKey, req.data);
 	}
 
 	async #requestPromotion(hashKey: KeyBytes, data: unknown): Promise<FokosRequestPromotionResult> {
@@ -1452,7 +1496,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (this.#target.isImporting()) {
 			throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 				message: "the owner of the key is still importing, please retry later",
-				attributes: { operation: "fokosRequestPromotion" },
+				attributes: { operation: RPC_OPERATION_NAMES.requestPromotion },
 			});
 		}
 		// A range partition serves the key from its own tree: the key is promoted for good.
@@ -1474,10 +1518,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		const resolution = this.#resolve({ hashKey, sortKey: NO_SORT_KEY }, EXACT);
 		if (resolution.kind === "out_of_range") {
-			throw misrouted("fokosRequestPromotion", "key outside this partition");
+			throw misrouted(RPC_OPERATION_NAMES.requestPromotion, "key outside this partition");
 		}
 		if (resolution.kind === "remote") {
-			return await this.#peer(resolution.target).fokosRequestPromotion({ target: resolution.target, hashKey, data });
+			return await this.#peer(resolution.target).fokosRpc("requestPromotion", { target: resolution.target, hashKey, data });
 		}
 		if (!this.#source.canQueue({ kind: "key_promotion", routingHash })) {
 			return { owner, queued: false, reason: "split_in_progress" };
@@ -1502,38 +1546,34 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/**
 	 * The identity of this partition and its split with the target links. The key promotions are in
-	 * `fokosPromotions`. A root request carries its context and bootstraps an empty root. A target
-	 * request omits the context and never creates an empty partition.
+	 * the `promotions` action. A root request carries its context and bootstraps an empty root. A
+	 * target request omits the context and never creates an empty partition.
 	 */
-	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
-		return await this.#guard("fokosStatus", async () => {
-			if (req.rootContext) {
-				this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>)();
-			}
-			const destroying = this.#store.isDestroying();
-			if (!this.#identity) {
-				return { initialized: false, destroying, ref: null, role: null, importState: null, split: [] };
-			}
-			return {
-				initialized: true,
-				destroying,
-				ref: this.#identity.ref,
-				role: this.#source.routerRole() ? "router" : "owner",
-				importState: this.#target.importState(),
-				split: this.#source.splitEntries(),
-			};
-		});
+	#status(req: FokosStatusRequest): FokosStatusPage {
+		if (req.rootContext) {
+			this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>)();
+		}
+		const destroying = this.#store.isDestroying();
+		if (!this.#identity) {
+			return { initialized: false, destroying, ref: null, role: null, importState: null, split: [] };
+		}
+		return {
+			initialized: true,
+			destroying,
+			ref: this.#identity.ref,
+			role: this.#source.routerRole() ? "router" : "owner",
+			importState: this.#target.importState(),
+			split: this.#source.splitEntries(),
+		};
 	}
 
 	/** One bounded page of the key promotions of this partition. A partition with no identity has none. */
-	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
-		return await this.#guard("fokosPromotions", async () => {
-			if (!this.#identity) {
-				return { entries: [], nextCursor: null };
-			}
-			const config = this.#config();
-			return this.#source.promotionEntries(req.cursor, config.promotionsPageEntries, config.promotionsPageBytes);
-		});
+	#promotions(req: FokosPromotionsRequest): FokosPromotionsPage {
+		if (!this.#identity) {
+			return { entries: [], nextCursor: null };
+		}
+		const config = this.#config();
+		return this.#source.promotionEntries(req.cursor, config.promotionsPageEntries, config.promotionsPageBytes);
 	}
 
 	/**
@@ -1542,42 +1582,38 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * pass in flight, which re-reads the fence before each remaining step, and deletes the alarm after
 	 * it. A repeated call succeeds.
 	 */
-	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		return await this.#guard("fokosPrepareDestroy", async () => {
-			let commitIdentity = NO_COMMIT;
-			this.#store.transactionSync(() => {
-				if (req.rootContext) {
-					commitIdentity = this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
-				}
-				this.#store.setDestroying();
-			});
-			commitIdentity();
-			await this.#scheduler.inFlight();
-			this.#scheduler.stop();
-			await this.#ctx.storage.deleteAlarm();
+	async #prepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
+		let commitIdentity = NO_COMMIT;
+		this.#store.transactionSync(() => {
+			if (req.rootContext) {
+				commitIdentity = this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
+			}
+			this.#store.setDestroying();
 		});
+		commitIdentity();
+		await this.#scheduler.inFlight();
+		this.#scheduler.stop();
+		await this.#ctx.storage.deleteAlarm();
 	}
 
 	/** Cancels the schedule, deletes all storage, and aborts the instance so the next caller gets a fresh one. */
-	async fokosDestroy(): Promise<void> {
-		return await this.#guard("fokosDestroy", async () => {
-			this.#scheduler.stop();
-			console.warn({ ...this.#logParams(), message: "fokos/runtime: destroying the partition, deleting all storage." });
-			await this.#ctx.blockConcurrencyWhile(async () => {
-				// Clears every timer of the instance: setTimeout returns a numeric ID that increments on
-				// each call, so the newest ID gives the upper bound to clear from.
-				const highestId = setTimeout(() => {
-					for (let i = Number(highestId); i >= 0; i--) {
-						clearTimeout(i);
-					}
-				}, 0);
-				// The alarm goes before the storage, so the platform does not fire it on the evicted instance.
-				await this.#ctx.storage.deleteAlarm();
-				await this.#ctx.storage.deleteAll();
-			});
-			// Evicts the instance. The caller sees a throw with the sentinel message and ignores it.
-			this.#ctx.abort(DESTROY_ABORT_SENTINEL);
+	async #destroy(): Promise<void> {
+		this.#scheduler.stop();
+		console.warn({ ...this.#logParams(), message: "fokos/runtime: destroying the partition, deleting all storage." });
+		await this.#ctx.blockConcurrencyWhile(async () => {
+			// Clears every timer of the instance: setTimeout returns a numeric ID that increments on
+			// each call, so the newest ID gives the upper bound to clear from.
+			const highestId = setTimeout(() => {
+				for (let i = Number(highestId); i >= 0; i--) {
+					clearTimeout(i);
+				}
+			}, 0);
+			// The alarm goes before the storage, so the platform does not fire it on the evicted instance.
+			await this.#ctx.storage.deleteAlarm();
+			await this.#ctx.storage.deleteAll();
 		});
+		// Evicts the instance. The caller sees a throw with the sentinel message and ignores it.
+		this.#ctx.abort(DESTROY_ABORT_SENTINEL);
 	}
 
 	async alarm(info?: AlarmInvocationInfo): Promise<void> {
@@ -1607,7 +1643,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/**
 	 * Validates the route context of a request against the stored identity, and stores a changed
 	 * policy with the same or a higher `policyVersion`. A root hash partition without an identity takes it from its first request. Every other
-	 * partition is created by `fokosInit` only. Synchronous: `fokosPrepareDestroy` and `fokosInit` call
+	 * partition is created by the `init` action only. Synchronous: the `prepareDestroy` and `init` actions call
 	 * it inside the transaction that writes the fence, or the import record.
 	 *
 	 * It returns the step that puts the new state in memory, and never takes that step itself. A caller
@@ -1659,7 +1695,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * Writes the identity of a target from its `fokosInit`. It runs inside the transaction that writes
+	 * Writes the identity of a target from its `init` action. It runs inside the transaction that writes
 	 * the import record, so it returns the in-memory step for `initAsTarget` to take after the commit.
 	 */
 	#applyTargetIdentity(req: FokosInitRequest): () => void {
@@ -1669,9 +1705,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		let range: { depth: number; ancestors: RangeAncestorInfo[] } | undefined;
 		if (isRangePartition(target)) {
-			invariant(req.rangeDepth !== undefined, "fokos/runtime.fokosInit: a range target needs its depth");
+			invariant(req.rangeDepth !== undefined, "fokos/runtime.init: a range target needs its depth");
 			const ancestors = req.rangeAncestors ?? [];
-			invariant(ancestors.length === 0 || req.rangeDepth > 0, "fokos/runtime.fokosInit: only a non-root range partition has ancestors");
+			invariant(ancestors.length === 0 || req.rangeDepth > 0, "fokos/runtime.init: only a non-root range partition has ancestors");
 			range = { depth: req.rangeDepth, ancestors };
 		}
 		return this.#writeIdentity(target, range);
@@ -1720,7 +1756,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			});
 		}
 		return new FokosRoutingError(SHARDING_ROUTING_CODES.hash_partition_not_initialized, {
-			message: "hash partition is not initialized; only fokosInit creates a non-root hash partition",
+			message: "hash partition is not initialized; only the init action creates a non-root hash partition",
 			attributes: { doName },
 		});
 	}
@@ -2557,17 +2593,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/**
 	 * Runs one entry point: the destroy fence first, then `fn`, and every error that leaves is a
-	 * `FokosError` that carries the routing of this partition. `fokosStatus`, `fokosPromotions`,
-	 * `fokosPrepareDestroy`, and `fokosDestroy` stay available behind the fence.
+	 * `FokosError` that carries the routing of this partition. The `status`, `promotions`,
+	 * `prepareDestroy`, and `destroy` actions stay available behind the fence.
 	 */
 	async #guard<T>(name: string, fn: () => Promise<T>, collector?: () => RouteCollector | undefined): Promise<T> {
 		try {
 			const descriptor = this.#ops[name];
 			const allowedWhileDestroying =
-				name === "fokosStatus" ||
-				name === "fokosPromotions" ||
-				name === "fokosPrepareDestroy" ||
-				name === "fokosDestroy" ||
+				name === RPC_OPERATION_NAMES.status ||
+				name === RPC_OPERATION_NAMES.promotions ||
+				name === RPC_OPERATION_NAMES.prepareDestroy ||
+				name === RPC_OPERATION_NAMES.destroy ||
 				(descriptor?.shape === "local" && descriptor.allowedWhileDestroying === true);
 			if (this.#store.isDestroying() && !allowedWhileDestroying) {
 				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
@@ -2575,12 +2611,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					attributes: { operation: name },
 				});
 			}
-			// A failed initialization degrades every storage path. `fokosDestroy` and
-			// `fokosPrepareDestroy` stay live: they are the way out of a poisoned object. `fokosStatus`
-			// stays live too: it is the diagnosis path, and it reads KV before it reads any table. A failed
-			// host initialization degrades the same paths, because the runtime RPCs read the host tables.
+			// A failed initialization degrades every storage path. The `destroy` and `prepareDestroy`
+			// actions stay live: they are the way out of a poisoned object. The `status` action stays live
+			// too: it is the diagnosis path, and it reads KV before it reads any table. A failed host
+			// initialization degrades the same paths, because the runtime RPCs read the host tables.
 			const initError = this.#initError ?? this.#hostInitError?.();
-			if (initError !== undefined && name !== "fokosStatus" && name !== "fokosPrepareDestroy" && name !== "fokosDestroy") {
+			if (
+				initError !== undefined &&
+				name !== RPC_OPERATION_NAMES.status &&
+				name !== RPC_OPERATION_NAMES.prepareDestroy &&
+				name !== RPC_OPERATION_NAMES.destroy
+			) {
 				throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_init_failed, {
 					message: "the initialization of the partition failed",
 					attributes: { operation: name, ...causeAttributes(initError) },
@@ -2612,9 +2653,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	#validateOperations(): void {
 		for (const [name, descriptor] of Object.entries(this.#ops)) {
-			// The runtime reserves the prefix for its control RPCs, and `#guard` answers three of them
-			// behind the destroy fence. A host operation that took one of those names would answer there
-			// too, and `forward` would call the control method of the peer instead of the operation.
+			// The runtime reserves the prefix for the operation names of its control-plane actions, and
+			// `#guard` answers some of them behind the destroy fence. A host operation that took one of
+			// those names would answer there too.
 			if (name.startsWith("fokos")) {
 				throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
 					message: "a host operation must not use the fokos prefix, which the runtime reserves for its control RPCs",

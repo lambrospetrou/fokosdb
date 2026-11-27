@@ -454,8 +454,7 @@ to another partition, learns its caches, and returns an envelope around the host
   │  allRoots()                  │  carries   │                                               │
   │  walk(...)                   │  topology  │   putItem(ctx, req)  = fokos.dispatch(...)    │
   └──────────────────────────────┘  + policy  │   getItem(ctx, req)  = fokos.dispatch(...)    │
-                                              │   fokosInit(...)     = fokos.fokosInit(...)   │
-                                              │   fokosMigrationPull = fokos.fokosMigrat...   │
+                                              │   fokosRpc(a, req)   = fokos.fokosRpc(a, req) │
                                               │   alarm(info)        = fokos.alarm(info)      │
                                               │                                               │
                                               │   hooks: evaluateSplit, migration host,       │
@@ -491,7 +490,7 @@ and cache logic in the runtime while the host owns budgets, cursors, early exit,
 The runtime is an owned object, not a base class and not a decorator.
 
 - The host creates it in the constructor, before any other work, so its `blockConcurrencyWhile` runs first.
-- The host implements `FokosShardingRpc` (section 4.2.14) with one-line delegations.
+- The host implements `FokosShardingRpc` (section 4.2.14) with two one-line delegations: `fokosRpc` and `alarm`.
 - The host calls `runtime.dispatch(operationName, routeCtx, request)` from each public RPC method.
 - The host reads `runtime.identity()`, `runtime.lifecycle()`, and `runtime.policy()` when it needs facts.
 - The host signals work with `runtime.requestSplitEvaluation()` and `runtime.requestPromotion(hashKey)`.
@@ -542,15 +541,9 @@ export class MyPartitionDO extends DurableObject<Env> implements MyRpc {
 		return this.fokos.dispatch("getItem", routeCtx, req);
 	}
 
-	fokosInit(req: FokosInitRequest) { return this.fokos.fokosInit(req); }
-	fokosStartImport(req: FokosStartImportRequest) { return this.fokos.fokosStartImport(req); }
-	fokosMigrationPull(req: FokosMigrationPullRequest) { return this.fokos.fokosMigrationPull(req); }
-	fokosMigrationAck(req: FokosMigrationAckRequest) { return this.fokos.fokosMigrationAck(req); }
-	fokosExecuteLocal(req: FokosExecuteLocalRequest) { return this.fokos.fokosExecuteLocal(req); }
-	fokosRequestPromotion(req: FokosRequestPromotionRequest) { return this.fokos.fokosRequestPromotion(req); }
-	fokosStatus(req: FokosStatusRequest) { return this.fokos.fokosStatus(req); }
-	fokosPrepareDestroy(req: FokosPrepareDestroyRequest) { return this.fokos.fokosPrepareDestroy(req); }
-	fokosDestroy() { return this.fokos.fokosDestroy(); }
+	fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]) {
+		return this.fokos.fokosRpc(action, req);
+	}
 	alarm(info: AlarmInvocationInfo) { return this.fokos.alarm(info); }
 }
 ```
@@ -1544,37 +1537,51 @@ reads the record first. It persists the new deadline and moves the alarm earlier
 
 #### 4.2.14 Control-plane RPC surface
 
-The host implements this interface by delegation. These are the only RPC methods the runtime calls on a peer.
+The host implements this interface by delegation. The runtime calls only `fokosRpc` on a peer. One RPC method
+receives every control-plane action, and the action selects the handler. Thus the RPC surface of a host does not
+change when the runtime adds an action.
 
 ```ts
-interface FokosShardingRpc {
-	fokosInit(req: FokosInitRequest): Promise<void>;
-	fokosStartImport(req: FokosStartImportRequest): Promise<void>;
-	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage>;
-	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void>;
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>>;
+type FokosShardingActions = {
+	init: { req: FokosInitRequest; res: void };
+	startImport: { req: FokosStartImportRequest; res: void };
+	migrationPull: { req: FokosMigrationPullRequest; res: FokosMigrationPage };
+	migrationAck: { req: FokosMigrationAckRequest; res: void };
+	executeLocal: { req: FokosExecuteLocalRequest; res: FokosEnvelope<unknown> };
 	/** Queue a key promotion on the partition that owns the key now. Forwards through routers like a point operation. */
-	fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult>;
-	fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage>;
-	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void>;
+	requestPromotion: { req: FokosRequestPromotionRequest; res: FokosRequestPromotionResult };
+	status: { req: FokosStatusRequest; res: FokosStatusPage };
+	promotions: { req: FokosPromotionsRequest; res: FokosPromotionsPage };
+	prepareDestroy: { req: FokosPrepareDestroyRequest; res: void };
 	/** Cancel the schedule, delete all storage, abort. The caller traverses the status pages first. */
-	fokosDestroy(): Promise<void>;
+	destroy: { req: FokosDestroyRequest; res: void };
+};
+
+interface FokosShardingRpc {
+	fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]): Promise<FokosShardingActions[A]["res"]>;
 	alarm(info: AlarmInvocationInfo): Promise<void>;
 }
 ```
 
-`fokosInit`, `fokosStartImport`, `fokosMigrationPull`, `fokosMigrationAck`, `fokosStatus`, and
-`fokosPrepareDestroy` keep the request types and the rules of the shipped flow, with `FokosInitRequest.target`
-as a `FokosRouteContext` and `FokosInitRequest.source` as a `FokosPartitionRef`. `fokosDestroy` replaces
-`destroyPartition`.
+Workers RPC stub types drop the type parameter of a method. Thus a call of `fokosRpc` on a Durable Object stub
+returns the union of all the results. A caller of a stub uses `callFokosRpc(stub, action, req)`, which keeps the
+result type of the action. The runtime and the client type their stubs as `FokosShardingRpc`, and do not need it.
 
-`fokosRequestPromotion` is new. Its request is `{ target: FokosPartitionRef; hashKey: KeyBytes; data?: unknown }`.
+Every action goes through the lifecycle gate with the operation name `fokosRpc.<action>`. A host operation name
+cannot start with `fokos`, so no host operation has the name of an action. An action that the receiver does not
+know fails with `sharding_operation_invalid`.
+
+The actions `init`, `startImport`, `migrationPull`, `migrationAck`, `status`, and `prepareDestroy` keep the
+request types and the rules of the shipped flow, with `FokosInitRequest.target` as a `FokosRouteContext` and
+`FokosInitRequest.source` as a `FokosPartitionRef`. The `destroy` action replaces `destroyPartition`.
+
+The `requestPromotion` action is new. Its request is `{ target: FokosPartitionRef; hashKey: KeyBytes; data?: unknown }`.
 The receiver validates `target` against its stored identity as dispatch step 1 validates a route context, and
 throws `partition_context_mismatch` on a difference; an uninitialized receiver throws the initialization error
 of its kind. The runtime then resolves the owner of `{ hashKey, sortKey: empty }` as a point operation with the
 Bloom step skipped. A route override in any state, or a range owner, means the key is promoted or on its way:
 the result is `{ queued: false, reason: "already_promoted", state, owner }`, where `state` is the state of that
-promotion row. A remote hash owner receives `fokosRequestPromotion` with its own ref as `target` and answers for
+promotion row. A remote hash owner receives the `requestPromotion` action with its own ref as `target` and answers for
 itself. An importing owner throws `partition_migrating`. A local owner runs arbitration and answers
 `queued: true`, or `reason: "split_in_progress"` when a split row refused it.
 

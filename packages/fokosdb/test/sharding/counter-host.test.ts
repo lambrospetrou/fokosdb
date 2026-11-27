@@ -5,6 +5,7 @@ import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { routingHashOf } from "../../src/sharding/hash-primitives.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
 import { testRoutingHashSeedResolver } from "../routing-hash.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 describe.concurrent("Sharding runtime — counter host", () => {
 	it("splits the root on request volume and routes the next write through it", async () => {
@@ -104,7 +105,7 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		}
 
 		expect(nodes).toEqual([]);
-		expect(await stub(table.root.doName).fokosStatus({})).toMatchObject({ initialized: false, role: null });
+		expect(await callFokosRpc(stub(table.root.doName), "status", {})).toMatchObject({ initialized: false, role: null });
 	});
 
 	it("walks only the owners of a split root with scope owners", async () => {
@@ -132,7 +133,7 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		const table = makeCounterTable();
 		await table.increment("k");
 		// The destroy fence refuses every operation with `partition_migrating`.
-		await stub(table.root.doName).fokosPrepareDestroy({});
+		await callFokosRpc(stub(table.root.doName), "prepareDestroy", {});
 		const seen: boolean[] = [];
 
 		const err = await table.client
@@ -238,7 +239,7 @@ describe.concurrent("Sharding runtime — the collect failure policy", () => {
 		await stub(table.root.doName)
 			.debugAbort()
 			.catch(() => {});
-		await stub(owner).fokosPrepareDestroy({});
+		await callFokosRpc(stub(owner), "prepareDestroy", {});
 
 		const keys = ["k-0", "k-1", "k-2", "k-3", "k-4", "m-0", "m-1", "m-2"];
 		const result = await table.incrementMany(keys);

@@ -5,7 +5,7 @@
 
 // ─── The client ───────────────────────────────────────────────────────────────
 
-export { FokosShardingClient } from "./client.js";
+export { callFokosRpc, FokosShardingClient } from "./client.js";
 export type {
 	FokosCallCost,
 	FokosCallOptions,
@@ -86,13 +86,7 @@ export type { FokosTopologyCacheOptions } from "./topology-cache.js";
 
 // ─── Sort-key intervals ───────────────────────────────────────────────────────
 
-export {
-	clipToChildRange,
-	cursorFallsInChild,
-	isChildFullyBeforeCursor,
-	makeBoundaryCursor,
-	rangeIntersects,
-} from "./sk-interval.js";
+export { clipToChildRange, cursorFallsInChild, isChildFullyBeforeCursor, makeBoundaryCursor, rangeIntersects } from "./sk-interval.js";
 export type { FokosRangeCursor, SkInterval } from "./sk-interval.js";
 
 // ─── Errors ───────────────────────────────────────────────────────────────────

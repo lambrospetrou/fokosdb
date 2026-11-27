@@ -28,13 +28,13 @@ import type { FokosImportRecord, FokosStoredRepartitionPlan } from "./repartitio
 // ---------------------------------------------------------------------------
 
 export const FOKOS_KV_KEYS = {
-	/** `FokosPartitionIdentity`, written once at bootstrap or `fokosInit`. */
+	/** `FokosPartitionIdentity`, written once at bootstrap or by the `init` action. */
 	IDENTITY: "__fokos/identity",
 	/** `FokosStoredPolicy`: the mutable part of the last route context this partition received. */
 	POLICY: "__fokos/policy",
 	/** `FokosImportRecord`: the whole durable import state of a target. */
 	IMPORT: "__fokos/import",
-	/** `true` after `fokosPrepareDestroy` fences the partition. */
+	/** `true` after the `prepareDestroy` action fences the partition. */
 	DESTROYING: "__fokos/destroying",
 	/** `FokosJobsRecord`: the next run of every job that a request or a pass scheduled. */
 	JOBS: "__fokos/jobs",
@@ -549,7 +549,7 @@ export class FokosShardingStore {
 		}
 	}
 
-	/** True after `fokosPrepareDestroy` fences this partition. Every transition must then stop. */
+	/** True after the `prepareDestroy` action fences this partition. Every transition must then stop. */
 	isDestroying(): boolean {
 		let fenced = kvCopies.get(this.#storage)?.destroying;
 		if (fenced === undefined) {
@@ -818,7 +818,7 @@ export class FokosShardingStore {
 
 	/**
 	 * The due targets of one step, at most `limit` of them. `init` selects the targets that still need
-	 * a `fokosInit`; `start` selects the ones that still need a start notification.
+	 * an `init` action; `start` selects the ones that still need a start notification.
 	 */
 	selectDueTargets(
 		repartitionId: string,

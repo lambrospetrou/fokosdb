@@ -3,6 +3,7 @@ import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { untilAvailable } from "./property-based/harness.js";
 import { testPartitionStub } from "./stub-helpers.js";
+import { callFokosRpc } from "../src/sharding/client.js";
 
 // 3 root partitions, each splits into 2 children.
 // maxSizeMb: 0.25 = 262 144 bytes. The empty schema already holds ~100 KB of pages, so a smaller cap
@@ -47,7 +48,7 @@ describe("FokosDB.destroy()", () => {
 
 		for (const doName of doNamesSet) {
 			// A target request carries no context, so a destroyed partition stays uninitialized.
-			const page = await testPartitionStub(doName).fokosStatus({});
+			const page = await callFokosRpc(testPartitionStub(doName), "status", {});
 			expect(page.initialized).toBe(false);
 		}
 

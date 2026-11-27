@@ -155,9 +155,9 @@ export type FokosRuntimeConfig = Readonly<{
 	 * read and not sent, so this limit stops a page that finds few rows of its target.
 	 */
 	migrationScanRows: number;
-	/** The maximum number of entries in one page of `fokosPromotions`, which lists the key promotions of a partition. */
+	/** The maximum number of entries in one page of the `promotions` action, which lists the key promotions of a partition. */
 	promotionsPageEntries: number;
-	/** The maximum estimated size of one page of `fokosPromotions`. */
+	/** The maximum estimated size of one page of the `promotions` action. */
 	promotionsPageBytes: number;
 }>;
 

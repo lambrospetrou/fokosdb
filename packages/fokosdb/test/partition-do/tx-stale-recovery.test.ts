@@ -17,6 +17,7 @@ import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-s
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { captureConsoleError, insertLock, kb, makeStub } from "./helpers.js";
 import { partitionRoutingHashOf } from "../routing-hash.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 
@@ -152,7 +153,7 @@ describe("FokosDBPartitionDO — stale transaction recovery", () => {
 			partitionId: child.partitionIdOpaque,
 		};
 		const childStub = testPartitionStub(childId);
-		await childStub.fokosInit({
+		await callFokosRpc(childStub, "init", {
 			repartitionId: "r1",
 			source: refOf(parentCtx),
 			target: childCtx,

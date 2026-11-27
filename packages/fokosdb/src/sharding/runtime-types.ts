@@ -34,8 +34,8 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * The runtime settings that the host overrides. The runtime merges them with
 	 * `DEFAULT_RUNTIME_CONFIG`, validates the result, and throws on a value that is not valid. The
 	 * runtime calls this at each use of a setting, so the callback must return valid values at any
-	 * time. A throw degrades the object: every entry point except `fokosStatus`, `fokosPrepareDestroy`,
-	 * and `fokosDestroy` answers `partition_init_failed`. The identity and the policy of a new
+	 * time. A throw degrades the object: every entry point except the `status`, `prepareDestroy`, and
+	 * `destroy` actions answers `partition_init_failed`. The identity and the policy of a new
 	 * partition do not exist before its first request. Absent: every setting takes its default.
 	 */
 	config?(this: void): FokosRuntimeConfigOverrides;
@@ -87,7 +87,7 @@ export type FokosLifecycle = {
 	/** The import this partition was created by, or null for a root. `source` is the partition it imports from. */
 	import: null | { state: FokosImportState; source: FokosPartitionRef; slice: FokosSlice };
 	activeRepartition: null | { id: string; kind: RepartitionKind; state: "queued" | "planned" | "cutover" };
-	/** True after `fokosPrepareDestroy`. Every operation is refused, and a host job or timer must make no transition. */
+	/** True after the `prepareDestroy` action. Every operation is refused, and a host job or timer must make no transition. */
 	destroying: boolean;
 };
 
@@ -204,7 +204,7 @@ export type FokosSignals = {
 /**
  * Handed to every `local` and `beforeForward` call. A handler reports signals through it, because it
  * knows facts its response does not carry. The runtime applies the signals after the handler returns
- * without throwing. `fokosExecuteLocal` passes one whose `signal` is a no-op.
+ * without throwing. The `executeLocal` action passes one whose `signal` is a no-op.
  */
 export type FokosLocalCall = {
 	signal(signals: FokosSignals): void;

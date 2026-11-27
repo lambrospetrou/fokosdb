@@ -11,19 +11,7 @@ import { systemPlatform, type FokosPlatform } from "../../shared/platform.js";
 import { INIT_RETRY_ALARM_MS } from "../../sharding/scheduler.js";
 import type { FokosRuntimeConfigOverrides } from "../../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosLifecycle, FokosLocalCall, FokosOperations, FokosShardingHooks } from "../../sharding/runtime-types.js";
-import type {
-	FokosExecuteLocalRequest,
-	FokosInitRequest,
-	FokosMigrationAckRequest,
-	FokosMigrationPage,
-	FokosMigrationPullRequest,
-	FokosPrepareDestroyRequest,
-	FokosPromotionsRequest,
-	FokosRequestPromotionRequest,
-	FokosShardingRpc,
-	FokosStartImportRequest,
-	FokosStatusRequest,
-} from "../../sharding/repartition-types.js";
+import type { FokosShardingAction, FokosShardingActions, FokosShardingRpc } from "../../sharding/repartition-types.js";
 import { promotedRoutingHashOf } from "../../sharding/repartition-slice.js";
 import { identityDepth } from "../../sharding/partition-id.js";
 import { materializationStubByName, partitionStubByName, pushTargetStub } from "../../shared/do-stubs.js";
@@ -294,37 +282,13 @@ export class FokosDBMaterializationDO extends DurableObject<Env> implements Mate
 		return this.fokos.dispatch("applyLatestImages", ctx, req);
 	}
 
-	fokosInit(req: FokosInitRequest): Promise<void> {
-		return this.fokos.fokosInit(req);
-	}
-	fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return this.fokos.fokosStartImport(req);
-	}
-	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return this.fokos.fokosMigrationPull(req);
-	}
-	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return this.fokos.fokosMigrationAck(req);
-	}
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		return this.fokos.fokosExecuteLocal(req);
-	}
-	fokosRequestPromotion(req: FokosRequestPromotionRequest) {
-		return this.fokos.fokosRequestPromotion(req);
-	}
-	fokosStatus(req: FokosStatusRequest) {
-		return this.fokos.fokosStatus(req);
-	}
-	fokosPromotions(req: FokosPromotionsRequest) {
-		return this.fokos.fokosPromotions(req);
-	}
-	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		await this.fokos.fokosPrepareDestroy(req);
-		// The fence stops the target runner. No call of this instance to a target stays in flight after it.
-		await this.#runner.settled();
-	}
-	fokosDestroy(): Promise<void> {
-		return this.fokos.fokosDestroy();
+	async fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]): Promise<FokosShardingActions[A]["res"]> {
+		const result = await this.fokos.fokosRpc(action, req);
+		if (action === "prepareDestroy") {
+			// The fence stops the target runner. No call of this instance to a target stays in flight after it.
+			await this.#runner.settled();
+		}
+		return result;
 	}
 	/** The `targetId` of each GSI target of the stored target list, or null when this partition has no list. */
 	fokosGsiTargetIds(): string[] | null {

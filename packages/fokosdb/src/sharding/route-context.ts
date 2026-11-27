@@ -86,7 +86,7 @@ export type FokosRouteContext<TPolicy> = {
 /** The immutable identity of one partition. A name alone is a value the caller chose. */
 export type FokosPartitionRef = Pick<FokosRouteContext<unknown>, "partitionId" | "doName">;
 
-/** The identity a partition stores under `__fokos/identity`, written once at bootstrap or `fokosInit`. */
+/** The identity a partition stores under `__fokos/identity`, written once at bootstrap or by the `init` action. */
 export type FokosPartitionIdentity = {
 	schema: 1;
 	ref: FokosPartitionRef;
@@ -105,7 +105,7 @@ export type FokosPartitionIdentity = {
 		start: FokosCompositeKey | null;
 		end: FokosCompositeKey | null;
 		depth: number;
-		/** The bounded ancestor set from `fokosInit`. Immutable. */
+		/** The bounded ancestor set from the `init` action. Immutable. */
 		ancestors: RangeAncestorInfo[];
 	};
 	topology: FokosTopology;

@@ -7,7 +7,16 @@ import { tryWhile } from "durable-utils/retries";
 import { SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type { KeyBytes } from "./key-codec.js";
 import { routingHashOf, type RoutingHash, type RoutingHashSeedResolver } from "./hash-primitives.js";
-import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
+import type {
+	FokosImportState,
+	FokosPromotionsCursor,
+	FokosPromotionsPage,
+	FokosShardingAction,
+	FokosShardingActions,
+	FokosShardingRpc,
+	FokosStatusEntry,
+	RouteKey,
+} from "./repartition-types.js";
 import { isRangePartition, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
 import { storagePositionOf } from "./storage-position.js";
@@ -395,8 +404,8 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	 * caller can stop early. The result is a best-effort snapshot: a split during the walk can add a
 	 * target that the walk does not see.
 	 *
-	 * The walk calls `fokosStatus` without a root context, so it never creates an identity, and it
-	 * skips a partition that has none. The status call still starts a cold Durable Object.
+	 * The walk sends the `status` action without a root context, so it never creates an identity, and it
+	 * skips a partition that has none. The status action still starts a cold Durable Object.
 	 *
 	 * `scope: "owners"` yields only the partitions that own a slice now: no router, and no target
 	 * whose repartition has not cut over. A walk is never a source of row totals, because the stored
@@ -422,7 +431,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		}
 		seen.add(ctx.doName);
 		const stub = this.#rpc(ctx);
-		const status = await stub.fokosStatus({});
+		const status = await stub.fokosRpc("status", {});
 		if (!status.initialized) {
 			return;
 		}
@@ -440,15 +449,15 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 
 	/**
 	 * Fences and deletes every partition: routers, owners, and targets before their cutover. For every
-	 * root, and then post-order for every target: fence the partition with `fokosPrepareDestroy` (with
-	 * the root context on a root only), read `fokosStatus` and every `fokosPromotions` page after the
-	 * fence is set, visit each target, then call `fokosDestroy`.
+	 * root, and then post-order for every target: fence the partition with the `prepareDestroy` action
+	 * (with the root context on a root only), read the `status` and every `promotions` page after the
+	 * fence is set, visit each target, then send the `destroy` action.
 	 *
 	 * The fence comes first, so nothing adds a target after the traversal reads the last page. A
 	 * destroy that stops halfway can run again, because each parent that remains still knows its
 	 * children.
 	 *
-	 * `beforeDestroy` runs after the targets of a partition are gone and before its `fokosDestroy`,
+	 * `beforeDestroy` runs after the targets of a partition are gone and before its `destroy` action,
 	 * with the routingHashes of its promotions. When it throws, the traversal stops, and the
 	 * partition keeps its promotions for the next destroy.
 	 */
@@ -467,8 +476,8 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 			}
 			visited.add(ctx.doName);
 			const stub = this.#rpc(ctx);
-			await stub.fokosPrepareDestroy({ rootContext });
-			const status = await stub.fokosStatus({ rootContext });
+			await stub.fokosRpc("prepareDestroy", { rootContext });
+			const status = await stub.fokosRpc("status", { rootContext });
 			const promoted: RoutingHash[] = [];
 			for await (const { repartition, target } of this.#targets(stub, status.split)) {
 				await destroyPartition(this.#targetContext(target.ref));
@@ -478,7 +487,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 			}
 			await opts.beforeDestroy?.(refOf(ctx), promoted);
 			try {
-				await stub.fokosDestroy();
+				await stub.fokosRpc("destroy", {});
 			} catch (e) {
 				if (!isDestroyAbortError(e)) {
 					throw e;
@@ -501,7 +510,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		yield* split.filter(withTarget);
 		let cursor: FokosPromotionsCursor | null = null;
 		do {
-			const page = await stub.fokosPromotions({ cursor });
+			const page: FokosPromotionsPage = await stub.fokosRpc("promotions", { cursor });
 			yield* page.entries.filter(withTarget);
 			cursor = page.nextCursor;
 		} while (cursor !== null);
@@ -516,4 +525,17 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		this.#firstRoot ??= this.#router.allRoots()[0];
 		return { ...this.#firstRoot, ...refOf(ref) };
 	}
+}
+
+/**
+ * Sends one control-plane action to a Durable Object stub of a host, with the request and result
+ * types of the action. Workers RPC stub types drop the type parameter of `fokosRpc`, so a call on the
+ * stub itself returns the union of all the results.
+ */
+export async function callFokosRpc<A extends FokosShardingAction>(
+	stub: { fokosRpc: (...args: never) => unknown },
+	action: A,
+	req: FokosShardingActions[A]["req"],
+): Promise<FokosShardingActions[A]["res"]> {
+	return await (stub as FokosShardingRpc).fokosRpc(action, req);
 }

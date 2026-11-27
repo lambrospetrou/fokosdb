@@ -23,19 +23,7 @@ import type {
 	FokosStorageInterval,
 	RouteKey,
 } from "../sharding/runtime-types.js";
-import type {
-	FokosExecuteLocalRequest,
-	FokosInitRequest,
-	FokosMigrationAckRequest,
-	FokosMigrationPage,
-	FokosMigrationPullRequest,
-	FokosPrepareDestroyRequest,
-	FokosPromotionsRequest,
-	FokosRequestPromotionRequest,
-	FokosShardingRpc,
-	FokosStartImportRequest,
-	FokosStatusRequest,
-} from "../sharding/repartition-types.js";
+import type { FokosShardingAction, FokosShardingActions, FokosShardingRpc } from "../sharding/repartition-types.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "./do-partition.js";
@@ -677,41 +665,15 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		return (await this.recoverTransaction(this.fokos.routeContext(), req)).value;
 	}
 
-	fokosInit(req: FokosInitRequest): Promise<void> {
-		return this.fokos.fokosInit(req);
-	}
-	fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return this.fokos.fokosStartImport(req);
-	}
-	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return this.fokos.fokosMigrationPull(req);
-	}
-	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return this.fokos.fokosMigrationAck(req);
-	}
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		return this.fokos.fokosExecuteLocal(req);
-	}
-	fokosRequestPromotion(req: FokosRequestPromotionRequest) {
-		return this.fokos.fokosRequestPromotion(req);
-	}
-	fokosStatus(req: FokosStatusRequest) {
-		return this.fokos.fokosStatus(req);
-	}
-	fokosPromotions(req: FokosPromotionsRequest) {
-		return this.fokos.fokosPromotions(req);
-	}
-	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		return this.fokos.fokosPrepareDestroy(req);
-	}
 	/**
-	 * Wipes this coordinator. `FokosDB.destroy()` calls it for every coordinator of the table. The
-	 * idempotency window lives in `tc_state`, so a coordinator that survives a destroy answers a replayed
-	 * `clientRequestToken` with the OLD transaction's outcome — "committed" for data that no longer
-	 * exists. That is why destroy must reach the coordinators and not the partitions alone.
+	 * The control-plane RPC of the runtime. The `destroy` action wipes this coordinator, and
+	 * `FokosDB.destroy()` sends it to every coordinator of the table. The idempotency window lives in
+	 * `tc_state`, so a coordinator that survives a destroy answers a replayed `clientRequestToken` with
+	 * the OLD transaction's outcome — "committed" for data that no longer exists. That is why destroy
+	 * must reach the coordinators and not the partitions alone.
 	 */
-	fokosDestroy(): Promise<void> {
-		return this.fokos.fokosDestroy();
+	fokosRpc<A extends FokosShardingAction>(action: A, req: FokosShardingActions[A]["req"]): Promise<FokosShardingActions[A]["res"]> {
+		return this.fokos.fokosRpc(action, req);
 	}
 
 	/** The runtime owns the alarm. The host work runs as the jobs `tx_recovery` and `idempotency_sweep`. */
@@ -1948,7 +1910,7 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 					);
 				} catch (err) {
 					// A partition with no identity holds no lock of this transaction, so the cancel is done
-					// there. A retry cannot change this: only `fokosInit` or a `destroy` changes the identity.
+					// there. A retry cannot change this: only the `init` action or a `destroy` changes the identity.
 					if (!hasNoIdentity(err, pCtx.doName)) {
 						throw err;
 					}

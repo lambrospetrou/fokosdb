@@ -30,6 +30,7 @@ import {
 	rangeOf,
 } from "./partition-harness.js";
 import { partitionRoutingHashOf } from "../routing-hash.js";
+import { callFokosRpc } from "../../src/sharding/client.js";
 
 // The tests in this file operate one after the other. Some tests hold a migration open on a
 // partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
@@ -640,7 +641,7 @@ describe("FokosDBPartitionDO — range split", () => {
 		});
 
 		it(
-			"fokosExecuteLocal reads the router's own local rows and never fans out to children (regression: infinite loop when children are migrating)",
+			"the executeLocal action reads the router's own local rows and never fans out to children (regression: infinite loop when children are migrating)",
 			{ concurrent: false },
 			async () => {
 				// Scenario: a migrating range child reads through its parent. Before the fix, the direct-read
@@ -648,7 +649,7 @@ describe("FokosDBPartitionDO — range split", () => {
 				// → child detects it's still migrating → parent direct read → … (infinite loop until the
 				// subrequest depth limit is hit).
 				//
-				// fokosExecuteLocal always calls queryItemsLocal and bypasses the child routing. forwardCount=0
+				// The executeLocal action always calls queryItemsLocal and bypasses the child routing. forwardCount=0
 				// asserts that: a walk of the children would report one forward per child, migrated or not.
 				const N = 2;
 				const { root, sks } = await makeRangeRoot(N, { ns: CONTROLLED_NS });
@@ -668,12 +669,12 @@ describe("FokosDBPartitionDO — range split", () => {
 					const caller = children[0];
 					const result = opened(
 						await Promise.resolve(
-							root.stub.fokosExecuteLocal({
+							callFokosRpc(root.stub, "executeLocal", {
 								op: "apiQueryItems",
 								repartitionId: await root.splitRepartitionId(),
 								caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
 								request: fullRequest(),
-							}) as FokosEnvelope<QueryItemsRpcResponse>,
+							}) as Promise<FokosEnvelope<QueryItemsRpcResponse>>,
 						),
 					);
 

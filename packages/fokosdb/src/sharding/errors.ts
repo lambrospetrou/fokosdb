@@ -56,7 +56,7 @@ export const SHARDING_INTERNAL_CODES = defineCodes("FokosInternalError", "intern
 	repartition_slice_reclaimed: "7tjj5t",
 	/** A synchronous `local` handler returned a thenable. */
 	sharding_local_must_be_sync: "5zt4je",
-	/** A descriptor is inconsistent, or `fokosExecuteLocal` named an unknown or non-`readOnly` operation. */
+	/** A descriptor is inconsistent, or the `executeLocal` action named an unknown or non-`readOnly` operation. */
 	sharding_operation_invalid: "fdqcab",
 });
 

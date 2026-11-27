@@ -135,32 +135,51 @@ export type FokosExecuteLocalRequest = { op: string; repartitionId: string; call
 export type FokosRequestPromotionRequest = { target: FokosPartitionRef; hashKey: KeyBytes; data?: unknown };
 
 /**
- * The control-plane surface. A host implements every method by delegation to its runtime, and these
- * are the only methods the runtime calls on a peer of the host's own class.
+ * The control-plane actions of `FokosShardingRpc.fokosRpc`: the request and the result of each one.
+ * The runtime calls only these actions on a peer of the host's own class.
  */
-export interface FokosShardingRpc {
-	fokosInit(req: FokosInitRequest): Promise<void>;
-	fokosStartImport(req: FokosStartImportRequest): Promise<void>;
-	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage>;
-	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void>;
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>>;
-	fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult>;
-	fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage>;
-	fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage>;
-	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void>;
+export type FokosShardingActions = {
+	init: { req: FokosInitRequest; res: void };
+	startImport: { req: FokosStartImportRequest; res: void };
+	migrationPull: { req: FokosMigrationPullRequest; res: FokosMigrationPage };
+	migrationAck: { req: FokosMigrationAckRequest; res: void };
+	executeLocal: { req: FokosExecuteLocalRequest; res: FokosEnvelope<unknown> };
+	requestPromotion: { req: FokosRequestPromotionRequest; res: FokosRequestPromotionResult };
+	status: { req: FokosStatusRequest; res: FokosStatusPage };
+	promotions: { req: FokosPromotionsRequest; res: FokosPromotionsPage };
+	prepareDestroy: { req: FokosPrepareDestroyRequest; res: void };
 	/** Cancel the schedule, delete all storage, abort. The caller reads the status and every promotions page first. */
-	fokosDestroy(): Promise<void>;
+	destroy: { req: FokosDestroyRequest; res: void };
+};
+
+export type FokosShardingAction = keyof FokosShardingActions;
+
+/** One control-plane call, as the runtime receives it. The action selects the type of the request. */
+export type FokosShardingRpcRequest = {
+	[A in FokosShardingAction]: { action: A; req: FokosShardingActions[A]["req"] };
+}[FokosShardingAction];
+
+/**
+ * The one control-plane RPC method, restricted to the actions `A`. Workers RPC stub types drop the
+ * type parameter of a method, so a caller of a stub uses `callFokosRpc` to keep the result type.
+ */
+export interface FokosShardingRpcCaller<A extends FokosShardingAction = FokosShardingAction> {
+	fokosRpc<K extends A>(action: K, req: FokosShardingActions[K]["req"]): Promise<FokosShardingActions[K]["res"]>;
+}
+
+/**
+ * The control-plane surface. A host implements `fokosRpc` by delegation to its runtime, and the
+ * runtime calls only `fokosRpc` on a peer of the host's own class.
+ */
+export interface FokosShardingRpc extends FokosShardingRpcCaller {
 	alarm(info?: AlarmInvocationInfo): Promise<void>;
 }
 
 /** Everything one partition calls on another to run a repartition. */
-export type FokosPartitionControlRpc = Pick<
-	FokosShardingRpc,
-	"fokosInit" | "fokosStartImport" | "fokosMigrationPull" | "fokosMigrationAck" | "fokosExecuteLocal"
->;
+export type FokosPartitionControlRpc = FokosShardingRpcCaller<"init" | "startImport" | "migrationPull" | "migrationAck" | "executeLocal">;
 
-/** The four methods the flow itself calls. It never reads through a peer; the runtime owns that path. */
-export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteLocal">;
+/** The four actions the flow itself calls. It never reads through a peer; the runtime owns that path. */
+export type FokosRepartitionPeer = FokosShardingRpcCaller<"init" | "startImport" | "migrationPull" | "migrationAck">;
 
 // ─── the application boundary ────────────────────────────────────────────────
 
@@ -231,7 +250,7 @@ export type FokosStatusPage = {
 	/**
 	 * The split of this partition, one entry for each target in `target.index` order, or one entry with
 	 * no target before the split has targets. Empty when the partition has no split. A partition splits
-	 * at most one time, so this list is short. The promotions are in `fokosPromotions`.
+	 * at most one time, so this list is short. The promotions are in the `promotions` action.
 	 */
 	split: FokosStatusEntry[];
 };
@@ -259,3 +278,5 @@ export type FokosPromotionsPage = {
 export type FokosPrepareDestroyRequest = {
 	rootContext?: FokosRouteContext<unknown>;
 };
+
+export type FokosDestroyRequest = Record<string, never>;
