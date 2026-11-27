@@ -526,6 +526,7 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	batch_request_too_large: "nhncs4",
 	batch_max_response_bytes_invalid: "7zkqbc",
 	batch_payload_too_large: "v3pw8k",
+	gsi_index_name_invalid: "dnzhwt",
 });
 
 export const EXPRESSION_CODES = defineCodes("FokosExpressionError", "caller", 400, {

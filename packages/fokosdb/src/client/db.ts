@@ -186,6 +186,7 @@ import {
 	isValidRoutingHashBaseSeed,
 	gsiShardGroup,
 	gsiTableConfig,
+	validateGsiIndexName,
 	materializationShardGroup,
 	materializationTableConfig,
 	type FokosDBPolicy,
@@ -195,6 +196,8 @@ import {
 	type FokosTableOptions,
 } from "../shared/partition-context.js";
 
+// The default `coordinatorRootsN` comes from this value. Never change it: the coordinators of each
+// table that uses the default would then reject every request.
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 
 /** The retries of the client, for the calls that can send a request again. */
@@ -731,19 +734,21 @@ export type FokosDBOptions = FokosTableOptions & {
 	platform?: FokosPlatform;
 };
 
-/** `FokosDBOptions` with the defaults of the client applied. */
-export type FokosDBResolvedOptions = Omit<
-	FokosDBOptions,
-	"table" | "singlePartitionFastPath" | "retry" | "partitionMigratingRetryDeadlineMs" | "platform"
-> & {
-	table: FokosTableIdentity & { readonly coordinatorRootsN: number };
-	singlePartitionFastPath: boolean;
-	retry: Required<FokosDBRetryOptions>;
-	partitionMigratingRetryDeadlineMs: number;
-};
+/**
+ * `FokosDBOptions` with the defaults of the client applied. The object, its `table` and its `retry` are
+ * frozen. The other nested objects are the objects of the caller's options.
+ */
+export type FokosDBResolvedOptions = Readonly<
+	Omit<FokosDBOptions, "table" | "singlePartitionFastPath" | "retry" | "partitionMigratingRetryDeadlineMs" | "platform"> & {
+		table: FokosTableIdentity & { readonly coordinatorRootsN: number };
+		singlePartitionFastPath: boolean;
+		retry: Readonly<Required<FokosDBRetryOptions>>;
+		partitionMigratingRetryDeadlineMs: number;
+	}
+>;
 
-/** The retry options with the defaults applied, validated. It throws `fokosdb_options_invalid` on a value that is not valid. */
-export function resolveRetryOptions(retry: FokosDBRetryOptions | undefined): Required<FokosDBRetryOptions> {
+/** The retry options with the defaults applied, validated, and frozen. It throws `fokosdb_options_invalid` on a value that is not valid. */
+export function resolveRetryOptions(retry: FokosDBRetryOptions | undefined): Readonly<Required<FokosDBRetryOptions>> {
 	if (retry === undefined) {
 		return DEFAULT_RETRY;
 	}
@@ -753,7 +758,7 @@ export function resolveRetryOptions(retry: FokosDBRetryOptions | undefined): Req
 		maxAttempts: retry.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
 	};
 	validateRetryOptions(resolved);
-	return resolved;
+	return Object.freeze(resolved);
 }
 
 const invalidOption = (option: string, value: number | string, message: string) =>
@@ -796,8 +801,8 @@ export class FokosDB implements FokosDBAPI {
 	}
 
 	/** The retry options of this client, with the defaults applied. `FokosDBStd` uses them when its call gives no `retry`. */
-	get retry(): Required<FokosDBRetryOptions> {
-		return { ...this.#options.retry };
+	get retry(): Readonly<Required<FokosDBRetryOptions>> {
+		return this.#options.retry;
 	}
 
 	constructor(options: FokosDBOptions) {
@@ -805,18 +810,18 @@ export class FokosDB implements FokosDBAPI {
 		this.#table = createTableConfig(options);
 		const { topology, rangeConfig, policy, policyVersion } = this.#table;
 		// The default has the same maximum as the check below, so a large `rootTreesN` does not fail.
-		this.#options = {
+		this.#options = Object.freeze({
 			...options,
-			table: {
+			table: Object.freeze({
 				...options.table,
 				coordinatorRootsN:
 					options.table.coordinatorRootsN ?? Math.min(TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN, FOKOS_HASH_PARTITIONS_MAX),
-			},
+			}),
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 			// A client is made for each request, so the defaults are shared and not checked again.
 			retry: resolveRetryOptions(options.retry),
 			partitionMigratingRetryDeadlineMs: options.partitionMigratingRetryDeadlineMs ?? PARTITION_MIGRATING_RETRY_DEADLINE_MS,
-		};
+		});
 		const deadlineMs = this.#options.partitionMigratingRetryDeadlineMs;
 		if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1) {
 			throw invalidOption(
@@ -939,9 +944,10 @@ export class FokosDB implements FokosDBAPI {
 	/**
 	 * The read view of the GSI `indexName`, a `targetId` of a GSI target of the `FokosDBMaterializationDO` of the
 	 * table. A `sortKeyCondition` applies to the GSI sort key. An entry has the GSI keys and the keys of
-	 * its base item.
+	 * its base item. Throws `gsi_index_name_invalid` when `indexName` is empty or has a `~`.
 	 */
 	gsi(indexName: string): FokosGsi {
+		validateGsiIndexName(indexName);
 		return {
 			queryItems: (async (opts: QueryItemsOptions) =>
 				await withFokosErrors(async () => await this.#queryItems(opts, this.#gsiClient(indexName)))) as FokosGsi["queryItems"],
@@ -966,7 +972,7 @@ export class FokosDB implements FokosDBAPI {
 
 	/** The options of this client, with the defaults applied. */
 	options(): FokosDBResolvedOptions {
-		return { ...this.#options };
+		return this.#options;
 	}
 
 	// Each public method wraps its body, so every error that leaves FokosDB is a FokosError.

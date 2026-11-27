@@ -104,6 +104,18 @@ describe("the validation codes of the item operations", () => {
 			() => db.transactWriteItems({ clientRequestToken: " ", items: [{ operation: "put", hashKey: "h", data: "x" }] }),
 			"client_request_token_invalid",
 		],
+		[
+			"a lone surrogate in a clientRequestToken",
+			() => db.transactWriteItems({ clientRequestToken: "\uD800", items: [{ operation: "put", hashKey: "h", data: "x" }] }),
+			"client_request_token_invalid",
+		],
+		[
+			"a NUL in a clientRequestToken",
+			() => db.transactWriteItems({ clientRequestToken: "a\0b", items: [{ operation: "put", hashKey: "h", data: "x" }] }),
+			"client_request_token_invalid",
+		],
+		["an empty GSI index name", () => db.gsi(""), "gsi_index_name_invalid"],
+		["a GSI index name with a ~", () => db.gsi("a~b"), "gsi_index_name_invalid"],
 		["a coordinatorRootsN of zero", () => makeDB({ coordinatorRootsN: 0 }), "num_tx_coordinators_invalid"],
 	];
 

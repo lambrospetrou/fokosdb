@@ -22,7 +22,7 @@ import {
 	type RoutingHashSeedResolver,
 } from "../sharding/hash-primitives.js";
 import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
-import { FokosValidationError } from "./errors.js";
+import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
 import { resolveLimits, type FokosDBLimitOverrides, type FokosDBLimits } from "./transaction-limits.js";
@@ -177,6 +177,21 @@ function checkedFingerprint(fp: string): string {
 export function gsiShardGroup(topology: FokosTopology, indexName: string): string {
 	const tableName = baseTableName(topology);
 	return `${RESERVED_SHARD_GROUP_PREFIX}gsiv1.${tableName.length}.${tableName}.${indexName}`;
+}
+
+/** A materialization target id is not empty and has no `~`, because a GSI shard group ends with it. */
+export function isValidTargetId(targetId: unknown): targetId is string {
+	return typeof targetId === "string" && targetId.length > 0 && !targetId.includes("~");
+}
+
+/** Throws `gsi_index_name_invalid` when `indexName` cannot be the `targetId` of a GSI target. */
+export function validateGsiIndexName(indexName: string): void {
+	if (!isValidTargetId(indexName)) {
+		throw new FokosValidationError(VALIDATION_CODES.gsi_index_name_invalid, {
+			message: 'indexName must be a non-empty string with no "~"',
+			attributes: { indexName },
+		});
+	}
 }
 
 /** True for the shard group of a GSI. */

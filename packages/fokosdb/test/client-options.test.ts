@@ -20,6 +20,15 @@ describe("FokosDB — client options", () => {
 		});
 	});
 
+	it("freezes the resolved options, so a caller cannot change the retries of the client", () => {
+		const db = makeDB({ retry: { maxAttempts: 3 } });
+		expect(() => {
+			(db.retry as { maxAttempts: number }).maxAttempts = 99;
+		}).toThrow(TypeError);
+		expect([Object.isFrozen(db.options()), Object.isFrozen(db.options().table)]).toEqual([true, true]);
+		expect(db.retry.maxAttempts).toBe(3);
+	});
+
 	it.each([
 		[{ retry: { maxAttempts: 0 } }, "retry.maxAttempts"],
 		[{ retry: { baseDelayMs: 1.5 } }, "retry.baseDelayMs"],

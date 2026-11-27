@@ -84,8 +84,11 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
 12. (FUTURE-TODO) **`db.destroy()` has no confirmation guard and misses detached GSIs** (`client/db.ts`).
     `destroy()` sits on `FokosDB` with zero arguments. It discovers GSI shard groups only through `fokosGsiTargetIds()` on `FokosDBMaterializationDO` when `nsMat` is set, so removed GSI targets or unset `nsMat` leave orphaned GSI objects behind.
 
-13. **Missing `db.gsi(indexName)` validation, `clientRequestToken` surrogate order, and shallow `db.options()`** (`client/db.ts`, `shared/partition-context.ts`, `shared/transaction-limits.ts`).
+13. (DONE) **Missing `db.gsi(indexName)` validation, `clientRequestToken` surrogate order, and shallow `db.options()`** (`client/db.ts`, `shared/partition-context.ts`, `shared/transaction-limits.ts`).
     `db.gsi("").queryItems(...)` fails in `gsiIndexNameStart` with `FokosInternalError` (`invariant_failed`, 500) instead of `FokosValidationError` (400). A `clientRequestToken` with a lone surrogate passes `validateClientRequestToken` and fails in `encodeHashKey` with `key_not_well_formed_utf16`. `db.options()` returns a shallow copy that shares nested `table` and `retry` objects and locks default formulas (`coordinatorRootsN`) into the public type.
+    `db.gsi(indexName)` now throws `gsi_index_name_invalid` at once for an empty name or a name with `~`. The server uses the same rule for a `targetId`. `validateClientRequestToken` now rejects a NUL and a lone surrogate with `client_request_token_invalid`. `db.options()` and `db.retry` now return the resolved options, which the constructor freezes with their `table` and `retry`. Before, a change to `db.options().retry` changed the retries of the client.
+    `coordinatorRootsN` stays in the resolved options. It is part of the table identity, so an operator must be able to read the resolved value and set it. The default formula must never change, and a comment on `TX_COORDINATORS_PER_ROOT_TREE` says so.
+    A name with no GSI target, such as `db.gsi("nope")`, still gives an empty result and no error. The client does not know the target list, because the list is in the code of `FokosDBMaterializationDO`. A check needs one RPC for each new index name.
 
 ### 2.3 Encapsulation Leaks in Public Types and Exports
 

@@ -56,7 +56,7 @@ function encode(key: string | Uint8Array): KeyBytes {
 			throw new FokosValidationError(SHARDING_VALIDATION_CODES.key_encode_empty, { message: "a key must not be an empty string" });
 		}
 		// isWellFormed() is false iff the string contains a lone surrogate (invalid UTF-16).
-		if (key.isWellFormed?.() === false) {
+		if (!key.isWellFormed()) {
 			throw new FokosValidationError(SHARDING_VALIDATION_CODES.key_not_well_formed_utf16, {
 				message: "key string contains a lone surrogate (not well-formed UTF-16)",
 			});

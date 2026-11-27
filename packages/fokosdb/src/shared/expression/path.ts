@@ -60,7 +60,7 @@ export function validateReadJsonPath(path: unknown): asserts path is string {
 	if (!utf8WithinLimit(path, EXPRESSION_LIMITS.jsonPathBytes)) {
 		throw new ExpressionError("complexity_limit", "JSON path exceeds the path limit");
 	}
-	if (path.isWellFormed?.() === false || path.includes("\0")) {
+	if (!path.isWellFormed() || path.includes("\0")) {
 		invalidPath();
 	}
 
@@ -89,7 +89,7 @@ export function validateWriteJsonPath(path: unknown, options?: { allowAppend?: b
 	if (!utf8WithinLimit(path, EXPRESSION_LIMITS.jsonPathBytes)) {
 		throw new ExpressionError("complexity_limit", "JSON path exceeds the path limit");
 	}
-	if (path.isWellFormed?.() === false || path.includes("\0")) {
+	if (!path.isWellFormed() || path.includes("\0")) {
 		invalidPath();
 	}
 

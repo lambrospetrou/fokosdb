@@ -3,6 +3,7 @@
  */
 import type { ExpressionValue, ProjectionExpression } from "../../shared/expression/types.js";
 import invariant from "../../shared/invariant.js";
+import { isValidTargetId } from "../../shared/partition-context.js";
 import { analyzeExpressionValue, validateProjectionExpression } from "../../shared/expression/semantic.js";
 import type { HashKey, ReadItemValue, SortKey } from "../../shared/types.js";
 
@@ -67,7 +68,7 @@ export function validateTargets(targets: readonly FokosTargetDefinition[]): void
 	let gsiCount = 0;
 	for (const target of targets) {
 		invariant(
-			typeof target.targetId === "string" && target.targetId.length > 0 && !target.targetId.includes("~"),
+			isValidTargetId(target.targetId),
 			() => `fokos/mat: the targetId ${JSON.stringify(target.targetId)} must be a non-empty string with no "~"`,
 		);
 		invariant(!ids.has(target.targetId), () => `fokos/mat: the targetId ${target.targetId} is not unique`);

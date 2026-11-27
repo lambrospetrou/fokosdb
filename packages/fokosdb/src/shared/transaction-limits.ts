@@ -204,6 +204,12 @@ export function validateClientRequestToken(token: string): void {
 			message: "clientRequestToken must be a non-empty string when provided",
 		});
 	}
+	// The token is the hash key of the coordinator route, so it takes the content rules of a key here.
+	if (token.includes("\0") || !token.isWellFormed()) {
+		throw new FokosValidationError(VALIDATION_CODES.client_request_token_invalid, {
+			message: "clientRequestToken must not contain the NUL (\\0) character or a lone surrogate",
+		});
+	}
 	const bytes = textEncoder.encode(token).byteLength;
 	if (bytes > MAX_CLIENT_REQUEST_TOKEN_BYTES) {
 		throw new FokosValidationError(VALIDATION_CODES.client_request_token_invalid, {
@@ -304,7 +310,7 @@ export function validateKeyContent(name: "hashKey" | "sortKey", k: string | Uint
 			attributes: { key: name },
 		});
 	}
-	if (k.isWellFormed?.() === false) {
+	if (!k.isWellFormed()) {
 		throw new FokosValidationError(SHARDING_VALIDATION_CODES.key_not_well_formed_utf16, {
 			message: `${name} string contains a lone surrogate (not well-formed UTF-16)`,
 			attributes: { key: name },
