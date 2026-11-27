@@ -1084,6 +1084,17 @@ export class MaterializationStore implements ItemSource {
 		return row && asKey(row.base_hk);
 	}
 
+	/** The first routingHash with items after `after`, or undefined when none follows. One primary-key seek. */
+	nextRoutingHash(after: RoutingHash | null): RoutingHash | undefined {
+		const row = tryOne(
+			this.#storage.sql.exec<{ routing_hash: ArrayBuffer }>(
+				`SELECT routing_hash FROM latest_items ${after === null ? "" : "WHERE routing_hash > ?"} ORDER BY routing_hash LIMIT 1`,
+				...(after === null ? [] : [after]),
+			),
+		);
+		return row && asRoutingHash(new Uint8Array(row.routing_hash));
+	}
+
 	// ─── migration ────────────────────────────────────────────────────────────
 
 	/**

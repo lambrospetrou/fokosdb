@@ -1,3 +1,12 @@
+import {
+	answerInspect,
+	INSPECT_CHECK_LIMIT,
+	INSPECT_SCAN_ROWS,
+	parseInspect,
+	type FokosInspectRequest,
+	type FokosInspectResponse,
+	type FokosInspectTransaction,
+} from "../shared/inspect-types.js";
 import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
@@ -698,6 +707,82 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 	fokosStatus(req: FokosStatusRequest) {
 		return this.fokos.fokosStatus(req);
 	}
+	/** A read of the transactions, the repartition state, the jobs and the local invariants. */
+	async fokosInspect(req: FokosInspectRequest): Promise<FokosInspectResponse> {
+		const parsed = parseInspect(req, ["transactions"], ["transactionId"]);
+		const runtime = await this.fokos.inspect();
+		const sql = this.ctx.storage.sql;
+		const router = runtime?.repartition.role === "router";
+		const owns = this.fokos.ownerCheck();
+		return answerInspect(
+			req,
+			parsed,
+			runtime,
+			{
+				transactions: (after, limit) => {
+					// A split source keeps the rows of the tokens that moved until its cleanup deletes them.
+					// They are not the state of this coordinator. A router owns no token, so it reads no row.
+					if (router) {
+						return { entries: [], next: null };
+					}
+					const params: unknown[] = [req.transactionId ?? null];
+					if (after !== null) {
+						params.push(Uint8Array.fromHex(after[0]), after[1]);
+					}
+					// The scan reads at most INSPECT_SCAN_ROWS rows in key order, also when the transactionId
+					// filter matches few of them, because no index has transaction_id first.
+					type Row = { routing_hash: ArrayBuffer; transaction_id: string; idempotency_token: string; state: string; matches: number };
+					const page: Row[] = [];
+					let scanned = 0;
+					let last: Row | null = null;
+					let more = false;
+					for (const row of sql.exec<Row>(
+						`SELECT routing_hash, transaction_id, idempotency_token, state, (?1 IS NULL OR transaction_id = ?1) AS matches
+						   FROM tc_state ${after === null ? "" : "WHERE (routing_hash, transaction_id) > (?2, ?3)"}
+						  ORDER BY routing_hash, transaction_id LIMIT ${INSPECT_SCAN_ROWS + 1}`,
+						...params,
+					)) {
+						if (page.length === limit || scanned === INSPECT_SCAN_ROWS) {
+							more = true;
+							break;
+						}
+						scanned++;
+						last = row;
+						if (row.matches === 1 && owns(tokenKey(row.idempotency_token))) {
+							page.push(row);
+						}
+					}
+					// One seek of the primary key of tc_participants for each transaction of the page.
+					const entries = page.map(
+						(row): FokosInspectTransaction => ({
+							transactionId: row.transaction_id,
+							state: row.state,
+							participants: sql
+								.exec<{ partition_do_name: string }>(
+									`SELECT partition_do_name FROM tc_participants WHERE routing_hash = ? AND transaction_id = ? ORDER BY partition_do_name`,
+									row.routing_hash,
+									row.transaction_id,
+								)
+								.toArray()
+								.map((p) => p.partition_do_name),
+						}),
+					);
+					return { entries, next: more && last !== null ? [new Uint8Array(last.routing_hash).toHex(), last.transaction_id] : null };
+				},
+				selfCheck: () => ({ entries: [], next: null }),
+			},
+			() =>
+				sql
+					.exec<{ transaction_id: string; idempotency_token: string; state: string }>(
+						`SELECT transaction_id, idempotency_token, state FROM tc_state WHERE completed_at IS NULL AND next_recovery_at IS NULL LIMIT ?`,
+						INSPECT_CHECK_LIMIT,
+					)
+					.toArray()
+					// The rows of the tokens that moved in a split are not the state of this coordinator.
+					.filter((row) => owns(tokenKey(row.idempotency_token)))
+					.map((row) => `the transaction ${row.transaction_id} in ${row.state} is not complete and has no next_recovery_at`),
+		);
+	}
 	fokosPromotions(req: FokosPromotionsRequest) {
 		return this.fokos.fokosPromotions(req);
 	}
@@ -1062,7 +1147,8 @@ export class FokosDBTransactionCoordinatorDO extends DurableObject<Env> implemen
 		// Durable before the first prepare, so a coordinator that stops after this point still resumes the
 		// transaction. The handler can end with a thrown answer, which drops the signals of a local call,
 		// so these calls do not go through `call.signal`.
-		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.#platform.now() + this.config().staleTransactionMs);
+		// The deadline that the insert stored. A second clock read can be later than it.
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, createdAt + this.config().staleTransactionMs);
 		this.fokos.requestSplitEvaluation();
 
 		return await this.drivePrepare(

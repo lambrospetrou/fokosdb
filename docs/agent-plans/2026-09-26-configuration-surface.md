@@ -39,7 +39,7 @@ A user can change only some of these values today, and each changeable value use
 | `PartitionContextCreator.create` options, carried in the policy on every RPC | `hashSplitConditions`, `rangeSplitConditions`, `rangeSplitN`, `hashSplitN`, `rootTreesN`, `rangeAncestorsConfig`, `jurisdiction`, `locationHint` |
 | `FokosDBOptions` (the constructor of the client) | `coordinatorRootsN`, `singlePartitionFastPath` |
 | Per-call options | `limit`, `maxResponseBytes`, `clientRequestToken` |
-| Overridable DO methods | `fokosStaleTransactionMs()`, `fokosTtlConfig()`, `fokosFanoutRequestBudgetMs()`, `fokosNow()` |
+| Overridable DO methods | `fokosStaleTransactionMs()`, `fokosTtlConfig()`, `fokosFanoutRequestBudgetMs()`, `fokosNow()` (replaced, see below) |
 | `FokosShardingRuntime` constructor options | `caches.{hashArenaBytes, rangeHierarchyMaxRows, promotionBloom}`, `scheduler.{fallbackAlarmMs, fastPathDelayMs}` |
 | `hooks.runtimeConfig()` callback | `importPagesPerPass` |
 
@@ -319,6 +319,8 @@ class PartitionDO {
 - The validation is a few number checks, so it runs at each read. If a profile shows a cost, the host can cache on
   the identity of the returned object.
 - `fokosNow()` stays a separate method, because it is a clock and not a setting.
+  `fokosPlatform(ctx)` replaces it: see section 4.2.1 of
+  [2026-11-16-protocol-aware-deterministic-simulation-testing.md](./2026-11-16-protocol-aware-deterministic-simulation-testing.md).
 
 The settings of `PartitionDO`:
 
