@@ -118,10 +118,47 @@ describe("FokosDBStd.batchGetItemsWithRetry — pages and attempts", () => {
 
 		const read = await FokosDBStd.batchGetItemsWithRetry(batcher, { items: keys }, { ...SHORT_RETRY, maxAttempts: 1 });
 
-		expect(calls).toEqual([["a", "b", "c", "d"], ["b", "c", "d"], ["c", "d"], ["d"]]);
+		// Each page answers 1 key, so each next call sends at most 2 keys.
+		expect(calls).toEqual([["a", "b", "c", "d"], ["b", "c"], ["c", "d"], ["d"]]);
 		expect(waits).toEqual([]);
 		expect(read.items).toEqual([OK, OK, OK, OK]);
 		expect(read.unprocessedKeys).toEqual([]);
+	});
+
+	it("doubles the keys of the next call after a page where every key fits", async () => {
+		const many: BatchGetItemKey[] = Array.from({ length: 10 }, (_, i) => ({ hashKey: `k${i}` }));
+		// The first call answers only "k0". Every later call answers all its keys.
+		const { batcher, calls } = readBatcher((page) => page.map((key, i) => (i === 0 || page.length < many.length ? OK : TOO_LARGE)));
+
+		const read = await FokosDBStd.batchGetItemsWithRetry(batcher, { items: many }, { ...SHORT_RETRY, maxAttempts: 1 });
+
+		expect(calls.map((keys) => keys.length)).toEqual([10, 2, 4, 3]);
+		expect(read.unprocessedKeys).toEqual([]);
+	});
+
+	it("keeps the size of the next call after an error, and keeps the last answer of a key that waits", async () => {
+		const many: BatchGetItemKey[] = Array.from({ length: 6 }, (_, i) => ({ hashKey: `k${i}` }));
+		// The first call answers only "k0". Then "k1" always fails, and each call answers the key after it.
+		const answerOf = (page: BatchGetItemKey[], key: BatchGetItemKey, i: number): BatchGetItemResult => {
+			if (page.length === many.length) {
+				return i === 0 ? OK : TOO_LARGE;
+			}
+			if (key.hashKey === "k1") {
+				return FAULT;
+			}
+			return i === 1 ? OK : TOO_LARGE;
+		};
+		const { batcher, calls } = readBatcher((page) => page.map((key, i) => answerOf(page, key, i)));
+
+		const read = await FokosDBStd.batchGetItemsWithRetry(batcher, { items: many }, { ...SHORT_RETRY, maxAttempts: 2 });
+
+		expect(calls).toEqual([
+			["k0", "k1", "k2", "k3", "k4", "k5"],
+			["k1", "k2"],
+			["k1", "k3"],
+		]);
+		expect(read.items).toEqual([OK, FAULT, OK, OK, TOO_LARGE, TOO_LARGE]);
+		expect(read.unprocessedKeys).toEqual([{ hashKey: "k1" }, { hashKey: "k4" }, { hashKey: "k5" }]);
 	});
 
 	it("counts a call with an error, and waits before the next call", async () => {

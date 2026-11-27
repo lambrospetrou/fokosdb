@@ -33,9 +33,12 @@ export class FokosDBStd {
 	 * backoff (`retry.baseDelayMs`, `retry.maxDelayMs`). The random values and the wait come from
 	 * `db.platform`. When `retry` is absent, it uses `db.retry`.
 	 *
-	 * A key that is `unprocessed` with `response_too_large` is on the next page. It is not an error: the
-	 * next call sends it at once, and that call does not count as an attempt. `batchGetItems` always
-	 * answers the first key of a call that has no error, so the pages end.
+	 * A key that is `unprocessed` with `response_too_large` is on a later page. It is not an error: a
+	 * later call sends it with no backoff wait, and that call does not count as an attempt. `batchGetItems` always
+	 * answers the first key of a call that has no error, so the pages end. After such a page, the next
+	 * call sends at most two times the keys that the page answered, in request order, because each
+	 * partition reads up to the limit, and keys that cannot fit in the page are read for nothing. A key
+	 * that waits keeps its last answer, `response_too_large`, when the attempts end.
 	 *
 	 * The result has the positions of the first request: `items[i]` is the last answer for `opts.items[i]`.
 	 * `meta` joins the `meta` of every call. A key that is still unprocessed after the last call stays in
@@ -61,8 +64,8 @@ export class FokosDBStd {
 				return { results: answer.items, meta: answer.meta };
 			},
 			(result) => result.outcome === "unprocessed",
-			(result) => result.outcome === "unprocessed" && result.code === "response_too_large",
 			(_earlier, later) => later,
+			(result) => result.outcome === "unprocessed" && result.code === "response_too_large",
 		);
 		// Every item takes the same path, so the positional types of `Ts` are erased here, as in `db.ts`.
 		return { items: results, unprocessedKeys: unprocessed, meta } as unknown as BatchGetItemsResult<Ts>;
@@ -90,7 +93,6 @@ export class FokosDBStd {
 				return { results: answer.results, meta: answer.meta };
 			},
 			(result) => result.outcome === "unprocessed" || result.outcome === "unknown",
-			() => false,
 			(earlier, later) => (earlier.outcome === "unknown" && later.outcome !== "ok" ? earlier : later),
 		);
 		return { results, unprocessedItems: unprocessed, meta };
@@ -137,14 +139,19 @@ export class FokosDBStd {
 }
 
 /**
- * The retry loop of the batch helpers. `again` selects the results to send again, and `paged` selects
- * among them the results that are on the next page and are not an error. `keep` chooses between the
- * result that an item has and the result of a later call. Each result keeps the position of its entry
- * in `entries`, and each `partitionIndex` moves to the joined `meta`.
+ * The retry loop of the batch helpers. `again` selects the results to send again, and `keep` chooses
+ * between the result that an item has and the result of a later call. Each result keeps the position
+ * of its entry in `entries`, and each `partitionIndex` moves to the joined `meta`.
+ *
+ * `paged` selects the results to send again that are on the next page and are not an error. After a
+ * call with no error, the next call sends at most two times the entries that the call answered. A call
+ * after an error sends as many entries as the call before it. The entries that wait stay after the
+ * entries of the call, so each call holds the first entries in request order. The first call sends
+ * every entry, so each entry has a result.
  *
  * A call counts as an attempt when a result to send again is not `paged`, or when the call answers no
- * entry. Only such a call waits before the next call. Any other call sends the next call at once, with
- * fewer entries, so the loop ends.
+ * entry. Only such a call waits before the next call. Any other call answers at least one entry, so
+ * the loop ends.
  */
 async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	retry: Required<FokosDBRetryOptions>,
@@ -152,42 +159,58 @@ async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	entries: readonly Entry[],
 	call: (entries: Entry[]) => Promise<{ results: Result[]; meta: FokosMeta }>,
 	again: (result: Result) => boolean,
-	paged: (result: Result) => boolean,
 	keep: (earlier: Result, later: Result) => Result,
+	paged: (result: Result) => boolean = () => false,
 ): Promise<{ results: Result[]; unprocessed: Entry[]; meta: FokosMeta }> {
 	const join = new PartitionMetaJoin();
 	let forwardCount = 0;
 	const results: Result[] = [];
-	// `positions[j]` is the position in `entries` of the entry `j` of the next call.
-	let positions = entries.map((_, i) => i);
+	// The positions in `entries` that have no final answer yet, in request order.
+	let pending = entries.map((_, i) => i);
+	// The most entries that the next call sends. Each partition of a batch read reads its keys up to
+	// the response limit, and the client then keeps only one limit of items for all partitions together.
+	// So when a call sends all the remaining keys to many partitions, the partitions read many items that
+	// the client drops, and the next page reads them again. Example: 1,000 keys of 1 MiB on 64
+	// partitions, with a limit of 24 MiB, read about 21,000 items for 1,000 answers. When each call
+	// sends at most two times the keys that the call before it answered, they read about 3,000 items.
+	let sendCount = pending.length;
 	let failedCalls = 0;
+	// The first call always runs, also with no entry, so the method validates the options.
 	for (;;) {
-		const answer = await call(positions.map((position) => entries[position]));
+		const sent = pending.slice(0, sendCount);
+		const answer = await call(sent.map((position) => entries[position]));
 		forwardCount += answer.meta.forwardCount;
 		const indexes = answer.meta.partitions.map((entry) => join.add(entry));
 		const next: number[] = [];
 		let failed = false;
 		answer.results.forEach((result, j) => {
 			const moved = result.partitionIndex === undefined ? result : { ...result, partitionIndex: indexes[result.partitionIndex] };
-			const position = positions[j];
+			const position = sent[j];
 			results[position] = results[position] === undefined ? moved : keep(results[position], moved);
 			if (again(result)) {
 				next.push(position);
 				failed ||= !paged(result);
 			}
 		});
-		if (next.length === 0) {
+		// The keys that the call did not answer go before the keys that it did not send. So the next call
+		// sends the first keys in request order, and the first key of a call is always answered.
+		pending = next.concat(pending.slice(sent.length));
+		if (pending.length === 0) {
 			break;
 		}
-		if (failed || next.length === positions.length) {
+		if (failed || next.length === sent.length) {
 			failedCalls++;
 			if (failedCalls >= retry.maxAttempts) {
 				break;
 			}
 			// The first retry is retry 0 of the backoff.
 			await platform.wait(jitterBackoff(failedCalls - 1, retry.baseDelayMs, retry.maxDelayMs, platform));
+		} else {
+			// A page with no error shows how many keys fit in one response. Two times that number lets the
+			// window grow when the next keys are smaller, and limits the reads when they are not. After an
+			// error the window keeps its size, because a fault does not show how many keys fit.
+			sendCount = 2 * (sent.length - next.length);
 		}
-		positions = next;
 	}
 	return {
 		results,
