@@ -77,8 +77,9 @@ Every routed Durable Object method takes `(ctx: FokosDBRouteContext, req)` and r
     `FokosDBAPI` includes put, get, delete, query, transaction, and batch interfaces, and omits `scanItems` and `gsi(indexName)`.
     `FokosDBAPI` now also extends the new `ItemScanner` and `GsiReader` interfaces, and `FokosDB` declares `implements FokosDBAPI`, so the compiler checks that the class and the interface match.
 
-11. **`FokosDBStd` ignores `db.options().retry` and backs off on `response_too_large`** (`client/fokos-std.ts`).
+11. (DONE) **`FokosDBStd` ignores `db.options().retry` and backs off on `response_too_large`** (`client/fokos-std.ts`).
     `batchGetItemsWithRetry` and `batchWriteItemsWithRetry` take `db: ItemBatcher` and default to `DEFAULT_RETRY` instead of `db.options().retry`. `batchGetItemsWithRetry` also treats `code: "response_too_large"` as an error: it sleeps backoff delays between pages and stops after `maxAttempts` (default 5) even when zero errors occurred. `FokosDBStd` also has an implicit public constructor.
+    `ItemBatcher` now has an optional `retry`, and `FokosDB` gives its resolved `retry` option there. A helper uses it when its call gives no `retry`. A call with only `response_too_large` keys sends the next page at once, with no wait, and does not count as an attempt. A call with an error, or a call that answers no key, counts. `FokosDBStd` has a private constructor. A partition stops to read a batch at the first found item that does not fit in `maxResponseBytes`, and does not read the keys after it.
 
 12. (FUTURE-TODO) **`db.destroy()` has no confirmation guard and misses detached GSIs** (`client/db.ts`).
     `destroy()` sits on `FokosDB` with zero arguments. It discovers GSI shard groups only through `fokosGsiTargetIds()` on `FokosDBMaterializationDO` when `nsMat` is set, so removed GSI targets or unset `nsMat` leave orphaned GSI objects behind.

@@ -24,23 +24,33 @@ type QuerySpec = QueryItemsOptions["queries"][number];
  * only through the `ItemBatcher` they get.
  */
 export class FokosDBStd {
+	private constructor() {}
+
 	/**
 	 * Calls `db.batchGetItems` with every key, then again with `unprocessedKeys` and the `projection` and
-	 * `maxResponseBytes` of the request, until no key stays unprocessed or the calls reach
-	 * `retry.maxAttempts`. Before each retry it waits a random time with exponential backoff
-	 * (`retry.baseDelayMs`, `retry.maxDelayMs`). The random values and the wait come from `db.platform`.
+	 * `maxResponseBytes` of the request, until no key stays unprocessed or the calls with an error reach
+	 * `retry.maxAttempts`. Before each retry after an error it waits a random time with exponential
+	 * backoff (`retry.baseDelayMs`, `retry.maxDelayMs`). The random values and the wait come from
+	 * `db.platform`. When `retry` is absent, it uses `db.retry`.
+	 *
+	 * A key that is `unprocessed` with `response_too_large` is on the next page. It is not an error: the
+	 * next call sends it at once, and that call does not count as an attempt. `batchGetItems` always
+	 * answers the first key of a call that has no error, so the pages end.
 	 *
 	 * The result has the positions of the first request: `items[i]` is the last answer for `opts.items[i]`.
 	 * `meta` joins the `meta` of every call. A key that is still unprocessed after the last call stays in
 	 * `unprocessedKeys`. It takes the limits of `batchGetItems`, 0 to 1,000 keys, and makes one call at a
 	 * time. It throws only for options that are not valid, before any I/O.
+	 *
+	 * `maxResponseBytes` limits each call, not the result. The result holds the items of all pages in
+	 * memory together.
 	 */
 	static async batchGetItemsWithRetry<Ts extends readonly unknown[] = never[]>(
 		db: ItemBatcher,
 		opts: NoInfer<BatchGetItemsOptions<Ts>>,
 		retry?: FokosDBRetryOptions,
 	): Promise<BatchGetItemsResult<Ts>> {
-		const policy = resolveRetryOptions(retry);
+		const policy = resolveRetryOptions(retry ?? db.retry);
 		const { projection, maxResponseBytes } = opts as BatchGetItemsOptions;
 		const { results, unprocessed, meta } = await retryBatch<BatchGetItemKey, BatchGetItemResult>(
 			policy,
@@ -51,6 +61,7 @@ export class FokosDBStd {
 				return { results: answer.items, meta: answer.meta };
 			},
 			(result) => result.outcome === "unprocessed",
+			(result) => result.outcome === "unprocessed" && result.code === "response_too_large",
 			(_earlier, later) => later,
 		);
 		// Every item takes the same path, so the positional types of `Ts` are erased here, as in `db.ts`.
@@ -61,14 +72,15 @@ export class FokosDBStd {
 	 * Calls `db.batchWriteItems` with every operation, then again with `unprocessedItems`, as
 	 * `batchGetItemsWithRetry` does. It never sends a `rejected` operation again. An operation that got
 	 * `unknown` keeps `unknown` when a later call does not apply it, because the earlier call can have
-	 * applied it. `results[i]` answers `opts.items[i]`.
+	 * applied it. `results[i]` answers `opts.items[i]`. A write has no pages, so each call counts as an
+	 * attempt.
 	 */
 	static async batchWriteItemsWithRetry(
 		db: ItemBatcher,
 		opts: BatchWriteItemsOptions,
 		retry?: FokosDBRetryOptions,
 	): Promise<BatchWriteItemsResult> {
-		const policy = resolveRetryOptions(retry);
+		const policy = resolveRetryOptions(retry ?? db.retry);
 		const { results, unprocessed, meta } = await retryBatch<BatchWriteItem, BatchWriteItemResult>(
 			policy,
 			db.platform ?? systemPlatform,
@@ -78,6 +90,7 @@ export class FokosDBStd {
 				return { results: answer.results, meta: answer.meta };
 			},
 			(result) => result.outcome === "unprocessed" || result.outcome === "unknown",
+			() => false,
 			(earlier, later) => (earlier.outcome === "unknown" && later.outcome !== "ok" ? earlier : later),
 		);
 		return { results, unprocessedItems: unprocessed, meta };
@@ -124,9 +137,14 @@ export class FokosDBStd {
 }
 
 /**
- * The retry loop of the batch helpers. `again` selects the results to send again, and `keep` chooses
- * between the result that an item has and the result of a later call. Each result keeps the position
- * of its entry in `entries`, and each `partitionIndex` moves to the joined `meta`.
+ * The retry loop of the batch helpers. `again` selects the results to send again, and `paged` selects
+ * among them the results that are on the next page and are not an error. `keep` chooses between the
+ * result that an item has and the result of a later call. Each result keeps the position of its entry
+ * in `entries`, and each `partitionIndex` moves to the joined `meta`.
+ *
+ * A call counts as an attempt when a result to send again is not `paged`, or when the call answers no
+ * entry. Only such a call waits before the next call. Any other call sends the next call at once, with
+ * fewer entries, so the loop ends.
  */
 async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	retry: Required<FokosDBRetryOptions>,
@@ -134,6 +152,7 @@ async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	entries: readonly Entry[],
 	call: (entries: Entry[]) => Promise<{ results: Result[]; meta: FokosMeta }>,
 	again: (result: Result) => boolean,
+	paged: (result: Result) => boolean,
 	keep: (earlier: Result, later: Result) => Result,
 ): Promise<{ results: Result[]; unprocessed: Entry[]; meta: FokosMeta }> {
 	const join = new PartitionMetaJoin();
@@ -141,24 +160,33 @@ async function retryBatch<Entry, Result extends { partitionIndex?: number }>(
 	const results: Result[] = [];
 	// `positions[j]` is the position in `entries` of the entry `j` of the next call.
 	let positions = entries.map((_, i) => i);
-	for (let calls = 1; ; calls++) {
+	let failedCalls = 0;
+	for (;;) {
 		const answer = await call(positions.map((position) => entries[position]));
 		forwardCount += answer.meta.forwardCount;
 		const indexes = answer.meta.partitions.map((entry) => join.add(entry));
 		const next: number[] = [];
+		let failed = false;
 		answer.results.forEach((result, j) => {
 			const moved = result.partitionIndex === undefined ? result : { ...result, partitionIndex: indexes[result.partitionIndex] };
 			const position = positions[j];
 			results[position] = results[position] === undefined ? moved : keep(results[position], moved);
 			if (again(result)) {
 				next.push(position);
+				failed ||= !paged(result);
 			}
 		});
-		if (next.length === 0 || calls >= retry.maxAttempts) {
+		if (next.length === 0) {
 			break;
 		}
-		// The first retry is retry 0 of the backoff.
-		await platform.wait(jitterBackoff(calls - 1, retry.baseDelayMs, retry.maxDelayMs, platform));
+		if (failed || next.length === positions.length) {
+			failedCalls++;
+			if (failedCalls >= retry.maxAttempts) {
+				break;
+			}
+			// The first retry is retry 0 of the backoff.
+			await platform.wait(jitterBackoff(failedCalls - 1, retry.baseDelayMs, retry.maxDelayMs, platform));
+		}
 		positions = next;
 	}
 	return {

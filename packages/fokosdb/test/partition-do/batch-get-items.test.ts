@@ -62,7 +62,7 @@ describe.concurrent("FokosDBPartitionDO — apiBatchGetItems", () => {
 		expect(value.partitions[0]).toMatchObject({ rowsRead: expect.any(Number), databaseSize: expect.any(Number) });
 	});
 
-	it("trims its answer to maxResponseBytes, and keeps the item of opIndex 0", async () => {
+	it("stops to read at the first item above maxResponseBytes, and keeps the item of opIndex 0", async () => {
 		const partition = makePartition();
 		const keys = Array.from({ length: 4 }, (_, i): [string, string] => [`big-${i}`, "1"]);
 		for (const [hashKey, sortKey] of keys) {
@@ -70,17 +70,21 @@ describe.concurrent("FokosDBPartitionDO — apiBatchGetItems", () => {
 		}
 		const all = await batchGet(partition, batchRequest(keys));
 		expect(all.value.found).toHaveLength(4);
+		const rowsOf = (answer: FokosEnvelope<BatchGetItemsRpcResponse>) => answer.value.partitions[0].rowsRead;
+		const rowsOfOneRead = rowsOf(all)! / 4;
 
 		const two = await batchGet(partition, batchRequest(keys, bytesOfFirst(all.value.found, 2)));
 		expect(two.value.found.map((f) => f.opIndex)).toEqual([0, 1]);
-		expect(two.value.failed).toEqual([tooLarge(2, 0), tooLarge(3, 0)]);
+		expect(two.value.failed).toEqual([{ ...tooLarge(2, 0), opIndexes: [2, 3] }]);
+		expect(rowsOf(two), "opIndex 3 is not read").toBe(3 * rowsOfOneRead);
 
 		const one = await batchGet(partition, batchRequest(keys, 1));
 		expect(
 			one.value.found.map((f) => f.opIndex),
 			"opIndex 0 is above the limit and still comes back",
 		).toEqual([0]);
-		expect(one.value.failed).toEqual([tooLarge(1, 0), tooLarge(2, 0), tooLarge(3, 0)]);
+		expect(one.value.failed).toEqual([{ ...tooLarge(1, 0), opIndexes: [1, 2, 3] }]);
+		expect(rowsOf(one), "opIndex 2 and 3 are not read").toBe(2 * rowsOfOneRead);
 	});
 
 	it("reads each key on the child that owns it after a hash split", async () => {

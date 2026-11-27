@@ -121,6 +121,7 @@ import {
 	conditionFailedReason,
 	decodeItemKeys,
 	IDEMPOTENCY_WINDOW_MS,
+	MAX_PAYLOAD_BYTES_PER_BATCH,
 	txOrderTimestampNow,
 	validateTransactResponseBytes,
 } from "../shared/transaction-limits.js";
@@ -1544,13 +1545,23 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 
 	/**
 	 * Reads the items of one part of a batch read, in request order, as one snapshot of this partition.
-	 * It does not apply the response limit: `merge` does, after it joins this part with the others.
+	 * It stops to read at the first found item that does not fit in `maxResponseBytes`, clamped to
+	 * `MAX_PAYLOAD_BYTES_PER_BATCH`. That item and each item after it are `unprocessed` with
+	 * `response_too_large`, without a read. So for each call, this partition reads at most one found item
+	 * more than fits in the limit. The item of `opIndex` 0 is always read, as `fitBatchResponse` always keeps it.
+	 * `merge` applies the limit again, after it joins this part with the others.
 	 */
 	private batchGetLocal(req: BatchGetItemsRpcRequest): BatchGetItemsRpcResponse {
 		const out: BatchGetItemsRpcResponse = { found: [], notFound: [], failed: [], partitions: [] };
 		let rowsRead = 0;
 		let rowsWritten = 0;
+		let remaining = Math.min(req.maxResponseBytes, MAX_PAYLOAD_BYTES_PER_BATCH);
+		const tooLarge: number[] = [];
 		for (const { opIndex, hashKey, sortKey, projection } of req.items) {
+			if (tooLarge.length > 0 && opIndex !== 0) {
+				tooLarge.push(opIndex);
+				continue;
+			}
 			let read: ItemRead;
 			try {
 				read = this.readItem(hashKey, sortKey, projection ?? req.projection);
@@ -1560,11 +1571,17 @@ export class FokosDBPartitionDO extends DurableObject implements PartitionRpc {
 			}
 			rowsRead += read.rowsRead;
 			rowsWritten += read.rowsWritten;
-			if (read.found) {
+			if (!read.found) {
+				out.notFound.push({ opIndex, partitionIndex: 0 });
+			} else if (opIndex === 0 || read.found.bytes <= remaining) {
+				remaining -= read.found.bytes;
 				out.found.push({ opIndex, ...read.found, partitionIndex: 0 });
 			} else {
-				out.notFound.push({ opIndex, partitionIndex: 0 });
+				tooLarge.push(opIndex);
 			}
+		}
+		if (tooLarge.length > 0) {
+			out.failed.push({ outcome: "unprocessed", code: "response_too_large", opIndexes: tooLarge, partitionIndex: 0 });
 		}
 		out.partitions = this.answered({ rowsRead, rowsWritten });
 		return out;

@@ -206,7 +206,8 @@ export type FokosDBRetryOptions = {
 	/**
 	 * The attempts of each read of a read transaction, and of the single-partition read of
 	 * `transactGetItems`. A read applies nothing, so an attempt again is safe. It is also the maximum
-	 * number of calls of each `FokosDBStd` batch retry helper. Default: 5.
+	 * number of calls with an error of each `FokosDBStd` batch retry helper. A call that only gets the
+	 * next page of a batch read (`response_too_large`) does not count. Default: 5.
 	 */
 	maxAttempts?: number;
 };
@@ -792,6 +793,11 @@ export class FokosDB implements FokosDBAPI {
 	/** The platform of this client. `FokosDBStd` uses it for the retry backoff. */
 	get platform(): FokosPlatform {
 		return this.#platform;
+	}
+
+	/** The retry options of this client, with the defaults applied. `FokosDBStd` uses them when its call gives no `retry`. */
+	get retry(): Required<FokosDBRetryOptions> {
+		return { ...this.#options.retry };
 	}
 
 	constructor(options: FokosDBOptions) {

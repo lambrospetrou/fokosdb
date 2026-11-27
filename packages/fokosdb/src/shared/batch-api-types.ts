@@ -10,6 +10,7 @@ import type { JsonComposite } from "./json-types.js";
 import type { ConditionFailedReason } from "./transaction-api-types.js";
 import type { FokosMeta, HashKey, ItemKey, ReadResultItem, ReturnValuesOnConditionCheckFailure, SortKey } from "./types.js";
 import type { FokosPlatform } from "./platform.js";
+import type { FokosDBRetryOptions } from "../client/db.js";
 
 /** One key of `batchGetItems`. Its projection replaces the projection of the request. */
 export type BatchGetItemKey = ItemKey & { projection?: readonly ProjectionExpression[] };
@@ -137,4 +138,6 @@ export interface ItemBatcher {
 	batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult>;
 	/** The clock and the timers of the retry backoff of `FokosDBStd`. Absent: `systemPlatform`. */
 	readonly platform?: FokosPlatform;
+	/** The retries of `FokosDBStd` when its call gives no `retry`. Absent: the defaults of `FokosDBRetryOptions`. */
+	readonly retry?: FokosDBRetryOptions;
 }
