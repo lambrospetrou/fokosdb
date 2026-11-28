@@ -65,8 +65,8 @@ later kind of dispatch is not.
 
 ### 1.3 Glossary
 
-- **Position** — a place in the storage order `(routingHash, hk, sk)`. Type `FokosStorageKey`. An absent `hk` or `sk`
-  is the empty key, the minimum.
+- **Position** — a place in the storage order `(routingHash, hk, sk)`. Type `FokosStoragePosition`, which is
+  `FokosStorageKey` in the code today. An absent `hk` or `sk` is the empty key, the minimum.
 - **Storage interval** — a half-open interval `[start, end)` of positions. Type `FokosStorageInterval`.
 - **Scope** — the storage interval that one partition can own, from its identity (`storageInterval()`).
 - **Span** — one element of a footprint: an item, a hash key, a position, or a storage interval. Type `FokosSpan`.
@@ -74,6 +74,8 @@ later kind of dispatch is not.
 - **Footprint** — the list of spans of one request. Type `FokosFootprint`.
 - **Visit** — one target partition, or `local`, with the spans that it serves. A planner gives a list of visits.
 - **Execution** — the rule that runs the visits of one request: `one_owner`, `fan_out`, or `walk`.
+- **Normalized form** — the checked form of a position or a span, inside the runtime only: `NormalizedPosition` and
+  `NormalizedSpan` (section 7.2.1).
 
 ## 2. What routing must give
 
@@ -255,7 +257,9 @@ Each milestone ships on its own, and the full test suite passes after each one.
    and the range trees of promoted routingHashes. `planRangeFrontier` works on composite keys.
 3. **The new descriptor (breaking).** The shapes, `FokosRangeInput`, `FokosRangeVisit`, `SkInterval`, and
    `FokosRangeCursor` leave the sharding layer. Every operation of the three hosts moves. `hooks.admit` gets `spans`
-   in place of `keys`. The coordinator uses a `hash_key` span, and `apiScanItems` uses a `position` span.
+   in place of `keys`. The coordinator uses a `hash_key` span, and `apiScanItems` uses a `position` span. The position
+   types get their new names (section 7.2.1): `FokosStorageKey` becomes `FokosStoragePosition`, and the internal
+   `FokosStoragePosition` becomes `NormalizedPosition`.
 4. **The client (breaking).** `FokosShardingClient.plan(spans)` and `send` replace `resolve`, `resolveRange`,
    `resolveAll`, `point`, and `range`. `fanOut` replaces the five copies of the grouping code.
 5. **The first new consumer.** The `graphGetItems` step, with gets and queries in one `fan_out`, proves the design.
@@ -316,7 +320,7 @@ export type FokosSpan<D = unknown> =
 	/** Every position of one hash key, for a host that routes by a hash key with no sort key. */
 	| { kind: "hash_key"; hashKey: KeyBytes; data?: D }
 	/** A position that names no item, for example the start of a slice read. */
-	| { kind: "position"; position: FokosStorageKey; data?: D }
+	| { kind: "position"; position: FokosStoragePosition; data?: D }
 	/** A half-open storage interval. */
 	| { kind: "interval"; interval: FokosStorageInterval; data?: D };
 
@@ -333,6 +337,30 @@ Rules:
   check, and the learning work on intervals only. A one-position interval takes the `#resolvePosition` fast path.
 - A forwarded request must have a footprint inside the scope of its target. The executor makes sure of this with
   `split`, so `partition_misrouted` always means a defect (G2).
+
+**The public form and the normalized form.** Each storage type has two forms. The public form comes from a host or
+from an RPC, so the runtime cannot trust it. The normalized form is checked one time, at the edge of the pipeline, and
+only the runtime uses it.
+
+| Concept | Public form (exported) | Normalized form (internal) |
+| --- | --- | --- |
+| A position | `FokosStoragePosition`: `{ routingHash: Uint8Array; hk?; sk? }` | `NormalizedPosition`: a checked 8-byte `RoutingHash`, `hk` and `sk` always present, and a `FokosCompositeKey` |
+| An interval | `FokosStorageInterval`: bounds of `FokosStoragePosition` | bounds of `NormalizedPosition` |
+| A span | `FokosSpan` | `NormalizedSpan`: the span, its normalized intervals, and its routingHash interval |
+| A footprint | `FokosFootprint` | `readonly NormalizedSpan[]` |
+
+- **The names today.** `FokosStorageKey` is the public position, and `FokosStoragePosition` is the normalized position
+  (`runtime-types.ts:104` and `115`). Milestone 3 renames both. The word "key" then means an item key only, and a
+  position no longer looks like a `RouteKey`. That likeness is what let `"routingHash" in key` decide the kind.
+- **One check.** `storagePositionOf` becomes the normalization of a position. It checks the length of `routingHash`
+  with `asRoutingHash`, and gives the empty key to an absent `hk` or `sk`. Only the normalized form reaches the
+  planner, the read-through gate, and the learning.
+- **Why `routingHash` stays `Uint8Array` in the public form.** The value comes from a host or over RPC, and the brand of
+  `RoutingHash` is a type only, which an RPC does not keep. The comment of `FokosStorageKey` today gives another reason:
+  "a bound can also be the empty byte string". No code outside the tests makes such a bound, and `asRoutingHash`
+  refuses it, so the new comment drops that reason.
+- `NormalizedPosition` and `NormalizedSpan` are not exported. A host gets the public form back in `split`, in
+  `FokosLocalCall.spans`, and in `hooks.admit`.
 
 **Intervals with inclusive bounds.** `KeyCodec.compare` is an unsigned byte compare (`key-codec.ts:103`). In this
 order, the smallest key above `s` is `s || 0x00`. So:
