@@ -311,11 +311,10 @@ milestone 1 removes them:
 | 6 | `single_owner` could not read through. | `#validateOperations` refused it, because `#executeLocal` had no branch for it. | The rule is in `EXECUTION_RULES`, and `one_owner` reads through. |
 | 7 | The Bloom guard grouped spans by hash key. | The Bloom filter answers for a routingHash. Two hash keys with one routingHash were two groups. | The guard groups by routingHash. It needs no hash of the key. |
 | 8 | A forward hashed each key again for the learning. | `#forwardGroup` and `#forwardSingleOwner` hashed each key a second time. | Each span carries its routingHash. |
+| 9 | A walk could read stale rows after a cutover. | The walk planned its visits one time, and the host awaits each visit. A local visit after a cutover read the rows of this partition, which are stale when a child completed its import during the walk. | A local visit whose plan is older than the last cutover plans its part again, and walks the owners of now from that point (section 7.2.2). |
 
-Two findings stay open, because a fix changes behaviour (sections 10.5 and 10.6):
-
-- A walk can run a local visit after it awaited an earlier visit, and a cutover can come between the two.
-- An empty `group` runs its handler here and lists no `executed` node in `servedBy`. Each other local run lists one.
+One finding stays open, because a fix changes behaviour (section 10.5): an empty `group` runs its handler here and
+lists no `executed` node in `servedBy`. Each other local run lists one.
 
 Milestone 1 also changed two things in the design of section 7.2.5:
 
@@ -477,6 +476,9 @@ export type FokosExecution<Req, Res, S extends FokosSpan> =
 - **`walk`.** `FokosWalkInput` has `local` and `forward` functions, as today. `visits` becomes an
   `Iterable<FokosVisit<S>>` and not an array, because an interval across many promoted routingHashes can have many
   visits. The host stops the iteration when its budget is used up. A walk is `readOnly: true` for now (section 10).
+  The host awaits each visit, so a cutover can come between the plan and a later local visit. Such a visit plans its
+  part again, and the runtime walks the owners of now for that part with the same `walk` function. The part has the
+  form of a forward to a router, so the host folds it unchanged, also when a budget stops it with a cursor.
 - **`local`.** The `local` shape of today. The destroy fence and the import gate apply as today.
 
 `S` is the span type of the footprint function of the operation. `split`, `merge`, and `walk` get only that type
@@ -558,8 +560,7 @@ What the contract gives:
   fallback, and the learning from the context. G1, G2, G4, G7, G8, and G11 therefore hold for each executor, the new
   ones too.
 - **G3 as a check, not only a rule.** The cutover transaction increments an in-memory ownership epoch. `plan` records
-  the epoch in each visit. `runLocal` fails an invariant when the epoch changed. A `walk` is the exception: its local
-  visits can run after an `await` (section 10.5). Today G3 depends on each dispatch function to keep
+  the epoch in each visit. `runLocal` fails an invariant when the epoch changed. A `walk` awaits between its visits, so a local visit whose epoch changed plans its part again (section 7.2.2). Today G3 depends on each dispatch function to keep
   the plan and the local write in one synchronous block. With the check, a new executor that awaits between the two
   fails in a test, and it never writes on a partition that lost the key.
 - **One miss ladder.** `forwardVisit` forgets the hint and plans the spans of the visit again. It returns the new
@@ -845,20 +846,7 @@ give `split` both the spans and their indexes.
 A host can then refuse a scan on a partition that is over its size. The host must decide which tags refuse an
 interval, because a refused read on a full partition does not make it smaller.
 
-### 10.5 A local visit of a walk after a cutover
-
-A walk plans its visits one time, and the host awaits each forward before the next visit. When a split of this
-partition cuts over during the walk, a later local visit still reads the rows of this partition. Writes go to the
-children after the cutover. A child refuses writes while it imports, so the read is stale only when the import of a
-child completes during the walk. Options:
-
-- The `local` function of the walk checks the epoch. When it changed, the visit is planned again and forwarded. This
-  needs a walk that can fold more than one answer for one visit.
-- The `local` function throws `partition_migrating` when the epoch changed, and the caller retries the page.
-
-The second option is small and keeps G3. It changes the answer of a rare race from a stale read to a retry.
-
-### 10.6 The empty fan-out
+### 10.5 The empty fan-out
 
 An empty `group` request runs the handler on the partition that receives it, also on a router, and lists no
 `executed` node. `txPrepare` has a handler branch for it. With `onEmpty` (section 7.2.2), each operation declares this
