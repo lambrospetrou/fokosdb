@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-11-28
 **Author:** Lambros
-**Status:** Milestone 1 is built (section 6.1). This document gives the design that section 8 of
+**Status:** Milestones 1 and 2 are built (sections 6.1 to 6.4). This document gives the design that section 8 of
 `docs/agent-plans/2026-11-20-scan-items.md` asks for. It is a breaking change of the host API one time, by decision.
 After it, a new kind of dispatch must be an additive change (section 8).
 
@@ -253,10 +253,10 @@ Each milestone ships on its own, and the full test suite passes after each one.
    points, one `#forwardVisit`, one read-through gate, and the `FokosExecutor` interface of section 7.2.5. The shapes
    still are the input, and the runtime maps each shape to an executor. No change of the host API and no change of
    behaviour. This milestone isolates the risk of the refactor from the risk of the API change.
-2. **The composite frontier.** The planner plans storage intervals across routingHashes: local slices, hash children,
-   and the range trees of promoted routingHashes. `planRangeFrontier` works on composite keys. The planner of an
-   interval reads the topology cache, as the planner of a point does. The walk then reads through with the gate of
-   the other executors, and its own branch in `#executeLocal` goes.
+2. **The composite frontier.** `planRangeFrontier` plans a composite interval of one routingHash, and the
+   projection on one hash key goes from the planner. The planner of an interval reads the topology cache, as the
+   planner of a point does. The walk reads through with the executor, and its own branch in `#executeLocal` goes.
+   The plan of an interval across routingHashes waits for its first consumer (section 6.4).
 3. **The new descriptor (breaking).** The shapes, `FokosRangeInput`, `FokosRangeVisit`, `SkInterval`, and
    `FokosRangeCursor` leave the sharding layer. Every operation of the three hosts moves. `hooks.admit` gets `spans`
    in place of `keys`. The coordinator uses a `hash_key` span, and `apiScanItems` uses a `position` span. The position
@@ -323,6 +323,54 @@ Milestone 1 also changed two things in the design of section 7.2.5:
 - The Bloom rule on a retry stays a fact of each shape (`bloomOnRetry`): `point` and `range` keep the Bloom step, and
   `group` and `single_owner` turn it off. Milestone 3 gives each operation the rule of section 7.2.5, by the number of
   routingHashes of the visit.
+
+### 6.3 What milestone 2 built
+
+The change is in `sharding/range-frontier.ts`, `sharding/runtime.ts`, and one function in `sharding/key-codec.ts`. The
+host API changes only in the experimental export `planRangeFrontier`, which takes a `CompositeInterval` now. The full
+test suite passes, with two new tests and no other test change.
+
+- **`KeyCodec.after(k)`** gives the smallest key above `k`: `k || 0x00`. `KeyCodec.successor` already exists, but
+  it is the upper bound of a prefix, which is a different key.
+- **`hashKeyInterval(hk, interval)`** turns the sort-key interval of one hash key into a half-open composite interval
+  with `after`. An open upper bound ends at `(after(hk), empty)`.
+- **`planRangeFrontier`** plans on composite keys. It compares the learned slices and the bases directly, and it does
+  not project them on a hash key. The runtime projects each planned segment on the hash key of the request, because
+  the `range` shape still gives the host sort-key visits.
+- **The topology cache.** On a hash router, a range request goes to the deepest hash descendant that the hash arena
+  or the topology cache knows, through `#hashTopologyOwner`, as a point does. The miss ladder cuts a topology hint
+  that missed.
+- **The walk reads through with the executor.** `#executeLocal` runs every executor with the read-through scope.
+  The walk executor answers a read-through with one visit: the local handler for the part inside the caller slice,
+  or a forward to the range root of a promoted routingHash.
+- **A property test** compares the planner with a brute-force cover: random range trees, random learned slices,
+  random intervals, and both directions (`range-frontier.test.ts`).
+
+### 6.4 What milestone 2 found
+
+| # | Finding | Before | After |
+| --- | --- | --- | --- |
+| 10 | The planner ignored a learned slice that holds every sort key of the hash key. | It compared the projections on the hash key, and the projection of such a slice equals the projection of its base, when the slice is narrower than the base in the composite order. | The planner compares composite bounds, and sends the visit to the deeper slice. That saves one hop. |
+| 11 | A range request on a hash router read the hash arena only. | A point read the arena and the topology cache, so a range request could take more hops than a point to the same partition. | Both use `#hashTopologyOwner`. |
+| 12 | The fallback of a range visit expected one new visit. | An invariant failed when the new plan had more than one visit. A Bloom hit after a hash miss, or a promotion that cut over during the request, gives such a plan. | One remote visit takes the place of the failed target. Every other new plan is walked for the part of the visit. |
+| 13 | The read-through cursor check ignored the hash key of the cursor. | It compared the sort key only. | It compares the composite key. |
+| 14 | The planner compared each learned slice with each base. | It did O(bases × slices) composite compares. | Each slice finds its base with a binary search. |
+| 15 | An exclusive lower bound on a partition edge was not exact. | A partition that ends at `after(v)` counted as part of the interval "above `v`", which holds no key of it. | The composite bounds are exact. |
+
+**Performance.** A benchmark of the pure planner, in Node, measured the best of 5 rounds of 200000 plans:
+
+| Case | Before | After |
+| --- | --- | --- |
+| A range router with 8 children and 24 learned slices | about 16000 ns | about 12000 ns |
+| A leaf: one local base, no learned slice | about 72 ns | about 72 ns |
+
+A point request takes the path of milestone 1 with no extra allocation: a request of one span resolves its position
+directly, and the executors do not copy the span list.
+
+**A change of the design.** The plan of an interval across routingHashes (section 7.2.4) has no consumer until a scan
+walks inside a Durable Object. A planner with no consumer has no test that a real request drives, so it waits for that
+consumer. Until then, an `interval` span must stay inside one routingHash. Milestone 3 refuses an interval span across
+routingHashes with `sharding_operation_invalid`.
 
 ## 7. Proposed solution
 
@@ -504,6 +552,9 @@ One function, `#plan(intervals, scope, opts)`, gives the visits of a footprint. 
 partition, or the caller slice during a read-through.
 
 - **A one-position interval** resolves with `#resolvePosition`, as today.
+The two items about an interval across routingHashes wait for their first consumer (section 6.4). Today an interval
+span stays inside one routingHash.
+
 - **An interval on a hash owner** is cut at each cut-over route override inside it. The parts between overrides are
   `local` visits. Each promoted routingHash `P` gets the visits of its range tree for `[P, P + 1)`, planned with the
   learned slices of `P`. `firstCutOverRouteOverride` gives the next override in one seek, as `ownedSliceEnd` does.
