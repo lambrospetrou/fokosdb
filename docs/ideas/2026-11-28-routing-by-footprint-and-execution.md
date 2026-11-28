@@ -38,7 +38,7 @@ References:
 A host declares each operation with one dispatch shape: `point`, `group`, `single_owner`, `range`, or `local`
 (`FokosOperation` in `sharding/runtime-types.ts:288`). A shape answers two questions at once:
 
-1. **Footprint.** What part of the storage order does the request touch?
+1. **Footprint.** What part of the storage order does the request read or write?
 2. **Execution.** How does the runtime run the owners of that part?
 
 Each new use case so far needed a new answer to one of the two questions, and got it as a special case:
@@ -59,7 +59,7 @@ adds a shape or overloads one more.
 
 The shapes are the core contract between a host and the runtime. Three hosts use them today
 (`FokosDBPartitionDO`, `FokosDBTransactionCoordinatorDO`, `FokosDBMaterializationDO`). Each new shape or overload
-changes this contract, and each change touches about 19 `descriptor.shape` branches in `runtime.ts`. The design must
+changes this contract, and each change spans about 19 `descriptor.shape` branches in `runtime.ts`. The design must
 be decided before the next consumer. A breaking change of the host API is acceptable now. A breaking change for each
 later kind of dispatch is not.
 
@@ -69,9 +69,10 @@ later kind of dispatch is not.
   is the empty key, the minimum.
 - **Storage interval** — a half-open interval `[start, end)` of positions. Type `FokosStorageInterval`.
 - **Scope** — the storage interval that one partition can own, from its identity (`storageInterval()`).
-- **Touch** — one element of a footprint: an item, a position, or a storage interval.
-- **Footprint** — the list of touches of one request.
-- **Visit** — one target partition, or `local`, with the touches that it serves. A planner gives a list of visits.
+- **Span** — one element of a footprint: an item, a hash key, a position, or a storage interval. Type `FokosSpan`.
+  Each span normalizes to storage intervals.
+- **Footprint** — the list of spans of one request. Type `FokosFootprint`.
+- **Visit** — one target partition, or `local`, with the spans that it serves. A planner gives a list of visits.
 - **Execution** — the rule that runs the visits of one request: `one_owner`, `fan_out`, or `walk`.
 
 ## 2. What routing must give
@@ -85,7 +86,7 @@ This section lists what the routing layer must give, independent of the API. Sec
 | Q1 | Which partition owns position `p` now? | Exact |
 | Q2 | Which partition do I send `p` to, with the fewest hops? | Hinted: a cache can be wrong, and a miss falls back |
 | Q3 | Which disjoint segments of an interval does each owner hold, in storage order? | Exact cover, hinted targets |
-| Q4 | Which touches of one request have the same owner? | Exact grouping |
+| Q4 | Which spans of one request have the same owner? | Exact grouping |
 | Q5 | What does this partition own: its scope, the end of its owned slice, and does it own key `k`? | Exact |
 | Q6 | During an import: which source answers my reads, and inside which caller slice? | Exact |
 | Q7 | Which partitions served this request, and how many forwards did it cost? | Evidence for learning and metering |
@@ -94,7 +95,7 @@ This section lists what the routing layer must give, independent of the API. Sec
 
 - **G1 One owner.** At each instant, each position has exactly one owner. The topology, the cut-over route overrides,
   and the repartition state decide it.
-- **G2 No misroute.** A partition never runs a handler for a touch outside its scope. It throws
+- **G2 No misroute.** A partition never runs a handler for a span outside its scope. It throws
   `partition_misrouted`, and does not apply the request.
 - **G3 No cutover race.** The ownership decision, the admission, and the local write of a synchronous handler run in
   one synchronous block. The first `await` is a remote call.
@@ -102,10 +103,10 @@ This section lists what the routing layer must give, independent of the API. Sec
   it holds the whole segment (`2026-09-20-query-entry-point-into-a-range-tree.md`).
 - **G5 Stable order.** An ordered walk visits owners in storage order. A repartition does not move a position, so a
   continuation position stays valid across splits and promotions.
-- **G6 One call per owner.** The touches of one request that have one owner reach it in one sub-request. `txCommit`
+- **G6 One call per owner.** The spans of one request that have one owner reach it in one sub-request. `txCommit`
   needs this rule (`commit_keyset_mismatch`).
 - **G7 Safe fallback.** A cache-miss fallback starts only after an error that proves that no handler ran on the
-  target. A fan-out operation must be idempotent for each touch, because a router can apply one part before another
+  target. A fan-out operation must be idempotent for each span, because a router can apply one part before another
   part fails.
 - **G8 Correct read-through.** During an import, only a read-only operation reads through. The source serves only the
   caller slice, and sends a promoted routingHash to its range tree, so it never serves a stale copy.
@@ -169,7 +170,7 @@ and a merged design must keep each one as a parameter, not as a shape:
 
 - A `point` retry can use the Bloom step again. A `group` retry turns it off (`HINTED_NO_BLOOM`, `runtime.ts:190`).
   With one hash key, the Bloom step cannot break the one-call-per-owner rule, so the rule is "Bloom off on a retry
-  when the touches have more than one hash key".
+  when the spans have more than one hash key".
 - A `point` error reaches the caller unchanged. A remote failure of an `attempt_all` group becomes
   `partition_fanout_failed`.
 - A `point` has no `subRequest` and no `merge`.
@@ -177,7 +178,7 @@ and a merged design must keep each one as a parameter, not as a shape:
 
 **Claim 3: `single_owner` is a `group` with a stricter policy.** Not quite. `single_owner` is not a fan-out. It needs
 the whole request in one synchronous handler call on one owner, for atomicity, and it answers `notApplicable` when the
-keys span more than one partition. It is a precondition on the execution: "one owner, or decline". It also cannot read
+keys are on more than one partition. It is a precondition on the execution: "one owner, or decline". It also cannot read
 through: `#validateOperations` refuses it (`runtime.ts:2671`), and `#executeLocal` has no branch for it.
 
 **Claim 4: the FokosDB key model is in the sharding layer.** Confirmed. `FokosRangeInput` holds `hashKey`, an
@@ -224,7 +225,7 @@ coordinate for points. Intervals are the part that remains.
 - One read-through gate checks any footprint against the caller slice, and plans it again at the source.
 - `hooks.admit` gets the full footprint.
 - The client resolves the same footprint types as the runtime.
-- **A later touch kind, execution kind, or gate is an additive change** for the host API, the wire, and the stored
+- **A later span kind, execution kind, or gate is an additive change** for the host API, the wire, and the stored
   state (section 8).
 
 ### 5.2 Out of scope
@@ -239,23 +240,23 @@ coordinate for points. Intervals are the part that remains.
 - Each moved operation gives the same targets, the same errors, and the same answers as before the change.
 - The property-based suites and the routing suites pass after each milestone. A test changes only for a renamed API.
 - The sharding layer imports no FokosDB module, also not as `import type`.
-- An unknown touch kind or execution kind fails at construction with `sharding_operation_invalid`, never at request
+- An unknown span kind or execution kind fails at construction with `sharding_operation_invalid`, never at request
   time.
 
 ## 6. Milestones
 
 Each milestone ships on its own, and the full test suite passes after each one.
 
-1. **The executor core.** Inside the runtime: one normalization of touches to storage intervals, one planner for
+1. **The executor core.** Inside the runtime: one normalization of spans to storage intervals, one planner for
    points, one `#forwardVisit`, one read-through gate, and the `FokosExecutor` interface of section 7.2.5. The shapes
    still are the input, and the runtime maps each shape to an executor. No change of the host API and no change of
    behaviour. This milestone isolates the risk of the refactor from the risk of the API change.
 2. **The composite frontier.** The planner plans storage intervals across routingHashes: local slices, hash children,
    and the range trees of promoted routingHashes. `planRangeFrontier` works on composite keys.
 3. **The new descriptor (breaking).** The shapes, `FokosRangeInput`, `FokosRangeVisit`, `SkInterval`, and
-   `FokosRangeCursor` leave the sharding layer. Every operation of the three hosts moves. `hooks.admit` gets `touches`
-   in place of `keys`. The coordinator uses a `hash_key` touch, and `apiScanItems` uses a `position` touch.
-4. **The client (breaking).** `FokosShardingClient.plan(touches)` and `send` replace `resolve`, `resolveRange`,
+   `FokosRangeCursor` leave the sharding layer. Every operation of the three hosts moves. `hooks.admit` gets `spans`
+   in place of `keys`. The coordinator uses a `hash_key` span, and `apiScanItems` uses a `position` span.
+4. **The client (breaking).** `FokosShardingClient.plan(spans)` and `send` replace `resolve`, `resolveRange`,
    `resolveAll`, `point`, and `range`. `fanOut` replaces the five copies of the grouping code.
 5. **The first new consumer.** The `graphGetItems` step, with gets and queries in one `fan_out`, proves the design.
 
@@ -265,8 +266,8 @@ Each milestone ships on its own, and the full test suite passes after each one.
 
 An operation has three independent parts:
 
-1. **A footprint function** gives the touches of a request.
-2. **An execution** says how the runtime runs the owners of the touches.
+1. **A footprint function** gives the spans of a request.
+2. **An execution** says how the runtime runs the owners of the spans.
 3. **Gates** say what the runtime does around the handler: `whileMigrating`, `readOnly`, `admissionTag`,
    `localMode`, `allowedWhileDestroying`.
 
@@ -275,8 +276,8 @@ executor reaches partitions only through the primitives of the pipeline.
 
 ```
  req ──► footprint(req) ──► normalize ──► gates ──► executor ──► envelope
-                            (every touch  (import,   │  uses only:
-                             becomes      admit)     ├─ plan(touches)       → visits
+                            (every span  (import,   │  uses only:
+                             becomes      admit)     ├─ plan(spans)       → visits
                              intervals)              ├─ runLocal(visit)     → the handler, inside the sync window
                                                      └─ forwardVisit(visit) → forward, miss ladder, learning
 ```
@@ -286,7 +287,7 @@ The shapes of today become these combinations:
 | Shape today | Footprint | Execution |
 | --- | --- | --- |
 | `point` | one item, or one position | `one_owner` |
-| `single_owner` | some items | `one_owner` with `onSpan: { answer }` |
+| `single_owner` | some items | `one_owner` with `onManyOwners: { answer }` |
 | `group` | some items | `fan_out` with a failure policy |
 | `range` | one interval inside one hash key | `walk` |
 | `local` | none | `local` |
@@ -309,7 +310,7 @@ The new form adds the combinations that have no shape today:
 
 ```ts
 /** One element of a footprint. `data` is opaque host data: the runtime gives it back in the visit. */
-export type FokosTouch<D = unknown> =
+export type FokosSpan<D = unknown> =
 	/** An item. The runtime hashes `key.hashKey`. */
 	| { kind: "item"; key: RouteKey; data?: D }
 	/** Every position of one hash key, for a host that routes by a hash key with no sort key. */
@@ -318,13 +319,16 @@ export type FokosTouch<D = unknown> =
 	| { kind: "position"; position: FokosStorageKey; data?: D }
 	/** A half-open storage interval. */
 	| { kind: "interval"; interval: FokosStorageInterval; data?: D };
+
+/** The spans of one request, in the order of the request. */
+export type FokosFootprint<S extends FokosSpan = FokosSpan> = readonly S[];
 ```
 
 Rules:
 
-- Each touch has an explicit `kind`. No code tells two kinds apart by the fields they have.
+- Each span has an explicit `kind`. No code tells two kinds apart by the fields they have.
 - The footprint function must be pure and deterministic (G10). The runtime calls it at each hop.
-- **Each touch kind normalizes to storage intervals, in one function.** An item and a position become a one-position
+- **Each span kind normalizes to storage intervals, in one function.** An item and a position become a one-position
   interval. A hash key becomes `[(rh, hk), (rh, hk || 0x00))`. The planner, the read-through gate, the containment
   check, and the learning work on intervals only. A one-position interval takes the `#resolvePosition` fast path.
 - A forwarded request must have a footprint inside the scope of its target. The executor makes sure of this with
@@ -351,57 +355,57 @@ function hashKeyInterval(routingHash: RoutingHash, hk: KeyBytes, lower?: KeyByte
 #### 7.2.2 The execution
 
 ```ts
-export type FokosExecution<Req, Res, T extends FokosTouch> =
-	/** All touches must have one owner. The owner gets the whole request. */
-	| { kind: "one_owner"; onSpan?: "misrouted" | { answer: Res } }
-	/** Each owner gets one sub-request with its touches. The answers are merged. */
+export type FokosExecution<Req, Res, S extends FokosSpan> =
+	/** All spans must have one owner. The owner gets the whole request. */
+	| { kind: "one_owner"; onManyOwners?: "misrouted" | { answer: Res } }
+	/** Each owner gets one sub-request with its spans. The answers are merged. */
 	| {
 			kind: "fan_out";
-			split(req: Req, touches: readonly T[]): Req;
+			split(req: Req, spans: readonly S[]): Req;
 			merge(parts: Array<FokosPart<Req, Res>>): Res;
 			failurePolicy: "fail_fast" | "attempt_all" | "collect";
-			/** A request with no touches: "local" runs the handler here, and `{ answer }` answers with no handler. */
+			/** A request with no spans: "local" runs the handler here, and `{ answer }` answers with no handler. */
 			onEmpty: "local" | { answer: Res };
 	  }
 	/** The host visits the owners in storage order, and owns the budget and the early exit. */
 	| {
 			kind: "walk";
 			order(req: Req): "asc" | "desc";
-			split(req: Req, touches: readonly T[]): Req;
-			walk(input: FokosWalkInput<Req, Res, T>): Promise<Res>;
+			split(req: Req, spans: readonly S[]): Req;
+			walk(input: FokosWalkInput<Req, Res, S>): Promise<Res>;
 	  }
 	/** No footprint: this partition runs the handler. */
 	| { kind: "local" };
 ```
 
-- **`one_owner`.** The default `onSpan: "misrouted"` fits an item, a hash key that is not promoted, and a position.
-  The single-shot transaction uses `{ answer: notApplicable }`. Before the runtime answers with `onSpan`, it resolves
+- **`one_owner`.** The default `onManyOwners: "misrouted"` fits an item, a hash key that is not promoted, and a position.
+  The single-shot transaction uses `{ answer: notApplicable }`. Before the runtime answers with `onManyOwners`, it resolves
   again with the Bloom step off, as `#singleOwner` does today. An error reaches the caller unchanged.
-- **`fan_out`.** `split` replaces `subRequest` and `clip`. In a sub-request, an interval touch has the clipped interval
-  of its visit, and an item touch is unchanged. One owner gets one sub-request for all its touches, items and intervals
+- **`fan_out`.** `split` replaces `subRequest` and `clip`. In a sub-request, an interval span has the clipped interval
+  of its visit, and an item span is unchanged. One owner gets one sub-request for all its spans, items and intervals
   together (G6). The `attempt_all` error stays `partition_fanout_failed`. Each `fan_out` operation must be idempotent
-  for each touch (G7). `onEmpty` has no default, so the rule that `txPrepare` uses today is now a declared choice.
+  for each span (G7). `onEmpty` has no default, so the rule that `txPrepare` uses today is now a declared choice.
 - **`walk`.** `FokosWalkInput` has `local` and `forward` functions, as today. `visits` becomes an
-  `Iterable<FokosVisit<T>>` and not an array, because an interval across many promoted routingHashes can have many
+  `Iterable<FokosVisit<S>>` and not an array, because an interval across many promoted routingHashes can have many
   visits. The host stops the iteration when its budget is used up. A walk is `readOnly: true` for now (section 10).
 - **`local`.** The `local` shape of today. The destroy fence and the import gate apply as today.
 
-`T` is the touch type of the footprint function of the operation. `split`, `merge`, and `walk` get only that type
+`S` is the span type of the footprint function of the operation. `split`, `merge`, and `walk` get only that type
 (section 8.3).
 
 #### 7.2.3 The visit
 
 ```ts
-export type FokosVisit<T extends FokosTouch = FokosTouch> = {
+export type FokosVisit<S extends FokosSpan = FokosSpan> = {
 	target: FokosPartitionRef | "local";
-	/** The touches that this visit serves. An interval is clipped to the scope of the target. */
-	touches: readonly T[];
+	/** The spans that this visit serves. An interval is clipped to the scope of the target. */
+	spans: readonly S[];
 	speculative: boolean;
 };
 ```
 
 `FokosVisit` replaces `FokosRangeVisit`, whose `start` and `end` are sort keys of one hash key. The `rangeVisits` and
-`forwardRangeVisit` primitives become `plan(touches)` and `forwardVisit(visit, op, req)`.
+`forwardRangeVisit` primitives become `plan(spans)` and `forwardVisit(visit, op, req)`.
 
 #### 7.2.4 The planner
 
@@ -418,8 +422,8 @@ partition, or the caller slice during a read-through.
 - **An interval on a range partition** uses `planRangeFrontier` on composite keys. The learned slices already have
   composite boundaries, so the projection on one hash key goes. The rule of G4 stays: a learned slice replaces its
   base only when the slice holds the whole segment.
-- **Grouping.** The planner merges the touches of one target into one visit, and runs `#guardBloomHits` over all
-  touches, so G6 holds for mixed footprints.
+- **Grouping.** The planner merges the spans of one target into one visit, and runs `#guardBloomHits` over all
+  spans, so G6 holds for mixed footprints.
 
 The planner is lazy for intervals. It yields visits in storage order, and it reads storage only for the visits that
 the caller takes.
@@ -435,7 +439,7 @@ interface FokosExecutor<E extends { kind: string }> {
 	readonly kind: E["kind"];
 	/** The rules of this kind, checked once at construction. */
 	readonly rules: {
-		touchKinds: ReadonlyArray<FokosTouch["kind"]> | "any";
+		spanKinds: ReadonlyArray<FokosSpan["kind"]> | "any";
 		readSource: "allowed" | "refused";
 		needsReadOnly: boolean;
 	};
@@ -448,13 +452,13 @@ interface FokosExecutor<E extends { kind: string }> {
 type FokosExecutionContext = {
 	op: string;
 	req: unknown;
-	touches: readonly NormalizedTouch[];
-	plan(touches: readonly NormalizedTouch[], opts?: { bloom?: boolean }): Iterable<PlannedVisit>;
+	spans: readonly NormalizedSpan[];
+	plan(spans: readonly NormalizedSpan[], opts?: { bloom?: boolean }): Iterable<PlannedVisit>;
 	/** Runs the handler here. Throws `sharding_cutover_raced` when the ownership epoch changed since the plan. */
 	runLocal(visit: PlannedVisit, req: unknown): unknown;
 	/** One forward with the miss ladder and the learning. A miss gives the visits of a new plan to the executor. */
 	forwardVisit(visit: PlannedVisit, req: unknown): Promise<FokosForwardResult>;
-	admit(touches: readonly NormalizedTouch[]): void;
+	admit(spans: readonly NormalizedSpan[]): void;
 	collector: RouteCollector;
 };
 ```
@@ -468,10 +472,10 @@ What the contract gives:
   the epoch in each visit. `runLocal` throws when the epoch changed. Today G3 depends on each dispatch function to keep
   the plan and the local write in one synchronous block. With the check, a new executor that awaits between the two
   fails in a test, and it never writes on a partition that lost the key.
-- **One miss ladder.** `forwardVisit` forgets the hint and plans the touches of the visit again. It returns the new
-  visits to the executor. The executor decides what they mean: `one_owner` answers `onSpan` for more than one visit,
+- **One miss ladder.** `forwardVisit` forgets the hint and plans the spans of the visit again. It returns the new
+  visits to the executor. The executor decides what they mean: `one_owner` answers `onManyOwners` for more than one visit,
   `fan_out` runs each one as a part, and `walk` puts them in the place of the failed visit. The Bloom step stays on
-  when all touches of the visit have one routingHash, and turns off otherwise.
+  when all spans of the visit have one routingHash, and turns off otherwise.
 - **Data-driven validation.** The constructor checks each descriptor against the `rules` of its executor. A new
   executor brings its own rules, and no table elsewhere changes.
 
@@ -480,7 +484,7 @@ What the contract gives:
 On the importing target, `#whileImporting` checks each normalized interval against the scope. Then it sends
 `executeLocal` to the source, as today.
 
-On the source, `#executeLocal` derives the touches from the request, checks them against the caller slice, and runs
+On the source, `#executeLocal` derives the spans from the request, checks them against the caller slice, and runs
 the executor of the operation with `plan` limited to the caller slice and the `EXACT` options. The planner already
 sends a promoted routingHash of a `hash_child` caller slice to its range tree, and it clips intervals to the caller
 slice. This replaces the three branches of `#executeLocal`. The gate does not know the execution kind, so a new
@@ -488,35 +492,35 @@ executor gets the read-through with no new code. The `executeLocal` request does
 
 #### 7.2.7 Admission, local calls, and learning
 
-`hooks.admit` gets the touches of the local part in place of `keys`:
+`hooks.admit` gets the spans of the local part in place of `keys`:
 
 ```ts
 admit?(input: {
 	op: string;
 	admissionTag?: string;
-	/** The touches of the local part. Intervals are clipped to this partition. */
-	touches: readonly FokosTouch[];
+	/** The spans of the local part. Intervals are clipped to this partition. */
+	spans: readonly FokosSpan[];
 	lifecycle: FokosLifecycle;
 	policy: TPolicy;
 }): "allow" | { reject: Error };
 ```
 
-The FokosDB hooks change in two lines. The partition hook tests `touches.length === 0` in place of
-`keys.length === 0`. The coordinator hook reads `touches[0].hashKey` from its `hash_key` touch.
+The FokosDB hooks change in two lines. The partition hook tests `spans.length === 0` in place of
+`keys.length === 0`. The coordinator hook reads `spans[0].hashKey` from its `hash_key` span.
 
-`FokosLocalCall` is the place for per-call facts. It gets `touches`, the part of the footprint that this call
+`FokosLocalCall` is the place for per-call facts. It gets `spans`, the part of the footprint that this call
 serves, next to `signal` and `ownedSliceEnd`.
 
-`#learn` takes the routingHash intervals of the touches in place of a list of routingHashes. An item or a position
+`#learn` takes the routingHash intervals of the spans in place of a list of routingHashes. An item or a position
 gives a one-hash interval, so the learning of points does not change.
 
 #### 7.2.8 The descriptor
 
 ```ts
-export type FokosOperation<Req, Res, T extends FokosTouch = FokosTouch> = FokosOperationGates<Req, Res> & {
+export type FokosOperation<Req, Res, S extends FokosSpan = FokosSpan> = FokosOperationGates<Req, Res> & {
 	/** Absent only for the `local` execution. */
-	footprint?(req: Req): readonly T[];
-	execution: FokosExecution<Req, Res, T>;
+	footprint?(req: Req): FokosFootprint<S>;
+	execution: FokosExecution<Req, Res, S>;
 };
 ```
 
@@ -541,7 +545,7 @@ apiScanItems: {
 },
 txExecuteSingleShot: {
 	footprint: (req) => req.items.map((item) => ({ kind: "item", key: keyOf(item) })),
-	execution: { kind: "one_owner", onSpan: { answer: { outcome: "not_applicable" } } },
+	execution: { kind: "one_owner", onManyOwners: { answer: { outcome: "not_applicable" } } },
 	whileMigrating: "throw", admissionTag: "write",
 	local: (req, call) => this.singleShotLocal(req, call),
 },
@@ -551,7 +555,7 @@ txCommit: {
 		kind: "fan_out",
 		failurePolicy: "attempt_all",
 		onEmpty: "local",
-		split: (req, touches) => ({ ...req, items: touches.map((t) => t.data!) }),
+		split: (req, spans) => ({ ...req, items: spans.map((t) => t.data!) }),
 		merge: (parts) => ({ outcome: "committed", partitions: parts.flatMap((p) => p.result.partitions) }),
 	},
 	whileMigrating: "throw", admissionTag: "ignore_size_reject",
@@ -563,7 +567,7 @@ apiQueryItems: {
 	execution: {
 		kind: "walk",
 		order: (req) => req.direction,
-		split: (req, touches) => clipQueryToInterval(req, touches[0].interval),
+		split: (req, spans) => clipQueryToInterval(req, spans[0].interval),
 		walk: (input) => walkQueryVisits(input),
 	},
 	whileMigrating: "read_source", readOnly: true, admissionTag: "read",
@@ -581,14 +585,14 @@ initiateWrite: {
 
 `FokosShardingClient` gets the same model, and its old resolve methods go:
 
-- `plan(touches, opts?)` gives `Array<{ ctx; touches; indexes }>`. A one-position touch goes to the deepest known
-  partition of its position. An interval goes to the deepest known partition that holds the whole interval. Touches
+- `plan(spans, opts?)` gives `Array<{ ctx; spans; indexes }>`. A one-position span goes to the deepest known
+  partition of its position. An interval goes to the deepest known partition that holds the whole interval. Spans
   with the same entry form one group.
 - `send(op, entry, req, opts?)` sends one request to one entry, with the topology fallbacks and the retry policy of
   today. The unused `keys` argument goes.
-- `fanOut(op, touches, req, split, opts?)` sends one request for each group in parallel, and gives the parts back. It
+- `fanOut(op, spans, req, split, opts?)` sends one request for each group in parallel, and gives the parts back. It
   replaces the grouping code in `client/db.ts`, the coordinator, `gsi-writer.ts`, and `do-partition.ts`.
-- The normalization of touches is one module that the client and the runtime both import, so a new touch kind is one
+- The normalization of spans is one module that the client and the runtime both import, so a new span kind is one
   change for both sides.
 
 The client does not import a descriptor. A host that wants one footprint function on both sides puts it in a shared
@@ -596,16 +600,16 @@ module, next to the request type.
 
 #### 7.2.10 Performance
 
-- **Points.** The pipeline adds one array of one touch and one compiled-descriptor lookup. Milestone 1 must show no
+- **Points.** The pipeline adds one array of one span and one compiled-descriptor lookup. Milestone 1 must show no
   regression with the `profile-worker-local` skill on `getItem` and `putItem`.
-- **Groups.** The cost is the same as today: one resolution for each touch and one guard pass.
+- **Groups.** The cost is the same as today: one resolution for each span and one guard pass.
 - **Intervals.** A plan costs one override seek for each promoted routingHash in the interval, plus one learned-slice
   list for each range tree that it enters. The lazy planner pays only for the visits that the walk takes.
 
 #### 7.2.11 Testing
 
 - A property test, for random topologies with hash splits, range splits, and promotions: for each footprint, the
-  visits of `#plan` cover each touch exactly once (G4), in storage order, and each visit is inside the scope of its
+  visits of `#plan` cover each span exactly once (G4), in storage order, and each visit is inside the scope of its
   target (G2).
 - A property test, run once against the code before milestone 3: each moved operation gives the same targets, the
   same errors, the same answers, and the same admission decisions as its shape.
@@ -624,19 +628,19 @@ A "new kind of dispatch" is a change on one of three axes. Each axis has one ext
 
 | Axis | Examples | Extension point | What else changes |
 | --- | --- | --- | --- |
-| What the request touches | `hash_key` (in this RFC), a key prefix, a routingHash range | a touch kind: one normalization to intervals | nothing |
+| What the request reads or writes | `hash_key` (in this RFC), a key prefix, a routingHash range | a span kind: one normalization to intervals | nothing |
 | How the owners run | a local continuation for `graphGetItems`, a paged fan-out, a walk that writes | a `FokosExecutor` | nothing |
 | What happens around the handler | a new `whileMigrating` value | an optional gate with a default | the gates code only |
 
 The planner, the read-through gate, the admission, the learning, and the envelope work on normalized intervals and
-on visits. They do not know the touch kind or the execution kind. This is what makes each axis additive.
+on visits. They do not know the span kind or the execution kind. This is what makes each axis additive.
 
 ### 8.2 The host API (TypeScript)
 
-1. **The unions that a host builds are open for new members.** `FokosTouch` and `FokosExecution` get new members.
+1. **The unions that a host builds are open for new members.** `FokosSpan` and `FokosExecution` get new members.
    Code that builds an old member still compiles.
 2. **The values that a host receives have the types that the host declared.** `split`, `merge`, `walk`, and
-   `FokosLocalCall.touches` get `T`, the touch type of the footprint function of the operation. A new touch kind
+   `FokosLocalCall.spans` get `S`, the span type of the footprint function of the operation. A new span kind
    therefore never reaches the code of an operation that does not use it, and an exhaustive `switch` in host code
    stays exhaustive.
 3. **The values that the runtime makes are open, and the documentation says so.** `FokosServedRole`, the error codes,
@@ -652,7 +656,7 @@ on visits. They do not know the touch kind or the execution kind. This is what m
 During a gradual deploy, a router of version N can forward to a target of version N + 1. The rules:
 
 1. **The wire carries no kind and no plan.** A forward is `stub[op](targetCtx, req)`. A read-through is
-   `fokosRpc("executeLocal", { op, repartitionId, caller, request })`. Each hop derives the touches and the execution
+   `fokosRpc("executeLocal", { op, repartitionId, caller, request })`. Each hop derives the spans and the execution
    from its own descriptor of `op` (G10).
 2. **The meaning of a request at its target does not depend on the execution kind.** The contract of every executor
    is: a target gets a request whose footprint is inside its scope, and serves exactly that footprint. A target
@@ -680,8 +684,8 @@ operation gets a new name (rule 3 of section 8.3).
 
 ### 8.6 Checklist for a new kind
 
-1. Add the member to `FokosTouch` or to `FokosExecution`, with a doc comment.
-2. For a touch kind: add its normalization to intervals in the shared module, and a case in the coverage property
+1. Add the member to `FokosSpan` or to `FokosExecution`, with a doc comment.
+2. For a span kind: add its normalization to intervals in the shared module, and a case in the coverage property
    test.
 3. For an execution kind: add one `FokosExecutor` with its `rules`. Use only the context primitives.
 4. Add the validation tests of its rules, and the property test for G4 and G2 with the new kind.
@@ -690,17 +694,17 @@ operation gets a new name (rule 3 of section 8.3).
 
 ### 8.7 Two worked examples
 
-**A touch kind: `hash_key`.** This RFC adds it for the coordinator. Its normalization is
+**A span kind: `hash_key`.** This RFC adds it for the coordinator. Its normalization is
 `[(rh, hk), (rh, hk || 0x00))`. The planner, the gate, and the learning need no change. The coordinator stops making up
-a sort key, and its admission hook reads `touches[0].hashKey`.
+a sort key, and its admission hook reads `spans[0].hashKey`.
 
 **An execution kind: the local continuation of `graphGetItems`** (`2026-11-27-graph-get-items.md`, section 4.2.12).
-The handler reads its touches, and returns derived reads as new touches. The executor `continue` runs:
+The handler reads its spans, and returns derived reads as new spans. The executor `continue` runs:
 
-1. `plan` the touches, and run the local visit with `runLocal`.
-2. Take the new touches from the answer, and `plan` them. Run the local visits in the same synchronous block, until no
-   local touch is ready or the answer is full.
-3. Return the remaining touches as the frontier, or forward them with `forwardVisit`.
+1. `plan` the spans, and run the local visit with `runLocal`.
+2. Take the new spans from the answer, and `plan` them. Run the local visits in the same synchronous block, until no
+   local span is ready or the answer is full.
+3. Return the remaining spans as the frontier, or forward them with `forwardVisit`.
 
 The executor uses only the context primitives. The epoch check replaces the rule "no checker is kept across an
 `await`" of that RFC. No other part of the runtime changes, and the wire gets no new field.
@@ -734,13 +738,13 @@ Options: a cap with an error, or a paged fan-out executor. The answer decides if
 ### 10.2 A walk that writes
 
 A delete over an interval is a `walk` or a `fan_out` with `readOnly: false` and `whileMigrating: "throw"`. It must be
-idempotent for each touch, and it must stop at a budget. Option: allow `fan_out` writes over intervals first, and keep
+idempotent for each span, and it must stop at a budget. Option: allow `fan_out` writes over intervals first, and keep
 `walk` read-only.
 
-### 10.3 Data on the touch or an index
+### 10.3 Data on the span or an index
 
 `data` keeps the shape of `items(req)` today. An index into the footprint needs no generic type for the data. Option:
-give `split` both the touches and their indexes.
+give `split` both the spans and their indexes.
 
 ### 10.4 Admission of intervals
 
@@ -758,11 +762,11 @@ Yes, as a name. A point is a footprint of one item, one hash key, or one positio
 
 **Why does `single_owner` not become a `fan_out`?**
 Because it needs the whole request in one synchronous handler call, for atomicity. A `fan_out` gives each owner a part.
-`one_owner` with `onSpan` says the rule directly.
+`one_owner` with `onManyOwners` says the rule directly.
 
 **Why keep positions when intervals exist?**
-A scan step needs "the owner of this position, which serves its slice from there". An interval of `one_owner` can span
-owners and then gives `onSpan`. A position cannot span, so it says the rule of the step directly.
+A scan step needs "the owner of this position, which serves its slice from there". An interval of `one_owner` can have
+more than one owner and then gives `onManyOwners`. A position has one owner, so it says the rule of the step directly.
 
 **Why does a new dispatch for an existing operation need a new name?**
 Because each hop plans the request with its own descriptor. During a deploy, two versions of one operation can be on
