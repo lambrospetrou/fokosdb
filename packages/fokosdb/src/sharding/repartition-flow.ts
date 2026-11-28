@@ -108,6 +108,8 @@ export type RepartitionCommonDeps = {
 	platform: FokosPlatform;
 	/** Runs inside the completion transaction, after `beforeComplete`. Synchronous. */
 	onCompleted?: (plan: FokosRepartitionPlan, completedAt: number) => void;
+	/** Runs inside the cutover transaction, after `onRepartitionCutover`. Synchronous. */
+	onCutover?: () => void;
 };
 
 export type RepartitionSourceDeps = RepartitionCommonDeps;
@@ -562,6 +564,7 @@ export class RepartitionSource {
 
 			this.deps.hooks.onRepartitionCutover?.(this.#hookPlan(current));
 			this.store.setRepartitionState(row.id, "cutover", { cutoverAt: now });
+			this.deps.onCutover?.();
 			this.store.refreshRepartitionDue(row.id, now);
 			return "progressed";
 		});

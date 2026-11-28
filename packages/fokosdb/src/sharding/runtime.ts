@@ -47,7 +47,6 @@ import {
 	hashStorageInterval,
 	rangeStorageInterval,
 	sliceIncludesHashKey,
-	sliceIncludesItem,
 	sliceIncludesPosition,
 	type FokosSlice,
 } from "./repartition-slice.js";
@@ -202,21 +201,77 @@ type RouterView = {
 
 const NOT_ROUTER: RouterView = { router: false, rangeChildren: [] };
 
-/** One item of a `group` request with its route key. */
-type GroupEntry = { key: RouteKey; item: unknown };
-/** The items of a `group` request that resolved to one remote target. They share one resolution. */
-type RemoteGroup = { resolution: RemoteResolution; entries: GroupEntry[] };
-type GroupParts = Array<FokosGroupPart<unknown, unknown> | FokosGroupFailure<unknown>>;
-/** The parts of a `group` run, and the failures that the failure policy reports. */
-type GroupRun = { parts: GroupParts; localFailure?: { request: unknown; error: unknown }; remoteFailures: unknown[] };
-/** The entries of a `group` request by target, as `#groupByOwner` builds them. `remote` is keyed by partition ID. */
-type Groups = { local: GroupEntry[]; remote: Map<string, RemoteGroup> };
-/** The entries of one hash key that have a Bloom hit, each with its own resolution. */
-type BloomHashKey = { hashKey: KeyBytes; entries: Array<{ entry: GroupEntry; resolution: RemoteResolution }> };
-/** Where the keys of a `single_owner` request go. `spans` is the set that is local and remote, or on two remote targets. */
-type SingleOwnerResolution = { kind: "local" } | { kind: "remote"; resolution: RemoteResolution } | { kind: "spans_many" };
+/**
+ * One element of the footprint of a request, after normalization. Every shape gives its footprint in
+ * this form, so the import gate, the admission, the planner, and the learning have one input.
+ */
+type NormalizedSpan = PointSpan | IntervalSpan;
+/** A span with one owner: an item that a request names, or a position that names no item. */
+type PointSpan =
+	| { kind: "item"; key: RouteKey; data: unknown; position: FokosStoragePosition }
+	| { kind: "position"; position: FokosStoragePosition };
+/** The interval of a `range` request. `position` is the start of its hash key, `(routingHash, hk)`. */
+type IntervalSpan = { kind: "interval"; range: FokosRangeInput; position: FokosStoragePosition };
+
+/** The point spans of a request that resolved to one remote target. They share one resolution. */
+type RemoteVisit = { resolution: RemoteResolution; spans: PointSpan[] };
+/** The point spans of a request by target, as `#planPoints` builds them. `remote` is keyed by partition ID. */
+type PointPlan = {
+	local: PointSpan[];
+	remote: Map<string, RemoteVisit>;
+	/** The ownership epoch when the plan was made. A local run checks it (`#assertEpoch`). */
+	epoch: number;
+};
+/** The spans of one routingHash that have a Bloom hit, each with its own resolution. */
+type BloomRoutingHash = { routingHash: RoutingHash; spans: Array<{ span: PointSpan; resolution: RemoteResolution }> };
+/** Where the spans of a `one_owner` request go. `many` is a set that is local and remote, or on two remote targets. */
+type OneOwnerResolution = { kind: "local"; epoch: number } | { kind: "remote"; resolution: RemoteResolution } | { kind: "many" };
+type FanOutParts = Array<FokosGroupPart<unknown, unknown> | FokosGroupFailure<unknown>>;
+/** The parts of a `fan_out` run, and the failures that the failure policy reports. */
+type FanOutRun = { parts: FanOutParts; localFailure?: { request: unknown; error: unknown }; remoteFailures: unknown[] };
+
+/**
+ * The facts of a remote target that the miss ladder reads: which step of the resolution chose it, and
+ * the cache hint that it came from. A point resolution and a planned range visit both give one.
+ */
+type MissHint = Pick<RemoteResolution, "via" | "learned" | "relDepth" | "topologyHint">;
 
 type AnyOperation = FokosOperation<unknown, unknown>;
+
+/** One planned range visit, and the hint of its target for the miss ladder. */
+type RangePlan = { planned: PlannedVisit; hint: MissHint };
+
+/** The execution kinds. Each shape maps to one of them, in `#compile`. */
+type ExecutionKind = "one_owner" | "fan_out" | "walk" | "local";
+
+/** The rules of each execution kind, checked once for each operation in the constructor. */
+const EXECUTION_RULES: { readonly [K in ExecutionKind]: { readonly readSource: boolean } } = {
+	one_owner: { readSource: true },
+	fan_out: { readSource: true },
+	walk: { readSource: true },
+	local: { readSource: false },
+};
+
+/** One registered operation, compiled once in the constructor. */
+type CompiledOperation = {
+	descriptor: AnyOperation;
+	execution: ExecutionKind;
+	/** `one_owner` only: the answer when the spans have more than one owner. Absent: the spans cannot have more than one. */
+	onManyOwners?: { answer: unknown };
+	/**
+	 * A retry after a cache miss can use the Bloom step again. Only a request of one point keeps it: a
+	 * Bloom hit answers for one routingHash, so on a retry it can split the spans of one owner.
+	 */
+	bloomOnRetry: boolean;
+};
+
+/**
+ * Where an execution runs. `owned`: on this partition, for its own scope. `readThrough`: on an import
+ * source, for the caller slice of its target. A read-through admits nothing, runs no `beforeForward`,
+ * applies no signal, and plans each span inside the caller slice.
+ */
+type ExecutionScope = { kind: "owned" } | { kind: "readThrough"; slice: FokosSlice };
+const OWNED: ExecutionScope = { kind: "owned" };
 
 export type FokosRuntimeConstructorOptions<TPolicy, Ops extends FokosOperationSpec> = FokosRuntimeOptions<TPolicy> & {
 	ctx: DurableObjectState;
@@ -231,6 +286,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #stub: FokosRuntimeOptions<TPolicy>["stub"];
 	readonly #hooks: FokosShardingHooks<TPolicy>;
 	readonly #ops: Record<string, AnyOperation>;
+	readonly #compiled: Record<string, CompiledOperation>;
 	readonly #store: FokosShardingStore;
 	readonly #source: RepartitionSource;
 	readonly #target: RepartitionTarget;
@@ -260,7 +316,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/** Writes the Bloom filter at most once per `promotionBloomFlushMs`, in a timer task of its own. */
 	readonly #bloomFlushThrottled: ReturnType<typeof throttleTrailing>;
 	/** The plan of every visit `rangeVisits` returned, by the visit object, so `forwardRangeVisit` can fall back. */
-	readonly #plans = new WeakMap<FokosRangeVisit, PlannedVisit>();
+	readonly #plans = new WeakMap<FokosRangeVisit, RangePlan>();
+	/**
+	 * Counts the cutovers of this partition in this isolate. A cutover changes the owner of some keys, so
+	 * a local run checks that the count did not change after its plan (`#assertEpoch`).
+	 */
+	#ownershipEpoch = 0;
 
 	constructor(opts: FokosRuntimeConstructorOptions<TPolicy, Ops>) {
 		this.#ctx = opts.ctx;
@@ -268,7 +329,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#stub = opts.stub;
 		this.#hooks = opts.hooks;
 		this.#ops = opts.operations as Record<string, AnyOperation>;
-		this.#validateOperations();
+		this.#compiled = this.#compileOperations();
 		this.#configOverrides = opts.config;
 		this.#adminOutbox = opts.adminOutbox;
 		this.#topologyCache = opts.topologyCache;
@@ -290,6 +351,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			routingHashSeedResolver: this.#routingHashSeedResolver,
 			platform: this.#platform,
 			onCompleted: (plan, completedAt) => this.#recordCompletion(plan, completedAt),
+			onCutover: () => {
+				this.#ownershipEpoch++;
+			},
 		};
 		this.#source = new RepartitionSource(this.#store, deps);
 		this.#target = new RepartitionTarget(this.#store, {
@@ -348,21 +412,22 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		routeCtx: FokosRouteContext<TPolicy>,
 		req: Ops[K]["req"],
 	): Promise<FokosEnvelope<Ops[K]["res"]>> {
-		const descriptor = this.#ops[op];
-		invariant(descriptor, () => `fokos/runtime: operation ${op} is not registered`);
+		const compiled = this.#compiled[op];
+		invariant(compiled, () => `fokos/runtime: operation ${op} is not registered`);
 		let collector: RouteCollector | undefined;
 		return await this.#guard(
 			op,
 			async () => {
 				this.#ensureIdentity(routeCtx)();
 				collector = new RouteCollector();
-				return (await this.#dispatch(op, descriptor, req, collector)) as FokosEnvelope<Ops[K]["res"]>;
+				return (await this.#dispatch(op, compiled, req, collector)) as FokosEnvelope<Ops[K]["res"]>;
 			},
 			() => collector,
 		);
 	}
 
-	async #dispatch(op: string, descriptor: AnyOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
+	async #dispatch(op: string, compiled: CompiledOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
+		const { descriptor } = compiled;
 		if (descriptor.shape === "local") {
 			if (descriptor.whileMigrating === "throw" && this.#target.isImporting()) {
 				// The same gate the other shapes take, under the name of this operation: the request nudges
@@ -379,19 +444,61 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return envelope(value, collector.build());
 		}
 
+		const spans = this.#spansOf(descriptor, req);
 		if (this.#target.isImporting()) {
-			return await this.#whileImporting(op, descriptor, req, collector);
+			return await this.#whileImporting(op, compiled, spans, req, collector);
 		}
+		const value = await this.#execute(op, compiled, spans, req, collector, OWNED);
+		return envelope(value, collector.build());
+	}
 
+	/**
+	 * Runs the executor of the operation. This is the only place that selects code by the execution
+	 * kind: the import gate, the planner, the forward, the miss ladder, and the learning are the same
+	 * for each kind.
+	 */
+	async #execute(
+		op: string,
+		compiled: CompiledOperation,
+		spans: readonly NormalizedSpan[],
+		req: unknown,
+		collector: RouteCollector,
+		scope: ExecutionScope,
+	): Promise<unknown> {
+		switch (compiled.execution) {
+			case "one_owner":
+				return await this.#runOneOwner(op, compiled, pointSpans(spans), req, collector, scope);
+			case "fan_out":
+				return await this.#runFanOut(op, compiled, pointSpans(spans), req, collector, scope);
+			case "walk":
+				invariant(scope.kind === "owned", "fokos/runtime: a walk reads through with its own gate");
+				return await this.#runWalk(op, compiled, intervalSpan(spans), req, collector);
+			case "local":
+				return invariant(false, "fokos/runtime: a local operation has no executor");
+		}
+	}
+
+	/**
+	 * The footprint of a request as spans. A `RouteKey` and a position each become one point span, and
+	 * a range request becomes one interval span.
+	 */
+	#spansOf(descriptor: AnyOperation, req: unknown): NormalizedSpan[] {
 		switch (descriptor.shape) {
-			case "point":
-				return await this.#dispatchPoint(op, descriptor, req, collector);
+			case "point": {
+				const key = descriptor.key(req);
+				const position = this.#positionOf(key);
+				return ["routingHash" in key ? { kind: "position", position } : { kind: "item", key, data: undefined, position }];
+			}
 			case "group":
-				return await this.#dispatchGroup(op, descriptor, req, collector);
+				return descriptor.items(req).map(({ key, item }) => ({ kind: "item", key, data: item, position: this.#positionOf(key) }));
 			case "single_owner":
-				return await this.#dispatchSingleOwner(op, descriptor, req, collector);
-			case "range":
-				return await this.#dispatchRange(op, descriptor, req, collector);
+				return descriptor.items(req).map(({ key }) => ({ kind: "item", key, data: undefined, position: this.#positionOf(key) }));
+			case "range": {
+				const range = descriptor.range(req);
+				return [{ kind: "interval", range, position: this.#positionOf({ hashKey: range.hashKey, sortKey: NO_SORT_KEY }) }];
+			}
+			case "local":
+				return [];
 		}
 	}
 
@@ -414,8 +521,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * step and restores the fallback alarm, so the partition makes progress even when no start
 	 * notification arrived.
 	 */
-	async #whileImporting(op: string, descriptor: AnyOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
+	async #whileImporting(
+		op: string,
+		compiled: CompiledOperation,
+		spans: readonly NormalizedSpan[],
+		req: unknown,
+		collector: RouteCollector,
+	): Promise<FokosEnvelope<unknown>> {
 		await this.#nudgeImport();
+		const { descriptor } = compiled;
 		// `dispatch` gates a `local` operation with `whileMigrating: "throw"` before this point and runs
 		// every other `local` operation without the gate, so this gate never sees one.
 		invariant(descriptor.shape !== "local", "fokos/runtime: a local operation cannot reach the import gate");
@@ -430,15 +544,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			});
 		}
 
-		// Ownership only, never a forward: a key this partition cannot own is a routing defect, and a
-		// key it owns is answered by the source for as long as the import runs.
-		if (descriptor.shape === "range") {
-			this.#assertCanOwnRange(op, descriptor.range(req));
-		} else {
-			for (const pos of this.#scopePositions(descriptor, req)) {
-				if (!this.#ownsByTopology(pos)) {
-					throw misrouted(op, "key outside this partition");
-				}
+		// Ownership only, never a forward: a span this partition cannot own is a routing defect, and a
+		// span it owns is answered by the source for as long as the import runs.
+		for (const span of spans) {
+			if (span.kind === "interval") {
+				this.#assertCanOwnRange(op, span.range);
+			} else if (!this.#ownsByTopology(span.position)) {
+				throw misrouted(op, "key outside this partition");
 			}
 		}
 		// This partition owns the scope and its source executes for it: both facts reach the caller, and
@@ -470,134 +582,279 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			throw e;
 		}
-		this.#learn(result.routing.servedBy, this.#scopeRoutingHashes(descriptor, req));
+		this.#learn(result.routing.servedBy, routingHashesOf(spans));
 		collector.mergeForwarded(result.routing, this.#hashDepthStampForRangeNodes());
 		return envelope(result.value, collector.build());
 	}
 
-	async #dispatchPoint(
+	// ═══ the one_owner executor ═════════════════════════════════════════════
+
+	/**
+	 * Runs the whole request on the one owner of its spans: the `point` and the `single_owner` shapes.
+	 * When the spans have more than one owner, the answer is `onManyOwners`.
+	 */
+	async #runOneOwner(
 		op: string,
-		descriptor: Extract<AnyOperation, { shape: "point" }>,
+		compiled: CompiledOperation,
+		spans: readonly PointSpan[],
 		req: unknown,
 		collector: RouteCollector,
-	): Promise<FokosEnvelope<unknown>> {
-		const key = descriptor.key(req);
-		const pos = this.#positionOf(key);
-		// A position names no item, so its admission gets no keys.
-		const admitted = "routingHash" in key ? [] : [key];
-		const resolution = this.#resolvePosition(pos, HINTED);
-		if (resolution.kind === "out_of_range") {
-			throw misrouted(op, "key outside this partition");
+		scope: ExecutionScope,
+	): Promise<unknown> {
+		const descriptor = routedDescriptor(compiled);
+		const owner = this.#oneOwner(op, spans, HINTED, scope);
+		if (owner.kind === "local") {
+			this.#admitIn(scope, op, descriptor, spans);
+			const before = this.#beforeForwardIn(scope, descriptor, req);
+			const { value, signals } = await this.#runLocalScope(descriptor, req, collector, scope, owner.epoch);
+			await this.#applySignalsIn(scope, [...before, ...signals]);
+			return value;
 		}
-		if (resolution.kind === "local") {
-			this.#admit(op, descriptor, admitted);
-			const before = this.#beforeForward(descriptor, req);
-			const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
-			await this.#applySignals([...before, ...signals]);
-			return envelope(value, collector.build());
+		const before = this.#beforeForwardIn(scope, descriptor, req);
+		if (owner.kind === "many") {
+			// A value and not an error: on a split shard group this is the ordinary answer for such a
+			// set, and it carries no side effects at any depth of a forwarding chain.
+			await this.#applySignalsIn(scope, before);
+			return manyOwnersAnswer(op, compiled);
 		}
-		const before = this.#beforeForward(descriptor, req);
-		const forwarded = this.#forwardPoint(op, descriptor, req, pos, admitted, resolution, collector, 0);
+		const forwarded = this.#forwardOneOwner(op, compiled, spans, req, owner.resolution, collector, scope, 0);
 		forwarded.catch(() => {});
-		await this.#applySignals(before);
-		return envelope(await forwarded, collector.build());
+		await this.#applySignalsIn(scope, before);
+		return await forwarded;
 	}
 
 	/**
-	 * Runs the local handler and lists this partition as its executor. The node is added before the
-	 * handler runs: a handler that throws still served the scope, and the error carries the node so a
-	 * forwarding partition learns from the error as it learns from a result. The signals come back to
-	 * the caller, because the caller decides when they apply: after the handler settled, and only when
-	 * it did not throw.
+	 * Where the spans of a `one_owner` request go. A Bloom hit answers for one routingHash, so it can make
+	 * the spans of one owner look like the spans of two partitions. Such a set resolves again with the
+	 * Bloom step off before the answer is `many`.
 	 */
-	async #runLocalScope(
-		descriptor: Exclude<AnyOperation, { shape: "local" }>,
-		req: unknown,
-		collector: RouteCollector,
-	): Promise<{ value: unknown; signals: FokosSignals[] }> {
-		const { call, signals } = this.#localCall();
-		collector.add(this.#selfNode("executed"));
-		const value = await this.#runLocal(descriptor, req, call);
-		return { value, signals };
+	#oneOwner(op: string, spans: readonly PointSpan[], opts: ResolveOptions, scope: ExecutionScope): OneOwnerResolution {
+		const plan = this.#plan(op, spans, opts, scope);
+		if (plan.remote.size === 0) {
+			return { kind: "local", epoch: plan.epoch };
+		}
+		const [first] = plan.remote.values();
+		if (plan.remote.size === 1 && plan.local.length === 0) {
+			return { kind: "remote", resolution: first.resolution };
+		}
+		if (opts.bloom && [...plan.remote.values()].some((visit) => isBloomHit(visit.resolution))) {
+			return this.#oneOwner(op, spans, HINTED_NO_BLOOM, scope);
+		}
+		return { kind: "many" };
 	}
 
 	/**
-	 * Forwards one point request and applies the two fallbacks of a cache miss: a speculative range
-	 * forward that finds no range partition, or no cutover on a read, resolves again with the Bloom
-	 * step off; a cached hash jump that finds no partition forgets the hint and resolves again from
-	 * the nearest known ancestor. A learned range slice that no longer exists is forgotten the same way.
+	 * Forwards a `one_owner` request and falls back after a cache miss. After the fallback the spans can
+	 * be local, on one remote target, or on more than one partition. A `one_owner` request never fans
+	 * out, and every error that starts a fallback comes from a check before the handler, so no handler
+	 * ran on the chain.
 	 */
-	async #forwardPoint(
+	async #forwardOneOwner(
 		op: string,
-		descriptor: Extract<AnyOperation, { shape: "point" }>,
+		compiled: CompiledOperation,
+		spans: readonly PointSpan[],
 		req: unknown,
-		pos: FokosStoragePosition,
-		admitted: RouteKey[],
 		resolution: RemoteResolution,
 		collector: RouteCollector,
+		scope: ExecutionScope,
 		retries: number,
 	): Promise<unknown> {
-		try {
-			return await this.#forwardTo(collector, resolution.target, op, req, [pos.routingHash]);
-		} catch (e) {
-			const opts = this.#missLadder(pos.routingHash, resolution, e, descriptor.readOnly === true, "point");
-			if (!opts || retries >= this.#config().maxForwardRetries) {
-				throw e;
+		const answer = await this.#forwardVisit(op, compiled, { resolution, spans: [...spans] }, req, collector, retries);
+		if (answer.kind === "answered") {
+			return answer.value;
+		}
+		const owner = this.#oneOwner(op, spans, answer.opts, scope);
+		if (owner.kind === "many") {
+			return manyOwnersAnswer(op, compiled);
+		}
+		if (owner.kind === "local") {
+			const descriptor = routedDescriptor(compiled);
+			this.#admitIn(scope, op, descriptor, spans);
+			const { value, signals } = await this.#runLocalScope(descriptor, req, collector, scope, owner.epoch);
+			await this.#applySignalsIn(scope, signals);
+			return value;
+		}
+		return await this.#forwardOneOwner(op, compiled, spans, req, owner.resolution, collector, scope, retries + 1);
+	}
+
+	// ═══ the point planner, the forward, and the miss ladder ════════════════
+
+	/** The plan of the point spans of a request, in the scope of the execution. */
+	#plan(op: string, spans: readonly PointSpan[], opts: ResolveOptions, scope: ExecutionScope): PointPlan {
+		return scope.kind === "owned" ? this.#planPoints(op, spans, opts) : this.#planInCallerSlice(op, spans, scope.slice);
+	}
+
+	/**
+	 * Resolves each point span, and groups the remote spans by their target. When a span has a Bloom
+	 * hit, the speculation guard runs before the spans are grouped.
+	 */
+	#planPoints(op: string, spans: readonly PointSpan[], opts: ResolveOptions): PointPlan {
+		const plan: PointPlan = { local: [], remote: new Map(), epoch: this.#ownershipEpoch };
+		// The spans with a Bloom hit wait for the guard, by routingHash. The filter answers for a whole
+		// routingHash, so the spans of one routingHash always go to one place.
+		let bloomHits: Map<string, BloomRoutingHash> | undefined;
+		const view = this.#routerView();
+		for (const span of spans) {
+			const resolution = this.#resolvePosition(span.position, opts, view);
+			if (resolution.kind === "out_of_range") {
+				throw misrouted(op, span.kind === "item" ? "key outside this partition" : "position outside this partition");
 			}
-			// Every error that starts a fallback comes before any handler ran on the target.
-			collector.forget(resolution.target.partitionId);
-			const next = this.#resolvePosition(pos, opts);
-			if (next.kind === "out_of_range") {
-				throw misrouted(op, "key outside this partition");
+			if (!isBloomHit(resolution)) {
+				addToPlan(plan, span, resolution);
+				continue;
 			}
-			if (next.kind === "local") {
-				this.#admit(op, descriptor, admitted);
-				const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
-				await this.#applySignals(signals);
-				return value;
+			bloomHits ??= new Map();
+			const id = span.position.routingHash.toHex();
+			let hit = bloomHits.get(id);
+			if (hit === undefined) {
+				hit = { routingHash: span.position.routingHash, spans: [] };
+				bloomHits.set(id, hit);
 			}
-			return await this.#forwardPoint(op, descriptor, req, pos, admitted, next, collector, retries + 1);
+			hit.spans.push({ span, resolution });
+		}
+		if (bloomHits) {
+			this.#guardBloomHits(bloomHits, plan, view.router);
+		}
+		return plan;
+	}
+
+	/**
+	 * The plan of a read-through on the source. Each span must be inside the caller slice. A promoted
+	 * routingHash of a `hash_child` caller slice goes to its range tree, because the rows of this
+	 * partition are stale copies or already collected. A range or promoted-routingHash caller slice is
+	 * itself inside a range tree, so only a hash-child caller can reach one. Every other span runs here.
+	 */
+	#planInCallerSlice(op: string, spans: readonly PointSpan[], slice: FokosSlice): PointPlan {
+		const topology = this.identity().topology;
+		const plan: PointPlan = { local: [], remote: new Map(), epoch: this.#ownershipEpoch };
+		for (const span of spans) {
+			const { routingHash } = span.position;
+			if (!sliceIncludesPosition(slice, routingHash, span.position, topology)) {
+				throw misrouted(op, "key outside the caller slice");
+			}
+			const promoted = slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash);
+			addToPlan(plan, span, promoted ? this.#rangeOwner(routingHash, span.position, "override", false, true) : LOCAL);
+		}
+		return plan;
+	}
+
+	/**
+	 * The speculation guard of a point plan. It keeps a Bloom hit only when the hit cannot split the
+	 * spans of one owner over two sub-requests.
+	 *
+	 * Why. The owner of a key must receive all its keys of this request in one sub-request: `txCommit`
+	 * compares its keys with the lock rows of the transaction that it owns, and throws
+	 * `commit_keyset_mismatch` when the two sets differ. A Bloom hit is a guess for one routingHash R,
+	 * and it sends the spans of R to a range partition of R. When the guess is wrong, the range partition
+	 * refuses, and the spans of R fall back to the exact target of R: the partition that owns R without
+	 * the filter. When another routingHash also goes to that exact target, the owner then receives two
+	 * sub-requests.
+	 *
+	 * How. The input is `plan`, the spans without a Bloom hit, and `bloomHits`, the spans of each
+	 * routingHash R with a Bloom hit.
+	 * 1. For each R, find its exact target with `#hashTopologyOwner`. R has no cut-over route override
+	 *    here, because a Bloom hit comes after the override check. So the exact target is the topology
+	 *    owner, `local` or a hash descendant, and the guard reads no route override again.
+	 * 2. Count the Bloom routingHashes at each exact target.
+	 * 3. The exact target of R is shared when another Bloom routingHash has the same exact target, or
+	 *    when `plan` already has a span there. A span of `plan` belongs to another routingHash, because
+	 *    the filter answers for the whole routingHash, so each span of R has a Bloom hit.
+	 * 4. When the target is shared, each span of R goes to the exact target, and the owner gets all its
+	 *    spans in one sub-request. Otherwise each span of R keeps its Bloom resolution. A later fallback
+	 *    then reaches a partition that gets no other span of this request from this partition.
+	 *
+	 * The guard compares the exact target of R only with the targets that `plan` already holds. The
+	 * resolution of a span without a Bloom hit is exact, or it names a range partition of its own
+	 * routingHash. A range partition of another routingHash is never the exact target of R.
+	 *
+	 * Example. This hash leaf owns `alice` and `carol`. A commit has the keys (alice, a) and
+	 * (carol, b). The filter gives a false positive for `alice`.
+	 * - Without the guard, (alice, a) goes to the range root of `alice`, which does not exist, and
+	 *   (carol, b) runs here. The fallback then runs (alice, a) here in a second call. The first call
+	 *   has {b}, the lock rows have {a, b}, and the commit throws `commit_keyset_mismatch`.
+	 * - With the guard, the exact target of `alice` is `local`, and `plan.local` holds (carol, b). The
+	 *   target is shared, so (alice, a) runs here with (carol, b) in one call.
+	 * - When the commit has only `alice` keys, no other routingHash shares `local`. The Bloom hit stays,
+	 *   and a true positive saves the forwards to the range owner.
+	 */
+	#guardBloomHits(bloomHits: Map<string, BloomRoutingHash>, plan: PointPlan, router: boolean): void {
+		const owners: Array<{ hit: BloomRoutingHash; owner: OwnedResolution; id: string }> = [];
+		const routingHashesAt = new Map<string, number>();
+		for (const hit of bloomHits.values()) {
+			const owner = this.#hashTopologyOwner(hit.routingHash, router);
+			const id = owner.kind === "local" ? "local" : owner.target.partitionId;
+			owners.push({ hit, owner, id });
+			routingHashesAt.set(id, (routingHashesAt.get(id) ?? 0) + 1);
+		}
+		for (const { hit, owner, id } of owners) {
+			// An earlier routingHash of this loop adds spans at `id` only when two Bloom routingHashes
+			// share `id`, and then the count already says that the target is shared.
+			const shared = routingHashesAt.get(id)! > 1 || (id === "local" ? plan.local.length > 0 : plan.remote.has(id));
+			for (const { span, resolution } of hit.spans) {
+				addToPlan(plan, span, shared ? owner : resolution);
+			}
 		}
 	}
 
 	/**
-	 * The options to resolve the keys of a failed forward again with, or null when the failure is not
-	 * a cache miss. It forgets the hint that caused the miss, so the next resolution cannot repeat it.
-	 * The keys share the target of `resolution`, thus they share its hint, and one forget covers all
-	 * of them. `routingHash` is the routingHash of the first key. A point retry can use the Bloom step
-	 * again. A group or single-owner retry turns the Bloom step off and keeps the learned range slices.
+	 * One forward of the point spans of one visit. On a cache miss it forgets the hint and the node of
+	 * the target, and gives the executor the options to plan the spans of the visit again. The executor
+	 * decides what the new plan means. Every error that starts a fallback comes before any handler ran
+	 * on the target.
 	 */
-	#missLadder(
-		routingHash: RoutingHash,
-		resolution: RemoteResolution,
-		e: unknown,
-		readOnly: boolean,
-		shape: "point" | "group" | "single_owner",
-	): ResolveOptions | null {
-		const retry = (point: ResolveOptions) => (shape === "point" ? point : HINTED_NO_BLOOM);
+	async #forwardVisit(
+		op: string,
+		compiled: CompiledOperation,
+		visit: RemoteVisit,
+		req: unknown,
+		collector: RouteCollector,
+		retries: number,
+	): Promise<{ kind: "answered"; value: unknown } | { kind: "missed"; opts: ResolveOptions }> {
+		const { target } = visit.resolution;
+		const routingHashes = routingHashesOf(visit.spans);
+		try {
+			return { kind: "answered", value: await this.#forwardTo(collector, target, op, req, routingHashes) };
+		} catch (e) {
+			const opts =
+				retries < this.#config().maxForwardRetries
+					? this.#missLadder(routingHashes[0], visit.resolution, e, routedDescriptor(compiled).readOnly === true, compiled.bloomOnRetry)
+					: null;
+			if (!opts) {
+				throw e;
+			}
+			collector.forget(target.partitionId);
+			return { kind: "missed", opts };
+		}
+	}
+
+	/**
+	 * The options to plan the spans of a failed forward again with, or null when the failure is not a
+	 * cache miss. It forgets the hint that caused the miss, so the next plan cannot repeat it. The spans
+	 * share the target of `hint`, thus they share its hint, and one forget covers all of them.
+	 * `routingHash` is the routingHash of the first span. With `bloomOnRetry`, a retry can use the Bloom
+	 * step again. Otherwise every retry turns the Bloom step off and keeps the learned range slices.
+	 */
+	#missLadder(routingHash: RoutingHash, hint: MissHint, e: unknown, readOnly: boolean, bloomOnRetry: boolean): ResolveOptions | null {
+		const retry = (opts: ResolveOptions) => (bloomOnRetry ? opts : HINTED_NO_BLOOM);
 		const notInitialized = FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
 		const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
 		const awaitingData = isAwaitingData(e);
-		if (resolution.learned && notInitialized) {
-			this.#store.deleteLearnedRangeSlice(routingHash, resolution.learned);
-			return retry({ bloom: resolution.via === "bloom", learnedRange: true });
+		if (hint.learned && notInitialized) {
+			this.#store.deleteLearnedRangeSlice(routingHash, hint.learned);
+			return retry({ bloom: hint.via === "bloom", learnedRange: true });
 		}
 		// A Bloom hit can name the range root of a key whose promotion has not cut over. The exact
 		// resolution reads the route overrides, so it names the partition that owns the key now.
-		if (resolution.via === "bloom" && (notInitialized || awaitingData || (readOnly && notCutOver))) {
+		if (hint.via === "bloom" && (notInitialized || awaitingData || (readOnly && notCutOver))) {
 			return retry({ bloom: false, learnedRange: true });
 		}
-		if (
-			resolution.via === "hash" &&
-			(resolution.relDepth ?? 1) > 1 &&
-			FokosError.isCode(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized)
-		) {
+		if (hint.via === "hash" && (hint.relDepth ?? 1) > 1 && FokosError.isCode(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized)) {
 			// The hint that missed is the one at `relDepth`: the topology, the arena, or both.
-			if (resolution.topologyHint) {
-				cutTopologyHint(resolution.topologyHint.entry, resolution.topologyHint.pos);
+			if (hint.topologyHint) {
+				cutTopologyHint(hint.topologyHint.entry, hint.topologyHint.pos);
 			}
 			const arena = this.#arena();
-			if (arena?.invalidate(routingHash, resolution.relDepth!)) {
+			if (arena?.invalidate(routingHash, hint.relDepth!)) {
 				this.#store.putHashArena(arena.toSnapshot());
 			}
 			return retry(HINTED);
@@ -605,47 +862,49 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return null;
 	}
 
-	async #dispatchGroup(
+	// ═══ the fan_out executor ═══════════════════════════════════════════════
+
+	/** Runs the `group` shape: one sub-request for each owner, then `merge`. */
+	async #runFanOut(
 		op: string,
-		descriptor: Extract<AnyOperation, { shape: "group" }>,
+		compiled: CompiledOperation,
+		spans: readonly PointSpan[],
 		req: unknown,
 		collector: RouteCollector,
-	): Promise<FokosEnvelope<unknown>> {
-		const items = descriptor.items(req);
-		if (items.length === 0) {
-			this.#admit(op, descriptor, []);
-			const before = this.#beforeForward(descriptor, req);
-			const { call, signals } = this.#localCall();
+		scope: ExecutionScope,
+	): Promise<unknown> {
+		const descriptor = groupDescriptor(compiled);
+		if (spans.length === 0) {
+			this.#admitIn(scope, op, descriptor, []);
+			const before = this.#beforeForwardIn(scope, descriptor, req);
+			const { call, signals } = this.#localCall(sliceOf(scope));
 			const value = await this.#runLocal(descriptor, req, call);
-			await this.#applySignals([...before, ...signals]);
-			return envelope(value, collector.build());
+			await this.#applySignalsIn(scope, [...before, ...signals]);
+			return value;
 		}
 
-		const { local, remote } = this.#groupByOwner(op, items, HINTED);
+		const plan = this.#plan(op, spans, HINTED, scope);
+		const remote = [...plan.remote.values()];
 		const collect = descriptor.failurePolicy === "collect";
 
 		// Admission, `beforeForward`, the local work, and the start of every remote call run in the same
-		// synchronous block as the resolution above: an outbound RPC yields only at the first await of
-		// `#runGroups`, so a cutover cannot interleave between the ownership decision and the write.
-		// Under `collect`, the local part admits its own entries, so a refusal fails only that part.
-		if (local.length > 0 && !collect) {
-			this.#admit(
-				op,
-				descriptor,
-				local.map((entry) => entry.key),
-			);
+		// synchronous block as the plan above: an outbound RPC yields only at the first await of
+		// `#runParts`, so a cutover cannot interleave between the ownership decision and the write.
+		// Under `collect`, the local part admits its own spans, so a refusal fails only that part.
+		if (plan.local.length > 0 && !collect) {
+			this.#admitIn(scope, op, descriptor, plan.local);
 		}
-		const signals: FokosSignals[] = this.#beforeForward(descriptor, req);
-		const run = await this.#runGroups(op, descriptor, req, local, remote, collector, 0, signals, collect);
-		return envelope(this.#settleGroup(op, descriptor, run, remote.length), collector.build());
+		const signals: FokosSignals[] = this.#beforeForwardIn(scope, descriptor, req);
+		const run = await this.#runParts(op, compiled, req, plan, remote, collector, 0, signals, collect, scope);
+		return this.#settleFanOut(op, descriptor, run, remote.length);
 	}
 
 	/**
-	 * The answer of a `group` operation after each group settled. Under `collect`, `merge` gets every
+	 * The answer of a `fan_out` operation after each part settled. Under `collect`, `merge` gets every
 	 * part, the failed parts included. Otherwise a failure throws: the local part is the more specific
-	 * answer, and every remote group has been attempted by now.
+	 * answer, and every remote part has been attempted by now.
 	 */
-	#settleGroup(op: string, descriptor: Extract<AnyOperation, { shape: "group" }>, run: GroupRun, groupCount: number): unknown {
+	#settleFanOut(op: string, descriptor: GroupDescriptor, run: FanOutRun, partCount: number): unknown {
 		if (descriptor.failurePolicy === "collect") {
 			return descriptor.merge(run.parts);
 		}
@@ -660,7 +919,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				attributes: {
 					operation: op,
 					failureCount: remoteFailures.length,
-					groupCount,
+					groupCount: partCount,
 					// `cause` is a non-enumerable own property, so it does not cross an RPC hop. The
 					// caller still needs the failure it stands for, and `attributes` does cross.
 					...causeAttributes(remoteFailures[0]),
@@ -672,145 +931,44 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * Resolves each entry of a `group` request, and groups the remote entries by their target. When an
-	 * entry has a Bloom hit, the speculation guard runs before the entries are grouped.
-	 */
-	#groupByOwner(op: string, entries: readonly GroupEntry[], opts: ResolveOptions): { local: GroupEntry[]; remote: RemoteGroup[] } {
-		const groups: Groups = { local: [], remote: new Map() };
-		// The entries with a Bloom hit wait for the guard, by hash key. `KeyCodec.mapKey` is a hash and
-		// not an identity, so a group holds each hash key of one hash value.
-		let bloomHits: Map<bigint, BloomHashKey[]> | undefined;
-		const view = this.#routerView();
-		for (const entry of entries) {
-			const resolution = this.#resolve(entry.key, opts, view);
-			if (resolution.kind === "out_of_range") {
-				throw misrouted(op, "item outside this partition");
-			}
-			if (!isBloomHit(resolution)) {
-				addToGroups(groups, entry, resolution);
-				continue;
-			}
-			bloomHits ??= new Map();
-			const id = KeyCodec.mapKey(entry.key.hashKey);
-			let hits = bloomHits.get(id);
-			if (hits === undefined) {
-				hits = [];
-				bloomHits.set(id, hits);
-			}
-			let hit = hits.find((b) => KeyCodec.compare(b.hashKey, entry.key.hashKey) === 0);
-			if (hit === undefined) {
-				hit = { hashKey: entry.key.hashKey, entries: [] };
-				hits.push(hit);
-			}
-			hit.entries.push({ entry, resolution });
-		}
-		if (bloomHits) {
-			this.#guardBloomHits(bloomHits, groups, view.router);
-		}
-		return { local: groups.local, remote: [...groups.remote.values()] };
-	}
-
-	/**
-	 * The speculation guard of a `group` request. It keeps a Bloom hit only when the hit cannot split
-	 * the keys of one owner over two sub-requests.
-	 *
-	 * Why. The owner of a key must receive all its keys of this request in one sub-request: `txCommit`
-	 * compares its keys with the lock rows of the transaction that it owns, and throws
-	 * `commit_keyset_mismatch` when the two sets differ. A Bloom hit is a guess for one hash key H, and it sends the entries of H to
-	 * a range partition of H. When the guess is wrong, the range partition refuses, and the entries of
-	 * H fall back to the exact target of H: the partition that owns H without the filter. When another
-	 * hash key also goes to that exact target, the owner then receives two sub-requests.
-	 *
-	 * How. The input is `groups`, the entries without a Bloom hit, and `bloomHits`, the entries of each
-	 * hash key H with a Bloom hit.
-	 * 1. For each H, find its exact target with `#hashTopologyOwner`. H has no cut-over route override
-	 *    here, because a Bloom hit comes after the override check. So the exact target is the topology
-	 *    owner, `local` or a hash descendant, and the guard reads no route override again.
-	 * 2. Count the Bloom hash keys at each exact target.
-	 * 3. The exact target of H is shared when another Bloom hash key has the same exact target, or when
-	 *    `groups` already has an entry there. An entry of `groups` belongs to another hash key, because
-	 *    the filter answers for the whole hash key, so each entry of H has a Bloom hit.
-	 * 4. When the target is shared, each entry of H goes to the exact target, and the owner gets all its
-	 *    keys in one sub-request. Otherwise each entry of H keeps its Bloom resolution. A later fallback
-	 *    then reaches a partition that gets no other key of this request from this partition.
-	 *
-	 * The guard compares the exact target of H only with the targets that `groups` already holds. The
-	 * resolution of an entry without a Bloom hit is exact, or it names a range partition of its own
-	 * hash key. A range partition of another hash key is never the exact target of H.
-	 *
-	 * Example. This hash leaf owns `alice` and `carol`. A commit has the keys (alice, a) and
-	 * (carol, b). The filter gives a false positive for `alice`.
-	 * - Without the guard, (alice, a) goes to the range root of `alice`, which does not exist, and
-	 *   (carol, b) runs here. The fallback then runs (alice, a) here in a second call. The first call
-	 *   has {b}, the lock rows have {a, b}, and the commit throws `commit_keyset_mismatch`.
-	 * - With the guard, the exact target of `alice` is `local`, and `groups.local` holds (carol, b). The
-	 *   target is shared, so (alice, a) runs here with (carol, b) in one call.
-	 * - When the commit has only `alice` keys, no other hash key shares `local`. The Bloom hit stays,
-	 *   and a true positive saves the forwards to the range owner.
-	 */
-	#guardBloomHits(bloomHits: Map<bigint, BloomHashKey[]>, groups: Groups, router: boolean): void {
-		const owners: Array<{ hit: BloomHashKey; owner: OwnedResolution; id: string }> = [];
-		const hashKeysAt = new Map<string, number>();
-		for (const hits of bloomHits.values()) {
-			for (const hit of hits) {
-				const owner = this.#hashTopologyOwner(this.#routingHash(hit.hashKey), router);
-				const id = owner.kind === "local" ? "local" : owner.target.partitionId;
-				owners.push({ hit, owner, id });
-				hashKeysAt.set(id, (hashKeysAt.get(id) ?? 0) + 1);
-			}
-		}
-		for (const { hit, owner, id } of owners) {
-			// An earlier hash key of this loop adds entries at `id` only when two Bloom hash keys share
-			// `id`, and then the count already says that the target is shared.
-			const shared = hashKeysAt.get(id)! > 1 || (id === "local" ? groups.local.length > 0 : groups.remote.has(id));
-			for (const { entry, resolution } of hit.entries) {
-				addToGroups(groups, entry, shared ? owner : resolution);
-			}
-		}
-	}
-
-	/**
-	 * Runs the local part of a `group` operation and starts each remote group, in the synchronous
+	 * Runs the local part of a `fan_out` operation and starts each remote part, in the synchronous
 	 * block of the caller, then settles them by the failure policy. With `admitLocal`, the local part
-	 * admits its entries itself; otherwise the caller admitted them. `signals` holds the signals of
-	 * the caller, which apply with the local part. A `fail_fast` failure throws at once. An
-	 * `attempt_all` failure comes back after each group settled. A `collect` failure comes back as a
-	 * failed part, after each group settled.
+	 * admits its spans itself; otherwise the caller admitted them. `signals` holds the signals of the
+	 * caller, which apply with the local part. A `fail_fast` failure throws at once. An `attempt_all`
+	 * failure comes back after each part settled. A `collect` failure comes back as a failed part, after
+	 * each part settled.
 	 */
-	async #runGroups(
+	async #runParts(
 		op: string,
-		descriptor: Extract<AnyOperation, { shape: "group" }>,
+		compiled: CompiledOperation,
 		req: unknown,
-		local: GroupEntry[],
-		remote: RemoteGroup[],
+		plan: PointPlan,
+		remote: RemoteVisit[],
 		collector: RouteCollector,
 		retries: number,
 		signals: FokosSignals[],
 		admitLocal: boolean,
-	): Promise<GroupRun> {
+		scope: ExecutionScope,
+	): Promise<FanOutRun> {
+		const descriptor = groupDescriptor(compiled);
+		const { local } = plan;
 		const collect = descriptor.failurePolicy === "collect";
 		const settleAll = descriptor.failurePolicy !== "fail_fast";
 		let localCall: { request: unknown; value: unknown; signals: FokosSignals[] } | undefined;
-		// An `attempt_all` or `collect` group runs every group before it reports a failure, and that
+		// An `attempt_all` or `collect` operation runs every part before it reports a failure, and that
 		// includes the case where the local part is the part that failed. The report waits until the
-		// remote groups have settled, so a decided transaction still reaches every partition that holds
+		// remote parts have settled, so a decided transaction still reaches every partition that holds
 		// a piece of it.
 		let localFailure: { request: unknown; error: unknown } | undefined;
 		if (local.length > 0) {
-			const { call, signals: own } = this.#localCall();
-			const request = descriptor.subRequest(
-				req,
-				local.map((entry) => entry.item),
-			);
+			const { call, signals: own } = this.#localCall(sliceOf(scope));
+			const request = descriptor.subRequest(req, local.map(dataOf));
 			collector.add(this.#selfNode("executed"));
 			try {
 				if (admitLocal) {
-					this.#admit(
-						op,
-						descriptor,
-						local.map((entry) => entry.key),
-					);
+					this.#admitIn(scope, op, descriptor, local);
 				}
+				this.#assertEpoch(plan.epoch);
 				localCall = { request, value: this.#runLocal(descriptor, request, call), signals: own };
 			} catch (error) {
 				if (!settleAll) {
@@ -819,8 +977,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				localFailure = { request, error };
 			}
 		}
-		const remoteCalls = remote.map((group) => {
-			const promise = this.#forwardGroup(op, descriptor, req, group, collector, retries);
+		const remoteCalls = remote.map((visit) => {
+			const promise = this.#forwardFanOutVisit(op, compiled, req, visit, collector, retries, scope);
 			// A rejection that lands while the signals below run must not count as unhandled; it is
 			// awaited right after.
 			promise.catch(() => {});
@@ -839,28 +997,25 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				localCall = undefined;
 			}
 		}
-		await this.#applySignals(signals);
+		await this.#applySignalsIn(scope, signals);
 
 		// The merge over remote parts makes this partition a router of the request. A partition that also
 		// ran the handler keeps its `executed` role.
 		if (remoteCalls.length > 0) {
 			collector.add(this.#selfNode("merged"));
 		}
-		const parts: GroupParts = [];
+		const parts: FanOutParts = [];
 		const remoteFailures: unknown[] = [];
 		if (settleAll) {
 			for (const [i, result] of (await Promise.allSettled(remoteCalls)).entries()) {
 				if (result.status === "fulfilled") {
 					parts.push(...result.value);
 				} else if (collect) {
-					// The group failed after its fallbacks. It is one failed part, with the sub-request that
+					// The part failed after its fallbacks. It is one failed part, with the sub-request that
 					// its first forward sent.
-					const group = remote[i];
-					const request = descriptor.subRequest(
-						req,
-						group.entries.map((entry) => entry.item),
-					);
-					parts.push({ target: group.resolution.target, request, error: result.reason });
+					const visit = remote[i];
+					const request = descriptor.subRequest(req, visit.spans.map(dataOf));
+					parts.push({ target: visit.resolution.target, request, error: result.reason });
 				} else {
 					remoteFailures.push(result.reason);
 				}
@@ -877,204 +1032,103 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * Forwards one remote group of a `group` operation, and falls back after a cache miss: it forgets
-	 * the hint, resolves the entries of the group again, and runs them where they resolve now. The
-	 * answer holds one part for each forward that answered and one for a local run.
+	 * Forwards one remote part of a `fan_out` operation, and falls back after a cache miss: it plans the
+	 * spans of the part again, and runs them where they resolve now. The answer holds one part for each
+	 * forward that answered and one for a local run.
 	 *
 	 * A router below the target can apply one part before another part fails, so the fallback can send
 	 * a key again to an owner that applied it. Each `group` operation is safe to repeat for each key.
 	 */
-	async #forwardGroup(
+	async #forwardFanOutVisit(
 		op: string,
-		descriptor: Extract<AnyOperation, { shape: "group" }>,
+		compiled: CompiledOperation,
 		req: unknown,
-		group: RemoteGroup,
+		visit: RemoteVisit,
 		collector: RouteCollector,
 		retries: number,
-	): Promise<GroupParts> {
-		const { target } = group.resolution;
-		const request = descriptor.subRequest(
+		scope: ExecutionScope,
+	): Promise<FanOutParts> {
+		const descriptor = groupDescriptor(compiled);
+		const { target } = visit.resolution;
+		const request = descriptor.subRequest(req, visit.spans.map(dataOf));
+		const answer = await this.#forwardVisit(op, compiled, visit, request, collector, retries);
+		if (answer.kind === "answered") {
+			return [{ target, request, result: answer.value }];
+		}
+		// The plan, the admission, the local run, and the start of each remote part run in one synchronous
+		// block, as in `#runFanOut`.
+		const collect = descriptor.failurePolicy === "collect";
+		const plan = this.#plan(op, visit.spans, answer.opts, scope);
+		if (plan.local.length > 0 && !collect) {
+			this.#admitIn(scope, op, descriptor, plan.local);
+		}
+		const { parts, localFailure, remoteFailures } = await this.#runParts(
+			op,
+			compiled,
 			req,
-			group.entries.map((entry) => entry.item),
+			plan,
+			[...plan.remote.values()],
+			collector,
+			retries + 1,
+			[],
+			collect,
+			scope,
 		);
-		const keys = group.entries.map((entry) => entry.key);
-		const routingHashes = keys.map((key) => this.#routingHash(key.hashKey));
-		try {
-			const result = await this.#forwardTo(collector, target, op, request, routingHashes);
-			return [{ target, request, result }];
-		} catch (e) {
-			const opts = this.#missLadder(routingHashes[0], group.resolution, e, descriptor.readOnly === true, "group");
-			if (!opts || retries >= this.#config().maxForwardRetries) {
-				throw e;
-			}
-			collector.forget(target.partitionId);
-			// The resolution, the admission, the local run, and the start of each remote group run in one
-			// synchronous block, as in `#dispatchGroup`.
-			const collect = descriptor.failurePolicy === "collect";
-			const { local, remote } = this.#groupByOwner(op, group.entries, opts);
-			if (local.length > 0 && !collect) {
-				this.#admit(
-					op,
-					descriptor,
-					local.map((entry) => entry.key),
-				);
-			}
-			const { parts, localFailure, remoteFailures } = await this.#runGroups(
-				op,
-				descriptor,
-				req,
-				local,
-				remote,
-				collector,
-				retries + 1,
-				[],
-				collect,
-			);
-			if (collect) {
-				return parts;
-			}
-			if (localFailure) {
-				throw localFailure.error;
-			}
-			if (remoteFailures.length > 0) {
-				throw remoteFailures[0];
-			}
+		if (collect) {
 			return parts;
 		}
+		if (localFailure) {
+			throw localFailure.error;
+		}
+		if (remoteFailures.length > 0) {
+			throw remoteFailures[0];
+		}
+		return parts;
 	}
 
-	async #dispatchSingleOwner(
-		op: string,
-		descriptor: Extract<AnyOperation, { shape: "single_owner" }>,
-		req: unknown,
-		collector: RouteCollector,
-	): Promise<FokosEnvelope<unknown>> {
-		const keys = descriptor.items(req).map((item) => item.key);
-		const owner = this.#singleOwner(op, keys, HINTED);
-		if (owner.kind === "local") {
-			this.#admit(op, descriptor, keys);
-			const before = this.#beforeForward(descriptor, req);
-			const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
-			await this.#applySignals([...before, ...signals]);
-			return envelope(value, collector.build());
-		}
-		const before = this.#beforeForward(descriptor, req);
-		if (owner.kind === "spans_many") {
-			// A value and not an error: on a split shard group this is the ordinary answer for such a
-			// set, and it carries no side effects at any depth of a forwarding chain.
-			await this.#applySignals(before);
-			return envelope(descriptor.notApplicable, collector.build());
-		}
-		const forwarded = this.#forwardSingleOwner(op, descriptor, req, keys, owner.resolution, collector, 0);
-		forwarded.catch(() => {});
-		await this.#applySignals(before);
-		return envelope(await forwarded, collector.build());
-	}
+	// ═══ the walk executor ══════════════════════════════════════════════════
 
-	/**
-	 * Where the keys of a single-owner request go. A Bloom hit answers for one hash key, so it can make
-	 * the keys of one owner look like the keys of two partitions. Such a set resolves again with the
-	 * Bloom step off before the answer is `spans_many`.
-	 */
-	#singleOwner(op: string, keys: readonly RouteKey[], opts: ResolveOptions): SingleOwnerResolution {
-		let localCount = 0;
-		let remote: RemoteResolution | null = null;
-		let spansPartitions = false;
-		let bloomHit = false;
-		const view = this.#routerView();
-		for (const key of keys) {
-			const resolution = this.#resolve(key, opts, view);
-			if (resolution.kind === "out_of_range") {
-				throw misrouted(op, "item outside this partition");
+	/** Runs the `range` shape: the host walks the planned visits of the interval. */
+	async #runWalk(op: string, compiled: CompiledOperation, span: IntervalSpan, req: unknown, collector: RouteCollector): Promise<unknown> {
+		const descriptor = rangeDescriptor(compiled);
+		const planned = this.#planRange(op, span.range, true);
+		const visits = planned.map((p) => p.planned.visit);
+		// The walk admits one time, before the first local run: at the start when the plan has a local
+		// visit, or at a fallback that runs a visit here.
+		let admitted = false;
+		const admitOnce = () => {
+			if (!admitted) {
+				admitted = true;
+				this.#admit(op, descriptor, [span]);
 			}
-			bloomHit ||= isBloomHit(resolution);
-			if (resolution.kind === "local") {
-				localCount++;
-			} else if (remote === null) {
-				remote = resolution;
-			} else if (remote.target.partitionId !== resolution.target.partitionId) {
-				spansPartitions = true;
-			}
-		}
-		if (remote === null) {
-			return { kind: "local" };
-		}
-		if (spansPartitions || localCount > 0) {
-			return bloomHit ? this.#singleOwner(op, keys, HINTED_NO_BLOOM) : { kind: "spans_many" };
-		}
-		return { kind: "remote", resolution: remote };
-	}
-
-	/**
-	 * Forwards a single-owner request and falls back after a cache miss, as `#forwardPoint` does. After
-	 * the fallback the keys can be local, on one remote target, or on more than one partition.
-	 */
-	async #forwardSingleOwner(
-		op: string,
-		descriptor: Extract<AnyOperation, { shape: "single_owner" }>,
-		req: unknown,
-		keys: readonly RouteKey[],
-		resolution: RemoteResolution,
-		collector: RouteCollector,
-		retries: number,
-	): Promise<unknown> {
-		const routingHashes = keys.map((key) => this.#routingHash(key.hashKey));
-		try {
-			return await this.#forwardTo(collector, resolution.target, op, req, routingHashes);
-		} catch (e) {
-			const opts = this.#missLadder(routingHashes[0], resolution, e, descriptor.readOnly === true, "single_owner");
-			if (!opts || retries >= this.#config().maxForwardRetries) {
-				throw e;
-			}
-			// A single-owner request never fans out, and every error that starts a fallback comes from a
-			// check before the handler, so no handler ran on the chain.
-			collector.forget(resolution.target.partitionId);
-			const owner = this.#singleOwner(op, keys, opts);
-			if (owner.kind === "spans_many") {
-				return descriptor.notApplicable;
-			}
-			if (owner.kind === "local") {
-				this.#admit(op, descriptor, [...keys]);
-				const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
-				await this.#applySignals(signals);
-				return value;
-			}
-			return await this.#forwardSingleOwner(op, descriptor, req, keys, owner.resolution, collector, retries + 1);
-		}
-	}
-
-	async #dispatchRange(
-		op: string,
-		descriptor: Extract<AnyOperation, { shape: "range" }>,
-		req: unknown,
-		collector: RouteCollector,
-	): Promise<FokosEnvelope<unknown>> {
-		const input = descriptor.range(req);
-		const planned = this.#planRange(op, input, true);
-		const visits = planned.map((p) => p.visit);
+		};
 		if (visits.some((visit) => visit.target === "local")) {
-			this.#admit(op, descriptor, [{ hashKey: input.hashKey, sortKey: NO_SORT_KEY }]);
+			admitOnce();
 		}
 		const signals = this.#beforeForward(descriptor, req);
+		const local = (r: unknown) => {
+			const { call, signals: own } = this.#localCall();
+			collector.add(this.#selfNode("executed"));
+			const out = this.#runLocal(descriptor, r, call);
+			signals.push(...own);
+			return out;
+		};
 		const value = await descriptor.walk({
 			request: req,
 			visits,
-			local: (r) => {
-				const { call, signals: own } = this.#localCall();
-				collector.add(this.#selfNode("executed"));
-				const out = this.#runLocal(descriptor, r, call);
-				signals.push(...own);
-				return out;
-			},
+			local,
 			forward: async (visit, r) => {
 				// A walk that forwards makes this partition a router of the request. A leaf that also ran
 				// the handler keeps its `executed` role, because `executed` outranks `merged`.
 				collector.add(this.#selfNode("merged"));
-				return await this.#forwardRangeVisit(op, descriptor, visit, r, collector);
+				return await this.#forwardRangeVisit(op, compiled, visit, r, collector, (fallback) => {
+					admitOnce();
+					return local(fallback);
+				});
 			},
 		});
 		await this.#applySignals(signals);
-		return envelope(value, collector.build());
+		return value;
 	}
 
 	// ═══ the primitive API ══════════════════════════════════════════════════
@@ -1249,7 +1303,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** A disjoint, ordered cover of one range request. The host walks it with `forwardRangeVisit`. */
 	rangeVisits(input: FokosRangeInput): FokosRangeVisit[] {
-		return this.#planRange("rangeVisits", input, true).map((p) => p.visit);
+		return this.#planRange("rangeVisits", input, true).map((p) => p.planned.visit);
 	}
 
 	/** Forwards one registered operation to one target and learns its routes. The envelope is that call's own. */
@@ -1257,7 +1311,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const descriptor = this.#ops[op];
 		invariant(descriptor && descriptor.shape !== "local", () => `fokos/runtime: ${op} cannot be forwarded`);
 		const collector = new RouteCollector();
-		const value = await this.#forwardTo(collector, target, op, req, this.#scopeRoutingHashes(descriptor, req));
+		const value = await this.#forwardTo(collector, target, op, req, routingHashesOf(this.#spansOf(descriptor, req)));
 		return envelope(value as Ops[K]["res"], collector.build());
 	}
 
@@ -1267,10 +1321,21 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		op: K,
 		req: Ops[K]["req"],
 	): Promise<FokosEnvelope<Ops[K]["res"]>> {
-		const descriptor = this.#ops[op];
-		invariant(descriptor?.shape === "range", () => `fokos/runtime: ${op} is not a range operation`);
+		const compiled = this.#compiled[op];
+		invariant(compiled?.execution === "walk", () => `fokos/runtime: ${op} is not a range operation`);
+		const descriptor = rangeDescriptor(compiled);
 		const collector = new RouteCollector();
-		const value = await this.#forwardRangeVisit(op, descriptor, visit, req, collector);
+		const signals: FokosSignals[] = [];
+		// A fallback that runs the visit here admits and signals as a planned local visit does.
+		const value = await this.#forwardRangeVisit(op, compiled, visit, req, collector, (r) => {
+			this.#admit(op, descriptor, this.#spansOf(descriptor, r));
+			const { call, signals: own } = this.#localCall();
+			collector.add(this.#selfNode("executed"));
+			const out = this.#runLocal(descriptor, r, call);
+			signals.push(...own);
+			return out;
+		});
+		await this.#applySignals(signals);
 		return envelope(value as Ops[K]["res"], collector.build());
 	}
 
@@ -1395,55 +1460,28 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	async #executeLocal(req: FokosExecuteLocalRequest, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
 		const slice = this.#source.resolveCallerSlice(req.repartitionId, req.caller);
-		const descriptor = this.#ops[req.op];
+		const compiled = this.#compiled[req.op];
+		const descriptor = compiled?.descriptor;
 		if (!descriptor || descriptor.shape === "local" || descriptor.readOnly !== true) {
 			throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
 				message: "the operation is not registered as a read-only operation",
 				attributes: { operation: req.op },
 			});
 		}
-		const topology = this.identity().topology;
-		const routeCtx = this.routeContext();
 
-		if (descriptor.shape === "point") {
-			const pos = this.#positionOf(descriptor.key(req.request));
-			if (!sliceIncludesPosition(slice, pos.routingHash, pos, topology)) {
-				throw misrouted(req.op, "key outside the caller slice");
-			}
-			// A promoted key's rows live in the range tree; the local copies are stale or already
-			// collected. Only a hash-child caller can reach one: a range or promoted-key slice is itself
-			// inside a range tree.
-			if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(pos.routingHash)) {
-				const owner = this.#rangeOwner(pos.routingHash, pos, "override", false, true);
-				const value = await this.#forwardTo(collector, owner.target, req.op, req.request, [pos.routingHash]);
-				return envelope(value, collector.build());
-			}
-			collector.add(this.#selfNode("executed"));
-			// A read-through applies no signal, and its scope is the caller slice.
-			const value = await this.#runLocal(descriptor, req.request, this.#localCall(slice).call);
+		// The same executor as on the owner, with a plan inside the caller slice: each span must be inside
+		// the slice, a promoted routingHash goes to its range tree, and every other span runs here.
+		if (compiled.execution !== "walk") {
+			const spans = this.#spansOf(descriptor, req.request);
+			const value = await this.#execute(req.op, compiled, spans, req.request, collector, { kind: "readThrough", slice });
 			return envelope(value, collector.build());
 		}
 
-		if (descriptor.shape === "group") {
-			// The `point` rules, for each key: each key must be inside the caller slice, and a promoted
-			// key goes to its range tree. The keys of one range owner go in one sub-request, and the other
-			// keys run here in one sub-request. A read admits nothing.
-			const groups: Groups = { local: [], remote: new Map() };
-			for (const entry of descriptor.items(req.request)) {
-				const { hashKey, sortKey } = entry.key;
-				if (!sliceIncludesItem(slice, hashKey, sortKey, topology, this.#routingHashSeedResolver)) {
-					throw misrouted(req.op, "key outside the caller slice");
-				}
-				const routingHash = this.#routingHash(hashKey);
-				const promoted = slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash);
-				addToGroups(groups, entry, promoted ? this.#rangeOwner(routingHash, { hk: hashKey, sk: sortKey }, "override", false, true) : LOCAL);
-			}
-			const remote = [...groups.remote.values()];
-			const run = await this.#runGroups(req.op, descriptor, req.request, groups.local, remote, collector, 0, [], false);
-			return envelope(this.#settleGroup(req.op, descriptor, run, remote.length), collector.build());
-		}
-
-		invariant(descriptor.shape === "range", "fokos/runtime: read_source is allowed for point, group and range operations only");
+		// The point planner plans positions only. A walk reads an interval of one hash key, so it reads
+		// through with its own gate.
+		const topology = this.identity().topology;
+		const routeCtx = this.routeContext();
+		invariant(descriptor.shape === "range", "fokos/runtime: a walk is the range shape");
 		const input = descriptor.range(req.request);
 		if (!sliceIncludesHashKey(slice, input.hashKey, topology, this.#routingHashSeedResolver)) {
 			throw misrouted(req.op, "hash key outside the caller slice");
@@ -1947,12 +1985,18 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	// ═══ the range frontier ═════════════════════════════════════════════════
 
-	#planRange(op: string, input: FokosRangeInput, bloom: boolean): PlannedVisit[] {
+	#planRange(op: string, input: FokosRangeInput, bloom: boolean): RangePlan[] {
 		const identity = this.identity();
 		const routeCtx = this.routeContext();
 		let bases: FrontierBase[];
 		let learned: LearnedRangeSlice[] = [];
 		this.#assertCanOwnRange(op, input);
+		// The miss hint of each remote base, for the miss ladder.
+		const hints = new Map<FrontierBase, MissHint>();
+		const base = (b: FrontierBase, hint: MissHint): FrontierBase => {
+			hints.set(b, hint);
+			return b;
+		};
 
 		// The range tree of the key, if it has one, is the tree of this routingHash.
 		const routingHash = this.#routingHash(input.hashKey);
@@ -1960,14 +2004,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const override = this.#store.routeOverrideFor(routingHash);
 			const root = refOf(resolveRangePartitionContext(routeCtx, routingHash, null, null));
 			if (override && cutOver(override.state)) {
-				bases = [{ target: root, start: null, end: null, speculative: false }];
+				bases = [base({ target: root, start: null, end: null, speculative: false }, { via: "override", learned: null })];
 				learned = this.#store.listLearnedRangeSlices(routingHash);
 			} else if (bloom && this.#bloom?.maybePromoted(routingHash)) {
-				bases = [{ target: root, start: null, end: null, speculative: true }];
+				bases = [base({ target: root, start: null, end: null, speculative: true }, { via: "bloom", learned: null })];
 				learned = this.#store.listLearnedRangeSlices(routingHash);
 			} else if (this.#source.routerRole()) {
 				const relDepth = Math.max(1, this.#arena()?.findLeaf(routingHash) ?? 0);
-				bases = [{ target: this.#hashDescendant(routingHash, relDepth), start: null, end: null, speculative: false }];
+				const target = this.#hashDescendant(routingHash, relDepth);
+				bases = [base({ target, start: null, end: null, speculative: false }, { via: "hash", relDepth, learned: null })];
 			} else {
 				bases = [{ target: "local", start: null, end: null, speculative: false }];
 			}
@@ -1975,7 +2020,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const range = identity.range!;
 			const { router, rangeChildren } = this.#routerView();
 			if (router) {
-				bases = rangeChildren.map((child) => ({ target: child.ref, start: child.start, end: child.end, speculative: false }));
+				bases = rangeChildren.map((child) =>
+					base({ target: child.ref, start: child.start, end: child.end, speculative: false }, { via: "range", learned: null }),
+				);
 				learned = this.#store.listLearnedRangeSlices(range.routingHash);
 			} else {
 				bases = [{ target: "local", start: range.start, end: range.end, speculative: false }];
@@ -1985,66 +2032,69 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const planned = planRangeFrontier(input.hashKey, bases, learned, input.interval, input.descending, (slice) =>
 			refOf(resolveRangePartitionContext(routeCtx, routingHash, slice.startBoundary, slice.endBoundary)),
 		);
-		for (const p of planned) {
-			this.#plans.set(p.visit, p);
-		}
-		return planned;
+		return planned.map((p) => {
+			const baseHint = hints.get(p.base);
+			const plan: RangePlan = {
+				planned: p,
+				// A visit to a learned slice misses as that slice does. The base gives the Bloom fact.
+				hint: p.learned ? { via: baseHint?.via ?? "range", learned: p.learned } : (baseHint ?? { via: "range", learned: null }),
+			};
+			this.#plans.set(p.visit, plan);
+			return plan;
+		});
 	}
 
 	/**
-	 * Forwards one planned visit. A learned slice that does not exist is forgotten and the segment
-	 * goes to its base target. A speculative visit that finds no range partition, or no cutover,
-	 * resolves the hash tree again with the Bloom step off: on a router the target is the hash child,
-	 * on a leaf it is this partition and the local handler answers for the same visit. Every retry of a
+	 * Forwards one planned visit, with the miss ladder of every forward. A learned slice that does not
+	 * exist is forgotten, and the segment goes to its base target. A hash jump that finds no partition
+	 * forgets its arena hint and plans again. A speculative visit that finds no range partition, or no
+	 * cutover, plans the hash tree again with the Bloom step off: on a router the target is the hash
+	 * child, on a leaf it is this partition, and `runLocal` answers for the same visit. Every retry of a
 	 * cache miss goes through the same ladder, so a miss on a retry cannot skip a fallback.
 	 * `maxForwardRetries` bounds the misses one call can absorb.
 	 */
 	async #forwardRangeVisit(
 		op: string,
-		descriptor: Extract<AnyOperation, { shape: "range" }>,
+		compiled: CompiledOperation,
 		visit: FokosRangeVisit,
 		req: unknown,
 		collector: RouteCollector,
+		runLocal: (req: unknown) => unknown,
 	): Promise<unknown> {
-		let plan = this.#plans.get(visit);
+		let plan: RangePlan | undefined = this.#plans.get(visit);
 		invariant(plan, "fokos/runtime.forwardRangeVisit: the visit was not planned by this runtime");
 		invariant(visit.target !== "local", "fokos/runtime.forwardRangeVisit: a local visit is served by the tracked local function");
-		const input = descriptor.range(req);
+		const input = rangeDescriptor(compiled).range(req);
 		const routingHashes = [this.#routingHash(input.hashKey)];
 		let target = visit.target;
 		for (let attempt = 0; ; attempt++) {
 			try {
 				return await this.#forwardTo(collector, target, op, req, routingHashes);
 			} catch (e) {
-				if (attempt >= this.#config().maxForwardRetries) {
+				const base: FrontierBase = plan.planned.base;
+				const learned: LearnedRangeSlice | null = plan.planned.learned;
+				// The ladder deletes a learned slice that does not exist. Only then does the segment go to its base.
+				const learnedMissed = learned !== null && FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
+				const opts = attempt < this.#config().maxForwardRetries ? this.#missLadder(routingHashes[0], plan.hint, e, true, true) : null;
+				if (!opts) {
 					throw e;
 				}
-
-				const notInitialized = FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
-				const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
-				const awaitingData = isAwaitingData(e);
-				if (plan.learned && notInitialized) {
-					this.#store.deleteLearnedRangeSlice(routingHashes[0], plan.learned);
-					invariant(plan.base.target !== "local", "fokos/runtime.forwardRangeVisit: a learned slice never overlays a local base");
-					target = plan.base.target;
-					plan = { visit, base: plan.base, learned: null };
+				// Every error that starts a fallback comes before any handler ran on the target.
+				collector.forget(target.partitionId);
+				if (learnedMissed) {
+					invariant(base.target !== "local", "fokos/runtime.forwardRangeVisit: a learned slice never overlays a local base");
+					target = base.target;
+					plan = { planned: { visit, base, learned: null }, hint: { via: plan.hint.via, learned: null } };
 					continue;
 				}
-				if (plan.base.speculative && (notInitialized || notCutOver || awaitingData)) {
-					// Every error that starts this fallback comes before any handler ran on the target.
-					collector.forget(target.partitionId);
-					const again = this.#planRange(op, input, false);
-					invariant(again.length === 1, "fokos/runtime.forwardRangeVisit: a hash partition plans one base visit");
-					const fallback = again[0];
-					if (fallback.visit.target === "local") {
-						collector.add(this.#selfNode("executed"));
-						return await this.#runLocal(descriptor, req, this.#localCall().call);
-					}
-					target = fallback.visit.target;
-					plan = fallback;
-					continue;
+				const again = this.#planRange(op, input, opts.bloom);
+				invariant(again.length === 1, "fokos/runtime.forwardRangeVisit: a hash partition plans one base visit");
+				const fallback = again[0];
+				if (fallback.planned.visit.target === "local") {
+					return await runLocal(req);
 				}
-				throw e;
+				target = fallback.planned.visit.target;
+				plan = fallback;
 			}
 		}
 	}
@@ -2305,14 +2355,44 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return signals;
 	}
 
-	#admit(op: string, descriptor: Exclude<AnyOperation, { shape: "local" }>, keys: RouteKey[]): void {
+	/**
+	 * Runs the local handler and lists this partition as its executor. The node is added before the
+	 * handler runs: a handler that throws still served the scope, and the error carries the node so a
+	 * forwarding partition learns from the error as it learns from a result. The signals come back to
+	 * the caller, because the caller decides when they apply: after the handler settled, and only when
+	 * it did not throw. `epoch` is the ownership epoch of the plan that chose this partition.
+	 */
+	async #runLocalScope(
+		descriptor: Exclude<AnyOperation, { shape: "local" }>,
+		req: unknown,
+		collector: RouteCollector,
+		scope: ExecutionScope,
+		epoch: number,
+	): Promise<{ value: unknown; signals: FokosSignals[] }> {
+		const { call, signals } = this.#localCall(sliceOf(scope));
+		collector.add(this.#selfNode("executed"));
+		this.#assertEpoch(epoch);
+		const value = await this.#runLocal(descriptor, req, call);
+		return { value, signals };
+	}
+
+	/**
+	 * The plan that chose this partition and the local run must be in one synchronous block, so that no
+	 * cutover comes between the ownership decision and the write. A cutover increments the epoch, so a
+	 * changed epoch means that an executor awaited between its plan and its local run.
+	 */
+	#assertEpoch(epoch: number): void {
+		invariant(epoch === this.#ownershipEpoch, "fokos/runtime: a cutover came between the plan and the local run");
+	}
+
+	#admit(op: string, descriptor: Exclude<AnyOperation, { shape: "local" }>, spans: readonly NormalizedSpan[]): void {
 		if (!this.#hooks.admit) {
 			return;
 		}
 		const decision = this.#hooks.admit({
 			op,
 			admissionTag: descriptor.admissionTag,
-			keys,
+			keys: admittedKeys(spans),
 			// Every dispatch admits. A `lifecycle()` result reads its storage only for the fields that the
 			// hook reads, so a host that admits on its own size or tag alone reads nothing.
 			lifecycle: this.lifecycle(),
@@ -2327,21 +2407,27 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 	}
 
-	/** The routingHashes of the keys or the position that a request names, which a forward learns against. */
-	#scopeRoutingHashes(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): RoutingHash[] {
-		return this.#scopePositions(descriptor, req).map((pos) => pos.routingHash);
+	/** A read-through admits nothing: the target admitted the request, and a read changes nothing here. */
+	#admitIn(
+		scope: ExecutionScope,
+		op: string,
+		descriptor: Exclude<AnyOperation, { shape: "local" }>,
+		spans: readonly NormalizedSpan[],
+	): void {
+		if (scope.kind === "owned") {
+			this.#admit(op, descriptor, spans);
+		}
 	}
 
-	/** The positions of the keys a request names, or its position, for the ownership check of the read-through gate. */
-	#scopePositions(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): FokosStoragePosition[] {
-		switch (descriptor.shape) {
-			case "point":
-				return [this.#positionOf(descriptor.key(req))];
-			case "group":
-			case "single_owner":
-				return descriptor.items(req).map((item) => this.#positionOf(item.key));
-			case "range":
-				return [this.#positionOf({ hashKey: descriptor.range(req).hashKey, sortKey: NO_SORT_KEY })];
+	/** A read-through runs no `beforeForward`: the target ran it. */
+	#beforeForwardIn(scope: ExecutionScope, descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): FokosSignals[] {
+		return scope.kind === "owned" ? this.#beforeForward(descriptor, req) : [];
+	}
+
+	/** A read-through applies no signal: its handler serves the slice of another partition. */
+	async #applySignalsIn(scope: ExecutionScope, signals: readonly FokosSignals[]): Promise<void> {
+		if (scope.kind === "owned") {
+			await this.#applySignals(signals);
 		}
 	}
 
@@ -2651,7 +2737,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return this.#stub(this.routeContext(), ref.doName) as unknown as FokosShardingRpc;
 	}
 
-	#validateOperations(): void {
+	/**
+	 * Compiles each operation once: its execution kind, and the facts the executor reads. It refuses a
+	 * descriptor that breaks a rule of its execution kind (`EXECUTION_RULES`).
+	 */
+	#compileOperations(): Record<string, CompiledOperation> {
+		const compiled: Record<string, CompiledOperation> = {};
 		for (const [name, descriptor] of Object.entries(this.#ops)) {
 			// The runtime reserves the prefix for the operation names of its control-plane actions, and
 			// `#guard` answers some of them behind the destroy fence. A host operation that took one of
@@ -2662,20 +2753,18 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					attributes: { operation: name },
 				});
 			}
-			if (descriptor.shape === "local") {
-				continue;
+			const entry = compileOperation(descriptor);
+			if (descriptor.shape !== "local" && descriptor.whileMigrating === "read_source") {
+				if (descriptor.readOnly !== true || !EXECUTION_RULES[entry.execution].readSource) {
+					throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
+						message: "a read_source operation must be readOnly, and its execution must allow a read-through",
+						attributes: { operation: name, shape: descriptor.shape, execution: entry.execution, readOnly: descriptor.readOnly },
+					});
+				}
 			}
-			if (descriptor.whileMigrating !== "read_source") {
-				continue;
-			}
-			const shapeReadsThrough = descriptor.shape === "point" || descriptor.shape === "group" || descriptor.shape === "range";
-			if (descriptor.readOnly !== true || !shapeReadsThrough) {
-				throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
-					message: "a read_source operation must be readOnly and of the point, group or range shape",
-					attributes: { operation: name, shape: descriptor.shape, readOnly: descriptor.readOnly },
-				});
-			}
+			compiled[name] = entry;
 		}
+		return compiled;
 	}
 
 	#logParams(): Record<string, unknown> {
@@ -2761,17 +2850,103 @@ function isBloomHit(resolution: Resolution): resolution is RemoteResolution {
 	return resolution.kind === "remote" && resolution.via === "bloom";
 }
 
-function addToGroups(groups: Groups, entry: GroupEntry, resolution: OwnedResolution): void {
+function addToPlan(plan: PointPlan, span: PointSpan, resolution: OwnedResolution): void {
 	if (resolution.kind === "local") {
-		groups.local.push(entry);
+		plan.local.push(span);
 		return;
 	}
-	const group = groups.remote.get(resolution.target.partitionId);
-	if (group) {
-		group.entries.push(entry);
+	const visit = plan.remote.get(resolution.target.partitionId);
+	if (visit) {
+		visit.spans.push(span);
 	} else {
-		groups.remote.set(resolution.target.partitionId, { resolution, entries: [entry] });
+		plan.remote.set(resolution.target.partitionId, { resolution, spans: [span] });
 	}
+}
+
+/** The execution kind of a shape, and the facts of the shape that its executor reads. */
+function compileOperation(descriptor: AnyOperation): CompiledOperation {
+	switch (descriptor.shape) {
+		case "point":
+			return { descriptor, execution: "one_owner", bloomOnRetry: true };
+		case "single_owner":
+			return { descriptor, execution: "one_owner", onManyOwners: { answer: descriptor.notApplicable }, bloomOnRetry: false };
+		case "group":
+			return { descriptor, execution: "fan_out", bloomOnRetry: false };
+		case "range":
+			return { descriptor, execution: "walk", bloomOnRetry: true };
+		case "local":
+			return { descriptor, execution: "local", bloomOnRetry: false };
+	}
+}
+
+type RoutedDescriptor = Exclude<AnyOperation, { shape: "local" }>;
+type GroupDescriptor = Extract<AnyOperation, { shape: "group" }>;
+type RangeDescriptor = Extract<AnyOperation, { shape: "range" }>;
+
+function routedDescriptor(compiled: CompiledOperation): RoutedDescriptor {
+	invariant(compiled.descriptor.shape !== "local", "fokos/runtime: a local operation has no executor");
+	return compiled.descriptor;
+}
+
+function groupDescriptor(compiled: CompiledOperation): GroupDescriptor {
+	invariant(compiled.descriptor.shape === "group", "fokos/runtime: a fan_out operation is the group shape");
+	return compiled.descriptor;
+}
+
+function rangeDescriptor(compiled: CompiledOperation): RangeDescriptor {
+	invariant(compiled.descriptor.shape === "range", "fokos/runtime: a walk operation is the range shape");
+	return compiled.descriptor;
+}
+
+/** The answer of a `one_owner` request whose spans have more than one owner. */
+function manyOwnersAnswer(op: string, compiled: CompiledOperation): unknown {
+	invariant(compiled.onManyOwners, () => `fokos/runtime: the spans of ${op} cannot have more than one owner`);
+	return compiled.onManyOwners.answer;
+}
+
+function pointSpans(spans: readonly NormalizedSpan[]): PointSpan[] {
+	return spans.map((span) => {
+		invariant(span.kind !== "interval", "fokos/runtime: a point executor got an interval span");
+		return span;
+	});
+}
+
+function intervalSpan(spans: readonly NormalizedSpan[]): IntervalSpan {
+	const [span] = spans;
+	invariant(spans.length === 1 && span.kind === "interval", "fokos/runtime: a walk has one interval span");
+	return span;
+}
+
+/** The host data of an item span: the `item` that `items(req)` gave for its key. */
+function dataOf(span: PointSpan): unknown {
+	invariant(span.kind === "item", "fokos/runtime: a fan_out span names an item");
+	return span.data;
+}
+
+/** The routingHashes that a forward learns against: one for each span. */
+function routingHashesOf(spans: readonly NormalizedSpan[]): RoutingHash[] {
+	return spans.map((span) => span.position.routingHash);
+}
+
+/**
+ * The keys that `hooks.admit` gets. An item gives its key. A position names no item, so it gives none.
+ * An interval gives its hash key with the empty sort key.
+ */
+function admittedKeys(spans: readonly NormalizedSpan[]): RouteKey[] {
+	const keys: RouteKey[] = [];
+	for (const span of spans) {
+		if (span.kind === "item") {
+			keys.push(span.key);
+		} else if (span.kind === "interval") {
+			keys.push({ hashKey: span.range.hashKey, sortKey: NO_SORT_KEY });
+		}
+	}
+	return keys;
+}
+
+/** The slice that is the scope of a local call: the caller slice of a read-through, or null for the owned scope. */
+function sliceOf(scope: ExecutionScope): FokosSlice | null {
+	return scope.kind === "readThrough" ? scope.slice : null;
 }
 
 /** Never transient: the key reached a partition that can neither own nor route it. */
