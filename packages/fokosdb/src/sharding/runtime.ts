@@ -1091,6 +1091,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/** Runs the `range` shape: the host walks the planned visits of the interval. */
 	async #runWalk(op: string, compiled: CompiledOperation, span: IntervalSpan, req: unknown, collector: RouteCollector): Promise<unknown> {
 		const descriptor = rangeDescriptor(compiled);
+		const epoch = this.#ownershipEpoch;
 		const planned = this.#planRange(op, span.range, true);
 		const visits = planned.map((p) => p.planned.visit);
 		// The walk admits one time, before the first local run: at the start when the plan has a local
@@ -1113,20 +1114,32 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			signals.push(...own);
 			return out;
 		};
-		const value = await descriptor.walk({
-			request: req,
-			visits,
-			local,
-			forward: async (visit, r) => {
-				// A walk that forwards makes this partition a router of the request. A leaf that also ran
-				// the handler keeps its `executed` role, because `executed` outranks `merged`.
-				collector.add(this.#selfNode("merged"));
-				return await this.#forwardRangeVisit(op, compiled, visit, r, collector, (fallback) => {
-					admitOnce();
-					return local(fallback);
-				});
-			},
-		});
+		// The host awaits each visit before the next one, so a cutover can come between the plan and a
+		// later local visit. After a cutover this partition can own less of the interval: a local visit
+		// then plans its part again, and walks the owners of now from that point. The part of the nested
+		// walk has the form of a forward to a router, so the outer walk folds it unchanged.
+		const walk = async (request: unknown, planned: readonly RangePlan[], epoch: number): Promise<unknown> =>
+			await descriptor.walk({
+				request,
+				visits: planned.map((p) => p.planned.visit),
+				local: (r) => {
+					if (epoch !== this.#ownershipEpoch) {
+						const epochNow = this.#ownershipEpoch;
+						return walk(r, this.#planRange(op, descriptor.range(r), true), epochNow);
+					}
+					return local(r);
+				},
+				forward: async (visit, r) => {
+					// A walk that forwards makes this partition a router of the request. A leaf that also ran
+					// the handler keeps its `executed` role, because `executed` outranks `merged`.
+					collector.add(this.#selfNode("merged"));
+					return await this.#forwardRangeVisit(op, compiled, visit, r, collector, (fallback) => {
+						admitOnce();
+						return local(fallback);
+					});
+				},
+			});
+		const value = await walk(req, planned, epoch);
 		await this.#applySignals(signals);
 		return value;
 	}
