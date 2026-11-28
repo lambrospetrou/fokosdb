@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-11-28
 **Author:** Lambros
-**Status:** Nothing is built. This document gives the design that section 8 of
+**Status:** Milestone 1 is built (section 6.1). This document gives the design that section 8 of
 `docs/agent-plans/2026-11-20-scan-items.md` asks for. It is a breaking change of the host API one time, by decision.
 After it, a new kind of dispatch must be an additive change (section 8).
 
@@ -254,7 +254,9 @@ Each milestone ships on its own, and the full test suite passes after each one.
    still are the input, and the runtime maps each shape to an executor. No change of the host API and no change of
    behaviour. This milestone isolates the risk of the refactor from the risk of the API change.
 2. **The composite frontier.** The planner plans storage intervals across routingHashes: local slices, hash children,
-   and the range trees of promoted routingHashes. `planRangeFrontier` works on composite keys.
+   and the range trees of promoted routingHashes. `planRangeFrontier` works on composite keys. The planner of an
+   interval reads the topology cache, as the planner of a point does. The walk then reads through with the gate of
+   the other executors, and its own branch in `#executeLocal` goes.
 3. **The new descriptor (breaking).** The shapes, `FokosRangeInput`, `FokosRangeVisit`, `SkInterval`, and
    `FokosRangeCursor` leave the sharding layer. Every operation of the three hosts moves. `hooks.admit` gets `spans`
    in place of `keys`. The coordinator uses a `hash_key` span, and `apiScanItems` uses a `position` span. The position
@@ -263,6 +265,65 @@ Each milestone ships on its own, and the full test suite passes after each one.
 4. **The client (breaking).** `FokosShardingClient.plan(spans)` and `send` replace `resolve`, `resolveRange`,
    `resolveAll`, `point`, and `range`. `fanOut` replaces the five copies of the grouping code.
 5. **The first new consumer.** The `graphGetItems` step, with gets and queries in one `fan_out`, proves the design.
+
+### 6.1 What milestone 1 built
+
+The change is in `sharding/runtime.ts`, and one callback in `sharding/repartition-flow.ts`. The host API, the wire,
+and the stored state do not change. The full test suite passes with no test change: 148 files and 2809 tests, and the
+26 tests of `examples/http-api`, the same as before the change.
+
+- **Spans.** `#spansOf` gives the footprint of each shape as `NormalizedSpan`s: an `item`, a `position`, or the
+  `interval` of a `range` request. Each span carries its position, so a key is hashed one time for each request. The
+  import gate, the admission (`admittedKeys`), and the learning (`routingHashesOf`) read spans. The
+  `"routingHash" in key` check of the runtime is now in `#spansOf` only.
+- **Compiled operations.** The constructor compiles each descriptor to a `CompiledOperation` with its execution kind
+  (`compileOperation`), and checks it against `EXECUTION_RULES`. `#execute` is the only `switch` on the execution kind.
+  `point` and `single_owner` are one executor, `one_owner`, with `onManyOwners` for `single_owner`. `group` is
+  `fan_out`, and `range` is `walk`.
+- **One point planner.** `#planPoints` plans the point spans of every point executor, with the Bloom guard.
+  `#planInCallerSlice` is the same plan for a read-through.
+- **One forward, one miss ladder.** `#forwardVisit` forwards the spans of a point visit, and `#forwardRangeVisit`
+  forwards a range visit. Both use `#missLadder` with a `MissHint`. A planned range visit carries a hint, as a point
+  resolution does.
+- **One read-through path for the point executors.** `#executeLocal` runs the same executor as the owner, with an
+  `ExecutionScope` of kind `readThrough`. The scope turns off the admission, `beforeForward`, and the signals, and it
+  gives the local call the caller slice. The walk keeps its own read-through branch until milestone 2.
+- **The epoch check.** A cutover increments `#ownershipEpoch` (`onCutover` of the repartition flow). A point plan
+  records the epoch, and `#runLocalScope` and the local part of a `fan_out` check it with an invariant.
+
+The executors are private methods of the runtime, not objects behind a context interface. The primitives that they
+use (the planner, the forward, the admission, the local run) are private fields of the runtime. A new executor is one
+entry in `EXECUTION_RULES`, one case in `compileOperation`, one case in `#execute`, and one method. Milestone 3 moves
+the executors behind the `FokosExecutionContext` of section 7.2.5, together with the public descriptor.
+
+### 6.2 What milestone 1 found
+
+The refactor put the code of each shape next to the code of the other shapes. These differences had no reason, and
+milestone 1 removes them:
+
+| # | Finding | Before | After |
+| --- | --- | --- | --- |
+| 1 | The range forward had its own miss ladder. | A stale hash-arena hint on a range visit had no fallback: the error went to the caller. A point, a group, and a single-owner forward fell back. | `#forwardRangeVisit` uses `#missLadder`. A hash miss forgets the arena hint and plans again. |
+| 2 | A range fallback that ran the visit here skipped steps. | It did not admit, and it dropped the signals of the handler, in the walk and in `forwardRangeVisit`. | It runs through the local function of the walk: it admits one time and keeps the signals. |
+| 3 | The read-through of `group` used the wrong scope. | `ownedSliceEnd` of its local call gave the end of the owned slice of the source, not of the caller slice. | Each read-through local call has the caller slice. |
+| 4 | The read-through of `group` applied signals on the source. | The read-through of `point` applied none. | No read-through applies a signal. |
+| 5 | The read-through of a promoted `point` key had no miss fallback. | A stale learned slice gave an error. The read-through of `group` fell back. | Both use `#forwardVisit`. |
+| 6 | `single_owner` could not read through. | `#validateOperations` refused it, because `#executeLocal` had no branch for it. | The rule is in `EXECUTION_RULES`, and `one_owner` reads through. |
+| 7 | The Bloom guard grouped spans by hash key. | The Bloom filter answers for a routingHash. Two hash keys with one routingHash were two groups. | The guard groups by routingHash. It needs no hash of the key. |
+| 8 | A forward hashed each key again for the learning. | `#forwardGroup` and `#forwardSingleOwner` hashed each key a second time. | Each span carries its routingHash. |
+
+Two findings stay open, because a fix changes behaviour (sections 10.5 and 10.6):
+
+- A walk can run a local visit after it awaited an earlier visit, and a cutover can come between the two.
+- An empty `group` runs its handler here and lists no `executed` node in `servedBy`. Each other local run lists one.
+
+Milestone 1 also changed two things in the design of section 7.2.5:
+
+- The epoch check is an invariant, not the error code `sharding_cutover_raced`. A changed epoch is a defect of an
+  executor, so `invariant_failed` is the correct answer, and the error catalog gets no new code.
+- The Bloom rule on a retry stays a fact of each shape (`bloomOnRetry`): `point` and `range` keep the Bloom step, and
+  `group` and `single_owner` turn it off. Milestone 3 gives each operation the rule of section 7.2.5, by the number of
+  routingHashes of the visit.
 
 ## 7. Proposed solution
 
@@ -497,7 +558,8 @@ What the contract gives:
   fallback, and the learning from the context. G1, G2, G4, G7, G8, and G11 therefore hold for each executor, the new
   ones too.
 - **G3 as a check, not only a rule.** The cutover transaction increments an in-memory ownership epoch. `plan` records
-  the epoch in each visit. `runLocal` throws when the epoch changed. Today G3 depends on each dispatch function to keep
+  the epoch in each visit. `runLocal` fails an invariant when the epoch changed. A `walk` is the exception: its local
+  visits can run after an `await` (section 10.5). Today G3 depends on each dispatch function to keep
   the plan and the local write in one synchronous block. With the check, a new executor that awaits between the two
   fails in a test, and it never writes on a partition that lost the key.
 - **One miss ladder.** `forwardVisit` forgets the hint and plans the spans of the visit again. It returns the new
@@ -517,6 +579,10 @@ the executor of the operation with `plan` limited to the caller slice and the `E
 sends a promoted routingHash of a `hash_child` caller slice to its range tree, and it clips intervals to the caller
 slice. This replaces the three branches of `#executeLocal`. The gate does not know the execution kind, so a new
 executor gets the read-through with no new code. The `executeLocal` request does not change.
+
+A read-through admits nothing, runs no `beforeForward`, and applies no signal: the target did the first two, and the
+handler serves the slice of another partition. Its local call gets the caller slice, so `ownedSliceEnd` ends at the
+caller slice. A `one_owner` operation with `onManyOwners` reads through like any other executor.
 
 #### 7.2.7 Admission, local calls, and learning
 
@@ -778,6 +844,25 @@ give `split` both the spans and their indexes.
 
 A host can then refuse a scan on a partition that is over its size. The host must decide which tags refuse an
 interval, because a refused read on a full partition does not make it smaller.
+
+### 10.5 A local visit of a walk after a cutover
+
+A walk plans its visits one time, and the host awaits each forward before the next visit. When a split of this
+partition cuts over during the walk, a later local visit still reads the rows of this partition. Writes go to the
+children after the cutover. A child refuses writes while it imports, so the read is stale only when the import of a
+child completes during the walk. Options:
+
+- The `local` function of the walk checks the epoch. When it changed, the visit is planned again and forwarded. This
+  needs a walk that can fold more than one answer for one visit.
+- The `local` function throws `partition_migrating` when the epoch changed, and the caller retries the page.
+
+The second option is small and keeps G3. It changes the answer of a rare race from a stale read to a retry.
+
+### 10.6 The empty fan-out
+
+An empty `group` request runs the handler on the partition that receives it, also on a router, and lists no
+`executed` node. `txPrepare` has a handler branch for it. With `onEmpty` (section 7.2.2), each operation declares this
+behaviour. Option: an empty request with `onEmpty: "local"` lists `executed`, as every other local run does.
 
 ## 11. Frequently asked questions
 
