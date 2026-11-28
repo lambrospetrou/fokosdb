@@ -11,7 +11,7 @@
 	"name": "fokos-lib-dev",
 	"main": "test/worker-entry.ts",
 	"compatibility_date": "2026-05-23",
-	"compatibility_flags": ["nodejs_compat"],
+	"compatibility_flags": ["nodejs_compat", "durable_object_snapshots"],
 	"migrations": [
 		{
 			"new_sqlite_classes": [
@@ -40,6 +40,10 @@
 		{
 			"new_sqlite_classes": ["BaseSeedPartitionDO"],
 			"tag": "v4",
+		},
+		{
+			"new_sqlite_classes": ["SnapshotPartitionDO", "SnapshotStoreDO"],
+			"tag": "v5",
 		},
 	],
 	"durable_objects": {
@@ -99,6 +103,14 @@
 			{
 				"class_name": "BaseSeedPartitionDO",
 				"name": "BASE_SEED_PARTITION_DO",
+			},
+			{
+				"class_name": "SnapshotPartitionDO",
+				"name": "SNAPSHOT_PARTITION_DO",
+			},
+			{
+				"class_name": "SnapshotStoreDO",
+				"name": "SNAPSHOT_STORE_DO",
 			},
 		],
 	},

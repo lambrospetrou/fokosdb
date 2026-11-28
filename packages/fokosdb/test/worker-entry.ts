@@ -42,6 +42,10 @@ export class BaseSeedPartitionDO extends FokosDBPartitionDO {
 export { ControlledPartitionDO } from "./controlled-partition-do.js";
 export { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
 
+// A partition with a local fake of the snapshot API, which workerd does not implement locally.
+export { SnapshotPartitionDO } from "./snapshot/snapshot-partition-do.js";
+export { SnapshotStoreDO } from "./snapshot/snapshot-store-do.js";
+
 // The example host of the sharding runtime. It uses no FokosDB module.
 export { CounterPartitionDO } from "./sharding/counter-host.js";
 // The topology admin of the sharding tests. It builds soon after a report.

@@ -1,5 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
+import { snapshotHost } from "./test/snapshot/snapshot-host.js";
 
 export default defineConfig({
 	define: {
@@ -11,10 +12,16 @@ export default defineConfig({
 		__FOKOS_PROPERTY_SEED__: JSON.stringify(process.env.FOKOS_PROPERTY_SEED ?? ""),
 		__FOKOS_PROPERTY_PATH__: JSON.stringify(process.env.FOKOS_PROPERTY_PATH ?? ""),
 		__FOKOS_PROPERTY_REPLAY_PATH__: JSON.stringify(process.env.FOKOS_PROPERTY_REPLAY_PATH ?? ""),
+		// The default backend of the fake snapshot API: memory, do or host. test/snapshot/fake-snapshots.ts
+		// describes them.
+		__FOKOS_SNAPSHOT_BACKEND__: JSON.stringify(process.env.FOKOS_SNAPSHOT_BACKEND ?? ""),
+		// `all` runs test/snapshot/snapshot-sizes.test.ts with every size in every backend.
+		__FOKOS_SNAPSHOT_SIZES__: JSON.stringify(process.env.FOKOS_SNAPSHOT_SIZES ?? ""),
 	},
 	test: {
-		// It applies the replay settings to fast-check and adds the replay commands to a failure.
-		setupFiles: ["./test/property-based/replay-setup.ts"],
+		// The first applies the replay settings to fast-check and adds the replay commands to a failure.
+		// The second deletes the fake snapshot copies of a file after it.
+		setupFiles: ["./test/property-based/replay-setup.ts", "./test/snapshot/cleanup-setup.ts"],
 		// Several suites spy on Date.now, console.error and PartitionStore.prototype. Restoring
 		// globally keeps a spy from leaking out of the test that installed it.
 		restoreMocks: true,
@@ -42,6 +49,14 @@ export default defineConfig({
 			miniflare: {
 				bindings: {
 					FOKOS_SHOULD_FETCH_COLO_INFO: false,
+				},
+				serviceBindings: {
+					// The `host` backend of the fake snapshot API. It runs in this Node process, and it
+					// writes each copy to a file. FOKOS_KEEP_SNAPSHOTS=1 keeps the files after the run.
+					FOKOS_SNAPSHOT_HOST: snapshotHost({
+						dir: process.env.FOKOS_SNAPSHOT_DIR,
+						keep: process.env.FOKOS_KEEP_SNAPSHOTS === "1",
+					}),
 				},
 			},
 		}),
