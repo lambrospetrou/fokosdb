@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Prepares a new Amp orb: installs the workspace dependencies from the lockfile.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "node $(node --version), pnpm $(pnpm --version)"
+time pnpm install --frozen-lockfile
