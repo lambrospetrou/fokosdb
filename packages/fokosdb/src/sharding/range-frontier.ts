@@ -1,20 +1,19 @@
 /**
- * The interval frontier of one range request: a disjoint, ordered cover of the requested sort-key
+ * The interval frontier of one range request: a disjoint, ordered cover of the requested composite
  * interval with the deepest partition this partition knows for each segment.
  *
  * The planner is pure. The runtime gives it the base cover its durable topology defines, the learned
  * descendant boundaries of the range tree, and the request; it returns the visits. A partial cache
  * cannot create a gap, because every segment that no learned slice covers keeps its base target.
  *
- * A range tree orders its rows by the composite key `(hk, sk)`, so the boundaries of its partitions
- * are composite keys. A request reads one hash key. The planner projects each boundary onto the
- * sort keys of that hash key (`projectOnHashKey`), and plans on the sort-key axis.
+ * A range tree orders its rows by the composite key `(hk, sk)`, and the boundaries of its partitions
+ * are composite keys. The planner plans on that axis: the request is a half-open composite interval,
+ * and a visit is a composite segment.
  */
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef } from "./route-context.js";
-import type { FokosRangeVisit } from "./runtime-types.js";
 import type { LearnedRangeSlice } from "./sharding-store.js";
-import { rangeIntersects, type SkInterval } from "./sk-interval.js";
+import type { SkInterval } from "./sk-interval.js";
 
 /** One partition of the durable cover: a direct child of a range router, a range root, or this partition. */
 export type FrontierBase = {
@@ -24,9 +23,20 @@ export type FrontierBase = {
 	speculative: boolean;
 };
 
+/** A half-open interval `[start, end)` of composite keys inside one routingHash. A null end has no upper bound. */
+export type CompositeInterval = { start: FokosCompositeKey; end: FokosCompositeKey | null };
+
+/** One segment of the cover: its target, and the bounds of the partition or learned slice that serves it. A null bound is open. */
+export type FrontierSegment = {
+	target: FokosPartitionRef | "local";
+	start: FokosCompositeKey | null;
+	end: FokosCompositeKey | null;
+	speculative: boolean;
+};
+
 /** One planned visit with the facts the runtime needs when the visit fails: its base, and the learned slice it used. */
 export type PlannedVisit = {
-	visit: FokosRangeVisit;
+	segment: FrontierSegment;
 	base: FrontierBase;
 	learned: LearnedRangeSlice | null;
 };
@@ -94,74 +104,95 @@ export function projectOnHashKey(hashKey: KeyBytes, start: FokosCompositeKey | n
 	return { start: skStart, end: skEnd };
 }
 
-function skStartCmp(a: KeyBytes | null, b: KeyBytes | null): number {
-	if (a === null || b === null) {
-		return a === b ? 0 : a === null ? -1 : 1;
-	}
-	return KeyCodec.compare(a, b);
+/**
+ * The composite interval of the sort keys of `hashKey` inside `interval`. An inclusive bound becomes
+ * a half-open bound with `KeyCodec.after`: no key is between `k` and `after(k)`. An open lower bound
+ * starts at the empty sort key, and an open upper bound ends before the next hash key, `after(hashKey)`.
+ */
+export function hashKeyInterval(hashKey: KeyBytes, interval: SkInterval): CompositeInterval {
+	const { lower, upper } = interval;
+	const startSk = lower === undefined ? NO_KEY : lower.inclusive ? lower.value : KeyCodec.after(lower.value);
+	const end =
+		upper === undefined
+			? { hk: KeyCodec.after(hashKey), sk: NO_KEY }
+			: { hk: hashKey, sk: upper.inclusive ? KeyCodec.after(upper.value) : upper.value };
+	return { start: { hk: hashKey, sk: startSk }, end };
 }
 
-function skEndCmp(a: KeyBytes | null, b: KeyBytes | null): number {
-	if (a === null || b === null) {
-		return a === b ? 0 : a === null ? 1 : -1;
-	}
-	return KeyCodec.compare(a, b);
+/** True when `[start, end)` and `interval` have a key in common. A null bound is open. */
+export function segmentIntersects(start: FokosCompositeKey | null, end: FokosCompositeKey | null, interval: CompositeInterval): boolean {
+	return (
+		(end === null || KeyCodec.compareComposite(interval.start, end) < 0) &&
+		(start === null || interval.end === null || KeyCodec.compareComposite(start, interval.end) < 0)
+	);
 }
 
-/** True when `[start, end)` is inside `[outerStart, outerEnd)`. */
-function contains(outer: SkSegment, inner: SkSegment): boolean {
-	return skStartCmp(outer.start, inner.start) <= 0 && skEndCmp(outer.end, inner.end) >= 0;
-}
-
-/** True when `inner` is inside `outer` and narrower than it. */
-function isStrictSubSegment(inner: SkSegment, outer: SkSegment): boolean {
-	const startRel = skStartCmp(inner.start, outer.start);
-	const endRel = skEndCmp(inner.end, outer.end);
-	return startRel >= 0 && endRel <= 0 && (startRel > 0 || endRel < 0);
+/** True when `[start, end)` holds the whole `[innerStart, innerEnd)`. A null bound is open. */
+function holds(
+	start: FokosCompositeKey | null,
+	end: FokosCompositeKey | null,
+	innerStart: FokosCompositeKey | null,
+	innerEnd: FokosCompositeKey | null,
+): boolean {
+	return startCmp(start, innerStart) <= 0 && endCmp(end, innerEnd) >= 0;
 }
 
 const NO_KEY = KeyCodec.encodeOptional(undefined);
 
 /**
- * Plans the visits of one request for the sort keys of `hashKey`.
+ * Plans the visits of one request for the composite interval `interval`.
  *
  * 1. Keep the base partitions that intersect the requested interval.
  * 2. Overlay the learned slices that are strict sub-slices of a base partition: split its interval at
  *    every learned boundary inside it.
- * 3. For each segment, select the deepest learned slice that contains it, or keep the base target.
+ * 3. For each segment that intersects the interval, select the deepest learned slice that contains the
+ *    whole segment, or keep the base target.
  * 4. Merge adjacent segments with one target, and order the visits by `descending`.
  *
  * `bases` must be disjoint and in ascending boundary order. `refOf` builds the reference of a learned
- * slice, because only the runtime holds the route context that names a range partition. Each visit
- * holds a sort-key segment of `hashKey`.
+ * slice, because only the runtime holds the route context that names a range partition. A segment is
+ * not clipped to the interval: it is the part of its target that the cover gives it.
  */
 export function planRangeFrontier(
-	hashKey: KeyBytes,
 	bases: readonly FrontierBase[],
 	learned: readonly LearnedRangeSlice[],
-	interval: SkInterval,
+	interval: CompositeInterval,
 	descending: boolean,
 	refOf: (slice: LearnedRangeSlice) => FokosPartitionRef,
 ): PlannedVisit[] {
-	const learnedSegments: Array<{ slice: LearnedRangeSlice; segment: SkSegment }> = [];
-	for (const slice of learned) {
-		const segment = projectOnHashKey(hashKey, slice.startBoundary, slice.endBoundary);
-		if (segment !== null) {
-			learnedSegments.push({ slice, segment });
-		}
-	}
 	const visits: PlannedVisit[] = [];
-	for (const base of bases) {
-		const baseSegment = projectOnHashKey(hashKey, base.start, base.end);
-		if (baseSegment === null || !rangeIntersects(baseSegment.start ?? NO_KEY, baseSegment.end, interval)) {
+	// The learned slices inside each base. The bases are disjoint and in order, so a slice can only be
+	// inside the last base that starts at or before it, and a binary search finds that base. A slice
+	// outside the interval can serve no segment of it, so the planner drops it.
+	const insideOf: LearnedRangeSlice[][] = bases.map(() => []);
+	for (const slice of learned) {
+		if (!segmentIntersects(slice.startBoundary, slice.endBoundary, interval)) {
 			continue;
 		}
-		const inside = learnedSegments.filter(
-			({ slice, segment }) => isStrictSubSlice(slice, base.start, base.end) && isStrictSubSegment(segment, baseSegment),
-		);
+		let lo = 0;
+		let hi = bases.length - 1;
+		let at = -1;
+		while (lo <= hi) {
+			const mid = (lo + hi) >> 1;
+			if (startCmp(bases[mid].start, slice.startBoundary) <= 0) {
+				at = mid;
+				lo = mid + 1;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		if (at >= 0 && isStrictSubSlice(slice, bases[at].start, bases[at].end)) {
+			insideOf[at].push(slice);
+		}
+	}
+	for (const [b, base] of bases.entries()) {
+		if (!segmentIntersects(base.start, base.end, interval)) {
+			continue;
+		}
+		const inside = insideOf[b];
 		if (inside.length === 0) {
 			visits.push({
-				visit: { target: base.target, start: baseSegment.start, end: baseSegment.end, speculative: base.speculative },
+				segment: { target: base.target, start: base.start, end: base.end, speculative: base.speculative },
 				base,
 				learned: null,
 			});
@@ -169,39 +200,49 @@ export function planRangeFrontier(
 		}
 
 		// Every learned boundary strictly inside the base interval, once, in order.
-		const points: KeyBytes[] = [];
-		for (const { segment } of inside) {
-			for (const point of [segment.start, segment.end]) {
-				if (point === null || skStartCmp(point, baseSegment.start) <= 0 || skEndCmp(point, baseSegment.end) >= 0) {
-					continue;
-				}
-				if (!points.some((p) => KeyCodec.compare(p, point) === 0)) {
+		const points: FokosCompositeKey[] = [];
+		for (const slice of inside) {
+			for (const point of [slice.startBoundary, slice.endBoundary]) {
+				if (point !== null && startCmp(point, base.start) > 0 && endCmp(point, base.end) < 0) {
 					points.push(point);
 				}
 			}
 		}
-		points.sort(KeyCodec.compare);
-		const bounds: (KeyBytes | null)[] = [baseSegment.start, ...points, baseSegment.end];
+		points.sort(KeyCodec.compareComposite);
+		const bounds: (FokosCompositeKey | null)[] = [base.start];
+		for (const point of points) {
+			const last = bounds[bounds.length - 1];
+			if (last === null || KeyCodec.compareComposite(last, point) !== 0) {
+				bounds.push(point);
+			}
+		}
+		bounds.push(base.end);
 
 		let previous: PlannedVisit | null = null;
 		for (let i = 0; i + 1 < bounds.length; i++) {
-			const piece: SkSegment = { start: bounds[i], end: bounds[i + 1] };
-			if (!rangeIntersects(piece.start ?? NO_KEY, piece.end, interval)) {
+			const start = bounds[i];
+			const end = bounds[i + 1];
+			if (!segmentIntersects(start, end, interval)) {
+				// The pieces are in order, so after the first piece above the interval no piece touches it.
+				if (start !== null && interval.end !== null && KeyCodec.compareComposite(start, interval.end) >= 0) {
+					break;
+				}
 				previous = null;
 				continue;
 			}
 			let deepest: LearnedRangeSlice | null = null;
-			for (const { slice, segment } of inside) {
-				if (contains(segment, piece) && (deepest === null || slice.depth > deepest.depth)) {
+			for (const slice of inside) {
+				if ((deepest === null || slice.depth > deepest.depth) && holds(slice.startBoundary, slice.endBoundary, start, end)) {
 					deepest = slice;
 				}
 			}
 			const target = deepest ? refOf(deepest) : base.target;
-			if (previous && sameTarget(previous.visit.target, target) && skEndCmp(previous.visit.end, piece.start) === 0) {
-				previous.visit.end = piece.end;
+			if (previous && sameTarget(previous.segment.target, target)) {
+				// The pieces of one base touch, so a merge extends the previous segment to the end of this one.
+				previous.segment.end = end;
 				continue;
 			}
-			previous = { visit: { target, start: piece.start, end: piece.end, speculative: base.speculative }, base, learned: deepest };
+			previous = { segment: { target, start, end, speculative: base.speculative }, base, learned: deepest };
 			visits.push(previous);
 		}
 	}

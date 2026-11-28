@@ -1,6 +1,17 @@
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { KeyCodec, type FokosCompositeKey, type KeyBytes } from "./key-codec.js";
-import { planRangeFrontier, type FrontierBase } from "./range-frontier.js";
+import {
+	hashKeyInterval,
+	planRangeFrontier,
+	projectOnHashKey,
+	segmentIntersects,
+	startCmp,
+	endCmp,
+	type CompositeInterval,
+	type FrontierBase,
+	type PlannedVisit,
+} from "./range-frontier.js";
 import type { FokosPartitionRef } from "./route-context.js";
 import type { LearnedRangeSlice } from "./sharding-store.js";
 import type { SkInterval } from "./sk-interval.js";
@@ -39,13 +50,20 @@ function plan(
 	descending: boolean,
 	ref: (start: KeyBytes | null, end: KeyBytes | null) => FokosPartitionRef,
 ) {
-	return planRangeFrontier(HK, bases, slices, interval, descending, (slice) =>
+	return planRangeFrontier(bases, slices, hashKeyInterval(HK, interval), descending, (slice) =>
 		ref(slice.startBoundary?.sk ?? null, slice.endBoundary?.sk ?? null),
-	);
+	).map((p) => ({ ...p, visit: onHashKey(HK, p) }));
+}
+
+/** The visit of `hashKey` that a planned segment gives: the target and the sort-key segment of the hash key. */
+function onHashKey(hashKey: KeyBytes, planned: PlannedVisit) {
+	const segment = projectOnHashKey(hashKey, planned.segment.start, planned.segment.end);
+	expect(segment).not.toBeNull();
+	return { target: planned.segment.target, start: segment!.start, end: segment!.end, speculative: planned.segment.speculative };
 }
 
 /** The visits as `[target, start, end]` names. */
-function shape(visits: ReturnType<typeof planRangeFrontier>) {
+function shape(visits: ReturnType<typeof plan>) {
 	return visits.map(({ visit }) => [
 		visit.target === "local" ? "local" : visit.target.doName,
 		visit.start === null ? null : KeyCodec.decode(visit.start),
@@ -186,9 +204,11 @@ describe("planRangeFrontier with two hash keys in one routingHash", () => {
 		{ target: { partitionId: "right", doName: "right" }, start: split, end: null, speculative: false },
 	];
 	const targets = (hashKey: string, interval: SkInterval) =>
-		planRangeFrontier(kb(hashKey), bases, [], interval, false, () => {
+		planRangeFrontier(bases, [], hashKeyInterval(kb(hashKey), interval), false, () => {
 			throw new Error("no learned slice");
-		}).map(({ visit }) => [visit.target === "local" ? "local" : visit.target.doName, visit.start, visit.end]);
+		})
+			.map((p) => onHashKey(kb(hashKey), p))
+			.map((visit) => [visit.target === "local" ? "local" : visit.target.doName, visit.start, visit.end]);
 
 	it("sends each hash key only to the child of its own sort keys, over the whole sort-key axis", () => {
 		expect(targets("a", ALL)).toEqual([["left", null, null]]);
@@ -196,14 +216,27 @@ describe("planRangeFrontier with two hash keys in one routingHash", () => {
 		expect(targets("b", { lower: { value: kb("x"), inclusive: true } })).toEqual([["right", null, null]]);
 	});
 
+	it("sends the request to a learned slice that holds every sort key of the hash key, also when the slice is narrower than its base", () => {
+		// The slice [(g), (i)) holds the whole hash key h, but other hash keys of the routingHash are outside it.
+		const root: FrontierBase = { target: { partitionId: "root", doName: "root" }, start: null, end: null, speculative: false };
+		const slice: LearnedRangeSlice = {
+			startBoundary: { hk: kb("g"), sk: KeyCodec.encodeOptional(undefined) },
+			endBoundary: { hk: kb("i"), sk: KeyCodec.encodeOptional(undefined) },
+			depth: 1,
+		};
+		const visits = planRangeFrontier([root], [slice], hashKeyInterval(kb("h"), ALL), false, () => ({ partitionId: "g-i", doName: "g-i" }));
+		expect(visits.map((v) => v.segment.target)).toEqual([{ partitionId: "g-i", doName: "g-i" }]);
+		expect(visits[0].learned).toBe(slice);
+	});
+
 	it("splits the sort keys of one hash key at a boundary inside it", () => {
 		const inside: FrontierBase[] = [
 			{ ...bases[0], end: { hk: kb("a"), sk: kb("m") } },
 			{ ...bases[1], start: { hk: kb("a"), sk: kb("m") } },
 		];
-		const visits = planRangeFrontier(kb("a"), inside, [], ALL, false, () => {
+		const visits = planRangeFrontier(inside, [], hashKeyInterval(kb("a"), ALL), false, () => {
 			throw new Error("no learned slice");
-		});
+		}).map((p) => ({ visit: onHashKey(kb("a"), p) }));
 		expect(
 			visits.map(({ visit }) => [
 				visit.start === null ? null : KeyCodec.decode(visit.start),
@@ -214,8 +247,140 @@ describe("planRangeFrontier with two hash keys in one routingHash", () => {
 			["m", null],
 		]);
 		// The other hash key is fully above the boundary.
-		expect(planRangeFrontier(kb("b"), inside, [], ALL, false, () => ({ partitionId: "", doName: "" })).map((v) => v.visit.target)).toEqual([
-			inside[1].target,
-		]);
+		expect(
+			planRangeFrontier(inside, [], hashKeyInterval(kb("b"), ALL), false, () => ({ partitionId: "", doName: "" })).map(
+				(v) => v.segment.target,
+			),
+		).toEqual([inside[1].target]);
+	});
+});
+
+describe("planRangeFrontier against a brute-force cover", () => {
+	const HASH_KEYS = ["a", "b", "c"];
+	const SORT_KEYS = ["", "d", "e", "f", "g"];
+	/** Every composite key of the small key space, in order. */
+	const UNIVERSE: FokosCompositeKey[] = HASH_KEYS.flatMap((hk) =>
+		SORT_KEYS.map((sk) => ({ hk: kb(hk), sk: sk === "" ? KeyCodec.encodeOptional(undefined) : kb(sk) })),
+	).sort(KeyCodec.compareComposite);
+
+	type Node = { start: FokosCompositeKey | null; end: FokosCompositeKey | null; depth: number; children: Node[] };
+
+	/** A range tree: each node splits at most three times, at keys of the universe strictly inside it. */
+	function tree(choices: number[]): Node {
+		let next = 0;
+		const pick = (n: number) => (n <= 0 ? 0 : choices[next++ % choices.length] % n);
+		const grow = (node: Node): Node => {
+			if (node.depth >= 3 || pick(3) === 0) {
+				return node;
+			}
+			const inside = UNIVERSE.filter((key) => startCmp(node.start, key) < 0 && endCmp(node.end, key) > 0);
+			const cuts = [...new Set(Array.from({ length: 1 + pick(3) }, () => pick(inside.length)))]
+				.sort((x, y) => x - y)
+				.map((i) => inside[i])
+				.filter((key) => key !== undefined);
+			if (cuts.length === 0) {
+				return node;
+			}
+			const bounds = [node.start, ...cuts, node.end];
+			node.children = bounds.slice(0, -1).map((start, i) => grow({ start, end: bounds[i + 1], depth: node.depth + 1, children: [] }));
+			return node;
+		};
+		return grow({ start: null, end: null, depth: 0, children: [] });
+	}
+
+	const nameOf = (start: FokosCompositeKey | null, end: FokosCompositeKey | null) =>
+		`${start ? KeyCodec.compositeForLog(start) : "min"}|${end ? KeyCodec.compositeForLog(end) : "max"}`;
+	const ref = (start: FokosCompositeKey | null, end: FokosCompositeKey | null): FokosPartitionRef => ({
+		partitionId: nameOf(start, end),
+		doName: nameOf(start, end),
+	});
+	const holdsKey = (start: FokosCompositeKey | null, end: FokosCompositeKey | null, key: FokosCompositeKey) =>
+		startCmp(start, key) <= 0 && endCmp(end, key) > 0;
+	const holdsSegment = (
+		start: FokosCompositeKey | null,
+		end: FokosCompositeKey | null,
+		inner: { start: FokosCompositeKey | null; end: FokosCompositeKey | null },
+	) => startCmp(start, inner.start) <= 0 && endCmp(end, inner.end) >= 0;
+
+	const bound = fc.option(fc.record({ sk: fc.constantFrom(...SORT_KEYS), inclusive: fc.boolean() }), { nil: undefined });
+	const arbitrary = fc.record({
+		choices: fc.array(fc.nat(1000), { minLength: 1, maxLength: 40 }),
+		baseLevel: fc.constantFrom(0, 1),
+		learnedMask: fc.array(fc.boolean(), { minLength: 1, maxLength: 40 }),
+		hashKey: fc.constantFrom(...HASH_KEYS, "bb"),
+		lower: bound,
+		upper: bound,
+		descending: fc.boolean(),
+	});
+
+	it("covers each key of the interval exactly once, in order, with the deepest learned slice that holds each segment", () => {
+		fc.assert(
+			fc.property(arbitrary, ({ choices, baseLevel, learnedMask, hashKey, lower, upper, descending }) => {
+				const root = tree(choices);
+				const baseNodes = baseLevel === 0 || root.children.length === 0 ? [root] : root.children;
+				const bases: FrontierBase[] = baseNodes.map((n) => ({
+					target: ref(n.start, n.end),
+					start: n.start,
+					end: n.end,
+					speculative: false,
+				}));
+				// The learned slices: some nodes below the bases, as the learned table of a router holds them.
+				const below: Node[] = [];
+				const collect = (n: Node) => {
+					for (const child of n.children) {
+						below.push(child);
+						collect(child);
+					}
+				};
+				baseNodes.forEach(collect);
+				const learnedSlices: LearnedRangeSlice[] = below
+					.filter((_, i) => learnedMask[i % learnedMask.length])
+					.map((n) => ({ startBoundary: n.start, endBoundary: n.end, depth: n.depth }));
+				const toBound = (b: { sk: string; inclusive: boolean } | undefined) =>
+					b === undefined ? undefined : { value: b.sk === "" ? KeyCodec.encodeOptional(undefined) : kb(b.sk), inclusive: b.inclusive };
+				const interval: CompositeInterval = hashKeyInterval(kb(hashKey), { lower: toBound(lower), upper: toBound(upper) });
+
+				const visits = planRangeFrontier(bases, learnedSlices, interval, descending, (s) => ref(s.startBoundary, s.endBoundary));
+				const ordered = descending ? [...visits].reverse() : visits;
+
+				// Each visit intersects the interval, and the visits are disjoint and in order.
+				for (const [i, v] of ordered.entries()) {
+					expect(segmentIntersects(v.segment.start, v.segment.end, interval)).toBe(true);
+					if (i > 0) {
+						expect(ordered[i - 1].segment.end).not.toBeNull();
+						expect(startCmp(v.segment.start, ordered[i - 1].segment.end)).toBeGreaterThanOrEqual(0);
+					}
+				}
+				// Each key of the interval is in exactly one visit.
+				const inInterval = UNIVERSE.filter(
+					(key) =>
+						KeyCodec.compareComposite(interval.start, key) <= 0 &&
+						(interval.end === null || KeyCodec.compareComposite(key, interval.end) < 0),
+				);
+				for (const key of inInterval) {
+					expect(visits.filter((v) => holdsKey(v.segment.start, v.segment.end, key))).toHaveLength(1);
+				}
+				// Each visit is inside its base, and its target is the deepest learned slice that holds the whole segment.
+				for (const v of visits) {
+					expect(holdsSegment(v.base.start, v.base.end, v.segment)).toBe(true);
+					const candidates = learnedSlices.filter(
+						(s) =>
+							holdsSegment(v.base.start, v.base.end, { start: s.startBoundary, end: s.endBoundary }) &&
+							!(startCmp(s.startBoundary, v.base.start) === 0 && endCmp(s.endBoundary, v.base.end) === 0) &&
+							holdsSegment(s.startBoundary, s.endBoundary, v.segment),
+					);
+					const deepest = candidates.reduce<LearnedRangeSlice | null>((d, s) => (d === null || s.depth > d.depth ? s : d), null);
+					if (deepest === null) {
+						expect(v.learned).toBeNull();
+						expect(v.segment.target).toEqual(v.base.target);
+					} else {
+						expect(v.learned?.depth).toBe(deepest.depth);
+						expect(holdsSegment(v.learned!.startBoundary, v.learned!.endBoundary, v.segment)).toBe(true);
+						expect(v.segment.target).toEqual(ref(v.learned!.startBoundary, v.learned!.endBoundary));
+					}
+				}
+			}),
+			{ numRuns: 500 },
+		);
 	});
 });

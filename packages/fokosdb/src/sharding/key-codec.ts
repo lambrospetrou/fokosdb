@@ -150,6 +150,17 @@ function incrementLastByte(bytes: Uint8Array): Uint8Array | null {
 }
 
 /**
+ * The smallest key above `key` in byte order: `key` with one 0x00 byte at the end. No key is between
+ * the two, so an inclusive bound `k` is the exclusive bound `after(k)`, and an exclusive lower bound
+ * `k` is the inclusive lower bound `after(k)`.
+ */
+function after(key: KeyBytes): KeyBytes {
+	const out = new Uint8Array(key.length + 1);
+	out.set(key);
+	return asKeyBytes(out);
+}
+
+/**
  * Prefix upper bound in byte space: the least key that is a strict upper bound of every key having
  * `prefix` as a prefix. Returns `null` (unbounded) when no such key exists — i.e. `prefix` is empty
  * or all `0xFF`. Used for `beginsWith` / prefix upper bounds.
@@ -394,6 +405,7 @@ export const KeyCodec = {
 	compareSlice,
 	compareSlices,
 	successor,
+	after,
 	publicSuccessor,
 	shortestSeparator,
 	compareComposite,

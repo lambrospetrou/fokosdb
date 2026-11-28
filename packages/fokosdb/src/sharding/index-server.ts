@@ -44,8 +44,8 @@ export { DEFAULT_RUNTIME_CONFIG, resolveRuntimeConfig } from "./runtime-config.j
 export type { FokosMigrationPageBudget, FokosRuntimeConfig, FokosRuntimeConfigOverrides } from "./runtime-config.js";
 export { ROUTE_EVIDENCE_MAX_BYTES, RouteCollector, attachRouting, routedError, routeNodeBytes } from "./envelope.js";
 export type { FokosRoutedError } from "./envelope.js";
-export { planRangeFrontier } from "./range-frontier.js";
-export type { FrontierBase, PlannedVisit } from "./range-frontier.js";
+export { hashKeyInterval, planRangeFrontier } from "./range-frontier.js";
+export type { CompositeInterval, FrontierBase, FrontierSegment, PlannedVisit } from "./range-frontier.js";
 export { FokosScheduler } from "./scheduler.js";
 export type { FokosSchedulerDeps } from "./scheduler.js";
 

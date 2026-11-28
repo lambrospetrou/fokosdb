@@ -39,14 +39,24 @@ import {
 	resolveDescendantHashPartitionContext,
 	resolveRangePartitionContext,
 } from "./partition-id.js";
-import { isStrictSubSlice, planRangeFrontier, projectOnHashKey, startCmp, type FrontierBase, type PlannedVisit } from "./range-frontier.js";
+import {
+	hashKeyInterval,
+	isStrictSubSlice,
+	planRangeFrontier,
+	projectOnHashKey,
+	segmentIntersects,
+	startCmp,
+	endCmp,
+	type CompositeInterval,
+	type FrontierBase,
+} from "./range-frontier.js";
 import { RepartitionSource, RepartitionTarget, type RepartitionCommonDeps } from "./repartition-flow.js";
 import { storagePositionOf } from "./storage-position.js";
 import {
 	compositeInInterval,
 	hashStorageInterval,
 	rangeStorageInterval,
-	sliceIncludesHashKey,
+	sliceIncludesRoutingHash,
 	sliceIncludesPosition,
 	type FokosSlice,
 } from "./repartition-slice.js";
@@ -107,7 +117,6 @@ import { systemPlatform, type FokosPlatform } from "../shared/platform.js";
 import { jitterBackoff } from "durable-utils/retries";
 import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
-import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
 import { cachedHashTopology, cutTopologyHint, type TopologyEntry } from "./topology-cache.js";
 import { findLeaf, TOPOLOGY_EVENT_TYPE, type FokosStoredTopologyEvent, type HashTopologyView } from "./topology-codec.js";
 import { topologyEventToJson } from "./topology-encode.js";
@@ -239,7 +248,11 @@ type MissHint = Pick<RemoteResolution, "via" | "learned" | "relDepth" | "topolog
 type AnyOperation = FokosOperation<unknown, unknown>;
 
 /** One planned range visit, and the hint of its target for the miss ladder. */
-type RangePlan = { planned: PlannedVisit; hint: MissHint };
+/**
+ * One planned range visit: the visit the host gets, the base and the learned slice that the planner
+ * chose it from, and the hint of its target for the miss ladder.
+ */
+type RangePlan = { visit: FokosRangeVisit; base: FrontierBase; learned: LearnedRangeSlice | null; hint: MissHint };
 
 /** The execution kinds. Each shape maps to one of them, in `#compile`. */
 type ExecutionKind = "one_owner" | "fan_out" | "walk" | "local";
@@ -471,8 +484,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			case "fan_out":
 				return await this.#runFanOut(op, compiled, pointSpans(spans), req, collector, scope);
 			case "walk":
-				invariant(scope.kind === "owned", "fokos/runtime: a walk reads through with its own gate");
-				return await this.#runWalk(op, compiled, intervalSpan(spans), req, collector);
+				return scope.kind === "owned"
+					? await this.#runWalk(op, compiled, intervalSpan(spans), req, collector)
+					: await this.#runWalkReadThrough(op, compiled, intervalSpan(spans), req, collector, scope.slice);
 			case "local":
 				return invariant(false, "fokos/runtime: a local operation has no executor");
 		}
@@ -629,6 +643,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * Bloom step off before the answer is `many`.
 	 */
 	#oneOwner(op: string, spans: readonly PointSpan[], opts: ResolveOptions, scope: ExecutionScope): OneOwnerResolution {
+		if (spans.length === 1 && scope.kind === "owned") {
+			// One span has one owner, and the Bloom guard keeps the resolution of a lone routingHash, so
+			// the plan is the resolution of its position. This is the path of every point request.
+			const [span] = spans;
+			const resolution = this.#resolvePosition(span.position, opts);
+			if (resolution.kind === "out_of_range") {
+				throw misrouted(op, span.kind === "item" ? "key outside this partition" : "position outside this partition");
+			}
+			return resolution.kind === "local" ? { kind: "local", epoch: this.#ownershipEpoch } : { kind: "remote", resolution };
+		}
 		const plan = this.#plan(op, spans, opts, scope);
 		if (plan.remote.size === 0) {
 			return { kind: "local", epoch: plan.epoch };
@@ -659,7 +683,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		scope: ExecutionScope,
 		retries: number,
 	): Promise<unknown> {
-		const answer = await this.#forwardVisit(op, compiled, { resolution, spans: [...spans] }, req, collector, retries);
+		const answer = await this.#forwardVisit(op, compiled, { resolution, spans }, req, collector, retries);
 		if (answer.kind === "answered") {
 			return answer.value;
 		}
@@ -805,7 +829,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	async #forwardVisit(
 		op: string,
 		compiled: CompiledOperation,
-		visit: RemoteVisit,
+		visit: { resolution: RemoteResolution; spans: readonly PointSpan[] },
 		req: unknown,
 		collector: RouteCollector,
 		retries: number,
@@ -1088,14 +1112,57 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	// ═══ the walk executor ══════════════════════════════════════════════════
 
+	/**
+	 * The read-through of a walk on the source: one visit for the part of the interval inside the caller
+	 * slice. The source holds every row of the slice, so the handler answers for the whole part, and no
+	 * walk runs. A promoted routingHash of a `hash_child` caller slice goes to its range root, because
+	 * the rows here are stale copies or already collected; the routers below the root fan out.
+	 */
+	async #runWalkReadThrough(
+		op: string,
+		compiled: CompiledOperation,
+		span: IntervalSpan,
+		req: unknown,
+		collector: RouteCollector,
+		slice: FokosSlice,
+	): Promise<unknown> {
+		const descriptor = rangeDescriptor(compiled);
+		const input = span.range;
+		const { routingHash } = span.position;
+		if (!sliceIncludesRoutingHash(slice, routingHash, this.identity().topology)) {
+			throw misrouted(op, "hash key outside the caller slice");
+		}
+		let request = req;
+		if (slice.kind === "range") {
+			if (!segmentIntersects(slice.start, slice.end, hashKeyInterval(input.hashKey, input.interval))) {
+				throw misrouted(op, "interval disjoint from the caller slice");
+			}
+			// The caller proves its slice with the cursor too: one that lies outside it asks for rows of
+			// another caller, which is a routing defect, not a rescan.
+			if (input.cursor && !(startCmp(slice.start, input.cursor) <= 0 && endCmp(slice.end, input.cursor) > 0)) {
+				throw misrouted(op, "cursor outside the caller slice");
+			}
+			// The sort keys of the requested hash key inside the composite slice.
+			const sortKeys = projectOnHashKey(input.hashKey, slice.start, slice.end);
+			invariant(sortKeys, "fokos/runtime.readThrough: a slice that the interval intersects holds sort keys of the hash key");
+			request = descriptor.clip(req, { target: "local", start: sortKeys.start, end: sortKeys.end, speculative: false });
+		}
+		if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash)) {
+			const root = refOf(resolveRangePartitionContext(this.routeContext(), routingHash, null, null));
+			return await this.#forwardTo(collector, root, op, request, [routingHash]);
+		}
+		collector.add(this.#selfNode("executed"));
+		return await this.#runLocal(descriptor, request, this.#localCall(slice).call);
+	}
+
 	/** Runs the `range` shape: the host walks the planned visits of the interval. */
 	async #runWalk(op: string, compiled: CompiledOperation, span: IntervalSpan, req: unknown, collector: RouteCollector): Promise<unknown> {
 		const descriptor = rangeDescriptor(compiled);
 		const epoch = this.#ownershipEpoch;
 		const planned = this.#planRange(op, span.range, true);
-		const visits = planned.map((p) => p.planned.visit);
+		const visits = planned.map((p) => p.visit);
 		// The walk admits one time, before the first local run: at the start when the plan has a local
-		// visit, or at a fallback that runs a visit here.
+		// visit, or at the first local visit of a new plan after a fallback or a cutover.
 		let admitted = false;
 		const admitOnce = () => {
 			if (!admitted) {
@@ -1121,22 +1188,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const walk = async (request: unknown, planned: readonly RangePlan[], epoch: number): Promise<unknown> =>
 			await descriptor.walk({
 				request,
-				visits: planned.map((p) => p.planned.visit),
+				visits: planned.map((p) => p.visit),
 				local: (r) => {
 					if (epoch !== this.#ownershipEpoch) {
 						const epochNow = this.#ownershipEpoch;
 						return walk(r, this.#planRange(op, descriptor.range(r), true), epochNow);
 					}
+					admitOnce();
 					return local(r);
 				},
 				forward: async (visit, r) => {
 					// A walk that forwards makes this partition a router of the request. A leaf that also ran
 					// the handler keeps its `executed` role, because `executed` outranks `merged`.
 					collector.add(this.#selfNode("merged"));
-					return await this.#forwardRangeVisit(op, compiled, visit, r, collector, (fallback) => {
-						admitOnce();
-						return local(fallback);
-					});
+					return await this.#forwardRangeVisit(op, compiled, visit, r, collector, (part, plans) => walk(part, plans, this.#ownershipEpoch));
 				},
 			});
 		const value = await walk(req, planned, epoch);
@@ -1316,7 +1381,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** A disjoint, ordered cover of one range request. The host walks it with `forwardRangeVisit`. */
 	rangeVisits(input: FokosRangeInput): FokosRangeVisit[] {
-		return this.#planRange("rangeVisits", input, true).map((p) => p.planned.visit);
+		return this.#planRange("rangeVisits", input, true).map((p) => p.visit);
 	}
 
 	/** Forwards one registered operation to one target and learns its routes. The envelope is that call's own. */
@@ -1339,15 +1404,24 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const descriptor = rangeDescriptor(compiled);
 		const collector = new RouteCollector();
 		const signals: FokosSignals[] = [];
-		// A fallback that runs the visit here admits and signals as a planned local visit does.
-		const value = await this.#forwardRangeVisit(op, compiled, visit, req, collector, (r) => {
+		// A fallback that plans the visit again walks the new plan with the walk of the operation. A local
+		// visit of it admits and signals as a planned local visit does.
+		const local = (r: unknown) => {
 			this.#admit(op, descriptor, this.#spansOf(descriptor, r));
 			const { call, signals: own } = this.#localCall();
 			collector.add(this.#selfNode("executed"));
 			const out = this.#runLocal(descriptor, r, call);
 			signals.push(...own);
 			return out;
-		});
+		};
+		const walkAgain = async (part: unknown, plans: readonly RangePlan[]): Promise<unknown> =>
+			await descriptor.walk({
+				request: part,
+				visits: plans.map((p) => p.visit),
+				local,
+				forward: async (next, r) => await this.#forwardRangeVisit(op, compiled, next, r, collector, walkAgain),
+			});
+		const value = await this.#forwardRangeVisit(op, compiled, visit, req, collector, walkAgain);
 		await this.#applySignals(signals);
 		return envelope(value as Ops[K]["res"], collector.build());
 	}
@@ -1482,47 +1556,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			});
 		}
 
-		// The same executor as on the owner, with a plan inside the caller slice: each span must be inside
-		// the slice, a promoted routingHash goes to its range tree, and every other span runs here.
-		if (compiled.execution !== "walk") {
-			const spans = this.#spansOf(descriptor, req.request);
-			const value = await this.#execute(req.op, compiled, spans, req.request, collector, { kind: "readThrough", slice });
-			return envelope(value, collector.build());
-		}
-
-		// The point planner plans positions only. A walk reads an interval of one hash key, so it reads
-		// through with its own gate.
-		const topology = this.identity().topology;
-		const routeCtx = this.routeContext();
-		invariant(descriptor.shape === "range", "fokos/runtime: a walk is the range shape");
-		const input = descriptor.range(req.request);
-		if (!sliceIncludesHashKey(slice, input.hashKey, topology, this.#routingHashSeedResolver)) {
-			throw misrouted(req.op, "hash key outside the caller slice");
-		}
-		let request = req.request;
-		if (slice.kind === "range") {
-			// The sort keys of the requested hash key inside the composite slice.
-			const segment = projectOnHashKey(input.hashKey, slice.start, slice.end);
-			if (segment === null || !rangeIntersects(segment.start ?? NO_SORT_KEY, segment.end, input.interval)) {
-				throw misrouted(req.op, "interval disjoint from the caller slice");
-			}
-			// The caller proves its slice with the cursor too: one that lies outside it asks for rows of
-			// another caller, which is a routing defect, not a rescan.
-			if (input.cursor && !cursorFallsInChild(segment.start ?? NO_SORT_KEY, segment.end, input.cursor)) {
-				throw misrouted(req.op, "cursor outside the caller slice");
-			}
-			request = descriptor.clip(req.request, { target: "local", start: segment.start, end: segment.end, speculative: false });
-		}
-		const routingHash = this.#routingHash(input.hashKey);
-		if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(routingHash)) {
-			// A range request spans sort keys, so it carries no one key that could select a deeper range
-			// slice; it enters at the range root and the routers below it fan out.
-			const root = refOf(resolveRangePartitionContext(routeCtx, routingHash, null, null));
-			const value = await this.#forwardTo(collector, root, req.op, request, [routingHash]);
-			return envelope(value, collector.build());
-		}
-		collector.add(this.#selfNode("executed"));
-		const value = await this.#runLocal(descriptor, request, this.#localCall(slice).call);
+		// The same executor as on the owner, in the scope of the caller slice: each span must be inside the
+		// slice, a promoted routingHash goes to its range tree, and every other span runs here.
+		const spans = this.#spansOf(descriptor, req.request);
+		const value = await this.#execute(req.op, compiled, spans, req.request, collector, { kind: "readThrough", slice });
 		return envelope(value, collector.build());
 	}
 
@@ -1815,7 +1852,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	// ═══ owner resolution ═══════════════════════════════════════════════════
 
 	/** The range form of the ownership check: the hash key, and the whole interval inside a range partition. */
-	#assertCanOwnRange(op: string, input: FokosRangeInput): void {
+	#assertCanOwnRange(op: string, input: FokosRangeInput, interval?: CompositeInterval): void {
 		const identity = this.identity();
 		const routingHash = this.#routingHash(input.hashKey);
 		if (identity.kind === "hash") {
@@ -1828,8 +1865,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (compareRoutingHashes(routingHash, range.routingHash) !== 0) {
 			throw misrouted(op, "hash key outside this range partition");
 		}
-		const segment = projectOnHashKey(input.hashKey, range.start, range.end);
-		if (segment === null || !intervalInside(input.interval, segment.start, segment.end)) {
+		const { start, end } = interval ?? hashKeyInterval(input.hashKey, input.interval);
+		if (startCmp(range.start, start) > 0 || endCmp(range.end, end) < 0) {
 			throw misrouted(op, "interval outside this range partition");
 		}
 	}
@@ -2001,9 +2038,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#planRange(op: string, input: FokosRangeInput, bloom: boolean): RangePlan[] {
 		const identity = this.identity();
 		const routeCtx = this.routeContext();
+		const interval = hashKeyInterval(input.hashKey, input.interval);
 		let bases: FrontierBase[];
 		let learned: LearnedRangeSlice[] = [];
-		this.#assertCanOwnRange(op, input);
+		this.#assertCanOwnRange(op, input, interval);
 		// The miss hint of each remote base, for the miss ladder.
 		const hints = new Map<FrontierBase, MissHint>();
 		const base = (b: FrontierBase, hint: MissHint): FrontierBase => {
@@ -2022,12 +2060,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			} else if (bloom && this.#bloom?.maybePromoted(routingHash)) {
 				bases = [base({ target: root, start: null, end: null, speculative: true }, { via: "bloom", learned: null })];
 				learned = this.#store.listLearnedRangeSlices(routingHash);
-			} else if (this.#source.routerRole()) {
-				const relDepth = Math.max(1, this.#arena()?.findLeaf(routingHash) ?? 0);
-				const target = this.#hashDescendant(routingHash, relDepth);
-				bases = [base({ target, start: null, end: null, speculative: false }, { via: "hash", relDepth, learned: null })];
 			} else {
-				bases = [{ target: "local", start: null, end: null, speculative: false }];
+				// The hash key stays in the hash tree: here on an owner, or at the deepest hash descendant
+				// that the hash arena and the topology cache know, as for a point.
+				const owner = this.#hashTopologyOwner(routingHash, this.#source.routerRole());
+				bases =
+					owner.kind === "local"
+						? [{ target: "local", start: null, end: null, speculative: false }]
+						: [base({ target: owner.target, start: null, end: null, speculative: false }, owner)];
 			}
 		} else {
 			const range = identity.range!;
@@ -2042,17 +2082,23 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 		}
 
-		const planned = planRangeFrontier(input.hashKey, bases, learned, input.interval, input.descending, (slice) =>
+		const planned = planRangeFrontier(bases, learned, interval, input.descending, (slice) =>
 			refOf(resolveRangePartitionContext(routeCtx, routingHash, slice.startBoundary, slice.endBoundary)),
 		);
-		return planned.map((p) => {
-			const baseHint = hints.get(p.base);
+		return planned.map(({ segment, base: from, learned: slice }) => {
+			// The host reads the sort keys of its hash key, so a visit is the part of the segment for that hash key.
+			const sortKeys = projectOnHashKey(input.hashKey, segment.start, segment.end);
+			invariant(sortKeys, "fokos/runtime.planRange: a planned segment holds sort keys of the hash key");
+			const visit: FokosRangeVisit = { target: segment.target, start: sortKeys.start, end: sortKeys.end, speculative: segment.speculative };
+			const baseHint = hints.get(from);
 			const plan: RangePlan = {
-				planned: p,
+				visit,
+				base: from,
+				learned: slice,
 				// A visit to a learned slice misses as that slice does. The base gives the Bloom fact.
-				hint: p.learned ? { via: baseHint?.via ?? "range", learned: p.learned } : (baseHint ?? { via: "range", learned: null }),
+				hint: slice ? { via: baseHint?.via ?? "range", learned: slice } : (baseHint ?? { via: "range", learned: null }),
 			};
-			this.#plans.set(p.visit, plan);
+			this.#plans.set(visit, plan);
 			return plan;
 		});
 	}
@@ -2062,7 +2108,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * exist is forgotten, and the segment goes to its base target. A hash jump that finds no partition
 	 * forgets its arena hint and plans again. A speculative visit that finds no range partition, or no
 	 * cutover, plans the hash tree again with the Bloom step off: on a router the target is the hash
-	 * child, on a leaf it is this partition, and `runLocal` answers for the same visit. Every retry of a
+	 * child, and on a leaf the visit runs here. A new plan with one remote target takes the place of the
+	 * failed target. `walkAgain` walks every other new plan for the part of this visit. Every retry of a
 	 * cache miss goes through the same ladder, so a miss on a retry cannot skip a fallback.
 	 * `maxForwardRetries` bounds the misses one call can absorb.
 	 */
@@ -2072,7 +2119,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		visit: FokosRangeVisit,
 		req: unknown,
 		collector: RouteCollector,
-		runLocal: (req: unknown) => unknown,
+		walkAgain: (req: unknown, plans: readonly RangePlan[]) => Promise<unknown>,
 	): Promise<unknown> {
 		let plan: RangePlan | undefined = this.#plans.get(visit);
 		invariant(plan, "fokos/runtime.forwardRangeVisit: the visit was not planned by this runtime");
@@ -2084,8 +2131,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			try {
 				return await this.#forwardTo(collector, target, op, req, routingHashes);
 			} catch (e) {
-				const base: FrontierBase = plan.planned.base;
-				const learned: LearnedRangeSlice | null = plan.planned.learned;
+				const base: FrontierBase = plan.base;
+				const learned: LearnedRangeSlice | null = plan.learned;
 				// The ladder deletes a learned slice that does not exist. Only then does the segment go to its base.
 				const learnedMissed = learned !== null && FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
 				const opts = attempt < this.#config().maxForwardRetries ? this.#missLadder(routingHashes[0], plan.hint, e, true, true) : null;
@@ -2097,17 +2144,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				if (learnedMissed) {
 					invariant(base.target !== "local", "fokos/runtime.forwardRangeVisit: a learned slice never overlays a local base");
 					target = base.target;
-					plan = { planned: { visit, base, learned: null }, hint: { via: plan.hint.via, learned: null } };
+					plan = { visit, base, learned: null, hint: { via: plan.hint.via, learned: null } };
 					continue;
 				}
+				// The new plan of the visit: one remote target takes the place of the old one. Every other plan
+				// (a local visit, or a range tree with learned slices) is walked for the part of this visit.
 				const again = this.#planRange(op, input, opts.bloom);
-				invariant(again.length === 1, "fokos/runtime.forwardRangeVisit: a hash partition plans one base visit");
-				const fallback = again[0];
-				if (fallback.planned.visit.target === "local") {
-					return await runLocal(req);
+				if (again.length !== 1 || again[0].visit.target === "local") {
+					return await walkAgain(req, again);
 				}
-				target = fallback.planned.visit.target;
-				plan = fallback;
+				target = again[0].visit.target;
+				plan = again[0];
 			}
 		}
 	}
@@ -2829,23 +2876,6 @@ function hashPathOwns(idBytes: Uint8Array, routingHash: RoutingHash, topology: {
 	return true;
 }
 
-/** True when the request interval lies inside the half-open `[start, end)` of a range partition. */
-function intervalInside(interval: SkInterval, start: KeyBytes | null, end: KeyBytes | null): boolean {
-	if (start !== null && (interval.lower === undefined || KeyCodec.compare(interval.lower.value, start) < 0)) {
-		return false;
-	}
-	if (end !== null) {
-		if (interval.upper === undefined) {
-			return false;
-		}
-		const cmp = KeyCodec.compare(interval.upper.value, end);
-		if (cmp > 0 || (cmp === 0 && interval.upper.inclusive)) {
-			return false;
-		}
-	}
-	return true;
-}
-
 /**
  * True when the lifecycle gate of a target in `awaiting_data` refused the request. The gate refuses
  * before any handler runs, so nothing applied.
@@ -2917,11 +2947,12 @@ function manyOwnersAnswer(op: string, compiled: CompiledOperation): unknown {
 	return compiled.onManyOwners.answer;
 }
 
-function pointSpans(spans: readonly NormalizedSpan[]): PointSpan[] {
-	return spans.map((span) => {
+/** The spans of a point executor. It checks them, and makes no copy: this runs for every request. */
+function pointSpans(spans: readonly NormalizedSpan[]): readonly PointSpan[] {
+	for (const span of spans) {
 		invariant(span.kind !== "interval", "fokos/runtime: a point executor got an interval span");
-		return span;
-	});
+	}
+	return spans as readonly PointSpan[];
 }
 
 function intervalSpan(spans: readonly NormalizedSpan[]): IntervalSpan {
